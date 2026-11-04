@@ -14,12 +14,15 @@ LCC      := $(GBDK_HOME)/bin/lcc
 ROMUSAGE := $(GBDK_HOME)/bin/romusage
 
 CFLAGS  := -Icommon
+# Linker flags shared by every game: map file (-Wl-m) and NoICE symbol file (-Wl-j).
+LINKFLAGS := -Wl-m -Wl-j
 # Cart type 0x03 = MBC1+RAM+BATTERY, 1 RAM bank (header code 0x02, 8 KiB) for
 # the high score (see common/common.h). ROM stays 32 KB.
-LDFLAGS := -Wl-m -Wl-j -Wm-yt0x03 -Wm-ya1
+LDFLAGS := $(LINKFLAGS) -Wm-yt0x03 -Wm-ya1
 
 GAMES   := snake breakout cgbdemo
 HEADERS := $(wildcard common/*.h snake/src/*.h breakout/src/*.h)
+CGBDEMO_HEADERS := $(wildcard cgbdemo/src/*.h)
 
 COMMON_OBJ   := $(patsubst common/%.c,$(BUILD)/common/%.o,$(wildcard common/*.c))
 SNAKE_OBJ    := $(patsubst snake/src/%.c,$(BUILD)/snake/%.o,$(wildcard snake/src/*.c)) $(COMMON_OBJ)
@@ -54,7 +57,7 @@ $(BUILD)/breakout/breakout.gb: $(BREAKOUT_OBJ)
 # CGB-only (-Wm-yC: header 0x143 = 0xC0). Cart type stays 0 (ROM only). The
 # output keeps the .gb extension: CI uploads roms/homebrew/*.gb.
 $(BUILD)/cgbdemo/cgbdemo.gb: $(CGBDEMO_OBJ)
-	$(LCC) -Wl-m -Wl-j -Wm-yC -Wm-yn"CGBDEMO" -o $@ $^
+	$(LCC) $(LINKFLAGS) -Wm-yC -Wm-yn"CGBDEMO" -o $@ $^
 
 $(BUILD)/snake/%.o: snake/src/%.c $(HEADERS) | $(BUILD)/snake
 	$(LCC) $(CFLAGS) -c -o $@ $<
@@ -62,8 +65,10 @@ $(BUILD)/snake/%.o: snake/src/%.c $(HEADERS) | $(BUILD)/snake
 $(BUILD)/breakout/%.o: breakout/src/%.c $(HEADERS) | $(BUILD)/breakout
 	$(LCC) $(CFLAGS) -c -o $@ $<
 
-$(BUILD)/cgbdemo/%.o: cgbdemo/src/%.c | $(BUILD)/cgbdemo
-	$(LCC) $(CFLAGS) -c -o $@ $<
+# No -Icommon (it does not use common/). The Makefile is a prerequisite so a flag
+# change rebuilds it, and the link step follows since it depends on these objects.
+$(BUILD)/cgbdemo/%.o: cgbdemo/src/%.c $(CGBDEMO_HEADERS) Makefile | $(BUILD)/cgbdemo
+	$(LCC) -c -o $@ $<
 
 $(BUILD)/common/%.o: common/%.c $(HEADERS) | $(BUILD)/common
 	$(LCC) $(CFLAGS) -c -o $@ $<

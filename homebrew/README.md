@@ -35,10 +35,12 @@ with no dependency on `common/`. It runs only on a Game Boy Color (or `Model::Cg
 * A writes BCPS with auto-increment set and then two BCPD bytes (low, high) in VBlank.
 
 The headless case `play-cgbdemo-cgb` (`crates/gb-test`, kind suffix `-cgb`, DECISIONS #37) runs it as a
-CGB and reads `cgb_framebuffer()` (RGB555): at least 31 distinct colours; the exact colour at the middle of
-every swatch and at each quadrant of the flipped tiles; the sprite's 6x6 core found by colour and
-moved exactly 16 px by each of Right, Left, Down and Up held for 8 frames (and nothing on the other
-axis); and each A press changing only palette 7 colour 3, once per press. Like the other homebrew
+CGB and reads `cgb_framebuffer()` (RGB555): at least 31 distinct colours; the whole frame equal, pixel for
+pixel, to the card derived from the tile data and palettes (every swatch, every flip variant, the backdrop and
+the sprite); the sprite's 6x6 core found by colour and moved by whole steps of 2 px along the held
+direction only (7 to 9 steps in 8 held frames, since the ROM's poll can fall either side of a frame
+boundary); and five A presses stepping palette 7 colour 3 through all of `CYCLE` and back to the first
+entry, each changing exactly the swatch's pixels and no others. Like the other homebrew
 cases it fails (not skips) when `CI=true` and the ROM is missing.
 
 ## High score and saves
