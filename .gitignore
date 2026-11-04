@@ -4,6 +4,7 @@
 /roms/
 *.sav
 .DS_Store
+.claude/
 homebrew/**/build/
 homebrew/**/*.o
 homebrew/**/*.lst
