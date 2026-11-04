@@ -132,10 +132,11 @@ fn tima_write_during_reload_cycle_is_ignored_but_irq_still_fires() {
 }
 
 /// mooneye `timer/tma_write_reloading`: TMA written on the overflow cycle is
-/// what gets reloaded; written on the reload cycle (or later) it is too late.
+/// what gets reloaded, and a write on the reload cycle itself also propagates
+/// into TIMA; only from the cycle after that is it too late.
 #[test]
 fn tma_write_around_reload() {
-    let cases = [(28, 0x7F), (29, 0x7F), (30, 0xFE), (31, 0xFE)];
+    let cases = [(28, 0x7F), (29, 0x7F), (30, 0x7F), (31, 0xFE)];
     for (n, expect) in cases {
         let mut b = new_bus();
         timer_prelude(&mut b, 0xFE);
@@ -146,12 +147,12 @@ fn tma_write_around_reload() {
 }
 
 #[test]
-fn tma_write_on_reload_cycle_does_not_reach_tima() {
+fn tma_write_on_reload_cycle_propagates_to_tima() {
     let mut b = new_bus();
     timer_prelude(&mut b, 0xFE);
     nops(&mut b, 30 + 2);
     b.write(TMA, 0x11); // tick 33
-    assert_eq!(b.read(TIMA), 0xFE);
+    assert_eq!(b.read(TIMA), 0x11);
     assert_eq!(b.read(TMA), 0x11);
 }
 

@@ -16,10 +16,11 @@
 //! | access in tick | TIMA reads | TIMA write         | TMA write                |
 //! |----------------|------------|--------------------|--------------------------|
 //! | `T`            | `0x00`     | cancels reload+IRQ | picked up by the reload  |
-//! | `T + 1`        | `TMA`      | ignored            | too late for TIMA        |
-//! | `T + 2`        | normal     | normal             | normal                   |
+//! | `T + 1`        | `TMA`      | ignored            | copied into TIMA too     |
+//! | `T + 2`        | normal     | normal             | too late for TIMA        |
 //!
-//! (Pan Docs calls the `T` row the cycle where "TMA writes propagate".)
+//! The `T + 1` row is Pan Docs' reload cycle where "TMA writes propagate";
+//! mooneye `tma_write_reloading` requires it (a write there reads back in TIMA).
 
 use crate::interrupts::{Interrupt, Interrupts};
 
@@ -35,7 +36,7 @@ pub struct Timer {
     /// TIMA overflowed during the previous M-cycle; reload happens this cycle.
     overflow_pending: bool,
     /// TIMA was reloaded from TMA during the current M-cycle; CPU writes to TIMA
-    /// in this cycle are ignored.
+    /// in this cycle are ignored and TMA writes are copied into TIMA.
     reloaded_this_cycle: bool,
 }
 
@@ -129,7 +130,12 @@ impl Timer {
                     self.overflow_pending = false;
                 }
             }
-            0xFF06 => self.tma = value,
+            0xFF06 => {
+                self.tma = value;
+                if self.reloaded_this_cycle {
+                    self.tima = value;
+                }
+            }
             0xFF07 => {
                 let before = self.timer_signal();
                 self.tac = value | 0xF8;
