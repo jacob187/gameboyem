@@ -162,12 +162,13 @@ static void play(void)
     uint8_t dir = DIR_RIGHT;
     uint8_t next = DIR_RIGHT;
     uint8_t frames = 0;
-    uint8_t delay = step_delay();
+    uint8_t delay;
     uint8_t keys;
     int8_t nx, ny;
     uint8_t eat;
 
     new_game();
+    delay = step_delay(); /* after new_game(): it resets `foods` */
 
     for (;;) {
         wait_vbl_done();
