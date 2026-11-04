@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,36 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Largest valid save file: 128 KiB of cart RAM (MBC5, RAM code 4) plus the
+/// 48-byte MBC3 RTC footer. Anything bigger cannot be a save for any cartridge.
+/// (The core exports no such constant; a test checks this still covers it.)
+const MAX_SAVE_BYTES: u64 = 0x20000 + 48;
+
+/// Read the save at `path`: `Ok(None)` if there is none. Rejects, without
+/// reading the contents, anything that is not a regular file (a FIFO would block
+/// `open`, `/dev/zero` never ends), and stops at [`MAX_SAVE_BYTES`] + 1.
+fn read_save(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let mut data = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_SAVE_BYTES + 1)
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_SAVE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("larger than any valid save ({MAX_SAVE_BYTES} bytes)"),
+        ));
+    }
+    Ok(Some(data))
 }
 
 /// Highest numbered backup tried before giving up (`.bak`, `.bak1`, ...).
@@ -158,12 +188,18 @@ fn failure_message(path: &Path, err: &io::Error, w: &Warning) -> String {
     }
 }
 
+const BLOCKED_NOTE: &str = "The file was left untouched and SAVING IS DISABLED for this session \
+so it is not overwritten. Move or fix it and restart.";
+
 pub struct SaveManager {
     path: PathBuf,
     /// Battery RAM as of the last load/write; `None` until known.
     last: Option<Vec<u8>>,
     next_check: Instant,
     warn: WarnLimiter,
+    /// Set when an existing file at `path` could not be read or backed up. Writing
+    /// would replace it (rename ignores its permissions), so nothing is written.
+    write_blocked: bool,
 }
 
 impl SaveManager {
@@ -173,6 +209,7 @@ impl SaveManager {
             last: None,
             next_check: now + SAVE_INTERVAL,
             warn: WarnLimiter::default(),
+            write_blocked: false,
         }
     }
 
@@ -186,8 +223,8 @@ impl SaveManager {
         if gb.battery_ram().is_none() {
             return; // no battery: nothing to load or save
         }
-        match fs::read(&self.path) {
-            Ok(data) => match gb.load_battery_ram(&data) {
+        match read_save(&self.path) {
+            Ok(Some(data)) => match gb.load_battery_ram(&data) {
                 Ok(()) => eprintln!("loaded save {}", self.path.display()),
                 Err(e) => {
                     // Keep the odd file around: the next write would replace it.
@@ -197,15 +234,26 @@ impl SaveManager {
                             self.path.display(),
                             backup.display()
                         ),
-                        Err(c) => eprintln!(
-                            "warning: ignoring {}: {e} (backup failed: {c})",
-                            self.path.display()
-                        ),
+                        Err(c) => {
+                            self.write_blocked = true;
+                            eprintln!(
+                                "warning: ignoring {}: {e} (backup failed: {c})\n  {BLOCKED_NOTE}",
+                                self.path.display()
+                            );
+                        }
                     }
                 }
             },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("warning: cannot read {}: {e}", self.path.display()),
+            Ok(None) => {}
+            Err(e) => {
+                // Unreadable, not a regular file, or oversized: no copy is made,
+                // so the file must not be replaced either.
+                self.write_blocked = true;
+                eprintln!(
+                    "warning: cannot use save {}: {e}\n  {BLOCKED_NOTE}",
+                    self.path.display()
+                );
+            }
         }
         // Whatever the cartridge holds now is the baseline; only changes get written.
         self.last = gb.battery_ram();
@@ -230,10 +278,26 @@ impl SaveManager {
         self.sync(gb.battery_ram(), Instant::now(), true);
     }
 
+    /// Does `ram` differ from what is on disk (or was loaded)? The one place that
+    /// decides "changed"; a core-provided generation counter could replace it.
+    fn needs_write(&self, ram: &[u8]) -> bool {
+        self.last.as_deref() != Some(ram)
+    }
+
     /// Returns true if a file was written.
     fn sync(&mut self, ram: Option<Vec<u8>>, now: Instant, urgent: bool) -> bool {
         let Some(ram) = ram else { return false };
-        if self.last.as_ref() == Some(&ram) {
+        if !self.needs_write(&ram) {
+            return false;
+        }
+        if self.write_blocked {
+            // Said once at load; on exit say what that means for this session.
+            if urgent {
+                eprintln!(
+                    "warning: progress NOT saved: {} was not usable at startup and was left untouched",
+                    self.path.display()
+                );
+            }
             return false;
         }
         match write_atomic(&self.path, &ram) {
@@ -424,6 +488,143 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("g.sav.bak")).unwrap(), b"short");
     }
 
+    /// A cartridge with `cart_type` and RAM size code `ram_code`, 32 KiB ROM.
+    fn cart(cart_type: u8, ram_code: u8) -> GameBoy {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = cart_type;
+        rom[0x149] = ram_code;
+        GameBoy::new(rom).unwrap()
+    }
+
+    fn dir_names(dir: &Path) -> Vec<OsString> {
+        let mut v: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Load `contents` as `g.sav`, change RAM, and try every kind of write.
+    /// Returns the manager (for inspection) after asserting nothing was written.
+    fn load_then_try_to_save(dir: &Path, gb: &mut GameBoy) -> SaveManager {
+        let t0 = Instant::now();
+        let mut m = SaveManager::new(&dir.join("g.gb"), t0);
+        m.load(gb);
+        assert!(m.write_blocked);
+        let mut ram = gb.battery_ram().unwrap();
+        ram[0] = 0x55;
+        assert!(!m.sync(Some(ram.clone()), t0, false));
+        gb.load_battery_ram(&ram).unwrap();
+        m.flush(gb);
+        m.tick(gb, secs(t0, 10));
+        m.flush_final(gb);
+        m
+    }
+
+    #[test]
+    fn oversized_save_is_rejected_without_copy_or_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = vec![7u8; MAX_SAVE_BYTES as usize + 1];
+        fs::write(dir.path().join("g.sav"), &big).unwrap();
+        let mut gb = GameBoy::new(battery_rom()).unwrap();
+
+        load_then_try_to_save(dir.path(), &mut gb);
+
+        assert_eq!(
+            dir_names(dir.path()),
+            [OsString::from("g.sav")],
+            "no .bak, no .tmp"
+        );
+        assert_eq!(fs::read(dir.path().join("g.sav")).unwrap(), big);
+    }
+
+    #[test]
+    fn read_save_stops_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("g.sav");
+        fs::write(&p, vec![1u8; MAX_SAVE_BYTES as usize]).unwrap();
+        assert_eq!(read_save(&p).unwrap().unwrap().len() as u64, MAX_SAVE_BYTES);
+        fs::write(&p, vec![1u8; MAX_SAVE_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            read_save(&p).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(read_save(&dir.path().join("none.sav")).unwrap().is_none());
+    }
+
+    #[test]
+    fn directory_at_the_save_path_blocks_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("g.sav")).unwrap();
+        let mut gb = GameBoy::new(battery_rom()).unwrap();
+
+        load_then_try_to_save(dir.path(), &mut gb);
+
+        assert!(dir.path().join("g.sav").is_dir());
+        assert_eq!(dir_names(dir.path()), [OsString::from("g.sav")]);
+    }
+
+    /// Unreadable save (mode 000): the first RAM change must not rename over it.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_save_is_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sav = dir.path().join("g.sav");
+        fs::write(&sav, b"precious progress").unwrap();
+        fs::set_permissions(&sav, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::File::open(&sav).is_ok();
+        if !readable {
+            let mut gb = GameBoy::new(battery_rom()).unwrap();
+            load_then_try_to_save(dir.path(), &mut gb);
+            assert_eq!(
+                dir_names(dir.path()),
+                [OsString::from("g.sav")],
+                "no .bak, no .tmp"
+            );
+        }
+        // Restore so the content can be checked and the temp dir removed.
+        fs::set_permissions(&sav, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read(&sav).unwrap(), b"precious progress");
+        if readable {
+            eprintln!("skipped: file permissions are not enforced (running as root?)");
+        }
+    }
+
+    #[test]
+    fn max_save_bytes_covers_the_largest_cartridges() {
+        // MBC5 with 128 KiB RAM; MBC3 + RTC with 32 KiB RAM (+ footer).
+        for (cart_type, ram_code) in [(0x1B, 0x04), (0x10, 0x03)] {
+            let mut gb = cart(cart_type, ram_code);
+            let mut ram = gb.battery_ram().expect("battery");
+            assert!(ram.len() as u64 <= MAX_SAVE_BYTES, "type {cart_type:#x}");
+            // A save of exactly the largest valid size loads, and is not blocked.
+            ram[0] = 0xAB;
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("g.sav"), &ram).unwrap();
+            let mut m = SaveManager::new(&dir.path().join("g.gb"), Instant::now());
+            m.load(&mut gb);
+            assert!(!m.write_blocked);
+            assert_eq!(gb.battery_ram().unwrap()[0], 0xAB);
+        }
+        assert_eq!(cart(0x1B, 0x04).battery_ram().unwrap().len(), 0x20000);
+    }
+
+    #[test]
+    fn missing_save_does_not_block_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom()).unwrap();
+        let t0 = Instant::now();
+        let mut m = SaveManager::new(&dir.path().join("g.gb"), t0);
+        m.load(&mut gb);
+        assert!(!m.write_blocked);
+        let mut ram = gb.battery_ram().unwrap();
+        ram[0] = 1;
+        assert!(m.sync(Some(ram), t0, false));
+    }
+
     #[test]
     fn rom_without_battery_never_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -575,6 +776,10 @@ mod tests {
             let t0 = Instant::now();
             let mut m = SaveManager::new(&rom, t0);
             m.load(&mut gb); // wrong size -> .bak copy fails -> logged
+            assert!(
+                m.write_blocked,
+                "could not back it up, so must not replace it"
+            );
             let mut ram = gb.battery_ram().unwrap();
             ram[0] = 1;
             assert!(!m.sync(Some(ram), t0, false));
