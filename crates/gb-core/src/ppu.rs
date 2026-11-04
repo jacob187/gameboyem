@@ -183,6 +183,14 @@ pub struct Ppu {
     /// `back` / `front` stay all zero in colour mode.
     cgb_back: Option<Box<CgbFramebuffer>>,
     cgb_front: Option<Box<CgbFramebuffer>>,
+    /// The PPU entered HBlank (mode 3 -> 0 on a visible line) since the bus last
+    /// took the signal, or the LCD was switched off outside HBlank (SameBoy:
+    /// HDMA then still gets its block). It is set whether or not an HDMA is
+    /// running; the bus clears it when it starts one. Saved on a CGB only.
+    hblank_entered: bool,
+    /// The CPU runs in double speed: the PPU gets 2 dots per M-cycle instead of
+    /// 4. Set by the bus (it owns the speed), not saved.
+    double_speed: bool,
 }
 
 /// A frame filled with `colour`.
@@ -252,6 +260,8 @@ impl Ppu {
             obj_stale: true,
             cgb_back: None,
             cgb_front: None,
+            hblank_entered: false,
+            double_speed: false,
         }
     }
 
@@ -407,10 +417,28 @@ impl Ppu {
         self.lyc_flag && !blanked
     }
 
-    /// Advance the PPU by one M-cycle (4 dots).
+    /// Advance the PPU by one M-cycle (4 dots). Forced inline into the bus's
+    /// plain tick path: without it the DMG loses about 8% of its speed (the
+    /// generic body made the compiler stop inlining it).
+    #[inline(always)]
     pub fn tick_mcycle(&mut self, interrupts: &mut Interrupts) {
+        self.tick_dots::<4>(interrupts);
+    }
+
+    /// Advance the PPU by one CPU M-cycle in double speed (2 dots). The PPU
+    /// keeps its real-time rate, so a CPU cycle is half as many dots
+    /// (DECISIONS #38).
+    pub(crate) fn tick_mcycle_double(&mut self, interrupts: &mut Interrupts) {
+        self.tick_dots::<2>(interrupts);
+    }
+
+    /// `DOTS` dots per M-cycle: 4 at normal speed, 2 in double speed. The
+    /// windows below measured in literal dots (the first M-cycle of a line, the
+    /// LY=153 quirk) are properties of the dot clock and stay as they are.
+    #[inline(always)]
+    fn tick_dots<const DOTS: u16>(&mut self, interrupts: &mut Interrupts) {
         if !self.lcd_on() {
-            self.off_dots += 4;
+            self.off_dots += u32::from(DOTS);
             if self.off_dots >= DOTS_PER_FRAME {
                 self.off_dots -= DOTS_PER_FRAME;
                 self.frame_ready = true;
@@ -419,9 +447,9 @@ impl Ppu {
         }
         self.vis_mode = self.mode();
         let dot = self.line_dot;
-        let next = dot + 4;
+        let next = dot + DOTS;
         if next < DOTS_PER_LINE && !(dot < OAM_SCAN_DOTS && next >= OAM_SCAN_DOTS) {
-            // None of the 4 dots ends the line or starts mode 3, so every
+            // None of the dots ends the line or starts mode 3, so every
             // `step_dot` would only have incremented `line_dot`.
             self.line_dot = next;
             // The LYC flag and STAT line were last evaluated at `dot` (every
@@ -430,13 +458,26 @@ impl Ppu {
             // (dots 0..4), the mode 2 -> 3 edge (excluded above) and the mode
             // 3 -> 0 edge, so with none of those crossed they cannot change.
             let mode3_end = OAM_SCAN_DOTS + self.mode3_len;
-            if dot >= 4 && !(dot < mode3_end && next >= mode3_end) {
+            // A CGB also re-evaluates when entering the line-144 STAT pulse
+            // window, the last M-cycle of line 143 (see `stat_line_level_for`).
+            let pulse_start = DOTS_PER_LINE - DOTS;
+            if dot >= 4
+                && !(dot < mode3_end && next >= mode3_end)
+                && !(next >= pulse_start
+                    && dot < pulse_start
+                    && self.cgb
+                    && self.ly == VBLANK_LINE - 1)
+            {
                 debug_assert_eq!(self.lyc_flag, self.lyc == self.visible_ly());
                 debug_assert_eq!(self.stat_line, self.stat_line_level());
                 return;
             }
+            // The HBlank edge of a visible line (a no-op for the other windows).
+            if dot < mode3_end && next >= mode3_end && self.ly < VBLANK_LINE {
+                self.hblank_entered = true;
+            }
         } else {
-            for _ in 0..4 {
+            for _ in 0..DOTS {
                 self.step_dot(interrupts);
             }
         }
@@ -516,7 +557,15 @@ impl Ppu {
     fn stat_line_level_for(&self, sel: u8) -> bool {
         let mode_line = self.lcd_on() && !(self.first_line && self.line_dot < OAM_SCAN_DOTS) && {
             let mode = self.mode();
-            let vblank_oam = self.ly == VBLANK_LINE && self.line_dot < 4;
+            // DMG: the M-cycle VBlank starts in. CGB: the one before it (mooneye
+            // `vblank_stat_intr-C`: the STAT interrupt precedes VBlank by a
+            // cycle), which is 4 dots at normal speed and 2 in double speed.
+            let vblank_oam = if self.cgb {
+                let m_cycle = if self.double_speed { 2 } else { 4 };
+                self.ly == VBLANK_LINE - 1 && self.line_dot >= DOTS_PER_LINE - m_cycle
+            } else {
+                self.ly == VBLANK_LINE && self.line_dot < 4
+            };
             (sel & STAT_HBLANK_IRQ != 0 && mode == 0)
                 || (sel & STAT_VBLANK_IRQ != 0 && mode == 1)
                 || (sel & STAT_OAM_IRQ != 0 && (mode == 2 || vblank_oam))
@@ -634,9 +683,10 @@ impl Ppu {
         match addr {
             0xFF40 => {
                 let was_on = self.lcd_on();
+                let outside_hblank = was_on && !self.in_hdma_window();
                 self.lcdc = value;
                 match (was_on, self.lcd_on()) {
-                    (true, false) => self.lcd_turned_off(interrupts),
+                    (true, false) => self.lcd_turned_off(interrupts, outside_hblank),
                     (false, true) => self.lcd_turned_on(interrupts),
                     _ => {}
                 }
@@ -675,7 +725,13 @@ impl Ppu {
 
     /// Pan Docs "LCDC.7": turning the LCD off resets LY and the mode, and the
     /// screen goes blank.
-    fn lcd_turned_off(&mut self, interrupts: &mut Interrupts) {
+    ///
+    /// SameBoy (`GB_lcd_off`): an armed HDMA still gets a block if the LCD goes
+    /// off outside HBlank (`outside_hblank`), because the STAT mode then reads 0.
+    fn lcd_turned_off(&mut self, interrupts: &mut Interrupts, outside_hblank: bool) {
+        if outside_hblank {
+            self.hblank_entered = true;
+        }
         self.ly = 0;
         self.line_dot = 0;
         self.off_dots = 0;
@@ -696,7 +752,13 @@ impl Ppu {
     /// the first frame is not displayed (it stays blank).
     fn lcd_turned_on(&mut self, interrupts: &mut Interrupts) {
         self.ly = 0;
-        self.line_dot = LCD_ON_LINE_DOT;
+        // The write's own M-cycle is already ticked: 4 dots at normal speed, 2
+        // in double speed.
+        self.line_dot = if self.double_speed {
+            LCD_ON_LINE_DOT / 2
+        } else {
+            LCD_ON_LINE_DOT
+        };
         self.vis_mode = 0;
         self.first_line = true;
         self.skip_frame = true;
@@ -705,6 +767,37 @@ impl Ppu {
         self.mode3_len = MODE3_BASE_DOTS;
         self.refresh_lyc_flag();
         self.update_stat_line(interrupts);
+    }
+}
+
+/// Bus-facing hooks for CGB double speed and HDMA.
+impl Ppu {
+    pub(crate) fn set_double_speed(&mut self, double: bool) {
+        self.double_speed = double;
+    }
+
+    /// Take the "entered HBlank" signal (see [`Ppu::hblank_entered`] the field).
+    pub(crate) fn take_hblank_entered(&mut self) -> bool {
+        std::mem::take(&mut self.hblank_entered)
+    }
+
+    /// Raise (HDMA started in HBlank) or clear (HDMA started elsewhere, so a
+    /// stale signal from an earlier line cannot fire it) the signal.
+    pub(crate) fn set_hblank_entered(&mut self, signalled: bool) {
+        self.hblank_entered = signalled;
+    }
+
+    /// The HDMA copies a block now when it is armed: the PPU is in HBlank on a
+    /// visible line, or the LCD is off (the STAT mode reads 0 then; SameBoy).
+    pub(crate) fn in_hdma_window(&self) -> bool {
+        !self.lcd_on() || (self.ly < VBLANK_LINE && self.line_dot >= OAM_SCAN_DOTS + self.mode3_len)
+    }
+
+    /// HDMA write to VRAM: into the CPU-selected bank, whatever the PPU mode.
+    /// `offset` is 0..0x2000.
+    pub(crate) fn hdma_write_vram(&mut self, offset: u16, value: u8) {
+        let base = self.vram_base();
+        self.vram[base + usize::from(offset & 0x1FFF)] = value;
     }
 }
 
@@ -764,6 +857,7 @@ impl Ppu {
             w.u8(self.vbk);
             w.u8(self.bcps);
             w.u8(self.ocps);
+            w.bool(self.hblank_entered);
         }
         if let (true, Some(back), Some(front)) = (self.colour, &self.cgb_back, &self.cgb_front) {
             w.u8(self.opri);
@@ -851,6 +945,7 @@ impl Ppu {
                 (self.bcps | self.ocps) & !(PAL_INDEX_AUTO_INC | PAL_INDEX_MASK) == 0,
                 "palette index",
             )?;
+            self.hblank_entered = r.bool()?;
         }
         if self.colour {
             self.opri = r.u8()?;

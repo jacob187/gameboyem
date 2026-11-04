@@ -182,12 +182,12 @@ impl Cpu {
 
     pub fn step<B: CpuBus>(&mut self, bus: &mut B) {
         if self.locked {
-            bus.tick();
+            bus.idle_tick();
             return;
         }
         if self.stopped {
             if !bus.joypad_line_low() {
-                bus.tick();
+                bus.idle_tick();
                 return;
             }
             self.stopped = false;
@@ -195,7 +195,7 @@ impl Cpu {
         if self.halted {
             // Pan Docs "halt": wakes when IE & IF != 0, regardless of IME.
             if bus.pending_interrupts() == 0 {
-                bus.tick();
+                bus.idle_tick();
                 return;
             }
             self.halted = false;
@@ -436,8 +436,11 @@ impl Cpu {
                 2 => {
                     // STOP (simplified, see module docs): skip padding byte.
                     self.regs.pc = self.regs.pc.wrapping_add(1);
-                    bus.stop();
-                    self.stopped = true;
+                    // A CGB speed switch (the pause is spent inside `stop`)
+                    // leaves the CPU running.
+                    if !bus.stop() {
+                        self.stopped = true;
+                    }
                 }
                 3 => {
                     // JR e

@@ -14,7 +14,7 @@
 //! FFFF       IE
 //! ```
 //!
-//! CGB-only registers (KEY1, VBK, SVBK, FF72-FF77) are decoded in the fallback
+//! CGB-only registers (KEY1, VBK, HDMA, SVBK, FF72-FF77) are decoded in the fallback
 //! arms of `read_io` / `write_io`, which a DMG reaches only for addresses that
 //! are unmapped on it, so the DMG paths pay nothing for them. See
 //! [`Hw`](crate::model::Hw) for what each variant maps.
@@ -111,7 +111,7 @@ impl Bus {
     /// picks the 4 KiB half (the echo has the same parity), and the upper half is
     /// the selected bank's window.
     #[inline]
-    fn wram_index(&self, addr: u16) -> usize {
+    pub(crate) fn wram_index(&self, addr: u16) -> usize {
         let low = usize::from(addr & 0x0FFF);
         if addr & 0x1000 == 0 {
             low
@@ -150,7 +150,9 @@ impl Bus {
             (Hw::Cgb, 0xFF69) => self.ppu.read_pal_data(false),
             (Hw::Cgb, 0xFF6B) => self.ppu.read_pal_data(true),
             (Hw::Cgb, 0xFF6C) => self.ppu.read_opri(),
-            (Hw::Cgb, 0xFF4D) => 0x7E | u8::from(self.key1_prepare),
+            (Hw::Cgb, 0xFF4D) => self.read_key1(),
+            // HDMA1-4 are write-only.
+            (Hw::Cgb, 0xFF55) => self.hdma.read5(),
             (Hw::Cgb, 0xFF70) => 0xF8 | self.svbk,
             (_, 0xFF72) => self.cgb_scratch.ff72,
             (_, 0xFF73) => self.cgb_scratch.ff73,
@@ -190,6 +192,11 @@ impl Bus {
             (Hw::Cgb, 0xFF6B) => self.ppu.write_pal_data(true, value),
             (Hw::Cgb, 0xFF6C) => self.ppu.write_opri(value),
             (Hw::Cgb, 0xFF4D) => self.key1_prepare = value & 1 != 0,
+            (Hw::Cgb, 0xFF51) => self.hdma.write_src_hi(value),
+            (Hw::Cgb, 0xFF52) => self.hdma.write_src_lo(value),
+            (Hw::Cgb, 0xFF53) => self.hdma.write_dst_hi(value),
+            (Hw::Cgb, 0xFF54) => self.hdma.write_dst_lo(value),
+            (Hw::Cgb, 0xFF55) => self.write_hdma5(value),
             (Hw::Cgb, 0xFF70) => self.set_svbk(value),
             (_, 0xFF72) => self.cgb_scratch.ff72 = value,
             (_, 0xFF73) => self.cgb_scratch.ff73 = value,

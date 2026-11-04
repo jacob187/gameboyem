@@ -176,13 +176,13 @@ fn key1_is_a_prepare_bit_with_unused_bits_set() {
     let mut b = cgb();
     assert_eq!(b.read(0xFF4D), 0x7E);
     b.write(0xFF4D, 0xFF);
-    assert_eq!(b.read(0xFF4D), 0x7F, "bit 7 (current speed) stays 0");
+    assert_eq!(
+        b.read(0xFF4D),
+        0x7F,
+        "bit 7 is the current speed, not writable"
+    );
     b.write(0xFF4D, 0xFE);
     assert_eq!(b.read(0xFF4D), 0x7E);
-    // STOP does not switch speed yet (hook only).
-    b.write(0xFF4D, 1);
-    b.stop();
-    assert_eq!(b.read(0xFF4D), 0x7F);
 }
 
 #[test]

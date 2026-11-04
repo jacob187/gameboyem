@@ -1,6 +1,6 @@
 # gb: a Game Boy and Game Boy Color emulator in Rust
 
-A cycle-accurate-enough original Game Boy (DMG) emulator with Game Boy Color (CGB) support, plus two DMG homebrew games and a CGB colour test card written for it. Double speed and HDMA are still in progress (see Known gaps).
+A cycle-accurate-enough original Game Boy (DMG) emulator with Game Boy Color (CGB) support, plus two DMG homebrew games and a CGB colour test card written for it.
 
 | Crate | What it is |
 |-------|------------|
@@ -74,7 +74,7 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 ## Tests
 
 ```sh
-./scripts/fetch-test-roms.sh                 # Blargg, mooneye, dmg-acid2, cgb-acid2 -> roms/test (gitignored)
+./scripts/fetch-test-roms.sh                 # Blargg, mooneye, dmg-acid2, cgb-acid2, SameSuite dma, AGE speed-switch, cgb_sound -> roms/test (gitignored)
 make -C homebrew                             # needed for the homebrew cases (they fail when CI=true and the ROMs are missing)
 ./scripts/fetch-homebrew-corpus.sh           # open-source homebrew corpus -> roms/corpus
 cargo test --workspace                       # unit tests + one test per ROM
@@ -105,10 +105,14 @@ These are the results on `feat/cgb` at `e93d0b6`, run on macOS arm64 on 2026-11-
 | Open-source homebrew corpus (7 games, MBC1/MBC3+RTC/MBC5): smoke + 3 scripted play | 10 / 10 |
 | cgb-acid2 (run as a Game Boy Color, RGB555) | 1 / 1 |
 | Our CGB homebrew `cgbdemo`: colour test card, scripted play | 1 / 1 |
-| Mooneye CGB subset (run as a CGB, DMG-compatibility mode) | 4 / 5 |
-| **Total** | **142 / 143** |
+| Mooneye CGB subset (run as a CGB, DMG-compatibility mode) | 5 / 5 |
+| SameSuite `dma` (run as a CGB: GDMA / HDMA) | 4 / 4 |
+| AGE `speed-switch` (CGB) | 2 / 6 |
+| Blargg `cgb_sound` (CGB, 12 + combined) | 7 / 13 |
+| CGB homebrew corpus (six games, run as a CGB, `smoke-cgb`) | 5 / 6 |
+| **Total** | **161 / 172** |
 
-The Mooneye CGB cases that pass are `boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C` and `boot_div-cgbABCDE`. The one failing case, `ppu/vblank_stat_intr-C`, is an expected failure in `expected.txt`. Its cause is undiagnosed (probably CGB PPU timing; DECISIONS #36). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
+The Mooneye CGB cases (`boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C`, `boot_div-cgbABCDE`, `ppu/vblank_stat_intr-C`) all pass. The eleven failing cases are expected failures in `expected.txt`, each with a note: four AGE speed-switch ROMs (DIV-reset edges of the fast timers, LCD / APU phase across a switch; DECISIONS #38), six `cgb_sound` ROMs (CGB APU differences), and the CGB homebrew Rebound, which boots and draws in colour but whose picture does not change under the smoke inputs (DECISIONS #39). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
 ## Cartridges
 
@@ -157,8 +161,8 @@ They stand in for commercial games in the harness. All 7 boot, and 3 have PyBoy-
   - the duty-step-0 quirk after power-on
   - model-specific zombie variants
 - **STOP.** Like hardware, it wakes only on a selected joypad line. Unlike hardware, the LCD and timer keep running during STOP.
-- **Game Boy Color.** Supported: VRAM and WRAM banking, KEY1, the colour PPU (palette RAM, BG attributes, CGB sprite priority, OPRI) with RGB555 output, FF72-FF75 scratch registers and PCM12/PCM34. Still missing:
-  - **Double speed and GDMA/HDMA are in progress on another branch.** KEY1 can be armed, but STOP doesn't switch speed yet, so a CGB game that needs double speed or HDMA won't run correctly.
+- **Game Boy Color.** Supported: VRAM and WRAM banking, the KEY1 speed switch and double speed, GDMA / HDMA, the colour PPU (palette RAM, BG attributes, CGB sprite priority, OPRI) with RGB555 output, FF72-FF75 scratch registers and PCM12/PCM34. Still missing:
+  - Speed-switch edge cases: the LCD and APU phase across a switch and the DIV-reset edges of the fast timer rates are not exact (AGE `speed-switch` 2 / 6; DECISIONS #38). CGB APU differences fail 6 Blargg `cgb_sound` ROMs.
   - No colourisation of DMG games: a flag-less cartridge on a forced `--model cgb` runs in DMG-compatibility mode in the `--palette` shades, because the boot ROM's compatibility palettes aren't modelled.
   - No infrared port (RP, FF56).
   - CGB-mode post-boot timing is approximate. The DIV and serial phase and the PPU line and dot at hand-off are the compat-mode calibration or a guess, because no test ROM pins them (DECISIONS #33, #34). The CGB boot ROM's clearing of wave RAM isn't modelled either. The palette-port lock timing reuses the VRAM lock timing and is unverified (DECISIONS #36).

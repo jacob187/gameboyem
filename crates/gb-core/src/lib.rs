@@ -14,10 +14,12 @@
 
 pub mod apu;
 pub mod bus;
+mod bus_cgb;
 pub mod cartridge;
 pub mod cpu;
 pub mod dma;
 pub mod gameboy;
+mod hdma;
 pub mod interrupts;
 pub mod joypad;
 mod mmu;

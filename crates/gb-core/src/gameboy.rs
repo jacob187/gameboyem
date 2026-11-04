@@ -76,10 +76,18 @@ impl GameBoy {
     /// A safety cap of two frames' worth of cycles guarantees termination even
     /// if a component misbehaves.
     pub fn step_frame(&mut self) {
-        let limit = self.bus.mcycles() + 2 * M_CYCLES_PER_FRAME as u64;
+        // Double speed has twice the M-cycles per frame (DECISIONS #38).
+        let frames = if self.bus.double_speed { 4 } else { 2 };
+        let limit = self.bus.mcycles() + frames * M_CYCLES_PER_FRAME as u64;
         while !self.bus.ppu.take_frame_ready() && self.bus.mcycles() < limit {
             self.cpu.step(&mut self.bus);
         }
+    }
+
+    /// The CPU runs at CGB double speed (KEY1 bit 7). Always false on a DMG and
+    /// in compatibility mode. A frame is twice as many M-cycles then.
+    pub fn double_speed(&self) -> bool {
+        self.bus.double_speed()
     }
 
     /// Execute one CPU step (instruction, interrupt dispatch or halted cycle).

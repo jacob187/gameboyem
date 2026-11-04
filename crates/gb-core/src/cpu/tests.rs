@@ -68,8 +68,9 @@ impl CpuBus for TestBus {
         self.iflag &= !mask;
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> bool {
         self.stopped = true;
+        false
     }
 
     fn joypad_line_low(&self) -> bool {
