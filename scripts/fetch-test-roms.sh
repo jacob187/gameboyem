@@ -9,7 +9,11 @@ cd "$DEST"
 BLARGG_REV="${BLARGG_REV:-c240dd7d700e5c0b00a7bbba52b53e4ee67b5f15}"
 MTS="${MTS:-mts-20240926-1737-443f6e1}"
 ACID2_URL="https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-acid2.gb"
-ACID2_REF_URL="https://raw.githubusercontent.com/mattcurrie/dmg-acid2/master/img/reference-dmg.png"
+# Pinned to the v1.0 commit (the same one the release ROM is built from) rather
+# than the moving master branch. sha256 ca966d50...bb57 (identical to master at
+# the time of pinning).
+ACID2_REV="${ACID2_REV:-dc2295408f881637ff69f784d8d93f3d2db30181}"
+ACID2_REF_URL="https://raw.githubusercontent.com/mattcurrie/dmg-acid2/$ACID2_REV/img/reference-dmg.png"
 
 fetch() { # url out
   if [ ! -s "$2" ]; then
