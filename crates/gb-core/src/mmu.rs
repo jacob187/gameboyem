@@ -103,7 +103,7 @@ impl Bus {
 
     fn write_io(&mut self, addr: u16, value: u8) {
         match addr {
-            0xFF00 => self.joypad.write(value),
+            0xFF00 => self.joypad.write(value, &mut self.interrupts),
             0xFF01 | 0xFF02 => self.serial.write(addr, value),
             0xFF04..=0xFF07 => self.timer.write(addr, value, &mut self.interrupts),
             0xFF0F => self.interrupts.write_if(value),

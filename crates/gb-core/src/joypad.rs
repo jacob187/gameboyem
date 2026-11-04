@@ -82,8 +82,14 @@ impl Joypad {
         0xC0 | self.select | self.low_nibble()
     }
 
-    pub fn write(&mut self, value: u8) {
+    /// Selecting a group whose button is held pulls a line low, which is a
+    /// falling edge and requests the joypad interrupt like a key press.
+    pub fn write(&mut self, value: u8, interrupts: &mut Interrupts) {
+        let before = self.low_nibble();
         self.select = value & 0x30;
+        if before & !self.low_nibble() != 0 {
+            interrupts.request(Interrupt::Joypad);
+        }
     }
 
     /// Update a button. Requests the joypad interrupt when a selected line goes low.
@@ -116,12 +122,18 @@ mod tests {
         let mut i = Interrupts::new();
         i.write_if(0);
         assert_eq!(j.read(), 0xCF, "post-boot P1");
-        j.write(0x30); // deselect both groups
+        j.write(0x30, &mut i); // deselect both groups
         j.set_button(Button::Start, true, &mut i);
         assert_eq!(i.read_if() & 0x10, 0, "no interrupt when group unselected");
-        j.write(0x10); // select action buttons
+        j.write(0x10, &mut i); // select action buttons: Start's line falls
         assert_eq!(j.read() & 0x0F, 0b0111);
-        j.write(0x20); // select d-pad
+        assert_eq!(
+            i.read_if() & 0x10,
+            0x10,
+            "selecting a held button is an edge"
+        );
+        i.write_if(0);
+        j.write(0x20, &mut i); // select d-pad
         assert_eq!(j.read() & 0x0F, 0x0F);
         j.set_button(Button::Down, true, &mut i);
         assert_eq!(j.read() & 0x0F, 0b0111);
