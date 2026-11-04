@@ -1,7 +1,7 @@
 //! Pulse channels CH1 (with sweep) and CH2 (Pan Docs: "Audio Registers",
 //! NR10-NR14 / NR21-NR24).
 
-use super::common::{Envelope, Length};
+use super::common::{Envelope, Length, period_or_8};
 
 /// Duty waveforms, one bit per step, first step first (Pan Docs: NRx1).
 const DUTY: [[u8; 8]; 4] = [
@@ -28,10 +28,7 @@ impl Sweep {
     }
 
     fn pace_or_8(&self) -> u8 {
-        match self.pace() {
-            0 => 8,
-            p => p,
-        }
+        period_or_8(self.pace())
     }
 
     fn shift(&self) -> u8 {
