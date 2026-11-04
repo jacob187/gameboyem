@@ -17,6 +17,9 @@ pub const MANIFEST: &str = include_str!("../expected.txt");
 pub enum Kind {
     /// Blargg: result printed to the serial port.
     Blargg,
+    /// Blargg (newer ROMs): result in cartridge RAM -- signature `DE B0 61` at
+    /// A001-A003, status at A000 (0x80 = running, 0 = pass), text from A004.
+    BlarggMem,
     /// Mooneye: `LD B,B` with Fibonacci registers on pass.
     Mooneye,
     /// dmg-acid2: framebuffer compared to the reference image.
@@ -138,6 +141,7 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
             };
             let kind = match next("kind") {
                 "blargg" => Kind::Blargg,
+                "blargg-mem" => Kind::BlarggMem,
                 "mooneye" => Kind::Mooneye,
                 "acid2" => Kind::Acid2,
                 "smoke" => Kind::Smoke,
@@ -176,6 +180,7 @@ pub fn run_case(case: &Case) -> Outcome {
     };
     match case.kind {
         Kind::Blargg => run_blargg(&mut gb, case.max_frames),
+        Kind::BlarggMem => run_blargg_mem(&mut gb, case.max_frames),
         Kind::Mooneye => run_mooneye(&mut gb, case.max_frames),
         Kind::Acid2 => run_acid2(&mut gb, case),
         Kind::Smoke => run_smoke(&mut gb, case.max_frames),
@@ -228,6 +233,48 @@ fn run_blargg(gb: &mut GameBoy, max_frames: u32) -> Outcome {
         }
     }
     Outcome::Timeout(format!("serial: {:?}", serial_tail(gb)))
+}
+
+/// Blargg's memory protocol: `DE B0 61` at A001-A003 marks the block valid,
+/// A000 holds 0x80 while running and then the result code (0 = pass), and a
+/// NUL-terminated report starts at A004.
+fn run_blargg_mem(gb: &mut GameBoy, max_frames: u32) -> Outcome {
+    const STATUS: u16 = 0xA000;
+    const TEXT: u16 = 0xA004;
+    let report = |gb: &GameBoy| {
+        let text: Vec<u8> = (0..0x1000u16)
+            .map(|i| gb.peek(TEXT + i))
+            .take_while(|&b| b != 0)
+            .collect();
+        let text = String::from_utf8_lossy(&text);
+        let mut lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        // The ROM ends with "Passed"/"Failed" lines; keep the tail short.
+        lines.drain(..lines.len().saturating_sub(6));
+        lines.join(" | ")
+    };
+    for _ in 0..max_frames {
+        gb.step_frame();
+        if gb.cpu_locked() {
+            return Outcome::Fail(format!("{}; report: {}", locked_message(gb), report(gb)));
+        }
+        let signed = [0xDE, 0xB0, 0x61]
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| gb.peek(STATUS + 1 + i as u16) == b);
+        if !signed {
+            continue;
+        }
+        match gb.peek(STATUS) {
+            0x80 => {}
+            0 => return Outcome::Pass,
+            code => return Outcome::Fail(format!("code {code:#04X}: {}", report(gb))),
+        }
+    }
+    Outcome::Timeout(format!("status {:#04X}: {}", gb.peek(STATUS), report(gb)))
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
