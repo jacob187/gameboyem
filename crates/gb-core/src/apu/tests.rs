@@ -173,6 +173,167 @@ fn envelope_pace_zero_holds_volume() {
     assert_eq!(rig.apu.ch1.env.volume, 10);
 }
 
+/// CH1 triggered with `nr12`, ready for NR12 rewrites.
+fn ch1_with(nr12: u8) -> Rig {
+    let mut rig = Rig::new();
+    rig.w(0xFF12, nr12);
+    rig.w(0xFF14, 0x80);
+    rig
+}
+
+fn ch1_volume(rig: &Rig) -> u8 {
+    rig.apu.ch1.env.volume
+}
+
+#[test]
+fn zombie_period_zero_increase_adds_one_per_write() {
+    // The documented "manual volume" idiom: $V8 then repeated $08.
+    let mut rig = ch1_with(0x58);
+    rig.w(0xFF12, 0x08);
+    assert_eq!(ch1_volume(&rig), 6);
+    for _ in 0..14 {
+        rig.w(0xFF12, 0x08);
+    }
+    assert_eq!(ch1_volume(&rig), 4, "5 + 15 wraps to 4: decrement by one");
+}
+
+#[test]
+fn zombie_decrease_mode_adds_two() {
+    let mut rig = ch1_with(0x61);
+    rig.w(0xFF12, 0x61);
+    assert_eq!(ch1_volume(&rig), 8);
+    rig.w(0xFF12, 0x62); // pace change alone: still +2 (old was decrease)
+    assert_eq!(ch1_volume(&rig), 10);
+}
+
+#[test]
+fn zombie_increase_mode_with_nonzero_period_leaves_volume() {
+    let mut rig = ch1_with(0x99);
+    rig.w(0xFF12, 0x9A);
+    assert_eq!(ch1_volume(&rig), 9);
+}
+
+#[test]
+fn zombie_direction_flip_inverts_volume() {
+    // decrease -> increase: (9 + 2) then 16 - 11.
+    let mut rig = ch1_with(0x91);
+    rig.w(0xFF12, 0x99);
+    assert_eq!(ch1_volume(&rig), 5);
+    // increase (period 1) -> decrease: no increment, then 16 - 5.
+    rig.w(0xFF12, 0x91);
+    assert_eq!(ch1_volume(&rig), 11);
+    // volume 1, decrease -> increase: (1 + 2) then 16 - 3.
+    let mut rig = ch1_with(0x11);
+    rig.w(0xFF12, 0x08);
+    assert_eq!(ch1_volume(&rig), 13);
+}
+
+#[test]
+fn zombie_period_zero_needs_automatic_updates_still_running() {
+    // Increase mode runs into 15: the envelope stops updating itself.
+    let mut rig = ch1_with(0xF9);
+    rig.seq_ticks(8);
+    assert_eq!(ch1_volume(&rig), 15);
+    rig.w(0xFF12, 0xF8); // period 0 now; old period 1, increase: no change
+    assert_eq!(ch1_volume(&rig), 15);
+    // Old period is 0 but updates have stopped: +0 instead of +1 (-> 0).
+    rig.w(0xFF12, 0x08);
+    assert_eq!(ch1_volume(&rig), 15);
+    // A retrigger restarts automatic updates.
+    rig.w(0xFF12, 0xF8);
+    rig.w(0xFF14, 0x80);
+    rig.w(0xFF12, 0x08);
+    assert_eq!(ch1_volume(&rig), 0, "15 + 1 wraps");
+}
+
+#[test]
+fn zombie_does_not_apply_to_a_channel_that_is_off() {
+    let mut rig = Rig::new();
+    rig.w(0xFF12, 0x58);
+    rig.w(0xFF12, 0x08);
+    assert_eq!(ch1_volume(&rig), 0);
+    // Trigger then length expiry: off channels keep their volume on writes.
+    rig.w(0xFF12, 0x58);
+    rig.w(0xFF14, 0x80);
+    rig.w(0xFF12, 0x00); // DAC off disables the channel
+    let v = ch1_volume(&rig);
+    rig.w(0xFF12, 0x08);
+    assert_eq!(ch1_volume(&rig), v);
+}
+
+#[test]
+fn zombie_applies_to_ch2_and_ch4() {
+    let mut rig = Rig::new();
+    rig.w(0xFF17, 0x58);
+    rig.w(0xFF19, 0x80);
+    rig.w(0xFF17, 0x08);
+    assert_eq!(rig.apu.ch2.env.volume, 6);
+    rig.w(0xFF21, 0x91);
+    rig.w(0xFF23, 0x80);
+    rig.w(0xFF21, 0x99);
+    assert_eq!(rig.apu.ch4.env.volume, 5);
+}
+
+#[test]
+fn envelope_trigger_before_envelope_step_gets_one_extra_period() {
+    // Triggered while the next step (7) clocks the envelope: that clock only
+    // consumes the extra tick, so the first decrement is a full period late.
+    let mut rig = Rig::new();
+    rig.w(0xFF12, 0x81); // volume 8, decrease, period 1
+    rig.seq_ticks(7);
+    assert_eq!(rig.apu.seq_step, 7);
+    rig.w(0xFF14, 0x80);
+    rig.seq_ticks(1); // step 7
+    assert_eq!(ch1_volume(&rig), 8);
+    rig.seq_ticks(7);
+    assert_eq!(ch1_volume(&rig), 8);
+    rig.seq_ticks(1); // next step 7
+    assert_eq!(ch1_volume(&rig), 7);
+}
+
+#[test]
+fn envelope_trigger_before_other_steps_has_no_extra_period() {
+    let mut rig = Rig::new();
+    rig.w(0xFF12, 0x81);
+    rig.seq_ticks(6);
+    assert_eq!(rig.apu.seq_step, 6);
+    rig.w(0xFF14, 0x80);
+    rig.seq_ticks(1); // step 6
+    assert_eq!(ch1_volume(&rig), 8);
+    rig.seq_ticks(1); // step 7: first clock decrements
+    assert_eq!(ch1_volume(&rig), 7);
+}
+
+#[test]
+fn envelope_trigger_quirk_applies_to_ch2_and_ch4() {
+    let mut rig = Rig::new();
+    rig.w(0xFF17, 0x81);
+    rig.w(0xFF21, 0x81);
+    rig.seq_ticks(7);
+    rig.w(0xFF19, 0x80);
+    rig.w(0xFF23, 0x80);
+    rig.seq_ticks(1);
+    assert_eq!(rig.apu.ch2.env.volume, 8);
+    assert_eq!(rig.apu.ch4.env.volume, 8);
+    rig.seq_ticks(8);
+    assert_eq!(rig.apu.ch2.env.volume, 7);
+    assert_eq!(rig.apu.ch4.env.volume, 7);
+}
+
+#[test]
+fn envelope_period_zero_timer_keeps_counting_until_period_is_set() {
+    // Period 0 reloads as 8 but never steps; the timer still runs, so setting
+    // a period later takes effect when the running timer expires.
+    let mut rig = ch1_with(0x58);
+    rig.seq_ticks(8 * 3); // timer 8 -> 5
+    rig.w(0xFF12, 0x59); // old period 0, updating: zombie +1 -> 6; new period 1
+    assert_eq!(ch1_volume(&rig), 6);
+    rig.seq_ticks(8 * 4); // timer 5 -> 1
+    assert_eq!(ch1_volume(&rig), 6);
+    rig.seq_ticks(8);
+    assert_eq!(ch1_volume(&rig), 7);
+}
+
 #[test]
 fn sweep_up_updates_frequency_then_overflow_disables() {
     let mut rig = Rig::new();

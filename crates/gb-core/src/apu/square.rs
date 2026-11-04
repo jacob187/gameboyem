@@ -112,7 +112,7 @@ impl Square {
     }
 
     pub fn write_envelope(&mut self, v: u8) {
-        self.env.nr2 = v;
+        self.env.write(v, self.enabled);
         if !self.env.dac_on() {
             self.enabled = false;
         }
@@ -122,21 +122,21 @@ impl Square {
         self.freq = (self.freq & 0x700) | u16::from(v);
     }
 
-    pub fn write_freq_hi_ctrl(&mut self, v: u8, next_step_odd: bool) {
+    pub fn write_freq_hi_ctrl(&mut self, v: u8, next_step_odd: bool, env_next: bool) {
         self.freq = (self.freq & 0xFF) | (u16::from(v & 7) << 8);
         if self.length.set_enabled(v & 0x40 != 0, next_step_odd) {
             self.enabled = false;
         }
         if v & 0x80 != 0 {
-            self.trigger(next_step_odd);
+            self.trigger(next_step_odd, env_next);
         }
     }
 
-    fn trigger(&mut self, next_step_odd: bool) {
+    fn trigger(&mut self, next_step_odd: bool, env_next: bool) {
         self.length.trigger(next_step_odd);
         self.enabled = self.env.dac_on();
         self.timer = 2048 - self.freq;
-        self.env.trigger();
+        self.env.trigger(env_next);
         if self.has_sweep {
             let s = &mut self.sweep;
             s.shadow = self.freq;
@@ -200,6 +200,11 @@ impl Square {
         self.pos = (self.pos + 1) & 7;
         // Volume 0 is silent whatever the duty step, so nothing changed.
         self.env.volume != 0 && self.output() != before
+    }
+
+    /// The channel's DAC is powered (NR12/NR22 bits 7-3 not all zero).
+    pub fn dac_on(&self) -> bool {
+        self.env.dac_on()
     }
 
     /// Digital output 0..=15.

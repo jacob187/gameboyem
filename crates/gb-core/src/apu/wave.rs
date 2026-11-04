@@ -138,6 +138,11 @@ impl Wave {
         self.output() != before
     }
 
+    /// The channel's DAC is powered (NR30 bit 7).
+    pub fn dac_on(&self) -> bool {
+        self.dac
+    }
+
     /// Digital output 0..=15.
     pub fn output(&self) -> u8 {
         if !self.enabled {

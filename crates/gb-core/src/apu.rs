@@ -182,16 +182,17 @@ impl Apu {
     fn write_reg(&mut self, i: usize, v: u8) {
         self.regs[i] = v;
         let odd = self.seq_step & 1 == 1;
+        let env_next = self.seq_step == 7;
         match i {
             0x00 => self.ch1.write_nr10(v),
             0x01 => self.ch1.write_duty_length(v),
             0x02 => self.ch1.write_envelope(v),
             0x03 => self.ch1.write_freq_lo(v),
-            0x04 => self.ch1.write_freq_hi_ctrl(v, odd),
+            0x04 => self.ch1.write_freq_hi_ctrl(v, odd, env_next),
             0x06 => self.ch2.write_duty_length(v),
             0x07 => self.ch2.write_envelope(v),
             0x08 => self.ch2.write_freq_lo(v),
-            0x09 => self.ch2.write_freq_hi_ctrl(v, odd),
+            0x09 => self.ch2.write_freq_hi_ctrl(v, odd, env_next),
             0x0A => self.ch3.write_nr30(v),
             0x0B => self.ch3.write_length(v),
             0x0C => self.ch3.write_level(v),
@@ -200,7 +201,7 @@ impl Apu {
             0x10 => self.ch4.write_length(v),
             0x11 => self.ch4.write_envelope(v),
             0x12 => self.ch4.write_nr43(v),
-            0x13 => self.ch4.write_ctrl(v, odd),
+            0x13 => self.ch4.write_ctrl(v, odd, env_next),
             _ => {}
         }
     }
