@@ -679,7 +679,8 @@ fn play(
 /// * `Shot { moving: true }` must differ from the previous snapshot.
 /// * Every `Hold` must matter: a control run with that press left out (the
 ///   emulator is deterministic, so everything else is identical) must produce a
-///   different picture at the next `Shot`. Without this, a game that animates
+///   different picture at the next `Shot` (the control run stops there; the
+///   machine is not `Clone`, so each one replays from power-on). Without this, a game that animates
 ///   on its own would pass even with joypad input broken.
 fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
     let shots = match play(rom, script, None, max_frames) {
@@ -699,23 +700,24 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
                 shot_idx += 1;
             }
             Step::Hold(..) => {
-                let Some((next, label)) = script[i..]
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Shot { label, .. } => Some(*label),
-                        _ => None,
-                    })
-                    .enumerate()
-                    .map(|(k, l)| (shot_idx + k, l))
-                    .next()
+                // The control run only has to reach the next snapshot.
+                let Some((end, label)) =
+                    script
+                        .iter()
+                        .enumerate()
+                        .skip(i)
+                        .find_map(|(j, s)| match s {
+                            Step::Shot { label, .. } => Some((j, *label)),
+                            _ => None,
+                        })
                 else {
                     continue;
                 };
-                let control = match play(rom, script, Some(i), max_frames) {
+                let control = match play(rom, &script[..=end], Some(i), max_frames) {
                     Ok(s) => s,
                     Err(o) => return o,
                 };
-                if control[next] == shots[next] {
+                if control[shot_idx] == shots[shot_idx] {
                     return Outcome::Fail(format!(
                         "{label}: input had no effect (same picture without it)"
                     ));
