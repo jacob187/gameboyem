@@ -372,27 +372,55 @@ mod tests {
         }
     }
 
+    /// Random ROM content with a *valid* header (supported type, ROM size
+    /// <= 512 KiB, any RAM size), so every mapper is actually constructed and
+    /// exercised with random register writes, reads, ticks and saves.
     #[test]
     fn random_bytes_never_panic() {
-        // Deterministic xorshift noise as ROM content, header bytes included.
+        const TYPES: [u8; 17] = [
+            0x00, 0x08, 0x09, 0x01, 0x02, 0x03, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x19, 0x1A, 0x1B,
+            0x1C, 0x1D, 0x1E,
+        ];
         let mut x = 0x2545_F491u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let (mut built, mut per_kind) = (0usize, [0usize; 4]);
         for len in [0x150usize, 0x4000, 0x8000, 0x2_0000] {
             for _ in 0..200 {
-                let rom: Vec<u8> = (0..len)
-                    .map(|_| {
-                        x ^= x << 13;
-                        x ^= x >> 17;
-                        x ^= x << 5;
-                        x as u8
-                    })
-                    .collect();
-                if let Ok(mut c) = from_rom(rom) {
-                    c.write_rom(0x2000, 0xFF);
-                    c.write_rom(0x4000, 0xFF);
-                    c.read_rom(0x7FFF);
-                    c.read_ram(0xA000);
+                let mut rom: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                rom[0x147] = TYPES[next() as usize % TYPES.len()];
+                rom[0x148] = (next() % 6) as u8;
+                rom[0x149] = (next() % 6) as u8;
+                let mut c = from_rom(rom).expect("valid header must load");
+                built += 1;
+                per_kind[c.header().mbc as usize] += 1;
+                for _ in 0..64 {
+                    let r = next();
+                    match r % 5 {
+                        0 => c.write_rom((r >> 8) as u16 & 0x7FFF, (r >> 24) as u8),
+                        1 => c.write_ram(0xA000 | (r >> 8) as u16 & 0x1FFF, (r >> 24) as u8),
+                        2 => {
+                            c.read_rom((r >> 8) as u16 & 0x7FFF);
+                        }
+                        3 => {
+                            c.read_ram(0xA000 | (r >> 8) as u16 & 0x1FFF);
+                        }
+                        _ => c.tick_mcycle(),
+                    }
+                }
+                if let Some(save) = c.battery_ram() {
+                    c.load_battery_ram(&save).expect("own save must reload");
                 }
             }
         }
+        assert_eq!(built, 800, "every valid-header ROM must construct");
+        assert!(
+            per_kind.iter().all(|&n| n > 100),
+            "mapper mix: {per_kind:?}"
+        );
     }
 }
