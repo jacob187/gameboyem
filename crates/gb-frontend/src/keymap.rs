@@ -12,6 +12,10 @@ pub enum Action {
     Quit,
     Pause,
     FastForward,
+    SaveState,
+    LoadState,
+    /// Choose save-state slot 1..=9.
+    SelectSlot(u8),
 }
 
 pub fn map(key: KeyCode) -> Option<Action> {
@@ -27,6 +31,17 @@ pub fn map(key: KeyCode) -> Option<Action> {
         KeyCode::Escape => Action::Quit,
         KeyCode::KeyP => Action::Pause,
         KeyCode::Tab => Action::FastForward,
+        KeyCode::KeyS => Action::SaveState,
+        KeyCode::KeyL => Action::LoadState,
+        KeyCode::Digit1 => Action::SelectSlot(1),
+        KeyCode::Digit2 => Action::SelectSlot(2),
+        KeyCode::Digit3 => Action::SelectSlot(3),
+        KeyCode::Digit4 => Action::SelectSlot(4),
+        KeyCode::Digit5 => Action::SelectSlot(5),
+        KeyCode::Digit6 => Action::SelectSlot(6),
+        KeyCode::Digit7 => Action::SelectSlot(7),
+        KeyCode::Digit8 => Action::SelectSlot(8),
+        KeyCode::Digit9 => Action::SelectSlot(9),
         _ => return None,
     })
 }
@@ -39,7 +54,7 @@ pub struct InputState {
 }
 
 impl InputState {
-    fn is_down(&self, button: Button) -> bool {
+    pub fn is_down(&self, button: Button) -> bool {
         self.held
             .iter()
             .any(|&k| map(k) == Some(Action::Button(button)))
@@ -93,6 +108,11 @@ mod tests {
         assert_eq!(map(KeyCode::Escape), Some(Action::Quit));
         assert_eq!(map(KeyCode::KeyP), Some(Action::Pause));
         assert_eq!(map(KeyCode::Tab), Some(Action::FastForward));
+        assert_eq!(map(KeyCode::KeyS), Some(Action::SaveState));
+        assert_eq!(map(KeyCode::KeyL), Some(Action::LoadState));
+        assert_eq!(map(KeyCode::Digit1), Some(Action::SelectSlot(1)));
+        assert_eq!(map(KeyCode::Digit9), Some(Action::SelectSlot(9)));
+        assert_eq!(map(KeyCode::Digit0), None);
         assert_eq!(map(KeyCode::KeyQ), None);
     }
 

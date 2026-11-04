@@ -45,6 +45,14 @@ Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomica
 
 If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than any valid save (128 KiB + 48 bytes), or is a wrong-size save that couldn't be copied to a backup, it's left untouched. Saving is then disabled for that session, with a warning at startup and "progress NOT saved" on exit. A wrong-size save that can be copied is backed up to `<rom>.sav.bak` (then `.bak1`, ...) before it's replaced. For MBC3 carts with a clock, periodic and pause saves happen only when the game changes cart RAM or an RTC register. The running clock is written on quit.
 
+## Save states
+
+Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **S** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr.
+
+A state is tied to the exact ROM it was taken with. A state from another ROM, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched.
+
+Loading a state also rewinds battery RAM, and the next autosave writes that RAM over `<rom>.sav`. So before the first load in a session, the existing `<rom>.sav` is copied to `<rom>.sav.bak` (then `.bak1`, ...). If that copy fails, the load is refused.
+
 ## Controls
 
 | Game Boy | Keyboard |
@@ -55,6 +63,8 @@ If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than a
 | Select | Backspace or Right Shift |
 | Pause | P |
 | Fast-forward (hold) | Tab |
+| Save state / load state | S / L |
+| Select state slot | 1-9 |
 | Quit | Esc |
 
 ## Tests
