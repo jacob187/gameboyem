@@ -71,7 +71,7 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 ## Tests
 
 ```sh
-./scripts/fetch-test-roms.sh                 # Blargg, mooneye, dmg-acid2, cgb-acid2 -> roms/test (gitignored)
+./scripts/fetch-test-roms.sh                 # Blargg, mooneye, dmg-acid2, cgb-acid2, SameSuite dma, AGE speed-switch, cgb_sound -> roms/test (gitignored)
 make -C homebrew                             # needed for the homebrew cases (they fail when CI=true and the ROMs are missing)
 ./scripts/fetch-homebrew-corpus.sh           # open-source homebrew corpus -> roms/corpus
 cargo test --workspace                       # unit tests + one test per ROM
@@ -101,10 +101,13 @@ These are the results on `integration`, run on macOS arm64. Linux x86_64 was che
 | Our homebrew: smoke, scripted playability, battery save round-trip, sound effects | 8 / 8 |
 | Open-source homebrew corpus (7 games, MBC1/MBC3+RTC/MBC5): smoke + 3 scripted play | 10 / 10 |
 | cgb-acid2 (run as a Game Boy Color, RGB555) | 1 / 1 |
-| Mooneye CGB subset (run as a CGB, DMG-compatibility mode) | 4 / 5 |
-| **Total** | **141 / 142** |
+| Mooneye CGB subset (run as a CGB, DMG-compatibility mode) | 5 / 5 |
+| SameSuite `dma` (run as a CGB: GDMA / HDMA) | 4 / 4 |
+| AGE `speed-switch` (CGB) | 2 / 6 |
+| Blargg `cgb_sound` (CGB, 12 + combined) | 7 / 13 |
+| **Total** | **155 / 165** |
 
-The one failing case, mooneye `ppu/vblank_stat_intr-C`, is an expected failure in `expected.txt` (CGB PPU timing is not modelled; DECISIONS #36). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
+The ten failing cases are expected failures in `expected.txt`, each with a note: four AGE speed-switch ROMs (DIV-reset edges of the fast timers, LCD / APU phase across a switch; DECISIONS #38) and six `cgb_sound` ROMs (CGB APU differences). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
 ## Cartridges
 

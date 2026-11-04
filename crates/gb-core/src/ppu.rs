@@ -417,7 +417,10 @@ impl Ppu {
         self.lyc_flag && !blanked
     }
 
-    /// Advance the PPU by one M-cycle (4 dots).
+    /// Advance the PPU by one M-cycle (4 dots). Forced inline into the bus's
+    /// plain tick path: without it the DMG loses about 8% of its speed (the
+    /// generic body made the compiler stop inlining it).
+    #[inline(always)]
     pub fn tick_mcycle(&mut self, interrupts: &mut Interrupts) {
         self.tick_dots::<4>(interrupts);
     }
@@ -458,10 +461,12 @@ impl Ppu {
             // A CGB also re-evaluates when entering the line-144 STAT pulse
             // window, the last M-cycle of line 143 (see `stat_line_level_for`).
             let pulse_start = DOTS_PER_LINE - DOTS;
-            let enters_pulse = self.cgb && self.ly == VBLANK_LINE - 1 && dot < pulse_start;
             if dot >= 4
                 && !(dot < mode3_end && next >= mode3_end)
-                && !(enters_pulse && next >= pulse_start)
+                && !(next >= pulse_start
+                    && dot < pulse_start
+                    && self.cgb
+                    && self.ly == VBLANK_LINE - 1)
             {
                 debug_assert_eq!(self.lyc_flag, self.lyc == self.visible_ly());
                 debug_assert_eq!(self.stat_line, self.stat_line_level());

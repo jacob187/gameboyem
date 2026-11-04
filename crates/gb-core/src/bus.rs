@@ -84,6 +84,10 @@ pub struct Bus {
     pub(crate) serial: Serial,
     /// Total M-cycles elapsed since power-on.
     pub(crate) mcycles: u64,
+    /// Derived (never saved): `double_speed || hdma.hblank_active()`. When false
+    /// `tick_components` takes its plain path, the only one a DMG or a machine in
+    /// compatibility mode ever runs. Set again by [`Bus::refresh_slow`].
+    pub(crate) slow: bool,
     /// Whether the cartridge needs a per-M-cycle tick (only an MBC3 RTC does).
     pub(crate) cart_ticks: bool,
     // ---- CGB additions (DECISIONS #31, #33); VBK lives in the PPU ----
@@ -102,10 +106,6 @@ pub struct Bus {
     pub(crate) double_speed: bool,
     /// HDMA1-HDMA5 (FF51-FF55), `Hw::Cgb` only.
     pub(crate) hdma: Hdma,
-    /// Derived (never saved): `double_speed || hdma.hblank_active()`. When false
-    /// `tick_components` takes its plain path, the only one a DMG or a machine in
-    /// compatibility mode ever runs. Set again by [`Bus::refresh_slow`].
-    pub(crate) slow: bool,
     /// The undocumented read/write registers FF72-FF75 (CGB hardware only).
     pub(crate) cgb_scratch: CgbScratch,
 }
