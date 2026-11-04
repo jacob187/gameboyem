@@ -1213,3 +1213,76 @@ fn set_sample_rate_clamps_to_supported_range() {
     assert_eq!(apu.sample_rate(), 192_000);
     assert_eq!(apu.hpf_factor, hpf_factor(192_000));
 }
+
+/// xorshift32, deterministic.
+struct Rng(u32);
+
+impl Rng {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0
+    }
+}
+
+#[test]
+fn cached_mix_matches_a_per_mcycle_recompute_under_random_writes() {
+    // `fast` is the real thing (mix cached behind `dirty`); `slow` is forced to
+    // recompute the mix every M-cycle. Random writes to every register (and
+    // wave RAM) drive all four channels through the mixer; the cached levels
+    // must equal both the reference and `expected_mix` on every M-cycle, and
+    // the emitted samples must be bit-identical.
+    let mut rng = Rng(0x1234_5678);
+    let mut fast = Rig::new();
+    let mut slow = Rig::new();
+    let mut status_seen = 0u8;
+    let mut levels = std::collections::BTreeSet::new();
+    let mut remaining = 0u32;
+    let mut div_resets = 0;
+    for _ in 0..250_000 {
+        if remaining == 0 {
+            remaining = rng.next() % 24;
+            let r = rng.next();
+            let (addr, mut v) = match (r >> 8) % 40 {
+                0 => (0xFF26, if r >> 20 & 7 == 0 { 0x00 } else { 0x80 }),
+                n @ 1..=30 => (0xFF10 + (n as u16 - 1) % 22, (r >> 16) as u8),
+                n => (0xFF30 + (n as u16 - 31), (r >> 16) as u8),
+            };
+            if r & 3 == 0 {
+                match addr {
+                    // Fast frequencies so squares, wave and noise toggle often.
+                    0xFF13 | 0xFF18 | 0xFF1D => v |= 0xF0,
+                    0xFF14 | 0xFF19 | 0xFF1E => v |= 0x87,
+                    0xFF22 => v &= 0x0F,
+                    _ => {}
+                }
+            }
+            if matches!(addr, 0xFF25 | 0xFF24) && r >> 24 & 3 != 0 {
+                v |= 0x77; // keep panning/volume mostly audible
+            }
+            fast.w(addr, v);
+            slow.w(addr, v);
+        } else {
+            remaining -= 1;
+        }
+        if rng.next() % 4096 == 0 {
+            fast.div = 0; // a DIV write: extra falling edge
+            slow.div = 0;
+            div_resets += 1;
+        }
+        slow.apu.dirty = true;
+        fast.run(1);
+        slow.run(1);
+        let got = (fast.apu.cur_l, fast.apu.cur_r);
+        assert_eq!(got, (slow.apu.cur_l, slow.apu.cur_r));
+        assert_eq!(got, expected_mix(&fast.apu));
+        status_seen |= fast.status();
+        levels.insert(got.0);
+    }
+    assert_eq!(drain(&mut fast.apu), drain(&mut slow.apu));
+    // The run must actually exercise the mixer with every channel.
+    assert_eq!(status_seen, 0x0F, "not every channel was active");
+    assert!(levels.len() > 40, "only {} distinct levels", levels.len());
+    assert!(div_resets > 10);
+}
