@@ -21,6 +21,7 @@ pub mod interrupts;
 pub mod joypad;
 mod mmu;
 pub mod ppu;
+pub mod replay;
 pub mod serial;
 pub mod timer;
 

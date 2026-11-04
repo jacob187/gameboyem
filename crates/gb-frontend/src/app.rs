@@ -1,9 +1,11 @@
 //! The winit application: window, input, frame pacing and presentation.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gb_core::{FRAMES_PER_SECOND, Framebuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gb_core::replay::{Event, Record};
+use gb_core::{Button, FRAMES_PER_SECOND, Framebuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -15,6 +17,7 @@ use winit::window::{Window, WindowId};
 use crate::audio::{AudioOutput, ToneGen};
 use crate::keymap::{Action, InputState, map};
 use crate::pacer::FramePacer;
+use crate::record::{self, Recorder};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::video::{Palette, blit, test_pattern};
@@ -46,6 +49,10 @@ pub struct App {
     title: String,
     test: Option<TestMode>,
     shutdown: ShutdownFlag,
+    rom_path: PathBuf,
+    recorder: Option<Recorder>,
+    /// Emulated frames since power-on (the clock recordings are keyed by).
+    frame: u64,
 
     input: InputState,
     pacer: FramePacer,
@@ -97,6 +104,9 @@ impl App {
             title,
             test,
             shutdown,
+            rom_path: PathBuf::from("screenshot.gb"),
+            recorder: None,
+            frame: 0,
             input: InputState::default(),
             pacer: FramePacer::new(FRAMES_PER_SECOND),
             last_tick: Instant::now(),
@@ -107,6 +117,18 @@ impl App {
             pixels: None,
             error: None,
         }
+    }
+
+    /// Screenshots are saved next to this ROM path.
+    pub fn with_rom_path(mut self, rom_path: PathBuf) -> Self {
+        self.rom_path = rom_path;
+        self
+    }
+
+    /// Record every input from power-on (see `record.rs`).
+    pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
+        self.recorder = recorder;
+        self
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, msg: String) {
@@ -137,8 +159,13 @@ impl App {
 
     fn update_title(&self) {
         if let Some(w) = &self.window {
-            let suffix = if self.paused { " [paused]" } else { "" };
-            w.set_title(&format!("{}{suffix}", self.title));
+            let rec = if self.recorder.is_some() {
+                " [rec]"
+            } else {
+                ""
+            };
+            let paused = if self.paused { " [paused]" } else { "" };
+            w.set_title(&format!("{}{rec}{paused}", self.title));
         }
     }
 
@@ -163,15 +190,59 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, event_loop: &ActiveEventLoop, key: winit::keyboard::KeyCode, down: bool) {
-        if let Some((button, pressed)) = self.input.key(key, down) {
-            self.gb.set_button(button, pressed);
+    /// Every joypad change goes through here so recordings see all of them.
+    fn set_button(&mut self, button: Button, pressed: bool) {
+        self.gb.set_button(button, pressed);
+        if let Some(r) = self.recorder.as_mut() {
+            r.record(Record {
+                frame: self.frame,
+                event: Event::Button { button, pressed },
+            });
         }
+    }
+
+    fn on_key(&mut self, event_loop: &ActiveEventLoop, key: winit::keyboard::KeyCode, down: bool) {
+        self.on_key_input(key, down);
         match map(key) {
             Some(Action::Quit) if down => event_loop.exit(),
             Some(Action::Pause) if down => self.toggle_pause(),
             Some(Action::FastForward) => self.set_fast_forward(down),
             _ => {}
+        }
+    }
+
+    /// The part of key handling that needs no event loop (joypad, screenshot).
+    fn on_key_input(&mut self, key: winit::keyboard::KeyCode, down: bool) {
+        if let Some((button, pressed)) = self.input.key(key, down) {
+            self.set_button(button, pressed);
+        }
+        if down && map(key) == Some(Action::Screenshot) {
+            self.screenshot();
+        }
+    }
+
+    fn release_all_buttons(&mut self) {
+        for button in self.input.release_all() {
+            self.set_button(button, false);
+        }
+    }
+
+    /// Save the picture on screen next to the ROM and mark the frame.
+    fn screenshot(&mut self) {
+        let path = record::screenshot_path(&self.rom_path, self.frame);
+        let fb: &Framebuffer = match &self.test {
+            Some(t) => &t.fb,
+            None => self.gb.framebuffer(),
+        };
+        match record::write_png(fb, &path) {
+            Ok(()) => eprintln!("screenshot: {} (frame {})", path.display(), self.frame),
+            Err(e) => eprintln!("warning: cannot write screenshot {}: {e}", path.display()),
+        }
+        if let Some(r) = self.recorder.as_mut() {
+            r.record(Record {
+                frame: self.frame,
+                event: Event::Marker,
+            });
         }
     }
 
@@ -204,6 +275,7 @@ impl App {
                 }
                 None => {
                     self.gb.step_frame();
+                    self.frame += 1;
                     // Always drain so the core's buffer cannot grow unbounded.
                     self.gb.drain_audio_into(&mut self.audio_buf);
                 }
@@ -259,6 +331,7 @@ impl ApplicationHandler for App {
         self.surface_ok = surface_extent(size.width, size.height).is_some();
         self.window = Some(window);
         self.pixels = Some(pixels);
+        self.update_title();
         self.upload();
         self.reset_clock();
         if let Some(w) = &self.window {
@@ -286,9 +359,7 @@ impl ApplicationHandler for App {
                 if focused {
                     self.reset_clock();
                 } else {
-                    for button in self.input.release_all() {
-                        self.gb.set_button(button, false);
-                    }
+                    self.release_all_buttons();
                     self.set_fast_forward(false);
                 }
             }
@@ -349,6 +420,9 @@ impl ApplicationHandler for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.saves.flush_final(&self.gb);
+        if let Some(r) = self.recorder.as_mut() {
+            r.finish(self.frame);
+        }
     }
 }
 
@@ -384,6 +458,7 @@ mod tests {
             false,
             ShutdownFlag::default(),
         )
+        .with_rom_path(dir.join("g.gb"))
     }
 
     fn change_ram(app: &mut App, first_byte: u8) {
@@ -407,6 +482,138 @@ mod tests {
         app.toggle_pause();
         assert!(!app.paused);
         assert_eq!(fs::read(&sav).unwrap()[0], 0xAB, "not written on resume");
+    }
+
+    /// MBC3+RTC+RAM+battery ROM whose program loops: select the D-pad, read
+    /// P1, write it to BGP. VRAM is blank, so the whole screen's shade follows
+    /// Right/Left, and register A follows the latest read.
+    fn joypad_to_palette_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]); // JP 0x0150
+        rom[0x147] = 0x10; // MBC3+TIMER+RAM+BATTERY
+        rom[0x149] = 0x03; // 32 KiB
+        rom[0x150..0x15A].copy_from_slice(&[
+            0x3E, 0x20, // LD A,0x20      select the D-pad
+            0xE0, 0x00, // LDH (P1),A
+            0xF0, 0x00, // LDH A,(P1)
+            0xE0, 0x47, // LDH (BGP),A
+            0x18, 0xF6, // JR 0x0150
+        ]);
+        rom
+    }
+
+    /// The whole loop the user relies on: play with `--record`, press the
+    /// screenshot key, then replay headlessly and get the identical picture
+    /// and machine state. Covers a press+release inside one frame, the
+    /// focus-loss release, a short-footer RTC save, and a different audio rate.
+    #[test]
+    fn recording_replays_to_the_identical_state_and_screenshot() {
+        use gb_core::replay::{Header, Recording, Replayer, rom_hash};
+        use winit::keyboard::KeyCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        let rom_path = dir.path().join("g.gb");
+        // 32 KiB RAM + the 44-byte RTC footer variant, with recognisable content.
+        let mut sav: Vec<u8> = (0..0x8000u32).map(|i| (i * 7) as u8).collect();
+        sav.extend_from_slice(&[0; 44]);
+        sav[0x8000] = 12; // RTC seconds
+        fs::write(dir.path().join("g.sav"), &sav).unwrap();
+
+        let mut gb = GameBoy::new(rom.clone()).unwrap();
+        gb.set_audio_sample_rate(48_000);
+        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        saves.load(&mut gb);
+        assert_eq!(
+            gb.battery_ram().unwrap()[..0x8000],
+            sav[..0x8000],
+            "save loaded"
+        );
+        let rec_path = dir.path().join("s.gbinput");
+        let header = Header {
+            rom_hash: rom_hash(&rom),
+            battery: gb.battery_ram(),
+        };
+        let recorder = Recorder::create(&rec_path, &header).unwrap();
+        let mut app = App::new(
+            gb,
+            saves,
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(rom_path)
+        .with_recorder(Some(recorder));
+
+        app.run_frames(2);
+        app.on_key_input(KeyCode::ArrowRight, true);
+        app.run_frames(3);
+        app.on_key_input(KeyCode::ArrowLeft, true); // press and release in one frame
+        app.on_key_input(KeyCode::ArrowLeft, false);
+        app.run_frames(2);
+        app.on_key_input(KeyCode::ArrowLeft, true);
+        app.run_frames(1);
+        app.release_all_buttons(); // window lost focus with Right and Left held
+        app.on_key_input(KeyCode::ArrowRight, true);
+        app.run_frames(1);
+        app.on_key_input(KeyCode::KeyC, true); // screenshot + marker
+        let marker = app.frame;
+        app.run_frames(4);
+        let total = app.frame;
+        app.recorder.as_mut().unwrap().finish(total);
+
+        let rec = Recording::decode(&fs::read(&rec_path).unwrap()).unwrap();
+        assert_eq!(rec.end_frame, Some(total));
+        assert_eq!(rec.markers(), vec![marker]);
+        assert_eq!(
+            rec.records.len(),
+            8,
+            "7 button changes + 1 marker: {:?}",
+            rec.records
+        );
+
+        let mut gb = rec.power_on(rom).unwrap();
+        gb.set_audio_sample_rate(44_100); // output rate must not affect state
+        let mut player = Replayer::new(&rec);
+        let mut audio = Vec::new();
+        let mut step = |gb: &mut GameBoy, player: &mut Replayer, to: u64| {
+            while player.frame() < to {
+                player.step_frame(gb);
+                audio.clear();
+                gb.drain_audio_into(&mut audio);
+            }
+        };
+        step(&mut gb, &mut player, marker);
+        let shot = fs::read(record::screenshot_path(&dir.path().join("g.gb"), marker)).unwrap();
+        let replayed = dir.path().join("replayed.png");
+        record::write_png(gb.framebuffer(), &replayed).unwrap();
+        assert_eq!(
+            fs::read(&replayed).unwrap(),
+            shot,
+            "screenshot == replayed frame"
+        );
+        assert_eq!(
+            gb.framebuffer()[0],
+            2,
+            "Right held: shade follows the joypad"
+        );
+
+        step(&mut gb, &mut player, total);
+        assert_eq!(gb.mcycles(), app.gb.mcycles());
+        assert_eq!(gb.cpu_registers(), app.gb.cpu_registers());
+        assert_eq!(
+            gb.peek(0xFF0F),
+            app.gb.peek(0xFF0F),
+            "IF (joypad IRQ) matches"
+        );
+        assert_eq!(gb.framebuffer()[..], app.gb.framebuffer()[..]);
+        assert_eq!(
+            gb.battery_ram(),
+            app.gb.battery_ram(),
+            "cart RAM + RTC match"
+        );
     }
 
     #[test]

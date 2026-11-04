@@ -14,12 +14,14 @@ options:
   --mute             disable audio output
   --palette NAME     green (default) or grey
   --test-pattern     show a synthetic test pattern and tone instead of running the core
+  --record FILE      record every input to FILE (must not exist) for `gb-test --replay`
   -h, --help         show this help
   --                 end of options; the next argument is the ROM path, even if it starts with `-`
 
 controls:
   arrows = D-pad    X = A    Z = B    Enter = Start    Backspace / Right Shift = Select
-  P = pause    Tab (hold) = fast-forward    Esc = quit";
+  P = pause    Tab (hold) = fast-forward    C = screenshot (marks the frame when recording)
+  Esc = quit";
 
 pub const DEFAULT_SCALE: u32 = 4;
 pub const MAX_SCALE: u32 = 8;
@@ -31,6 +33,7 @@ pub struct Options {
     pub mute: bool,
     pub palette: PaletteKind,
     pub test_pattern: bool,
+    pub record: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +52,7 @@ where
     let mut mute = false;
     let mut palette = PaletteKind::Green;
     let mut test_pattern = false;
+    let mut record: Option<PathBuf> = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -74,6 +78,10 @@ where
                 let value = option_value("--palette", args.next())?;
                 palette = parse_palette(&value)?;
             }
+            "--record" => record = Some(path_value("--record", args.next())?),
+            _ if text.starts_with("--record=") && text.len() > "--record=".len() => {
+                record = Some(PathBuf::from(&text["--record=".len()..]));
+            }
             _ if text.starts_with("--scale=") => scale = parse_scale(&text["--scale=".len()..])?,
             _ if text.starts_with("--palette=") => {
                 palette = parse_palette(&text["--palette=".len()..])?;
@@ -86,13 +94,29 @@ where
     }
 
     let rom = rom.ok_or("missing ROM path")?;
+    if test_pattern && record.is_some() {
+        return Err("--record cannot be combined with --test-pattern".into());
+    }
     Ok(Command::Run(Options {
         rom,
         scale,
         mute,
         palette,
         test_pattern,
+        record,
     }))
+}
+
+/// Like [`option_value`] for a file path: kept as an `OsString` (no lossy UTF-8).
+fn path_value(name: &str, value: Option<OsString>) -> Result<PathBuf, String> {
+    match value {
+        Some(v) if !(v.to_string_lossy().starts_with('-') && v.len() > 1) => Ok(PathBuf::from(v)),
+        Some(v) => Err(format!(
+            "{name} is missing a value (found option `{}`)",
+            v.to_string_lossy()
+        )),
+        None => Err(format!("{name} is missing a value")),
+    }
 }
 
 /// The argument after `name`, which must exist and must not look like another
@@ -158,6 +182,7 @@ mod tests {
         assert_eq!(o.rom, PathBuf::from("game.gb"));
         assert_eq!(o.scale, 4);
         assert!(!o.mute && !o.test_pattern);
+        assert_eq!(o.record, None);
         assert_eq!(o.palette, PaletteKind::Green);
     }
 
@@ -174,6 +199,30 @@ mod tests {
         assert_eq!((o.scale, o.mute, o.test_pattern), (2, true, true));
         assert_eq!(o.palette, PaletteKind::Grey);
         assert_eq!(run(&["--scale=3", "g.gb"]).scale, 3);
+    }
+
+    #[test]
+    fn record_path() {
+        assert_eq!(
+            run(&["--record", "s.gbinput", "g.gb"]).record,
+            Some(PathBuf::from("s.gbinput"))
+        );
+        assert_eq!(
+            run(&["g.gb", "--record=s.gbinput"]).record,
+            Some(PathBuf::from("s.gbinput"))
+        );
+        assert!(
+            p(&["g.gb", "--record"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+        assert!(
+            p(&["--record", "--mute", "g.gb"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+        assert!(p(&["--record=", "g.gb"]).is_err());
+        assert!(p(&["--record", "s", "--test-pattern", "g.gb"]).is_err());
     }
 
     #[test]

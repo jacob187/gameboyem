@@ -38,6 +38,7 @@ usage: gb [options] [--] <rom.gb>
   --mute           disable audio output
   --palette NAME   green (default) or grey
   --test-pattern   synthetic pattern + tone instead of running the core
+  --record FILE    record every input to FILE (must not exist yet) for replay
   --               end of options; the next argument is the ROM path
 ```
 
@@ -55,7 +56,23 @@ If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than a
 | Select | Backspace or Right Shift |
 | Pause | P |
 | Fast-forward (hold) | Tab |
+| Screenshot (and mark the frame) | C |
 | Quit | Esc |
+
+## Recording, replay and screenshots
+
+Press **C** to save the exact 160×144 picture as a greyscale PNG next to the ROM, named `<rom>-f<frame>.png`.
+
+`gb --record session.gbinput game.gb` also records every button change, keyed by frame, plus the battery RAM the session started from. The file grows by about 9 bytes per button change, which is roughly 20–100 KB per hour of play. Screenshots taken while recording mark their frame in the file. The window title shows `[rec]`.
+
+The core is deterministic, so a recording reproduces the session exactly without a window:
+
+```sh
+cargo run -p gb-test --release -- --replay session.gbinput game.gb               # dump every marked frame + the last one
+cargo run -p gb-test --release -- --replay session.gbinput game.gb --dump 600,900 --out shots/
+```
+
+Replayed frames go to `target/gb-test-out/replay/<recording>/` by default. A replayed marker frame is byte-identical to the screenshot taken while playing. A recording made with a different ROM is rejected. If the game crashes or is killed, the file lacks its end record and replays up to the last input.
 
 ## Tests
 

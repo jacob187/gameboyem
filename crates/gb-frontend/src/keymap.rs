@@ -12,6 +12,8 @@ pub enum Action {
     Quit,
     Pause,
     FastForward,
+    /// Save the current picture as a PNG (and mark the frame in a recording).
+    Screenshot,
 }
 
 pub fn map(key: KeyCode) -> Option<Action> {
@@ -27,6 +29,7 @@ pub fn map(key: KeyCode) -> Option<Action> {
         KeyCode::Escape => Action::Quit,
         KeyCode::KeyP => Action::Pause,
         KeyCode::Tab => Action::FastForward,
+        KeyCode::KeyC => Action::Screenshot,
         _ => return None,
     })
 }
@@ -93,6 +96,7 @@ mod tests {
         assert_eq!(map(KeyCode::Escape), Some(Action::Quit));
         assert_eq!(map(KeyCode::KeyP), Some(Action::Pause));
         assert_eq!(map(KeyCode::Tab), Some(Action::FastForward));
+        assert_eq!(map(KeyCode::KeyC), Some(Action::Screenshot));
         assert_eq!(map(KeyCode::KeyQ), None);
     }
 
