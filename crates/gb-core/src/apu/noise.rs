@@ -41,7 +41,7 @@ impl Noise {
     }
 
     pub fn write_envelope(&mut self, v: u8) {
-        self.env.nr2 = v;
+        self.env.write(v, self.enabled);
         if !self.env.dac_on() {
             self.enabled = false;
         }
@@ -51,7 +51,7 @@ impl Noise {
         self.nr43 = v;
     }
 
-    pub fn write_ctrl(&mut self, v: u8, next_step_odd: bool) {
+    pub fn write_ctrl(&mut self, v: u8, next_step_odd: bool, env_next: bool) {
         if self.length.set_enabled(v & 0x40 != 0, next_step_odd) {
             self.enabled = false;
         }
@@ -60,7 +60,7 @@ impl Noise {
             self.enabled = self.env.dac_on();
             self.lfsr = 0;
             self.timer = self.period();
-            self.env.trigger();
+            self.env.trigger(env_next);
         }
     }
 
@@ -111,6 +111,11 @@ impl Noise {
             self.clock_lfsr();
         }
         self.output() != before
+    }
+
+    /// The channel's DAC is powered (NR42 bits 7-3 not all zero).
+    pub fn dac_on(&self) -> bool {
+        self.env.dac_on()
     }
 
     /// Digital output 0..=15.

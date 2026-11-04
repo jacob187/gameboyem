@@ -63,14 +63,22 @@ impl Length {
 
 /// Volume envelope (NRx2). Clocked at 64 Hz by the frame sequencer.
 ///
-/// Gaps (documented in `apu.rs`): the trigger-on-envelope-step timing quirk and
-/// DMG "zombie mode" writes to NRx2 while the channel plays are not modelled.
+/// Behaviours beyond the basic decay/grow (Pan Docs: "Audio Details",
+/// "Obscure Behavior"):
+/// - a period of 0 is treated as 8 for the timer, but never changes the volume;
+/// - a trigger that lands just before the sequencer step which clocks the
+///   envelope reloads the timer one higher than normal;
+/// - writing NRx2 while the channel plays ("zombie mode") alters the volume
+///   directly, see [`Envelope::write`].
 #[derive(Clone, Debug, Default)]
 pub(super) struct Envelope {
     /// Raw NRx2: initial volume (7-4), direction (3, 1 = increase), pace (2-0).
     pub nr2: u8,
     pub volume: u8,
     timer: u8,
+    /// Automatic updates are running: set by a trigger, cleared when a clock
+    /// tries to step the volume past 0 or 15.
+    auto: bool,
 }
 
 impl Envelope {
@@ -79,9 +87,12 @@ impl Envelope {
         self.nr2 & 0xF8 != 0
     }
 
-    pub fn trigger(&mut self) {
+    /// `env_next`: the next frame-sequencer step is the one that clocks the
+    /// envelope (step 7).
+    pub fn trigger(&mut self, env_next: bool) {
         self.volume = self.nr2 >> 4;
-        self.timer = self.pace_or_8();
+        self.timer = self.pace_or_8() + u8::from(env_next);
+        self.auto = true;
     }
 
     fn pace_or_8(&self) -> u8 {
@@ -91,19 +102,49 @@ impl Envelope {
         }
     }
 
+    /// NRx2 write. While the channel is on (`channel_on`) the volume changes as
+    /// on the DMG family (Pan Docs: "Zombie mode"): +1 if the old period was 0
+    /// and the envelope still auto-updates, otherwise +2 if the old direction
+    /// was decrease; then `16 - volume` if the direction flipped; only the low
+    /// 4 bits are kept. The timer is not reloaded.
+    pub fn write(&mut self, v: u8, channel_on: bool) {
+        if channel_on {
+            let old = self.nr2;
+            let mut vol = self.volume;
+            if old & 7 == 0 && self.auto {
+                vol += 1;
+            } else if old & 8 == 0 {
+                vol += 2;
+            }
+            if (old ^ v) & 8 != 0 {
+                vol = 16u8.wrapping_sub(vol);
+            }
+            self.volume = vol & 0xF;
+        }
+        self.nr2 = v;
+    }
+
     pub fn clock(&mut self) {
-        let pace = self.nr2 & 7;
-        if pace == 0 {
-            return; // pace 0 disables the envelope (Pan Docs: NRx2)
+        if !self.auto {
+            return;
         }
         self.timer = self.timer.saturating_sub(1);
-        if self.timer == 0 {
-            self.timer = pace;
-            if self.nr2 & 8 != 0 {
-                self.volume = (self.volume + 1).min(15);
-            } else {
-                self.volume = self.volume.saturating_sub(1);
-            }
+        if self.timer != 0 {
+            return;
+        }
+        self.timer = self.pace_or_8();
+        if self.nr2 & 7 == 0 {
+            return; // pace 0 reloads the timer but never steps the volume
+        }
+        let v = if self.nr2 & 8 != 0 {
+            self.volume + 1
+        } else {
+            self.volume.wrapping_sub(1)
+        };
+        if v > 15 {
+            self.auto = false; // 15 + 1 and 0 - 1 (wrapped) both land here
+        } else {
+            self.volume = v;
         }
     }
 }
