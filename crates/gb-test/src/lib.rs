@@ -1326,6 +1326,105 @@ mod tests {
         assert!(cases.iter().any(|c| c.path.ends_with("03-op sp,hl.gb")));
     }
 
+    /// A 32 KiB ROM with `code` at 0x150 (entry jumps there).
+    fn synth_rom(cart_type: u8, ram_code: u8, code: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x104].copy_from_slice(&[0x00, 0xC3, 0x50, 0x01]); // nop; jp $0150
+        rom[0x147] = cart_type;
+        rom[0x149] = ram_code;
+        rom[0x150..0x150 + code.len()].copy_from_slice(code);
+        rom
+    }
+
+    /// Shows one BG tile with a stripe and latches every D-pad press it sees
+    /// into BGP (the latch survives the release, so a snapshot taken after the
+    /// `Hold` still shows it). Buttons (A, B, ...) are never selected, so they
+    /// change nothing.
+    const JOYPAD_TO_PALETTE: &[u8] = &[
+        0xF3, // di
+        0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA, // wait for LY == 144
+        0xAF, 0xE0, 0x40, // LCD off
+        0x21, 0x00, 0x80, 0x01, 0x00, 0x20, // hl = $8000, bc = $2000
+        0xAF, 0x22, 0x0B, 0x78, 0xB1, 0x20, 0xF9, // clear VRAM
+        0x21, 0x00, 0x80, 0x36, 0xFF, // tile 0, first row = colour 1
+        0x3E, 0x91, 0xE0, 0x40, // LCD on, BG on
+        0x06, 0x00, // b = latch = 0
+        // loop:
+        0x3E, 0x20, 0xE0, 0x00, // select the D-pad
+        0xF0, 0x00, 0xE6, 0x0C, 0xEE, 0x0C, // a = pressed D-pad bits 3:2
+        0xB0, 0x47, // a |= b; b = a
+        0xF6, 0x03, 0xE0, 0x47, // BGP = a | 3
+        0x18, 0xEE, // jr loop
+    ];
+
+    fn play_script(button: Button) -> [Step; 5] {
+        [
+            Step::Run(20), // the boot code clears VRAM first (~1.2 frames)
+            Step::Shot {
+                label: "title",
+                moving: false,
+            },
+            Step::Hold(button, 3),
+            Step::Run(2),
+            Step::Shot {
+                label: "after the press",
+                moving: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn play_control_run_passes_when_input_changes_the_picture() {
+        let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
+        let out = run_play(&rom, &play_script(Button::Down), 100);
+        assert_eq!(out, Outcome::Pass, "{out}");
+    }
+
+    #[test]
+    fn play_control_run_fails_when_input_is_ignored() {
+        let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
+        let out = run_play(&rom, &play_script(Button::A), 100);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("input had no effect")),
+            "{out}"
+        );
+    }
+
+    /// Cart type MBC1+RAM+BATTERY, 8 KiB RAM. Enables SRAM, signs the block,
+    /// then: first run sets A010 and reports 0x81 (needs reset); the second
+    /// run (A010 survived the reset) reports 0 and disables SRAM again.
+    const BLARGG_RESET_THEN_PASS: &[u8] = &[
+        0x3E, 0x0A, 0xEA, 0x00, 0x00, // enable SRAM
+        0x3E, 0xDE, 0xEA, 0x01, 0xA0, //
+        0x3E, 0xB0, 0xEA, 0x02, 0xA0, //
+        0x3E, 0x61, 0xEA, 0x03, 0xA0, // signature
+        0xFA, 0x10, 0xA0, 0xB7, 0x20, 0x0C, // A010 != 0 -> second run
+        0x3E, 0x01, 0xEA, 0x10, 0xA0, // A010 = 1
+        0x3E, 0x81, 0xEA, 0x00, 0xA0, // status = needs reset
+        0x18, 0xFE, //
+        0xAF, 0xEA, 0x00, 0xA0, // status = 0 (pass)
+        0xEA, 0x00, 0x00, // disable SRAM
+        0x18, 0xFE,
+    ];
+
+    #[test]
+    fn blargg_mem_resets_on_0x81_and_reads_sram_ungated() {
+        let rom = synth_rom(0x03, 0x02, BLARGG_RESET_THEN_PASS);
+        assert_eq!(run_blargg_mem(&rom, 600), Outcome::Pass);
+    }
+
+    #[test]
+    fn blargg_mem_gives_up_after_too_many_resets() {
+        let mut code = BLARGG_RESET_THEN_PASS.to_vec();
+        code[23..26].fill(0x00); // NOP out `or a; jr nz`: every run reports "needs reset"
+        let rom = synth_rom(0x03, 0x02, &code);
+        let out = run_blargg_mem(&rom, 3000);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("needs reset")),
+            "{out}"
+        );
+    }
+
     #[test]
     fn missing_rom_reports_missing() {
         let case = Case {
