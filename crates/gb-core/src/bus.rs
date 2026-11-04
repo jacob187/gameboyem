@@ -88,8 +88,9 @@ impl Bus {
 
     /// Advance every component by one M-cycle.
     ///
-    /// Ordering within the M-cycle is owned by the timer/DMA work (Agent C) and
-    /// may be refined; the public contract is only "one M-cycle per call".
+    /// The order is load-bearing: timer, serial, DMA, PPU, APU, cartridge,
+    /// then the CPU's access (in `CpuBus` read/write). The mooneye timer and
+    /// OAM DMA tests and `bus_tests.rs` pin it down, so don't reorder casually.
     pub(crate) fn tick_components(&mut self) {
         self.mcycles += 1;
         self.timer.tick_mcycle(&mut self.interrupts);
