@@ -33,14 +33,15 @@ cargo build --release
 **Command-line options:**
 
 ```
-usage: gb [options] <rom.gb>
+usage: gb [options] [--] <rom.gb>
   --scale N        integer window scale, 1..=8 (default 4; HiDPI-aware)
   --mute           disable audio output
   --palette NAME   green (default) or grey
   --test-pattern   synthetic pattern + tone instead of running the core
+  --               end of options; the next argument is the ROM path
 ```
 
-Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomically every 5 s when RAM changes, on pause, and on quit.
+Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomically every 5 s when RAM changes, on pause, on quit, and on SIGINT/SIGTERM/SIGHUP (Ctrl-C). If writing fails, a warning is printed at once and then at most once a minute, and the failure is always reported on exit.
 
 ## Controls
 
