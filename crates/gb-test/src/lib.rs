@@ -8,7 +8,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use gb_core::{Button, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gb_core::{Button, GameBoy, Model, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// The manifest, compiled in so tests and the CLI always agree.
 pub const MANIFEST: &str = include_str!("../expected.txt");
@@ -55,6 +55,8 @@ pub struct Case {
     pub kind: Kind,
     pub expect_pass: bool,
     pub max_frames: u32,
+    /// The console to run on: a `-cgb` suffix on the kind selects [`Model::Cgb`].
+    pub model: Model,
 }
 
 impl Case {
@@ -161,7 +163,14 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "fail" => false,
                 o => panic!("expected.txt:{}: bad expectation {o:?}", n + 1),
             };
-            let kind = match next("kind") {
+            // `<kind>-cgb` runs <kind> on a CGB. Only the `-cgb` suffix is peeled
+            // off, so `blargg-mem` and friends keep parsing.
+            let kind_text = next("kind");
+            let (kind_text, model) = match kind_text.strip_suffix("-cgb") {
+                Some(base) => (base, Model::Cgb),
+                None => (kind_text, Model::Dmg),
+            };
+            let kind = match kind_text {
                 "blargg" => Kind::Blargg,
                 "blargg-mem" => Kind::BlarggMem,
                 "mooneye" => Kind::Mooneye,
@@ -187,6 +196,7 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 kind,
                 expect_pass,
                 max_frames,
+                model,
             }
         })
         .collect()
@@ -202,25 +212,27 @@ pub fn run_case(case: &Case) -> Outcome {
         return Outcome::Missing;
     };
     let frames = case.max_frames;
-    let on_machine = |run: &dyn Fn(&mut GameBoy) -> Outcome| match GameBoy::new(rom.clone()) {
-        Ok(mut gb) => run(&mut gb),
-        Err(e) => Outcome::Fail(format!("load error: {e}")),
-    };
+    let model = case.model;
+    let on_machine =
+        |run: &dyn Fn(&mut GameBoy) -> Outcome| match GameBoy::with_model(rom.clone(), model) {
+            Ok(mut gb) => run(&mut gb),
+            Err(e) => Outcome::Fail(format!("load error: {e}")),
+        };
     match case.kind {
         Kind::Blargg => on_machine(&|gb| run_blargg(gb, frames)),
         Kind::Mooneye => on_machine(&|gb| run_mooneye(gb, frames)),
         Kind::Acid2 => on_machine(&|gb| run_acid2(gb, case)),
         Kind::Smoke => on_machine(&|gb| run_smoke(gb, frames)),
-        Kind::BlarggMem => run_blargg_mem(&rom, frames),
-        Kind::PlaySnake => run_play(&rom, PLAY_SNAKE, frames),
-        Kind::PlayBreakout => run_play(&rom, PLAY_BREAKOUT, frames),
-        Kind::PlayTobu => run_play(&rom, PLAY_TOBU, frames),
-        Kind::PlayAdjustris => run_play(&rom, PLAY_ADJUSTRIS, frames),
-        Kind::PlayRenegade => run_play(&rom, PLAY_RENEGADE, frames),
-        Kind::SaveSnake => run_save(&rom, drive_snake, frames),
-        Kind::SaveBreakout => run_save(&rom, drive_breakout, frames),
-        Kind::SfxSnake => run_sfx(&rom, sfx_snake, frames),
-        Kind::SfxBreakout => run_sfx(&rom, sfx_breakout, frames),
+        Kind::BlarggMem => run_blargg_mem(&rom, model, frames),
+        Kind::PlaySnake => run_play(&rom, model, PLAY_SNAKE, frames),
+        Kind::PlayBreakout => run_play(&rom, model, PLAY_BREAKOUT, frames),
+        Kind::PlayTobu => run_play(&rom, model, PLAY_TOBU, frames),
+        Kind::PlayAdjustris => run_play(&rom, model, PLAY_ADJUSTRIS, frames),
+        Kind::PlayRenegade => run_play(&rom, model, PLAY_RENEGADE, frames),
+        Kind::SaveSnake => run_save(&rom, model, drive_snake, frames),
+        Kind::SaveBreakout => run_save(&rom, model, drive_breakout, frames),
+        Kind::SfxSnake => run_sfx(&rom, model, sfx_snake, frames),
+        Kind::SfxBreakout => run_sfx(&rom, model, sfx_breakout, frames),
     }
 }
 
@@ -304,7 +316,7 @@ impl Sram {
 /// On 0x81 the ROM wants a reset after >= 0.1 s with its SRAM kept (it is
 /// battery-backed on real carts): the machine is re-created from the ROM, the
 /// RAM carried over, and the run continues, at most `MAX_RESETS` times.
-fn run_blargg_mem(rom: &[u8], max_frames: u32) -> Outcome {
+fn run_blargg_mem(rom: &[u8], model: Model, max_frames: u32) -> Outcome {
     const STATUS: u16 = 0xA000;
     const TEXT: u16 = 0xA004;
     const RUNNING: u8 = 0x80;
@@ -315,7 +327,10 @@ fn run_blargg_mem(rom: &[u8], max_frames: u32) -> Outcome {
     /// Frames after a reset during which a leftover 0x81 is not a new request:
     /// the ROM has not rewritten the status byte yet.
     const BOOT_GRACE: u32 = 30;
-    let boot = || GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")));
+    let boot = || {
+        GameBoy::with_model(rom.to_vec(), model)
+            .map_err(|e| Outcome::Fail(format!("load error: {e}")))
+    };
     let report = |gb: &GameBoy, sram: &Sram| {
         let text: Vec<u8> = (0..0x1000u16)
             .map(|i| sram.read(gb, TEXT + i))
@@ -709,12 +724,13 @@ const PLAY_RENEGADE: &[Step] = &[
 /// `skip` replaces the `Hold` at that index with an equally long `Run`.
 fn play(
     rom: &[u8],
+    model: Model,
     script: &[Step],
     skip: Option<usize>,
     max_frames: u32,
 ) -> Result<Vec<Vec<u8>>, Outcome> {
-    let mut gb =
-        GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
+    let mut gb = GameBoy::with_model(rom.to_vec(), model)
+        .map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
     let mut frame = 0;
     let mut shots = Vec::new();
     for (i, step) in script.iter().enumerate() {
@@ -758,8 +774,8 @@ fn play(
 ///   different picture at the next `Shot` (the control run stops there; the
 ///   machine is not `Clone`, so each one replays from power-on). Without this, a game that animates
 ///   on its own would pass even with joypad input broken.
-fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
-    let shots = match play(rom, script, None, max_frames) {
+fn run_play(rom: &[u8], model: Model, script: &[Step], max_frames: u32) -> Outcome {
+    let shots = match play(rom, model, script, None, max_frames) {
         Ok(s) => s,
         Err(o) => return o,
     };
@@ -789,7 +805,7 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
                 else {
                     continue;
                 };
-                let control = match play(rom, &script[..=end], Some(i), max_frames) {
+                let control = match play(rom, model, &script[..=end], Some(i), max_frames) {
                     Ok(s) => s,
                     Err(o) => return o,
                 };
@@ -816,9 +832,9 @@ struct Session {
 }
 
 impl Session {
-    fn new(rom: &[u8], max_frames: u32) -> Result<Self, Outcome> {
-        let gb =
-            GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
+    fn new(rom: &[u8], model: Model, max_frames: u32) -> Result<Self, Outcome> {
+        let gb = GameBoy::with_model(rom.to_vec(), model)
+            .map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
         Ok(Self {
             gb,
             frame: 0,
@@ -951,16 +967,16 @@ fn drive_breakout(s: &mut Session) -> Result<(), Outcome> {
 ///    the control: the HI digits show the saved score.
 ///
 /// No RAM addresses or save format are assumed; only that something persists.
-fn run_save(rom: &[u8], bot: Bot, max_frames: u32) -> Outcome {
-    match save_round_trip(rom, bot, max_frames) {
+fn run_save(rom: &[u8], model: Model, bot: Bot, max_frames: u32) -> Outcome {
+    match save_round_trip(rom, model, bot, max_frames) {
         Ok(()) => Outcome::Pass,
         Err(o) => o,
     }
 }
 
-fn save_round_trip(rom: &[u8], bot: Bot, max_frames: u32) -> Result<(), Outcome> {
+fn save_round_trip(rom: &[u8], model: Model, bot: Bot, max_frames: u32) -> Result<(), Outcome> {
     let fail = |m: &str| Outcome::Fail(m.to_string());
-    let mut first = Session::new(rom, max_frames)?;
+    let mut first = Session::new(rom, model, max_frames)?;
     first.run(PLAY_BOOT_FRAMES)?;
     let control = first.gb.framebuffer().to_vec();
     if control.iter().all(|&x| x == control[0]) {
@@ -986,7 +1002,7 @@ fn save_round_trip(rom: &[u8], bot: Bot, max_frames: u32) -> Result<(), Outcome>
         ));
     }
 
-    let mut second = Session::new(rom, max_frames)?;
+    let mut second = Session::new(rom, model, max_frames)?;
     second
         .gb
         .load_battery_ram(&saved)
@@ -1026,9 +1042,9 @@ struct Listener {
 }
 
 impl Listener {
-    fn new(rom: &[u8], max_frames: u32) -> Result<Self, Outcome> {
+    fn new(rom: &[u8], model: Model, max_frames: u32) -> Result<Self, Outcome> {
         Ok(Self {
-            s: Session::new(rom, max_frames)?,
+            s: Session::new(rom, model, max_frames)?,
             frames: Vec::new(),
         })
     }
@@ -1118,11 +1134,11 @@ impl SfxReport {
     }
 }
 
-type SfxScript = fn(&[u8], u32, &mut SfxReport) -> Result<(), Outcome>;
+type SfxScript = fn(&[u8], Model, u32, &mut SfxReport) -> Result<(), Outcome>;
 
-fn run_sfx(rom: &[u8], script: SfxScript, max_frames: u32) -> Outcome {
+fn run_sfx(rom: &[u8], model: Model, script: SfxScript, max_frames: u32) -> Outcome {
     let mut report = SfxReport::new();
-    match script(rom, max_frames, &mut report) {
+    match script(rom, model, max_frames, &mut report) {
         Ok(()) => report.finish(),
         Err(o) => o,
     }
@@ -1134,6 +1150,7 @@ fn run_sfx(rom: &[u8], script: SfxScript, max_frames: u32) -> Outcome {
 /// (snake: field up, breakout: serving).
 fn sfx_title_and_start(
     rom: &[u8],
+    model: Model,
     l: &mut Listener,
     max_frames: u32,
     r: &mut SfxReport,
@@ -1145,7 +1162,7 @@ fn sfx_title_and_start(
     let end = PLAY_BOOT_FRAMES as usize + SFX_WINDOW;
     r.loud("Start blip", l.level(PLAY_BOOT_FRAMES as usize, end));
 
-    let mut ctl = Listener::new(rom, max_frames)?;
+    let mut ctl = Listener::new(rom, model, max_frames)?;
     ctl.run(end as u32)?;
     r.quiet("Start omitted", ctl.level(PLAY_BOOT_FRAMES as usize, end));
 
@@ -1156,12 +1173,12 @@ fn sfx_title_and_start(
 /// Snake: Start blip, silent movement, the first eat, then game over.
 ///
 /// Controls: no Start press; and Start but no steering, over the eat window.
-fn sfx_snake(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
+fn sfx_snake(rom: &[u8], model: Model, max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
     const HEAD: u8 = 130;
     const FOOD: u8 = 131;
     let pads = [Button::Up, Button::Right, Button::Down, Button::Left];
-    let mut l = Listener::new(rom, max_frames)?;
-    sfx_title_and_start(rom, &mut l, max_frames, r)?;
+    let mut l = Listener::new(rom, model, max_frames)?;
+    sfx_title_and_start(rom, model, &mut l, max_frames, r)?;
     let moving_from = l.now();
 
     let food0 =
@@ -1200,7 +1217,7 @@ fn sfx_snake(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outco
     r.loud("eat", l.level(win.0, win.1));
 
     // Same timeline as the main run, but no steering: nothing is eaten.
-    let mut pre = Listener::new(rom, max_frames)?;
+    let mut pre = Listener::new(rom, model, max_frames)?;
     pre.run(PLAY_BOOT_FRAMES)?;
     pre.hold(Button::Start, 5)?;
     pre.run(win.1 as u32 - PLAY_BOOT_FRAMES - 5)?;
@@ -1228,10 +1245,15 @@ fn sfx_snake(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outco
 ///
 /// Controls: no Start press; and Start with Left held but A never pressed, so
 /// the ball is never launched, over the whole play span.
-fn sfx_breakout(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
+fn sfx_breakout(
+    rom: &[u8],
+    model: Model,
+    max_frames: u32,
+    r: &mut SfxReport,
+) -> Result<(), Outcome> {
     const LIFE: u8 = 132;
-    let mut l = Listener::new(rom, max_frames)?;
-    sfx_title_and_start(rom, &mut l, max_frames, r)?;
+    let mut l = Listener::new(rom, model, max_frames)?;
+    sfx_title_and_start(rom, model, &mut l, max_frames, r)?;
     let serving = (l.now() - 20, l.now());
     r.quiet("serving", l.level(serving.0, serving.1));
 
@@ -1306,7 +1328,7 @@ fn sfx_breakout(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Ou
     r.loud("game over", worst(&l, &[over]));
 
     let span = (launch, over + SFX_WINDOW);
-    let mut ctl = Listener::new(rom, max_frames)?;
+    let mut ctl = Listener::new(rom, model, max_frames)?;
     ctl.run(PLAY_BOOT_FRAMES)?;
     ctl.hold(Button::Start, 5)?;
     ctl.s.gb.set_button(Button::Left, true);
@@ -1324,6 +1346,30 @@ mod tests {
         let cases = load_manifest();
         assert!(cases.len() > 50);
         assert!(cases.iter().any(|c| c.path.ends_with("03-op sp,hl.gb")));
+    }
+
+    #[test]
+    fn cgb_suffix_selects_the_model_and_only_the_suffix() {
+        let cases = parse_manifest(
+            "pass mooneye 10 a b.gb\n\
+             fail mooneye-cgb 20 c d.gb\n\
+             pass blargg-mem-cgb 30 e.gb\n\
+             pass blargg-mem 40 f.gb\n",
+        );
+        let got: Vec<_> = cases
+            .iter()
+            .map(|c| (c.kind, c.model, c.max_frames))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Kind::Mooneye, Model::Dmg, 10),
+                (Kind::Mooneye, Model::Cgb, 20),
+                (Kind::BlarggMem, Model::Cgb, 30),
+                (Kind::BlarggMem, Model::Dmg, 40),
+            ]
+        );
+        assert_eq!(cases[1].path, "c d.gb");
     }
 
     /// A 32 KiB ROM with `code` at 0x150 (entry jumps there).
@@ -1376,14 +1422,14 @@ mod tests {
     #[test]
     fn play_control_run_passes_when_input_changes_the_picture() {
         let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
-        let out = run_play(&rom, &play_script(Button::Down), 100);
+        let out = run_play(&rom, Model::Dmg, &play_script(Button::Down), 100);
         assert_eq!(out, Outcome::Pass, "{out}");
     }
 
     #[test]
     fn play_control_run_fails_when_input_is_ignored() {
         let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
-        let out = run_play(&rom, &play_script(Button::A), 100);
+        let out = run_play(&rom, Model::Dmg, &play_script(Button::A), 100);
         assert!(
             matches!(&out, Outcome::Fail(m) if m.contains("input had no effect")),
             "{out}"
@@ -1410,7 +1456,7 @@ mod tests {
     #[test]
     fn blargg_mem_resets_on_0x81_and_reads_sram_ungated() {
         let rom = synth_rom(0x03, 0x02, BLARGG_RESET_THEN_PASS);
-        assert_eq!(run_blargg_mem(&rom, 600), Outcome::Pass);
+        assert_eq!(run_blargg_mem(&rom, Model::Dmg, 600), Outcome::Pass);
     }
 
     #[test]
@@ -1418,7 +1464,7 @@ mod tests {
         let mut code = BLARGG_RESET_THEN_PASS.to_vec();
         code[23..26].fill(0x00); // NOP out `or a; jr nz`: every run reports "needs reset"
         let rom = synth_rom(0x03, 0x02, &code);
-        let out = run_blargg_mem(&rom, 3000);
+        let out = run_blargg_mem(&rom, Model::Dmg, 3000);
         assert!(
             matches!(&out, Outcome::Fail(m) if m.contains("needs reset")),
             "{out}"
@@ -1432,6 +1478,7 @@ mod tests {
             kind: Kind::Blargg,
             expect_pass: false,
             max_frames: 1,
+            model: Model::Dmg,
         };
         assert_eq!(run_case(&case), Outcome::Missing);
     }
