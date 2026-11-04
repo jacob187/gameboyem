@@ -1,7 +1,7 @@
 # Test-ROM manifest and expected outcomes (the "ratchet").
 #
 # Format: <expect> <kind> <max_frames> <path relative to the roms dir>
-#   expect: pass | fail      kind: blargg | mooneye | acid2 | smoke | play-snake | play-breakout
+#   expect: pass | fail      kind: blargg | mooneye | acid2 | smoke | play-snake | play-breakout | save-snake | save-breakout
 #
 # Each line is one `cargo test -p gb-test --test roms` case. A case FAILS when
 # the actual outcome differs from `expect` in either direction, so flipping a
@@ -126,3 +126,7 @@ pass smoke 600 homebrew/breakout.gb
 # --- Homebrew playability (boot, press Start, scripted input, framebuffer must change) ---
 pass play-snake 400 homebrew/snake.gb
 pass play-breakout 400 homebrew/breakout.gb
+
+# --- Homebrew saves (play to game over, carry battery RAM into a fresh machine, title HI differs) ---
+pass save-snake 700 homebrew/snake.gb
+pass save-breakout 1200 homebrew/breakout.gb
