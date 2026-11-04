@@ -113,7 +113,7 @@ static void put(uint8_t x, uint8_t y, uint8_t tile, uint8_t attr)
 
 static void draw_card(void)
 {
-    uint8_t p, row, x, y;
+    uint8_t p, row, x, y, col;
 
     for (y = 0; y < 18u; y++) {
         for (x = 0; x < 20u; x++) {
@@ -121,9 +121,12 @@ static void draw_card(void)
         }
     }
     for (p = 0; p < SWATCHES; p++) {
+        /* A named left column: written as `3u + 2u * p`, the second put() got
+         * 2p + 5 from SDCC (the address of the first plus 3), not 2p + 3. */
+        col = 2u + 2u * p;
         for (row = 0; row < 3u; row++) {
-            put(2u + 2u * p, 1u + row, TILE_SOLID + row, p);
-            put(3u + 2u * p, 1u + row, TILE_SOLID + row, p);
+            put(col, 1u + row, TILE_SOLID + row, p);
+            put(col + 1u, 1u + row, TILE_SOLID + row, p);
         }
     }
     put(2, 6, TILE_QUAD, 1);
