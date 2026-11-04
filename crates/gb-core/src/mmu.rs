@@ -18,18 +18,29 @@ use crate::bus::Bus;
 impl Bus {
     /// A CPU-initiated read (no cycle cost here; [`crate::bus::CpuBus::read`] ticks).
     ///
-    /// While OAM DMA is running the CPU can only reach HRAM; everything else
-    /// reads 0xFF. (Simplification of the real bus-conflict behaviour, Pan Docs
-    /// "OAM DMA Transfer"; refined in Phase 3.)
+    /// OAM DMA bus conflicts (DMG, Pan Docs "OAM DMA Transfer"), evaluated for
+    /// the cycle whose component tick just ran:
+    /// * OAM reads `0xFF`.
+    /// * An access to the bus the DMA source is on (external bus: ROM, cartridge
+    ///   RAM, WRAM/echo; video bus: VRAM) reads the byte the DMA engine is moving.
+    /// * HRAM, I/O registers (incl. `0xFF46`) and IE are always reachable.
     pub(crate) fn cpu_read(&self, addr: u16) -> u8 {
-        if self.dma.is_blocking() && !(0xFF80..=0xFFFE).contains(&addr) && addr != 0xFF46 {
+        if self.dma.is_blocking() && (0xFE00..=0xFE9F).contains(&addr) {
             return 0xFF;
+        }
+        if self.dma.conflicts_with(addr) {
+            return self.dma.data_byte();
         }
         self.read_mapped(addr)
     }
 
+    /// A CPU-initiated write. Writes that hit a DMA bus conflict or OAM during
+    /// a transfer are dropped.
     pub(crate) fn cpu_write(&mut self, addr: u16, value: u8) {
-        if self.dma.is_blocking() && !(0xFF80..=0xFFFE).contains(&addr) && addr != 0xFF46 {
+        if self.dma.is_blocking() && (0xFE00..=0xFE9F).contains(&addr) {
+            return;
+        }
+        if self.dma.conflicts_with(addr) {
             return;
         }
         self.write_mapped(addr, value);
@@ -53,13 +64,7 @@ impl Bus {
             0xA000..=0xBFFF => self.cart.read_ram(addr),
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
             0xE000..=0xFDFF => self.wram[(addr - 0xE000) as usize],
-            0xFE00..=0xFE9F => {
-                if self.dma.is_blocking() {
-                    0xFF
-                } else {
-                    self.ppu.read_oam(addr)
-                }
-            }
+            0xFE00..=0xFE9F => self.ppu.read_oam(addr),
             0xFEA0..=0xFEFF => 0xFF,
             0xFF00..=0xFF7F => self.read_io(addr),
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
@@ -74,11 +79,7 @@ impl Bus {
             0xA000..=0xBFFF => self.cart.write_ram(addr, value),
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = value,
             0xE000..=0xFDFF => self.wram[(addr - 0xE000) as usize] = value,
-            0xFE00..=0xFE9F => {
-                if !self.dma.is_blocking() {
-                    self.ppu.write_oam(addr, value);
-                }
-            }
+            0xFE00..=0xFE9F => self.ppu.write_oam(addr, value),
             0xFEA0..=0xFEFF => {}
             0xFF00..=0xFF7F => self.write_io(addr, value),
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = value,
