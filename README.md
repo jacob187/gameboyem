@@ -1,13 +1,13 @@
-# gb: a Game Boy (DMG) emulator in Rust
+# gb: a Game Boy and Game Boy Color emulator in Rust
 
-A cycle-accurate-enough original Game Boy emulator, plus two homebrew games written for it.
+A cycle-accurate-enough original Game Boy (DMG) emulator with Game Boy Color (CGB) support, plus two DMG homebrew games and a CGB colour test card written for it. Double speed and HDMA are still in progress (see Known gaps).
 
 | Crate | What it is |
 |-------|------------|
-| `crates/gb-core` | Pure emulation. It has no platform deps, no I/O, no `unsafe`, and runs deterministically. Builds anywhere, including `wasm32`. |
+| `crates/gb-core` | Pure emulation of the DMG and CGB. It has no platform deps, no I/O, no `unsafe`, and runs deterministically. Builds anywhere, including `wasm32`. |
 | `crates/gb-frontend` | The `gb` desktop binary (winit + pixels window, cpal audio). This is the only platform-specific crate. |
 | `crates/gb-test` | A headless test-ROM harness. Every ROM is a `cargo test` case, and a table runner prints the results. |
-| `homebrew/` | Snake and Breakout in C (GBDK-2020). |
+| `homebrew/` | Snake and Breakout (DMG) and `cgbdemo` (a CGB-only colour test card) in C (GBDK-2020). |
 
 ## Build and run
 
@@ -34,13 +34,16 @@ cargo build --release
 
 ```
 usage: gb [options] [--] <rom.gb|rom.gbc>
-  --scale N        integer window scale, 1..=8 (default 4; HiDPI-aware)
+  --scale N        integer window scale in logical points, 1..=8 (default 4)
   --mute           disable audio output
-  --palette NAME   green (default) or grey (DMG only)
-  --model NAME     auto (default: CGB for CGB-flagged ROMs, else DMG), dmg or cgb
-  --test-pattern   synthetic pattern + tone instead of running the core
-  --               end of options; the next argument is the ROM path
+  --palette NAME   green (default) or grey (DMG only; colour games use their own colours)
+  --model NAME     auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb
+  --test-pattern   show a synthetic test pattern and tone instead of running the core
+  -h, --help       show this help
+  --               end of options; the next argument is the ROM path, even if it starts with `-`
 ```
+
+`.gb` and `.gbc` ROMs are both accepted (the extension isn't checked; the header decides). With `--model auto`, a ROM whose header byte 0x143 is 0x80 or 0xC0 runs as a Game Boy Color, in colour. Any other ROM runs as a DMG. `--model cgb` forces a Game Boy Color, and a ROM without a CGB flag then runs in DMG-compatibility mode. It isn't colourised, because there's no boot ROM to pick a compatibility palette, so it uses `--palette`. `--model dmg` runs everything on a DMG, including CGB ROMs.
 
 Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomically every 5 s when RAM changes, on pause, on quit, and on SIGINT/SIGTERM/SIGHUP (Ctrl-C). If writing fails, a warning is printed at once and then at most once a minute, and the failure is always reported on exit.
 
@@ -50,7 +53,7 @@ If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than a
 
 Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **S** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr.
 
-A state is tied to the exact ROM it was taken with. A state from another ROM, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched.
+A state is tied to the exact ROM and the console model (DMG or Game Boy Color) it was taken with. A state from another ROM or model, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched. States from before CGB support (format version 1) still load on a DMG.
 
 Loading a state also rewinds battery RAM, and the next autosave writes that RAM over `<rom>.sav`. So before the first load in a session, the existing `<rom>.sav` is copied to `<rom>.sav.bak` (then `.bak1`, ...). If that copy fails, the load is refused.
 
@@ -88,7 +91,7 @@ cgb-acid2 (`acid2-cgb` in the manifest) runs on a Game Boy Color and compares th
 
 ### Test-ROM results
 
-These are the results on `integration`, run on macOS arm64. Linux x86_64 was checked with `scripts/docker-linux-test.sh amd64` (fmt, clippy, tests, ROM table) at `0160611` (136/136). GitHub Actions has not run yet, because this build had no push access.
+These are the results on `feat/cgb` at `e93d0b6`, run on macOS arm64 on 2026-11-04. Linux x86_64 was last checked with `scripts/docker-linux-test.sh amd64` (fmt, clippy, tests, ROM table) at `0160611` (136/136), before the CGB work. GitHub Actions has not run yet, because this build had no push access.
 
 | Suite | Pass / total |
 |-------|--------------|
@@ -101,10 +104,11 @@ These are the results on `integration`, run on macOS arm64. Linux x86_64 was che
 | Our homebrew: smoke, scripted playability, battery save round-trip, sound effects | 8 / 8 |
 | Open-source homebrew corpus (7 games, MBC1/MBC3+RTC/MBC5): smoke + 3 scripted play | 10 / 10 |
 | cgb-acid2 (run as a Game Boy Color, RGB555) | 1 / 1 |
+| Our CGB homebrew `cgbdemo`: colour test card, scripted play | 1 / 1 |
 | Mooneye CGB subset (run as a CGB, DMG-compatibility mode) | 4 / 5 |
-| **Total** | **141 / 142** |
+| **Total** | **142 / 143** |
 
-The one failing case, mooneye `ppu/vblank_stat_intr-C`, is an expected failure in `expected.txt` (CGB PPU timing is not modelled; DECISIONS #36). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
+The Mooneye CGB cases that pass are `boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C` and `boot_div-cgbABCDE`. The one failing case, `ppu/vblank_stat_intr-C`, is an expected failure in `expected.txt`. Its cause is undiagnosed (probably CGB PPU timing; DECISIONS #36). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
 ## Cartridges
 
@@ -122,13 +126,15 @@ The one failing case, mooneye `ppu/vblank_stat_intr-C`, is an expected failure i
 See `homebrew/README.md`. In short, GBDK-2020 4.5.0 must be in `tools/gbdk/` (gitignored), then:
 
 ```sh
-make -C homebrew          # -> roms/homebrew/snake.gb, roms/homebrew/breakout.gb
+make -C homebrew          # -> roms/homebrew/snake.gb, roms/homebrew/breakout.gb, roms/homebrew/cgbdemo.gb
 ```
 
 - **Snake:** the D-pad steers and Start begins.
 - **Breakout:** left/right move the paddle, A or B launches the ball, and Start begins.
 
 Both have title, score and game-over screens. Each keeps a high score in battery RAM (MBC1+RAM+BATTERY), so it persists in `<rom>.sav`, and has sound effects.
+
+- **cgbdemo:** a CGB-only colour test card (header 0x143 = 0xC0, so it needs a Game Boy Color). It shows the eight BG palettes, flipped tiles and a VRAM-bank-1 sprite. The D-pad moves the sprite, and A steps one palette entry. It has a headless play case that checks exact RGB555 pixels.
 
 ### Open-source homebrew corpus
 
@@ -145,13 +151,18 @@ They stand in for commercial games in the harness. All 7 boot, and 3 have PyBoy-
 
 ## Known gaps
 
-- **PPU.** It renders a whole scanline at the start of mode 3, so mid-scanline register writes take effect on the next line. Mode-3 sprite penalties are fitted for SCX=0 with no window.
+- **PPU.** It renders a whole scanline at the start of mode 3, so mid-scanline register writes (including palette and attribute writes in colour mode) take effect on the next line. Mode-3 sprite penalties are fitted for SCX=0 with no window, and colour mode reuses the DMG mode-3 timing.
 - **APU.** It passes all of Blargg `dmg_sound`. Output is a signed [-1, 1] stream: a bipolar DAC plus the DMG high-pass filter, and exactly 0 when the APU or every DAC is off. Zombie mode follows the Pan Docs rules. Still missing:
   - the sub-M-cycle low bits of the square frequency timer on trigger
   - the duty-step-0 quirk after power-on
   - model-specific zombie variants
 - **STOP.** Like hardware, it wakes only on a selected joypad line. Unlike hardware, the LCD and timer keep running during STOP.
-- **Not supported:** Game Boy Color, link cable, debugger, rewind and shaders.
+- **Game Boy Color.** Supported: VRAM and WRAM banking, KEY1, the colour PPU (palette RAM, BG attributes, CGB sprite priority, OPRI) with RGB555 output, FF72-FF75 scratch registers and PCM12/PCM34. Still missing:
+  - **Double speed and GDMA/HDMA are in progress on another branch.** KEY1 can be armed, but STOP doesn't switch speed yet, so a CGB game that needs double speed or HDMA won't run correctly.
+  - No colourisation of DMG games: a flag-less cartridge on a forced `--model cgb` runs in DMG-compatibility mode in the `--palette` shades, because the boot ROM's compatibility palettes aren't modelled.
+  - No infrared port (RP, FF56).
+  - CGB-mode post-boot timing is approximate. The DIV and serial phase and the PPU line and dot at hand-off are the compat-mode calibration or a guess, because no test ROM pins them (DECISIONS #33, #34). The CGB boot ROM's clearing of wave RAM isn't modelled either. The palette-port lock timing reuses the VRAM lock timing and is unverified (DECISIONS #36).
+- **Not supported:** link cable, debugger, rewind and shaders.
 - **No boot ROM.** The emulator starts in the documented post-boot state.
 
 Design decisions are in `DECISIONS.md`, status in `PROGRESS.md`, and deferred review findings in `REVIEW_NOTES.md`.
