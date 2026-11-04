@@ -85,9 +85,48 @@ pub struct Bus {
     /// KEY1 (FF4D) bit 0: a speed switch is armed for the next STOP. The speed
     /// itself (bit 7) is not implemented yet and always reads 0.
     pub(crate) key1_prepare: bool,
-    /// Undocumented read/write registers FF72, FF73, FF75 (bits 4-6 only) and
-    /// FF74, in that order. FF74 is mapped in CGB mode only.
-    pub(crate) cgb_scratch: [u8; 4],
+    /// The undocumented read/write registers FF72-FF75 (CGB hardware only).
+    pub(crate) cgb_scratch: CgbScratch,
+}
+
+/// FF72-FF75, the CGB's undocumented plain read/write registers (Pan Docs
+/// "Undocumented registers"), stored as the machine holds them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CgbScratch {
+    pub(crate) ff72: u8,
+    pub(crate) ff73: u8,
+    /// Mapped in CGB mode only; stays 0 in compatibility mode.
+    pub(crate) ff74: u8,
+    /// Only bits 4-6 are stored (the rest read 1): see [`CgbScratch::FF75_MASK`].
+    pub(crate) ff75: u8,
+}
+
+impl CgbScratch {
+    pub(crate) const FF75_MASK: u8 = 0x70;
+
+    /// Written in the order FF72, FF73, FF75, FF74.
+    fn save_state(&self, w: &mut StateWriter) {
+        for v in [self.ff72, self.ff73, self.ff75, self.ff74] {
+            w.u8(v);
+        }
+    }
+
+    /// Reads what [`CgbScratch::save_state`] wrote. `ff74_mapped` is whether
+    /// this machine maps FF74 (CGB mode); otherwise it can only be 0.
+    fn load_state(r: &mut StateReader, ff74_mapped: bool) -> Result<Self, StateError> {
+        let ff72 = r.u8()?;
+        let ff73 = r.u8()?;
+        let ff75 = r.u8()?;
+        check(ff75 & !Self::FF75_MASK == 0, "FF75")?;
+        let ff74 = r.u8()?;
+        check(ff74_mapped || ff74 == 0, "FF74")?;
+        Ok(Self {
+            ff72,
+            ff73,
+            ff74,
+            ff75,
+        })
+    }
 }
 
 impl Bus {
@@ -131,7 +170,7 @@ impl Bus {
             svbk: 0,
             wram_hi: WRAM_BANK1,
             key1_prepare: false,
-            cgb_scratch: [0; 4],
+            cgb_scratch: CgbScratch::default(),
         }
     }
 
@@ -242,7 +281,7 @@ impl Bus {
         if self.hw.is_cgb() {
             w.u8(self.svbk);
             w.bool(self.key1_prepare);
-            w.bytes(&self.cgb_scratch);
+            self.cgb_scratch.save_state(w);
         }
         w.u8(tag::INTERRUPTS);
         self.interrupts.save_state(w);
@@ -275,7 +314,7 @@ impl Bus {
             check(svbk < 8, "SVBK")?;
             self.set_svbk(svbk);
             self.key1_prepare = r.bool()?;
-            r.bytes_into(&mut self.cgb_scratch)?;
+            self.cgb_scratch = CgbScratch::load_state(r, self.hw == Hw::Cgb)?;
         }
         r.tag(tag::INTERRUPTS)?;
         self.interrupts.load_state(r)?;

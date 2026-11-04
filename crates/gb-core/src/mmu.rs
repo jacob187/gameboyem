@@ -19,7 +19,7 @@
 //! are unmapped on it, so the DMG paths pay nothing for them. See
 //! [`Hw`](crate::model::Hw) for what each variant maps.
 
-use crate::bus::Bus;
+use crate::bus::{Bus, CgbScratch};
 use crate::model::Hw;
 
 impl Bus {
@@ -152,11 +152,11 @@ impl Bus {
             (Hw::Cgb, 0xFF6C) => self.ppu.read_opri(),
             (Hw::Cgb, 0xFF4D) => 0x7E | u8::from(self.key1_prepare),
             (Hw::Cgb, 0xFF70) => 0xF8 | self.svbk,
-            (_, 0xFF72) => self.cgb_scratch[0],
-            (_, 0xFF73) => self.cgb_scratch[1],
+            (_, 0xFF72) => self.cgb_scratch.ff72,
+            (_, 0xFF73) => self.cgb_scratch.ff73,
             // Plain read/write in CGB mode only (Pan Docs "Undocumented registers").
-            (Hw::Cgb, 0xFF74) => self.cgb_scratch[3],
-            (_, 0xFF75) => 0x8F | self.cgb_scratch[2],
+            (Hw::Cgb, 0xFF74) => self.cgb_scratch.ff74,
+            (_, 0xFF75) => !CgbScratch::FF75_MASK | self.cgb_scratch.ff75,
             (_, 0xFF76 | 0xFF77) => self.apu.read_pcm(addr),
             _ => 0xFF,
         }
@@ -191,10 +191,10 @@ impl Bus {
             (Hw::Cgb, 0xFF6C) => self.ppu.write_opri(value),
             (Hw::Cgb, 0xFF4D) => self.key1_prepare = value & 1 != 0,
             (Hw::Cgb, 0xFF70) => self.set_svbk(value),
-            (_, 0xFF72) => self.cgb_scratch[0] = value,
-            (_, 0xFF73) => self.cgb_scratch[1] = value,
-            (Hw::Cgb, 0xFF74) => self.cgb_scratch[3] = value,
-            (_, 0xFF75) => self.cgb_scratch[2] = value & 0x70,
+            (_, 0xFF72) => self.cgb_scratch.ff72 = value,
+            (_, 0xFF73) => self.cgb_scratch.ff73 = value,
+            (Hw::Cgb, 0xFF74) => self.cgb_scratch.ff74 = value,
+            (_, 0xFF75) => self.cgb_scratch.ff75 = value & CgbScratch::FF75_MASK,
             _ => {}
         }
     }

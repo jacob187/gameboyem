@@ -558,6 +558,44 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_undocumented_registers_are_rejected() {
+        // CGB mode: FF75 holds bits 4-6 only; FF74 is a free register.
+        let with = |rom: Vec<u8>, v| {
+            let mut gb = GameBoy::with_model(rom, Model::Cgb).unwrap();
+            gb.bus.write(0xFF75, v);
+            gb
+        };
+        for (rom, ff74_free) in [(cgb_rom(), true), (nop_rom(), false)] {
+            let at = only_diff(
+                &with(rom.clone(), 0x10).save_state(),
+                &with(rom.clone(), 0x20).save_state(),
+            );
+            let mut gb = with(rom.clone(), 0x30);
+            let before = gb.save_state();
+            let snap = before.clone();
+            for bad in [0x01, 0x08, 0x80, 0xFF] {
+                let mut s = snap.clone();
+                s[at] = bad;
+                assert_eq!(gb.load_state(&s), Err(StateError::Invalid("FF75")), "{bad}");
+                assert_eq!(gb.save_state(), before, "rolled back");
+            }
+            let mut ok = snap.clone();
+            ok[at] = 0x70;
+            gb.load_state(&ok).unwrap();
+            assert_eq!(gb.peek(0xFF75), 0xFF);
+            // FF74 follows FF75 in the state; compatibility mode cannot hold it.
+            let mut s = snap.clone();
+            s[at + 1] = 0x5A;
+            if ff74_free {
+                gb.load_state(&s).unwrap();
+                assert_eq!(gb.peek(0xFF74), 0x5A);
+            } else {
+                assert_eq!(gb.load_state(&s), Err(StateError::Invalid("FF74")));
+            }
+        }
+    }
+
+    #[test]
     fn corrupt_cgb_fields_never_panic() {
         let mut src = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
         run(&mut src, 5);
