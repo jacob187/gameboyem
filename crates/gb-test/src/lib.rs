@@ -482,18 +482,6 @@ pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Expand one RGB555 pixel (`0bbbbbgggggrrrrr`) to RGB888 the way the cgb-acid2
-/// README does: each 5-bit channel `c` becomes `(c << 3) | (c >> 2)`, with no
-/// colour correction.
-pub fn rgb555_to_rgb888(px: u16) -> [u8; 3] {
-    let widen = |c: u16| ((c << 3) | (c >> 2)) as u8;
-    [
-        widen(px & 0x1F),
-        widen((px >> 5) & 0x1F),
-        widen((px >> 10) & 0x1F),
-    ]
-}
-
 /// Load a 160x144 reference PNG as RGB888. Indexed (palette), greyscale and
 /// RGB(A) images are all expanded; alpha is dropped.
 pub fn load_reference_rgb(path: &Path) -> Result<Vec<[u8; 3]>, String> {
@@ -616,7 +604,7 @@ fn run_acid2_cgb(gb: &mut GameBoy, case: &Case) -> Outcome {
             "cgb_framebuffer() is None: the machine is not rendering in CGB colour mode".into(),
         );
     };
-    let actual: Vec<[u8; 3]> = fb.iter().map(|&px| rgb555_to_rgb888(px)).collect();
+    let actual: Vec<[u8; 3]> = fb.iter().map(|&px| gb_core::rgb555_to_rgb888(px)).collect();
     let diff = actual
         .iter()
         .zip(&reference)
@@ -1485,20 +1473,6 @@ mod tests {
             ]
         );
         assert_eq!(cases[1].path, "c d.gb");
-    }
-
-    #[test]
-    fn rgb555_expands_with_the_readme_rule() {
-        assert_eq!(rgb555_to_rgb888(0x0000), [0, 0, 0]);
-        assert_eq!(rgb555_to_rgb888(0x7FFF), [255, 255, 255]);
-        // Red is the low 5 bits, blue the high.
-        assert_eq!(rgb555_to_rgb888(0x001F), [255, 0, 0]);
-        assert_eq!(rgb555_to_rgb888(0x03E0), [0, 255, 0]);
-        assert_eq!(rgb555_to_rgb888(0x7C00), [0, 0, 255]);
-        // (c << 3) | (c >> 2): 0x10 -> 0x84, 0x01 -> 0x08, 0x0F -> 0x7B.
-        assert_eq!(rgb555_to_rgb888(0b01111_00001_10000), [0x84, 0x08, 0x7B]);
-        // Bit 15 is ignored.
-        assert_eq!(rgb555_to_rgb888(0x8000), [0, 0, 0]);
     }
 
     /// A 160x144 4-bit palette PNG (the cgb-acid2 reference format) in memory.
