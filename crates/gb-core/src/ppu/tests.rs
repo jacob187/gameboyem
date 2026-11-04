@@ -2,6 +2,7 @@
 //! register state, no CPU or cartridge involved.
 
 use super::*;
+use crate::M_CYCLES_PER_FRAME;
 
 const STAT_BIT: u8 = Interrupt::Stat as u8;
 const VBLANK_BIT: u8 = Interrupt::VBlank as u8;
@@ -47,7 +48,10 @@ impl Rig {
         while !(self.ppu.ly == ly && self.ppu.line_dot == dot) {
             self.tick();
             guard += 1;
-            assert!(guard < 2 * 17_556 + 10, "never reached ly={ly} dot={dot}");
+            assert!(
+                guard < 2 * M_CYCLES_PER_FRAME + 10,
+                "never reached ly={ly} dot={dot}"
+            );
         }
     }
 
@@ -57,7 +61,7 @@ impl Rig {
         while !self.ppu.take_frame_ready() {
             self.tick();
             guard += 1;
-            assert!(guard < 2 * 17_556 + 10, "no frame completed");
+            assert!(guard < 2 * M_CYCLES_PER_FRAME + 10, "no frame completed");
         }
         self.ppu.framebuffer().to_vec()
     }
@@ -152,7 +156,7 @@ fn vblank_interrupt_and_frame_ready_every_70224_dots() {
     let mut vblanks = 0;
     let mut gaps = Vec::new();
     let mut since = 0u32;
-    for _ in 0..(3 * 17_556) {
+    for _ in 0..(3 * M_CYCLES_PER_FRAME) {
         rig.tick();
         since += 4;
         if rig.ints.flags & VBLANK_BIT != 0 {
@@ -238,6 +242,63 @@ fn mode3_is_extended_by_scx_window_and_sprites() {
     assert_eq!(rig.ppu.mode3_len, 172 + 8);
 }
 
+/// Mode 3 length for sprites at the given OAM X values on line 8 (Y = 24),
+/// with `scx` and OBJ enabled/disabled, straight from the OAM scan.
+fn mode3_len_with_sprites(xs: &[u8], scx: u8, obj: bool) -> u16 {
+    let mut rig = Rig::new();
+    for (i, &x) in xs.iter().enumerate() {
+        rig.set_sprite(i, 16 + 8, x, 0, 0);
+    }
+    rig.ppu.ly = 8;
+    rig.ppu.scx = scx;
+    rig.ppu.lcdc = if obj { 0x93 } else { 0x91 };
+    rig.ppu.scan_oam();
+    rig.ppu.compute_mode3_len()
+}
+
+#[test]
+fn sprite_penalty_table() {
+    // Per sprite: 6 dots, plus `5 - x % 8` (floored at 0) for the first sprite
+    // in each BG tile (x = OAM X + SCX); the sum is then reduced by 3. These
+    // are the values the mooneye-validated model (DECISIONS.md #20) produces.
+    const BASE: u16 = 172;
+    let table: [(&[u8], u8, u16); 13] = [
+        // One sprite per alignment: 11, 10, 9, 8, 7, 6 (clamp), 6, 6 minus 3.
+        (&[8], 0, BASE + 8),
+        (&[9], 0, BASE + 7),
+        (&[12], 0, BASE + 4),
+        (&[13], 0, BASE + 3),
+        (&[15], 0, BASE + 3),
+        (&[0], 0, BASE + 8),
+        // Same BG tile: the second sprite pays 6 only (11 + 6 - 3).
+        (&[8, 12], 0, BASE + 14),
+        // Different tiles: both pay the alignment term (11 + 11 - 3).
+        (&[8, 16], 0, BASE + 19),
+        // Same tile, later sprite less aligned than the first: still dedupes.
+        (&[9, 8], 0, BASE + 14),
+        // SCX moves a sprite across a tile boundary: 4 and 11 are two tiles
+        // (7 + 8 - 3) but 8 and 15 (SCX = 4) share one (11 + 6 - 3, +4 SCX).
+        (&[4, 11], 0, BASE + 12),
+        (&[4, 11], 4, BASE + 4 + 14),
+        // Ten sprites: one tile (6 * 10 + 5 - 3) and ten tiles (110 - 3).
+        (&[8; 10], 0, BASE + 62),
+        (&[8, 16, 24, 32, 40, 48, 56, 64, 72, 80], 0, BASE + 107),
+    ];
+    for (xs, scx, want) in table {
+        assert_eq!(
+            mode3_len_with_sprites(xs, scx, true),
+            want,
+            "OAM X {xs:?}, SCX {scx}"
+        );
+    }
+    // The 11th sprite on a line is not selected, so it costs nothing.
+    assert_eq!(mode3_len_with_sprites(&[8; 12], 0, true), BASE + 62);
+    // Sprites at X >= 168 cost nothing, wherever they sit in the list.
+    assert_eq!(mode3_len_with_sprites(&[168, 8, 255], 0, true), BASE + 8);
+    // OBJ disabled: no penalty at all.
+    assert_eq!(mode3_len_with_sprites(&[8, 16], 0, false), BASE);
+}
+
 // ------------------------------------------------------- LY/LYC and STAT
 
 #[test]
@@ -281,7 +342,7 @@ fn count_stat_interrupts_over_frame(select: u8) -> u32 {
     rig.write(0xFF41, select);
     rig.clear_if();
     let mut n = 0;
-    for _ in 0..17_556 {
+    for _ in 0..M_CYCLES_PER_FRAME {
         rig.tick();
         if rig.ints.flags & STAT_BIT != 0 {
             n += 1;
@@ -377,7 +438,7 @@ fn lcd_off_still_produces_a_frame_every_70224_dots() {
     rig.clear_if();
     let mut mcycles = 0u32;
     let mut gaps = Vec::new();
-    for _ in 0..(3 * 17_556) {
+    for _ in 0..(3 * M_CYCLES_PER_FRAME) {
         rig.tick();
         mcycles += 1;
         if rig.ppu.take_frame_ready() {
