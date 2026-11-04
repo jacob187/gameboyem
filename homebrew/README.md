@@ -13,6 +13,34 @@ Snake speeds up as it eats; score and the high score (HI) are on the HUD.
 Breakout has 3 lives, 6 brick rows (higher rows score more), ball angle set by
 where it meets the paddle, and a rebuilt, slightly faster board when cleared.
 
+There is also a small CGB-only colour test card, `cgbdemo` (see below).
+
+## CGB demo
+
+`cgbdemo.gb` is a CGB-only program (`-Wm-yC`: header 0x143 = 0xC0), a 32 KB ROM-only cartridge
+with no dependency on `common/`. It runs only on a Game Boy Color (or `Model::Cgb`). The output keeps the
+`.gb` extension because CI uploads `roms/homebrew/*.gb`.
+
+| Control | Effect |
+|---------|--------|
+| D-pad   | Move the sprite, 2 px a frame (kept below the tiles). |
+| A       | Step BG palette 7, colour 3 (the last swatch) through five colours. |
+
+* Rows 1-3: eight 2-tile-wide swatch columns, one per BG palette 0-7, showing its colours 1-3.
+* Row 6: one asymmetric tile (four quadrants, palette colours 1, 2, 3, 0) in palette 1 plain, X-flipped,
+  Y-flipped and X+Y-flipped, then plain in palettes 3, 4 and 5. Palette numbers and flips are the
+  attribute bytes in VRAM bank 1 (bits 0-2, 5, 6).
+* The sprite uses OBJ palette 1 and a tile that lives in VRAM bank 1 (OAM bit 3). Bank 0 holds a
+  different tile at the same number, so a sprite that ignores its bank bit looks wrong.
+* A writes BCPS with auto-increment set and then two BCPD bytes (low, high) in VBlank.
+
+The headless case `play-cgbdemo-cgb` (`crates/gb-test`, kind suffix `-cgb`, DECISIONS #37) runs it as a
+CGB and reads `cgb_framebuffer()` (RGB555): at least 31 distinct colours; the exact colour at the middle of
+every swatch and at each quadrant of the flipped tiles; the sprite's 6x6 core found by colour and
+moved exactly 16 px by each of Right, Left, Down and Up held for 8 frames (and nothing on the other
+axis); and each A press changing only palette 7 colour 3, once per press. Like the other homebrew
+cases it fails (not skips) when `CI=true` and the ROM is missing.
+
 ## High score and saves
 
 Each game keeps one high score (HI) in cartridge RAM. HI is loaded at boot, shown
@@ -73,6 +101,7 @@ GBDK-2020 4.5.0 must be unpacked so that `$(GBDK_HOME)/bin/lcc` exists.
 make -C homebrew                                  # GBDK_HOME=../tools/gbdk/  OUT=../roms/homebrew
 make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"     # explicit (what CI does)
 make -C homebrew usage                            # ROM/RAM usage from the linker maps
+make -C homebrew cgbdemo                          # one target: snake, breakout or cgbdemo
 make -C homebrew clean
 ```
 
@@ -84,4 +113,5 @@ are copied to `$(OUT)`.
 - `common/`: text/number printing, palette init, blinking PRESS START wait that seeds the RNG, high-score save/load.
 - `common/sfx.c`: sound effects (APU registers).
 - `snake/src/main.c`, `breakout/src/main.c`: one file per game.
+- `cgbdemo/src/main.c`: the CGB demo, a single self-contained file.
 - Tiles 0..101 are GBDK's font; game art starts at tile 128.

@@ -18,12 +18,14 @@ CFLAGS  := -Icommon
 # the high score (see common/common.h). ROM stays 32 KB.
 LDFLAGS := -Wl-m -Wl-j -Wm-yt0x03 -Wm-ya1
 
-GAMES   := snake breakout
+GAMES   := snake breakout cgbdemo
 HEADERS := $(wildcard common/*.h snake/src/*.h breakout/src/*.h)
 
 COMMON_OBJ   := $(patsubst common/%.c,$(BUILD)/common/%.o,$(wildcard common/*.c))
 SNAKE_OBJ    := $(patsubst snake/src/%.c,$(BUILD)/snake/%.o,$(wildcard snake/src/*.c)) $(COMMON_OBJ)
 BREAKOUT_OBJ := $(patsubst breakout/src/%.c,$(BUILD)/breakout/%.o,$(wildcard breakout/src/*.c)) $(COMMON_OBJ)
+# cgbdemo is self-contained (no common/): CGB-only, plain 32 KB ROM.
+CGBDEMO_OBJ  := $(patsubst cgbdemo/src/%.c,$(BUILD)/cgbdemo/%.o,$(wildcard cgbdemo/src/*.c))
 
 .PHONY: all clean usage $(GAMES)
 
@@ -31,11 +33,15 @@ all: $(GAMES)
 
 snake: $(OUT)/snake.gb
 breakout: $(OUT)/breakout.gb
+cgbdemo: $(OUT)/cgbdemo.gb
 
 $(OUT)/snake.gb: $(BUILD)/snake/snake.gb | $(OUT)
 	cp $< $@
 
 $(OUT)/breakout.gb: $(BUILD)/breakout/breakout.gb | $(OUT)
+	cp $< $@
+
+$(OUT)/cgbdemo.gb: $(BUILD)/cgbdemo/cgbdemo.gb | $(OUT)
 	cp $< $@
 
 # Link step (title must be <= 15 chars for the header).
@@ -45,16 +51,24 @@ $(BUILD)/snake/snake.gb: $(SNAKE_OBJ)
 $(BUILD)/breakout/breakout.gb: $(BREAKOUT_OBJ)
 	$(LCC) $(LDFLAGS) -Wm-yn"BREAKOUT" -o $@ $^
 
+# CGB-only (-Wm-yC: header 0x143 = 0xC0). Cart type stays 0 (ROM only). The
+# output keeps the .gb extension: CI uploads roms/homebrew/*.gb.
+$(BUILD)/cgbdemo/cgbdemo.gb: $(CGBDEMO_OBJ)
+	$(LCC) -Wl-m -Wl-j -Wm-yC -Wm-yn"CGBDEMO" -o $@ $^
+
 $(BUILD)/snake/%.o: snake/src/%.c $(HEADERS) | $(BUILD)/snake
 	$(LCC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD)/breakout/%.o: breakout/src/%.c $(HEADERS) | $(BUILD)/breakout
 	$(LCC) $(CFLAGS) -c -o $@ $<
 
+$(BUILD)/cgbdemo/%.o: cgbdemo/src/%.c | $(BUILD)/cgbdemo
+	$(LCC) $(CFLAGS) -c -o $@ $<
+
 $(BUILD)/common/%.o: common/%.c $(HEADERS) | $(BUILD)/common
 	$(LCC) $(CFLAGS) -c -o $@ $<
 
-$(BUILD)/snake $(BUILD)/breakout $(BUILD)/common $(OUT):
+$(BUILD)/snake $(BUILD)/breakout $(BUILD)/cgbdemo $(BUILD)/common $(OUT):
 	mkdir -p $@
 
 # Print ROM/RAM usage from the linker maps (needs a prior build).
