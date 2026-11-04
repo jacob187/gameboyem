@@ -16,6 +16,7 @@ use crate::audio::{AudioOutput, ToneGen};
 use crate::keymap::{Action, InputState, map};
 use crate::pacer::FramePacer;
 use crate::save::SaveManager;
+use crate::shutdown::ShutdownFlag;
 use crate::video::{Palette, blit, test_pattern};
 
 /// Speed multiplier while Tab is held.
@@ -36,6 +37,7 @@ pub struct App {
     scale: u32,
     title: String,
     test: Option<TestMode>,
+    shutdown: ShutdownFlag,
 
     input: InputState,
     pacer: FramePacer,
@@ -59,6 +61,7 @@ impl App {
         palette: Palette,
         scale: u32,
         test_pattern: bool,
+        shutdown: ShutdownFlag,
     ) -> Self {
         let name = gb.cartridge_header().title.trim().to_owned();
         let title = if name.is_empty() {
@@ -84,6 +87,7 @@ impl App {
             scale,
             title,
             test,
+            shutdown,
             input: InputState::default(),
             pacer: FramePacer::new(FRAMES_PER_SECOND),
             last_tick: Instant::now(),
@@ -99,6 +103,16 @@ impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, msg: String) {
         self.error = Some(msg);
         event_loop.exit();
+    }
+
+    /// Exit the loop (and so flush saves) if a termination signal was received.
+    fn check_shutdown(&self, event_loop: &ActiveEventLoop) -> bool {
+        let requested = self.shutdown.requested();
+        if requested && !event_loop.exiting() {
+            eprintln!("received a termination signal; saving and exiting");
+            event_loop.exit();
+        }
+        requested
     }
 
     fn reset_clock(&mut self) {
@@ -281,8 +295,15 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Woken by the signal handler (also covers the paused/idle loop, which
+    /// would otherwise sleep until the next window event).
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        self.check_shutdown(event_loop);
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.pixels.is_none() {
+        // Before the `pixels` check: a signal can arrive before the window exists.
+        if self.check_shutdown(event_loop) || self.pixels.is_none() {
             return;
         }
         let now = Instant::now();

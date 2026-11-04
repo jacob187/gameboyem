@@ -15,6 +15,7 @@ gb-core.workspace = true
 winit.workspace = true
 pixels.workspace = true
 cpal.workspace = true
+ctrlc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

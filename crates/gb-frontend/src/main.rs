@@ -9,6 +9,7 @@ mod keymap;
 mod pacer;
 mod rom;
 mod save;
+mod shutdown;
 mod video;
 
 use std::process::ExitCode;
@@ -21,6 +22,7 @@ use crate::app::App;
 use crate::audio::AudioOutput;
 use crate::cli::Command;
 use crate::save::SaveManager;
+use crate::shutdown::ShutdownFlag;
 
 fn main() -> ExitCode {
     let opts = match cli::parse(std::env::args_os().skip(1)) {
@@ -80,6 +82,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let shutdown = ShutdownFlag::default();
+    {
+        let flag = shutdown.clone();
+        let proxy = event_loop.create_proxy();
+        let installed = ctrlc::set_handler(move || {
+            flag.request();
+            // Wake a paused or idle loop; an error just means it is already gone.
+            let _ = proxy.send_event(());
+        });
+        if let Err(e) = installed {
+            eprintln!("warning: cannot install the Ctrl-C/SIGTERM handler: {e}");
+        }
+    }
     let mut app = App::new(
         gb,
         saves,
@@ -87,6 +102,7 @@ fn main() -> ExitCode {
         opts.palette.colors(),
         opts.scale,
         opts.test_pattern,
+        shutdown,
     );
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {
