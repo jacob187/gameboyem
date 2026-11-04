@@ -23,8 +23,15 @@ impl GameBoy {
     }
 
     /// Replace the cartridge and power-cycle the machine.
+    ///
+    /// Host configuration survives (the audio sample rate set by
+    /// [`GameBoy::set_audio_sample_rate`]); all emulated state is reset,
+    /// including held buttons, which the host must re-press. On error the
+    /// machine is left untouched.
     pub fn load_rom(&mut self, rom: Vec<u8>) -> Result<(), CartridgeError> {
-        *self = Self::new(rom)?;
+        let mut fresh = Self::new(rom)?;
+        fresh.set_audio_sample_rate(self.audio_sample_rate());
+        *self = fresh;
         Ok(())
     }
 
@@ -61,10 +68,19 @@ impl GameBoy {
 
     /// Drain buffered audio: interleaved stereo `f32` in -1.0..=1.0 at
     /// [`GameBoy::audio_sample_rate`].
+    ///
+    /// Allocates a new `Vec` per call; per-frame callers should prefer
+    /// [`GameBoy::drain_audio_into`].
     pub fn audio_samples(&mut self) -> Vec<f32> {
         let mut out = Vec::new();
-        self.bus.apu.drain_samples(&mut out);
+        self.drain_audio_into(&mut out);
         out
+    }
+
+    /// Like [`GameBoy::audio_samples`] but appends to `out` (existing contents
+    /// are kept), so a caller can reuse one buffer across frames.
+    pub fn drain_audio_into(&mut self, out: &mut Vec<f32>) {
+        self.bus.apu.drain_samples(out);
     }
 
     pub fn set_audio_sample_rate(&mut self, rate: u32) {
@@ -138,6 +154,38 @@ mod tests {
         let start = gb.mcycles();
         gb.step_frame();
         assert_eq!(gb.mcycles() - start, M_CYCLES_PER_FRAME as u64);
+    }
+
+    #[test]
+    fn load_rom_preserves_audio_sample_rate() {
+        let mut gb = GameBoy::new(nop_rom()).unwrap();
+        gb.set_audio_sample_rate(44_100);
+        gb.load_rom(nop_rom()).unwrap();
+        assert_eq!(gb.audio_sample_rate(), 44_100);
+        // A rejected ROM leaves the machine (and its rate) alone.
+        assert!(gb.load_rom(vec![0; 4]).is_err());
+        assert_eq!(gb.audio_sample_rate(), 44_100);
+        // And the rate actually drives sample generation after the reload.
+        for _ in 0..60 {
+            gb.step_frame();
+        }
+        let n = gb.audio_samples().len() / 2;
+        assert!((44_000..44_400).contains(&n), "{n}");
+    }
+
+    #[test]
+    fn drain_audio_into_appends_and_matches_audio_samples() {
+        let mut a = GameBoy::new(nop_rom()).unwrap();
+        let mut b = GameBoy::new(nop_rom()).unwrap();
+        a.step_frame();
+        b.step_frame();
+        let mut buf = vec![7.0];
+        a.drain_audio_into(&mut buf);
+        assert_eq!(buf[0], 7.0, "existing contents kept");
+        assert_eq!(&buf[1..], b.audio_samples().as_slice());
+        let mut again = Vec::new();
+        a.drain_audio_into(&mut again);
+        assert!(again.is_empty(), "drained");
     }
 
     #[test]
