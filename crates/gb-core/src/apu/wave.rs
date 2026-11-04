@@ -2,6 +2,10 @@
 
 use super::common::Length;
 
+/// T-cycles between a trigger and the first sample fetch, on top of the
+/// period (three 2 MHz ticks). Calibrated against Blargg `dmg_sound` 09/12.
+const TRIGGER_DELAY: i32 = 6;
+
 #[derive(Clone, Debug)]
 pub(super) struct Wave {
     pub enabled: bool,
@@ -76,9 +80,21 @@ impl Wave {
             self.enabled = false;
         }
         if v & 0x80 != 0 {
+            // DMG: retriggering just before the channel fetches a sample
+            // corrupts wave RAM: the byte about to be read overwrites byte 0
+            // (index < 4) or the first four bytes (Pan Docs: "Wave Pattern RAM").
+            if self.enabled && self.timer <= 2 {
+                let byte = usize::from(((self.pos + 1) & 31) >> 1);
+                if byte < 4 {
+                    self.ram[0] = self.ram[byte];
+                } else {
+                    let base = byte & !3;
+                    self.ram.copy_within(base..base + 4, 0);
+                }
+            }
             self.length.trigger(next_step_odd);
             self.enabled = self.dac;
-            self.timer = self.period();
+            self.timer = self.period() + TRIGGER_DELAY;
             self.pos = 0;
         }
     }
@@ -100,18 +116,24 @@ impl Wave {
             return false;
         }
         let before = self.output();
-        self.timer -= 4;
-        while self.timer <= 0 {
-            self.timer += self.period();
-            self.pos = (self.pos + 1) & 31;
-            let byte = self.ram[usize::from(self.pos >> 1)];
-            // High nibble plays first (Pan Docs: "Wave Pattern RAM").
-            self.sample = if self.pos & 1 == 0 {
-                byte >> 4
-            } else {
-                byte & 0xF
-            };
-            self.just_read = true;
+        // The wave timer runs on the 2 MHz clock: two half-steps per M-cycle.
+        // Only a fetch in the second half is still "just read" when the CPU's
+        // access lands at the end of the M-cycle.
+        for _ in 0..2 {
+            self.just_read = false;
+            self.timer -= 2;
+            while self.timer <= 0 {
+                self.timer += self.period();
+                self.pos = (self.pos + 1) & 31;
+                let byte = self.ram[usize::from(self.pos >> 1)];
+                // High nibble plays first (Pan Docs: "Wave Pattern RAM").
+                self.sample = if self.pos & 1 == 0 {
+                    byte >> 4
+                } else {
+                    byte & 0xF
+                };
+                self.just_read = true;
+            }
         }
         self.output() != before
     }
