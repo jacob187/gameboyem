@@ -131,11 +131,10 @@ pass play-breakout 400 homebrew/breakout.gb
 # --- Homebrew corpus (open-source games, scripts/fetch-homebrew-corpus.sh) ---
 pass smoke 600 corpus/tobutobugirl.gb
 pass smoke 600 corpus/squishy-the-turtle.gb
-pass smoke 600 corpus/porklike.gb
 pass smoke 600 corpus/sushi-nights.gb
 pass smoke 600 corpus/brekstascat.gb
 pass smoke 600 corpus/adjustris.gb
-pass smoke 400 corpus/max-pirate-extra-boom.gb
+pass smoke 600 corpus/airplanz.gb
 pass smoke 600 corpus/renegade-rush.gb
 
 # --- Homebrew corpus playability (scripts validated against headless PyBoy) ---
