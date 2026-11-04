@@ -61,16 +61,16 @@ pass mooneye 600 test/mooneye/acceptance/oam_dma/basic.gb
 pass mooneye 600 test/mooneye/acceptance/oam_dma/reg_read.gb
 fail mooneye 600 test/mooneye/acceptance/oam_dma/sources-GS.gb
 pass mooneye 600 test/mooneye/acceptance/pop_timing.gb
-fail mooneye 600 test/mooneye/acceptance/ppu/hblank_ly_scx_timing-GS.gb
-fail mooneye 600 test/mooneye/acceptance/ppu/intr_1_2_timing-GS.gb
-fail mooneye 600 test/mooneye/acceptance/ppu/intr_2_0_timing.gb
+pass mooneye 600 test/mooneye/acceptance/ppu/hblank_ly_scx_timing-GS.gb
+pass mooneye 600 test/mooneye/acceptance/ppu/intr_1_2_timing-GS.gb
+pass mooneye 600 test/mooneye/acceptance/ppu/intr_2_0_timing.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/intr_2_mode0_timing_sprites.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/intr_2_mode0_timing.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/intr_2_mode3_timing.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/intr_2_oam_ok_timing.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/lcdon_timing-GS.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/lcdon_write_timing-GS.gb
-fail mooneye 600 test/mooneye/acceptance/ppu/stat_irq_blocking.gb
+pass mooneye 600 test/mooneye/acceptance/ppu/stat_irq_blocking.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/stat_lyc_onoff.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/vblank_stat_intr-GS.gb
 fail mooneye 600 test/mooneye/acceptance/push_timing.gb
@@ -117,7 +117,7 @@ fail mooneye 600 test/mooneye/emulator-only/mbc5/rom_64Mb.gb
 fail mooneye 600 test/mooneye/emulator-only/mbc5/rom_8Mb.gb
 
 # --- dmg-acid2 (framebuffer vs reference-dmg.png) ---
-fail acid2 120 test/dmg-acid2/dmg-acid2.gb
+pass acid2 120 test/dmg-acid2/dmg-acid2.gb
 
 # --- Homebrew smoke tests (600 frames, framebuffer not blank) ---
 fail smoke 600 homebrew/snake.gb
