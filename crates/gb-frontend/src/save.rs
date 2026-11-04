@@ -31,6 +31,15 @@ fn append_ext(path: &Path, ext: &str) -> PathBuf {
 
 /// Write `data` to `path` via a temp file in the same directory + rename, so a
 /// crash mid-write never leaves a truncated save.
+///
+/// This blocks (`sync_all`) and is deliberately called on the event-loop thread.
+/// Measured on macOS with the real `fsync` (20 writes each): 8 KiB median 4.0 ms,
+/// max 18 ms; 128 KiB + footer median 4.5 ms, max 5 ms. That is under the 40 ms
+/// audio prefill and the 67 ms frame-pacer catch-up cap, and it happens at most
+/// once per [`SAVE_INTERVAL`], only after RAM changed. Pause and exit must write
+/// synchronously anyway, and a background writer would add states (in-flight
+/// write, retry, rate-limited warnings, what `last` means) for a ~1 frame stall.
+/// Revisit if a slow disk shows up in practice.
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let tmp = append_ext(path, "tmp");
     let result = (|| {
