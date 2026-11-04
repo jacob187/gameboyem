@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #include "common.h"
+#include "sfx.h"
 
 void hb_init(void)
 {
@@ -57,6 +58,7 @@ void wait_start_and_seed(uint8_t x, uint8_t y)
             break;
         }
     }
+    sfx_start();
     initrand(((uint16_t)DIV_REG << 8) | frames);
 }
 
