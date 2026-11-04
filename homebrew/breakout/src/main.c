@@ -89,6 +89,7 @@ static uint8_t serving; /* ball is resting on the paddle */
 static uint8_t lives;
 static uint8_t level;
 static uint16_t score;
+static uint16_t best; /* high score, persisted in cartridge RAM */
 
 static uint8_t speed_bonus(void)
 {
@@ -303,6 +304,7 @@ static void play(void)
     }
 
     HIDE_SPRITES;
+    hiscore_update(&best, score);
     /* Hold the final frame briefly. */
     for (keys = 0; keys < 45u; keys++) {
         wait_vbl_done();
@@ -320,6 +322,8 @@ static void title_screen(void)
     for (r = 0; r < 3u; r++) {
         fill_bkg_rect(0, 6u + r, 20, 1, TILE_BRICK0 + r);
     }
+    print_at(5, 4, "HI");
+    print_uint(8, 4, best, 5);
     print_at(2, 10, "A: LAUNCH BALL");
     print_at(2, 12, "D-PAD: MOVE");
     DISPLAY_ON;
@@ -336,6 +340,8 @@ static void game_over_screen(void)
     print_uint(10, 8, score, 5);
     print_at(4, 10, "LEVEL");
     print_uint(10, 10, level, 5);
+    print_at(4, 12, "HI");
+    print_uint(10, 12, best, 5);
     DISPLAY_ON;
     wait_start_and_seed(4, 14);
 }
@@ -343,6 +349,7 @@ static void game_over_screen(void)
 void main(void)
 {
     hb_init();
+    best = hiscore_load();
     HIDE_SPRITES;
     SHOW_BKG;
     set_bkg_data(TILE_BASE, BKG_COUNT, bkg_tiles);
