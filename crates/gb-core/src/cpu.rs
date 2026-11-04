@@ -122,13 +122,15 @@ impl Cpu {
         std::mem::take(&mut self.ld_b_b)
     }
 
-    /// Interrupt master enable (for debuggers/tests).
-    pub fn ime(&self) -> bool {
+    /// Interrupt master enable (tests only).
+    #[cfg(test)]
+    fn ime(&self) -> bool {
         self.ime
     }
 
-    /// True while halted/stopped.
-    pub fn is_halted(&self) -> bool {
+    /// True while halted/stopped (tests only).
+    #[cfg(test)]
+    fn is_halted(&self) -> bool {
         self.halted || self.stopped
     }
 
