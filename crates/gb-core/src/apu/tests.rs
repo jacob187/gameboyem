@@ -435,3 +435,231 @@ fn length_expires_for_noise() {
     rig.seq_ticks(3);
     assert_eq!(rig.status() & 8, 0);
 }
+
+fn drain(apu: &mut Apu) -> Vec<f32> {
+    let mut out = Vec::new();
+    apu.drain_samples(&mut out);
+    out
+}
+
+/// Start CH2 as an audible 50% square at volume 15.
+fn start_ch2(rig: &mut Rig) {
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF16, 0x80);
+    rig.w(0xFF18, 0x00);
+    rig.w(0xFF19, 0x80 | 0x07); // freq 0x700: fast enough to toggle many times
+}
+
+#[test]
+fn post_boot_registers_read_back_like_the_phase1_stub() {
+    let apu = Apu::new();
+    let expect: [u8; 32] = [
+        0x80, 0xBF, 0xF3, 0xFF, 0xBF, 0xFF, 0x3F, 0x00, 0xFF, 0xBF, 0x7F, 0xFF, 0x9F, 0xFF, 0xBF,
+        0xFF, 0xFF, 0x00, 0x00, 0xBF, 0x77, 0xF3, 0xF1, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF,
+    ];
+    for (i, &e) in expect.iter().enumerate() {
+        let addr = 0xFF10 + i as u16;
+        assert_eq!(apu.read(addr), e, "{addr:#06x}");
+    }
+    for addr in 0xFF30..=0xFF3F {
+        assert_eq!(apu.read(addr), 0, "wave RAM {addr:#06x}");
+    }
+    assert_eq!(apu.read(0xFF26), 0xF1, "boot_hwio: CH1 active");
+}
+
+#[test]
+fn register_read_masks_hide_write_only_bits() {
+    let mut apu = fresh();
+    let write_only_bits = |i: usize| READ_MASK[i];
+    for addr in 0xFF10..=0xFF25u16 {
+        if addr == 0xFF15 {
+            continue;
+        }
+        apu.write(addr, 0xFF);
+        // CH3 NR30 write of $FF also leaves the DAC on; reads are unaffected.
+        assert_eq!(apu.read(addr), 0xFF, "{addr:#06x} after $FF");
+        apu.write(addr, 0x00);
+        let i = (addr - 0xFF10) as usize;
+        assert_eq!(apu.read(addr), write_only_bits(i), "{addr:#06x} after $00");
+    }
+    assert_eq!(apu.read(0xFF15), 0xFF);
+    assert_eq!(apu.read(0xFF27), 0xFF, "unused registers read $FF");
+}
+
+#[test]
+fn nr52_reports_channel_status_and_only_bit7_is_writable() {
+    let mut rig = Rig::new();
+    assert_eq!(rig.apu.read(0xFF26), 0xF0);
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF19, 0x80);
+    assert_eq!(rig.apu.read(0xFF26), 0xF2);
+    rig.w(0xFF26, 0x8F); // low bits are read-only
+    assert_eq!(rig.apu.read(0xFF26), 0xF2);
+}
+
+#[test]
+fn nr52_power_off_clears_registers_and_ignores_writes() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF12, 0xF3);
+    rig.w(0xFF14, 0x80);
+    rig.w(0xFF30, 0xAB);
+    rig.w(0xFF26, 0x00);
+    assert_eq!(rig.apu.read(0xFF26), 0x70);
+    for addr in 0xFF10..=0xFF25u16 {
+        let i = (addr - 0xFF10) as usize;
+        assert_eq!(rig.apu.read(addr), READ_MASK[i], "{addr:#06x}");
+    }
+    assert_eq!(rig.apu.read(0xFF30), 0xAB, "wave RAM survives power-off");
+
+    rig.w(0xFF12, 0xF0);
+    rig.w(0xFF24, 0x55);
+    rig.w(0xFF26, 0x08); // bit 7 clear: stays off
+    assert_eq!(rig.apu.read(0xFF12), 0x00);
+    assert_eq!(rig.apu.read(0xFF24), 0x00);
+    rig.w(0xFF31, 0xCD);
+    assert_eq!(rig.apu.read(0xFF31), 0xCD, "wave RAM writable while off");
+}
+
+#[test]
+fn nr52_power_off_keeps_length_counters_writable_on_dmg() {
+    let mut rig = Rig::new();
+    rig.w(0xFF26, 0x00);
+    rig.w(0xFF11, 0xFE); // duty bits (3) must be dropped; length 64-62 = 2
+    rig.w(0xFF1B, 0xFE);
+    rig.w(0xFF20, 0x3E);
+    rig.w(0xFF26, 0x80);
+    assert_eq!(rig.apu.read(0xFF11), 0x3F, "duty not written while off");
+    assert_eq!(rig.apu.ch1.length.counter, 2);
+    assert_eq!(rig.apu.ch3.length.counter, 2);
+    assert_eq!(rig.apu.ch4.length.counter, 2);
+}
+
+#[test]
+fn power_off_silences_channels_and_power_on_restarts_sequencer() {
+    let mut rig = Rig::new();
+    start_ch2(&mut rig);
+    rig.seq_ticks(3);
+    assert_eq!(rig.apu.seq_step, 3);
+    rig.w(0xFF26, 0x00);
+    assert_eq!(rig.apu.read(0xFF26) & 0x0F, 0);
+    rig.seq_ticks(2);
+    rig.w(0xFF26, 0x80);
+    assert_eq!(rig.apu.seq_step, 0);
+    assert_eq!(rig.apu.read(0xFF26), 0xF0);
+}
+
+#[test]
+fn silent_apu_produces_exact_zero_samples() {
+    for mut rig in [
+        Rig::new(),
+        Rig {
+            apu: Apu::new(),
+            div: 0,
+        },
+    ] {
+        rig.run(M_CYCLES_PER_FRAME_TEST * 3);
+        let s = drain(&mut rig.apu);
+        assert!(!s.is_empty());
+        assert!(s.iter().all(|&x| x == 0.0));
+    }
+}
+
+#[test]
+fn powered_off_apu_stays_silent_even_with_stale_pan_state() {
+    let mut rig = Rig::new();
+    start_ch2(&mut rig);
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF26, 0x00);
+    rig.run(5000);
+    assert!(drain(&mut rig.apu).iter().all(|&x| x == 0.0));
+}
+
+const M_CYCLES_PER_FRAME_TEST: u32 = crate::M_CYCLES_PER_FRAME;
+
+#[test]
+fn triggered_channel_produces_bounded_non_silent_samples() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    start_ch2(&mut rig);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    let s = drain(&mut rig.apu);
+    assert!(s.iter().any(|&x| x > 0.0));
+    assert!(s.iter().all(|&x| (0.0..=1.0).contains(&x)));
+    // One channel at full volume out of four, master volume 8/8.
+    let max = s.iter().cloned().fold(0.0, f32::max);
+    assert!((max - 0.25).abs() < 1e-6, "{max}");
+    // Interleaved L/R are identical with symmetric panning.
+    assert!(s.chunks(2).all(|p| p[0] == p[1]));
+}
+
+#[test]
+fn panning_and_master_volume_apply_per_side() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x07); // left volume 1/8, right volume 1/8
+    rig.w(0xFF25, 0x20); // CH2 left only
+    start_ch2(&mut rig);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    let s = drain(&mut rig.apu);
+    assert!(s.chunks(2).all(|p| p[1] == 0.0));
+    let left_max = s.chunks(2).map(|p| p[0]).fold(0.0, f32::max);
+    assert!(left_max > 0.0);
+
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x70); // left volume 8/8
+    rig.w(0xFF25, 0x20);
+    start_ch2(&mut rig);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    let s = drain(&mut rig.apu);
+    let loud_max = s.chunks(2).map(|p| p[0]).fold(0.0, f32::max);
+    assert!((loud_max / left_max - 8.0).abs() < 1e-3);
+}
+
+#[test]
+fn sample_count_matches_configured_rate() {
+    for rate in [8_000u32, 22_050, 44_100, 48_000] {
+        let mut rig = Rig::new();
+        rig.apu.set_sample_rate(rate);
+        assert_eq!(rig.apu.sample_rate(), rate);
+        let frames = 60u32;
+        rig.run(frames * M_CYCLES_PER_FRAME_TEST / 2);
+        let n = drain(&mut rig.apu).len() / 2;
+        let expect = (u64::from(frames * M_CYCLES_PER_FRAME_TEST / 2) * u64::from(rate) / 1_048_576)
+            as usize;
+        assert_eq!(n, expect, "rate {rate}");
+        // Exactly 30 frames (~0.5 s) of audio, within one sample.
+        let secs = f64::from(frames / 2) / crate::FRAMES_PER_SECOND;
+        assert!(
+            (n as f64 - secs * f64::from(rate)).abs() < 2.0,
+            "rate {rate}"
+        );
+    }
+}
+
+#[test]
+fn undrained_buffer_is_capped() {
+    let mut rig = Rig::new();
+    rig.run(2_200_000); // > 2 s at 48 kHz
+    assert!(rig.apu.samples.len() <= MAX_BUFFERED);
+    assert_eq!(rig.apu.samples.len() % 2, 0);
+}
+
+#[test]
+fn output_is_deterministic() {
+    let run = || {
+        let mut rig = Rig::new();
+        rig.w(0xFF24, 0x77);
+        rig.w(0xFF25, 0xFF);
+        start_ch2(&mut rig);
+        rig.w(0xFF21, 0xF1);
+        rig.w(0xFF22, 0x33);
+        rig.w(0xFF23, 0x80);
+        rig.run(200_000);
+        drain(&mut rig.apu)
+    };
+    assert_eq!(run(), run());
+}
