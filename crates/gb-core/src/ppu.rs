@@ -227,8 +227,15 @@ impl Ppu {
             return;
         }
         self.vis_mode = self.mode();
-        for _ in 0..4 {
-            self.step_dot(interrupts);
+        let next = self.line_dot + 4;
+        if next < DOTS_PER_LINE && !(self.line_dot < OAM_SCAN_DOTS && next >= OAM_SCAN_DOTS) {
+            // None of the 4 dots ends the line or starts mode 3, so every
+            // `step_dot` would only have incremented `line_dot`.
+            self.line_dot = next;
+        } else {
+            for _ in 0..4 {
+                self.step_dot(interrupts);
+            }
         }
         self.refresh_lyc_flag();
         self.update_stat_line(interrupts);
