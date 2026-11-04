@@ -118,7 +118,7 @@ Both have title, score and game-over screens.
   - the high-pass filter. The output is unipolar, so channel starts and stops can click.
 
   Blargg `dmg_sound` isn't in the harness yet.
-- **STOP.** It wakes on a selected joypad line or a pending interrupt, but the LCD and timer keep running during STOP.
+- **STOP.** Like hardware, it wakes only on a selected joypad line. Unlike hardware, the LCD and timer keep running during STOP.
 - **Not supported:** Game Boy Color, link cable, debugger, rewind and shaders.
 - **No boot ROM.** The emulator starts in the documented post-boot state.
 
