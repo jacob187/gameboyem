@@ -2,7 +2,8 @@
 //!
 //! Usage: `cargo run -p gb-test --release -- [FILTER...] [--fail-on-mismatch]`
 //!
-//! `-- --bench [FRAMES] [REPEATS]` instead runs the speed benchmark (`bench.rs`).
+//! `-- --bench [FRAMES] [REPEATS] [--check] [--min-speed N] [--print-pins]` instead runs the
+//! speed benchmark (`bench.rs`).
 //!
 //! Exit status is nonzero with `--fail-on-mismatch` if any result differs from
 //! `expected.txt` (or a ROM is missing in CI).
@@ -21,7 +22,7 @@ fn main() -> ExitCode {
     let fail_on_mismatch = args.iter().any(|a| a == "--fail-on-mismatch");
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if args.iter().any(|a| a == "--bench") {
-        return bench::run(&filters);
+        return bench::run(&args);
     }
     let cases: Vec<Case> = load_manifest()
         .into_iter()

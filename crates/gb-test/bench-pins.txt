@@ -1,0 +1,17 @@
+# Pinned output of `gb-test --bench FRAMES` (see crates/gb-test/src/bench.rs).
+#
+# FRAMES ROM_HASH VIDEO_HASH AUDIO_HASH PATH (FNV-1a, hex; PATH relative to the ROMs dir)
+#
+# `--bench FRAMES R --check` fails if the emulator's output for a ROM differs
+# from its pin, so any change to emulation behaviour (including a "pure"
+# optimisation) shows up here. A ROM-hash mismatch means the ROM itself changed,
+# e.g. a homebrew source edit; rebuild, re-run with --print-pins and replace
+# the lines below. Homebrew builds are byte-identical on macOS and Linux GBDK.
+1200 135a93076059053c ce76cae962320e7e d9333912336b6d65 test/dmg-acid2/dmg-acid2.gb
+1200 9bc9250d7f185f9d 94d57173ba276d05 e3db61b1d8a1a7c5 test/blargg/cpu_instrs/cpu_instrs.gb
+1200 712444458c1dd6ba 9029ec196d701ee5 af5f058ad29285e5 homebrew/snake.gb
+1200 d8d2320126d0f27b 1d9d921fb76ee6b8 e03676113bc72925 homebrew/breakout.gb
+3600 135a93076059053c ee8c236a0d5738fe 0ffcd0c624c53065 test/dmg-acid2/dmg-acid2.gb
+3600 9bc9250d7f185f9d 4267ecfa524e945b 7eafea56014c75f1 test/blargg/cpu_instrs/cpu_instrs.gb
+3600 712444458c1dd6ba 2feeede17431f240 908e67430b97c8e5 homebrew/snake.gb
+3600 d8d2320126d0f27b 6a762d8a8fea1178 4743036af4432c25 homebrew/breakout.gb
