@@ -672,6 +672,16 @@ fn post_boot_registers_read_back_like_the_phase1_stub() {
 }
 
 #[test]
+fn post_boot_period_registers_start_at_ff_for_all_three_channels() {
+    // Pan Docs "Power Up Sequence": NR13, NR23 and NR33 are $FF (write-only,
+    // so only the internal period shows) and NR14/NR24/NR34 carry 0x3F.
+    let apu = Apu::new();
+    assert_eq!(apu.ch1.freq, 0x7FF);
+    assert_eq!(apu.ch2.freq, 0x7FF);
+    assert_eq!(apu.ch3.freq, 0x7FF);
+}
+
+#[test]
 fn register_read_masks_hide_write_only_bits() {
     let mut apu = fresh();
     let write_only_bits = |i: usize| READ_MASK[i];

@@ -12,7 +12,7 @@ pub(super) struct Wave {
     dac: bool,
     /// NR32 bits 6-5: 0 mute, 1 = 100%, 2 = 50%, 3 = 25%.
     level: u8,
-    freq: u16,
+    pub freq: u16,
     /// T-cycles until the next sample fetch. Kept in T-cycles because the
     /// period `(2048 - freq) * 2` can be shorter than one M-cycle.
     timer: i32,
