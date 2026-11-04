@@ -7,12 +7,10 @@ mod audio;
 mod cli;
 mod keymap;
 mod pacer;
+mod rom;
 mod save;
 mod video;
 
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -23,18 +21,6 @@ use crate::app::App;
 use crate::audio::AudioOutput;
 use crate::cli::Command;
 use crate::save::SaveManager;
-
-/// Largest ROM the core accepts (8 MiB); reading stops one byte past it so a
-/// bogus huge file or device node cannot exhaust memory.
-const MAX_ROM_BYTES: u64 = 8 * 1024 * 1024;
-
-fn read_rom(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut data = Vec::new();
-    File::open(path)?
-        .take(MAX_ROM_BYTES + 1)
-        .read_to_end(&mut data)?;
-    Ok(data)
-}
 
 fn main() -> ExitCode {
     let opts = match cli::parse(std::env::args_os().skip(1)) {
@@ -49,17 +35,18 @@ fn main() -> ExitCode {
         }
     };
 
-    let rom = match read_rom(&opts.rom) {
+    let rom = match rom::read_rom(&opts.rom) {
         Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {e}", opts.rom.display());
+        Err(msg) => {
+            eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
+    let archive = rom::archive_kind(&rom);
     let mut gb = match GameBoy::new(rom) {
         Ok(gb) => gb,
         Err(e) => {
-            eprintln!("error: {}: not a usable ROM: {e}", opts.rom.display());
+            eprintln!("error: {}", rom::cartridge_message(&opts.rom, &e, archive));
             return ExitCode::FAILURE;
         }
     };
