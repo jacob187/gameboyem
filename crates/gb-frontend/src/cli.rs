@@ -4,15 +4,18 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use gb_core::{CartridgeHeader, Model};
+
 use crate::video::PaletteKind;
 
 pub const USAGE: &str = "\
-usage: gb [options] [--] <rom.gb>
+usage: gb [options] [--] <rom.gb|rom.gbc>
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)
   --mute             disable audio output
-  --palette NAME     green (default) or grey
+  --palette NAME     green (default) or grey (DMG only; colour games use their own colours)
+  --model NAME       auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb
   --test-pattern     show a synthetic test pattern and tone instead of running the core
   -h, --help         show this help
   --                 end of options; the next argument is the ROM path, even if it starts with `-`
@@ -24,12 +27,36 @@ controls:
 pub const DEFAULT_SCALE: u32 = 4;
 pub const MAX_SCALE: u32 = 8;
 
+/// `--model`: which console to emulate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelChoice {
+    /// Follow the cartridge header ([`Model::from_header`]).
+    Auto,
+    Dmg,
+    Cgb,
+}
+
+impl ModelChoice {
+    /// The model to power on for `rom`. An unparsable header falls back to a
+    /// DMG; the core then reports the real cartridge error on construction.
+    pub fn resolve(self, rom: &[u8]) -> Model {
+        match self {
+            ModelChoice::Dmg => Model::Dmg,
+            ModelChoice::Cgb => Model::Cgb,
+            ModelChoice::Auto => {
+                CartridgeHeader::parse(rom).map_or(Model::Dmg, |h| Model::from_header(&h))
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
     pub rom: PathBuf,
     pub scale: u32,
     pub mute: bool,
     pub palette: PaletteKind,
+    pub model: ModelChoice,
     pub test_pattern: bool,
 }
 
@@ -48,6 +75,7 @@ where
     let mut scale = DEFAULT_SCALE;
     let mut mute = false;
     let mut palette = PaletteKind::Green;
+    let mut model = ModelChoice::Auto;
     let mut test_pattern = false;
 
     let mut args = args.into_iter();
@@ -74,10 +102,15 @@ where
                 let value = option_value("--palette", args.next())?;
                 palette = parse_palette(&value)?;
             }
+            "--model" => {
+                let value = option_value("--model", args.next())?;
+                model = parse_model(&value)?;
+            }
             _ if text.starts_with("--scale=") => scale = parse_scale(&text["--scale=".len()..])?,
             _ if text.starts_with("--palette=") => {
                 palette = parse_palette(&text["--palette=".len()..])?;
             }
+            _ if text.starts_with("--model=") => model = parse_model(&text["--model=".len()..])?,
             _ if text.starts_with('-') && text.len() > 1 => {
                 return Err(format!("unknown option `{text}`"));
             }
@@ -91,6 +124,7 @@ where
         scale,
         mute,
         palette,
+        model,
         test_pattern,
     }))
 }
@@ -137,6 +171,15 @@ fn parse_palette(s: &str) -> Result<PaletteKind, String> {
     }
 }
 
+fn parse_model(s: &str) -> Result<ModelChoice, String> {
+    match s {
+        "auto" => Ok(ModelChoice::Auto),
+        "dmg" => Ok(ModelChoice::Dmg),
+        "cgb" => Ok(ModelChoice::Cgb),
+        _ => Err(format!("--model must be `auto`, `dmg` or `cgb`, got `{s}`")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +202,37 @@ mod tests {
         assert_eq!(o.scale, 4);
         assert!(!o.mute && !o.test_pattern);
         assert_eq!(o.palette, PaletteKind::Green);
+        assert_eq!(o.model, ModelChoice::Auto);
+    }
+
+    #[test]
+    fn model_flag() {
+        assert_eq!(run(&["--model", "dmg", "g.gb"]).model, ModelChoice::Dmg);
+        assert_eq!(run(&["g.gbc", "--model=cgb"]).model, ModelChoice::Cgb);
+        assert_eq!(run(&["--model=auto", "g.gb"]).model, ModelChoice::Auto);
+        assert!(p(&["--model", "gba", "g.gb"]).is_err());
+        assert!(p(&["--model=", "g.gb"]).is_err());
+        assert!(p(&["g.gb", "--model"]).is_err());
+        assert!(
+            p(&["--model", "--mute", "g.gb"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+    }
+
+    #[test]
+    fn model_resolves_from_the_header_only_in_auto() {
+        let mut rom = vec![0u8; 0x8000];
+        assert_eq!(ModelChoice::Auto.resolve(&rom), Model::Dmg);
+        for flag in [0x80, 0xC0] {
+            rom[0x143] = flag;
+            assert_eq!(ModelChoice::Auto.resolve(&rom), Model::Cgb);
+        }
+        assert_eq!(ModelChoice::Dmg.resolve(&rom), Model::Dmg);
+        rom[0x143] = 0;
+        assert_eq!(ModelChoice::Cgb.resolve(&rom), Model::Cgb);
+        // A ROM too small for a header falls back to the DMG (the core rejects it).
+        assert_eq!(ModelChoice::Auto.resolve(&[0xC0; 4]), Model::Dmg);
     }
 
     #[test]

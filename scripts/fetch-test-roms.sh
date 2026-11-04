@@ -14,6 +14,12 @@ ACID2_URL="https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-ac
 # the time of pinning).
 ACID2_REV="${ACID2_REV:-dc2295408f881637ff69f784d8d93f3d2db30181}"
 ACID2_REF_URL="https://raw.githubusercontent.com/mattcurrie/dmg-acid2/$ACID2_REV/img/reference-dmg.png"
+# cgb-acid2, same shape. The v1.1 release ROM (sha256 197fb0bc...720e, header
+# 0x143 = 0xC0) and the reference from the commit the v1.1 tag points at.
+# Reference sha256 9ea9c262...fdf01 (160x144, 4-bit indexed colour).
+CGB_ACID2_URL="https://github.com/mattcurrie/cgb-acid2/releases/download/v1.1/cgb-acid2.gbc"
+CGB_ACID2_REV="${CGB_ACID2_REV:-fa5b7f86d6fb599f79e55169494d981a7af75a31}"
+CGB_ACID2_REF_URL="https://raw.githubusercontent.com/mattcurrie/cgb-acid2/$CGB_ACID2_REV/img/reference.png"
 
 fetch() { # url out
   if [ ! -s "$2" ]; then
@@ -51,4 +57,8 @@ fi
 # dmg-acid2
 fetch "$ACID2_URL" dmg-acid2/dmg-acid2.gb
 fetch "$ACID2_REF_URL" dmg-acid2/reference-dmg.png
+
+# cgb-acid2
+fetch "$CGB_ACID2_URL" cgb-acid2/cgb-acid2.gbc
+fetch "$CGB_ACID2_REF_URL" cgb-acid2/reference.png
 echo "test ROMs ready in $DEST"

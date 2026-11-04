@@ -18,7 +18,7 @@ use crate::pacer::FramePacer;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
-use crate::video::{Palette, blit, test_pattern};
+use crate::video::{Palette, blit, blit_cgb, test_pattern};
 
 /// Speed multiplier while Tab is held.
 const FAST_FORWARD_SPEED: f64 = 4.0;
@@ -293,12 +293,15 @@ impl App {
     }
 
     fn upload(&mut self) {
-        let fb: &Framebuffer = match &self.test {
-            Some(t) => &t.fb,
-            None => self.gb.framebuffer(),
+        let Some(p) = self.pixels.as_mut() else {
+            return;
         };
-        if let Some(p) = self.pixels.as_mut() {
-            blit(fb, &self.palette, p.frame_mut());
+        match &self.test {
+            Some(t) => blit(&t.fb, &self.palette, p.frame_mut()),
+            None => match self.gb.cgb_framebuffer() {
+                Some(fb) => blit_cgb(fb, p.frame_mut()),
+                None => blit(self.gb.framebuffer(), &self.palette, p.frame_mut()),
+            },
         }
     }
 }

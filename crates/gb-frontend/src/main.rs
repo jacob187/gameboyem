@@ -47,7 +47,8 @@ fn main() -> ExitCode {
         }
     };
     let archive = rom::archive_kind(&rom);
-    let mut gb = match GameBoy::new(rom) {
+    let model = opts.model.resolve(&rom);
+    let mut gb = match GameBoy::with_model(rom, model) {
         Ok(gb) => gb,
         Err(e) => {
             eprintln!("error: {}", rom::cartridge_message(&opts.rom, &e, archive));

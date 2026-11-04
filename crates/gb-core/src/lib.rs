@@ -41,6 +41,9 @@ pub const SCREEN_HEIGHT: usize = 144;
 /// One framebuffer: `SCREEN_WIDTH * SCREEN_HEIGHT` shades, row-major.
 /// Each byte is a DMG shade 0..=3 *after* palette mapping (0 = lightest, 3 = darkest).
 pub type Framebuffer = [u8; SCREEN_WIDTH * SCREEN_HEIGHT];
+/// One colour framebuffer, row-major. Each pixel is RGB555 as `0bbbbbgggggrrrrr`
+/// (red in the low 5 bits, the hardware palette-RAM order).
+pub type CgbFramebuffer = [u16; SCREEN_WIDTH * SCREEN_HEIGHT];
 
 /// CPU clock in T-cycles (dots) per second.
 pub const T_CYCLES_PER_SECOND: u32 = 4_194_304;

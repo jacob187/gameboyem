@@ -6,7 +6,7 @@ use crate::cpu::{Cpu, Registers};
 use crate::joypad::Button;
 use crate::model::{Hw, Model};
 use crate::state::{self, StateError, StateReader, StateWriter, check, tag};
-use crate::{Framebuffer, M_CYCLES_PER_FRAME};
+use crate::{CgbFramebuffer, Framebuffer, M_CYCLES_PER_FRAME};
 
 /// Magic + version + ROM hash + model + hardware mode.
 const STATE_HEADER_LEN: usize = 4 + 2 + 8 + 1 + 1;
@@ -90,6 +90,12 @@ impl GameBoy {
     /// Last completed frame: 160x144 shades 0..=3 (0 = lightest).
     pub fn framebuffer(&self) -> &Framebuffer {
         self.bus.ppu.framebuffer()
+    }
+
+    /// Last completed frame in RGB555, `Some` iff the machine renders in CGB
+    /// colour mode. Stub until the CGB PPU lands: always `None`.
+    pub fn cgb_framebuffer(&self) -> Option<&CgbFramebuffer> {
+        None
     }
 
     pub fn set_button(&mut self, button: Button, pressed: bool) {
