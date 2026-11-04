@@ -65,8 +65,11 @@ make -C homebrew                             # needed for the homebrew cases (th
 ./scripts/fetch-homebrew-corpus.sh           # open-source homebrew corpus -> roms/corpus
 cargo test --workspace                       # unit tests + one test per ROM
 cargo run -p gb-test --release               # pass/fail table
+cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5   # speed + pinned output hashes
 scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job in Docker; builds homebrew with Linux GBDK (tools/gbdk-linux/), needs roms/test + roms/corpus
 ```
+
+The benchmark compares each ROM's video, serial and audio hashes against `crates/gb-test/bench-pins.txt`. That catches any behaviour change, including from a "pure" optimisation. If a homebrew ROM is rebuilt from changed source, re-pin with `--print-pins`. CI also fails if the emulator drops below 5× real time.
 
 `crates/gb-test/expected.txt` is a ratchet. A case fails if its outcome changes in either direction, so a regression or an unrecorded fix both break the build.
 

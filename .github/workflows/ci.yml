@@ -91,6 +91,12 @@ jobs:
       - name: Test-ROM table
         run: cargo run -p gb-test --release -- --fail-on-mismatch
 
+      # Pinned output hashes (bit-identical emulation on every OS) plus a speed
+      # floor. Dev Macs run ~45x real time; 5x leaves room for slow, noisy runners
+      # while still catching a real regression.
+      - name: Benchmark (pinned hashes + speed floor)
+        run: cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5
+
   # gb-core must stay portable (no std I/O, threads or platform deps).
   wasm32:
     name: gb-core-wasm32
@@ -171,3 +177,9 @@ jobs:
 
       - name: Test-ROM table
         run: cargo run -p gb-test --release -- --fail-on-mismatch
+
+      # Pinned output hashes (bit-identical emulation on every OS) plus a speed
+      # floor. Dev Macs run ~45x real time; 5x leaves room for slow, noisy runners
+      # while still catching a real regression.
+      - name: Benchmark (pinned hashes + speed floor)
+        run: cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5
