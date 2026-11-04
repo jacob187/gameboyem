@@ -277,7 +277,7 @@ impl Cartridge for Mbc3 {
                 let o = ram_len + i * 4;
                 u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
             };
-            self.live = Rtc::from_regs(std::array::from_fn(|i| word(i)));
+            self.live = Rtc::from_regs(std::array::from_fn(&word));
             self.latched = Rtc::from_regs(std::array::from_fn(|i| word(5 + i)));
             self.subsecond = 0;
         }
