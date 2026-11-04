@@ -14,8 +14,9 @@ LCC      := $(GBDK_HOME)/bin/lcc
 ROMUSAGE := $(GBDK_HOME)/bin/romusage
 
 CFLAGS  := -Icommon
-# Cart type 0 = ROM only (32 KB, no MBC, no RAM).
-LDFLAGS := -Wl-m -Wl-j -Wm-yt0
+# Cart type 0x03 = MBC1+RAM+BATTERY, 1 RAM bank (header code 0x02, 8 KiB) for
+# the high score (see common/common.h). ROM stays 32 KB.
+LDFLAGS := -Wl-m -Wl-j -Wm-yt0x03 -Wm-ya1
 
 GAMES   := snake breakout
 HEADERS := $(wildcard common/*.h snake/src/*.h breakout/src/*.h)
