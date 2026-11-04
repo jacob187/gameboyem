@@ -65,7 +65,7 @@ static uint16_t tail_i; /* index of the tail in the ring */
 static uint16_t length;
 static uint16_t foods;  /* food eaten this game */
 static uint16_t score;
-static uint16_t best;
+static uint16_t best; /* high score, persisted in cartridge RAM */
 static uint8_t won;
 
 static void put_cell(uint8_t cx, uint8_t cy, uint8_t tile)
@@ -120,8 +120,8 @@ static void draw_field(void)
         set_bkg_tile_xy(19, i, TILE_WALL);
     }
     print_at(0, 0, "SCORE");
-    print_at(12, 0, "BEST");
-    print_uint(16, 0, best, 4);
+    print_at(13, 0, "HI");
+    print_uint(15, 0, best, 5);
     draw_score();
 }
 
@@ -230,9 +230,7 @@ static void play(void)
         }
     }
 
-    if (score > best) {
-        best = score;
-    }
+    hiscore_update(&best, score);
     /* Hold the final frame briefly so the collision is visible. */
     for (frames = 0; frames < 45; frames++) {
         wait_vbl_done();
@@ -253,6 +251,8 @@ static void title_screen(void)
     set_bkg_tile_xy(15, 8, TILE_HEAD);
     set_bkg_tile_xy(17, 8, TILE_FOOD);
     print_at(2, 12, "D-PAD: STEER");
+    print_at(5, 6, "HI");
+    print_uint(8, 6, best, 5);
     DISPLAY_ON;
     wait_start_and_seed(4, 14);
 }
@@ -265,7 +265,7 @@ static void game_over_screen(void)
     print_at(won ? 6 : 5, 4, won ? "YOU WIN" : "GAME OVER");
     print_at(4, 8, "SCORE");
     print_uint(10, 8, score, 5);
-    print_at(4, 10, "BEST");
+    print_at(4, 10, "HI");
     print_uint(10, 10, best, 5);
     DISPLAY_ON;
     wait_start_and_seed(4, 14);
@@ -274,6 +274,7 @@ static void game_over_screen(void)
 void main(void)
 {
     hb_init();
+    best = hiscore_load();
     HIDE_SPRITES;
     SHOW_BKG;
     set_bkg_data(TILE_BASE, TILE_COUNT, tiles);
