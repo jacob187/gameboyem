@@ -1156,3 +1156,60 @@ fn length_trigger_of_an_expired_counter_loses_one_before_a_length_step() {
     rig.w(0xFF19, 0xC0);
     assert_eq!(rig.apu.ch2.length.counter, 64);
 }
+
+#[test]
+fn nr51_maps_each_bit_to_one_channel_and_side() {
+    // Only the DAC of `ch` is on, so a DAC-on silent channel contributes
+    // +15 (bipolar DAC) exactly when its own left/right bit is set.
+    let dac_on = |rig: &mut Rig, ch: usize| match ch {
+        0 => rig.w(0xFF12, 0x08),
+        1 => rig.w(0xFF17, 0x08),
+        2 => rig.w(0xFF1A, 0x80),
+        _ => rig.w(0xFF21, 0x08),
+    };
+    for ch in 0..4 {
+        for bit in 0..8 {
+            let mut rig = Rig::new();
+            rig.w(0xFF24, 0x25); // left volume 3, right volume 6
+            rig.w(0xFF25, 1 << bit);
+            dac_on(&mut rig, ch);
+            rig.run(1);
+            let mine = bit % 4 == ch;
+            let left = bit >= 4;
+            let want = (
+                if mine && left { 15 * 3 } else { 0 },
+                if mine && !left { 15 * 6 } else { 0 },
+            );
+            assert_eq!(
+                (rig.apu.cur_l, rig.apu.cur_r),
+                want,
+                "CH{} with NR51 bit {bit}",
+                ch + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn nr51_all_bits_set_sums_all_four_channels_per_side() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x07);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF12, 0x08);
+    rig.w(0xFF17, 0x08);
+    rig.w(0xFF1A, 0x80);
+    rig.w(0xFF21, 0x08);
+    rig.run(1);
+    assert_eq!((rig.apu.cur_l, rig.apu.cur_r), (60, 480));
+}
+
+#[test]
+fn set_sample_rate_clamps_to_supported_range() {
+    let mut apu = Apu::new();
+    apu.set_sample_rate(1);
+    assert_eq!(apu.sample_rate(), 8_000);
+    assert_eq!(apu.hpf_factor, hpf_factor(8_000));
+    apu.set_sample_rate(10_000_000);
+    assert_eq!(apu.sample_rate(), 192_000);
+    assert_eq!(apu.hpf_factor, hpf_factor(192_000));
+}
