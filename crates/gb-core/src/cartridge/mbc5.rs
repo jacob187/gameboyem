@@ -7,7 +7,7 @@
 //! * `2000-2FFF` ROM bank, low 8 bits.
 //! * `3000-3FFF` ROM bank, bit 8 (only bit 0 of the written value is used).
 //! * `4000-5FFF` RAM bank, 4 bits. On rumble cartridges bit 3 drives the motor
-//!   instead and is not part of the RAM bank number.
+//!   instead and is not part of the RAM bank number (the motor is not modelled).
 //!
 //! Unlike MBC1, bank 0 is a valid selection for `4000-7FFF`; there is no 0 -> 1
 //! remapping. The ROM bank number is masked to the actual ROM size.
@@ -23,8 +23,6 @@ pub struct Mbc5 {
     /// 9-bit ROM bank number.
     rom_bank: u16,
     ram_bank: u8,
-    /// Rumble motor state (bit 3 of the RAM bank register); no effect on emulation.
-    rumble: bool,
 }
 
 impl Mbc5 {
@@ -39,13 +37,7 @@ impl Mbc5 {
             ram_enabled: false,
             rom_bank: 1,
             ram_bank: 0,
-            rumble: false,
         }
-    }
-
-    /// Whether the rumble motor is currently driven (informational).
-    pub fn rumble_active(&self) -> bool {
-        self.rumble
     }
 
     fn ram_offset(&self, addr: u16) -> Option<usize> {
@@ -78,7 +70,7 @@ impl Cartridge for Mbc5 {
             0x3000..=0x3FFF => self.rom_bank = (self.rom_bank & 0x0FF) | ((value as u16 & 1) << 8),
             0x4000..=0x5FFF => {
                 if self.header.has_rumble {
-                    self.rumble = value & 0x08 != 0;
+                    // Bit 3 drives the motor; there is no output to emulate.
                     self.ram_bank = value & 0x07;
                 } else {
                     self.ram_bank = value & 0x0F;
