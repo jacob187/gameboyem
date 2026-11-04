@@ -6,10 +6,11 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use gb_core::CartridgeError;
+use gb_core::cartridge::MAX_ROM_SIZE;
 
-/// Largest ROM the core accepts (8 MiB); reading stops one byte past it so a
-/// bogus huge file or device node cannot exhaust memory.
-pub const MAX_ROM_BYTES: u64 = 8 * 1024 * 1024;
+/// Reading stops one byte past the core's ROM limit (so the core still reports
+/// `TooLarge`), and a bogus huge file or device node cannot exhaust memory.
+const READ_LIMIT: u64 = MAX_ROM_SIZE as u64 + 1;
 
 /// Read the ROM at `path`. The error is a ready-to-print message.
 pub fn read_rom(path: &Path) -> Result<Vec<u8>, String> {
@@ -26,9 +27,7 @@ fn read_rom_io(path: &Path) -> io::Result<Vec<u8>> {
         ));
     }
     let mut data = Vec::new();
-    File::open(path)?
-        .take(MAX_ROM_BYTES + 1)
-        .read_to_end(&mut data)?;
+    File::open(path)?.take(READ_LIMIT).read_to_end(&mut data)?;
     Ok(data)
 }
 
@@ -182,8 +181,8 @@ mod tests {
     fn oversized_files_are_truncated_at_the_limit_plus_one() {
         let dir = tempfile::tempdir().unwrap();
         let big = dir.path().join("big.gb");
-        fs::write(&big, vec![0u8; MAX_ROM_BYTES as usize + 4096]).unwrap();
-        assert_eq!(read_rom(&big).unwrap().len() as u64, MAX_ROM_BYTES + 1);
+        fs::write(&big, vec![0u8; MAX_ROM_SIZE + 4096]).unwrap();
+        assert_eq!(read_rom(&big).unwrap().len(), MAX_ROM_SIZE + 1);
     }
 
     #[cfg(unix)]
