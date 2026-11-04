@@ -71,6 +71,45 @@ fn sequencer_ticks_when_div_is_reset_with_bit_set() {
 }
 
 #[test]
+fn first_div_apu_event_is_skipped_when_powering_on_with_div_bit_high() {
+    let mut apu = Apu::new();
+    apu.tick_mcycle(0x1000); // DIV bit 4 high
+    apu.write(0xFF26, 0x00);
+    apu.tick_mcycle(0x1000);
+    apu.write(0xFF26, 0x80);
+    apu.tick_mcycle(0x0000); // first falling edge: lost
+    assert_eq!(apu.seq_step, 0);
+    apu.tick_mcycle(0x1000);
+    apu.tick_mcycle(0x0000); // second edge runs step 0
+    assert_eq!(apu.seq_step, 1);
+}
+
+#[test]
+fn no_div_apu_event_is_skipped_when_powering_on_with_div_bit_low() {
+    let mut apu = Apu::new();
+    apu.tick_mcycle(0x0000);
+    apu.write(0xFF26, 0x00);
+    apu.write(0xFF26, 0x80);
+    apu.tick_mcycle(0x1000);
+    apu.tick_mcycle(0x0000);
+    assert_eq!(apu.seq_step, 1);
+}
+
+#[test]
+fn skipped_div_apu_event_does_not_survive_a_power_cycle() {
+    let mut apu = Apu::new();
+    apu.tick_mcycle(0x1000);
+    apu.write(0xFF26, 0x00);
+    apu.write(0xFF26, 0x80); // armed
+    apu.write(0xFF26, 0x00);
+    apu.tick_mcycle(0x0000);
+    apu.write(0xFF26, 0x80); // bit low now: nothing to skip
+    apu.tick_mcycle(0x1000);
+    apu.tick_mcycle(0x0000);
+    assert_eq!(apu.seq_step, 1);
+}
+
+#[test]
 fn sequencer_is_frozen_while_powered_off() {
     let mut apu = fresh();
     apu.write(0xFF26, 0x00);

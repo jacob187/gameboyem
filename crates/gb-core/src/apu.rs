@@ -92,6 +92,8 @@ pub struct Apu {
     /// Frame-sequencer step that will run on the next DIV-APU tick.
     seq_step: u8,
     last_div_bit: bool,
+    /// Powered on while DIV bit 4 was high: the next DIV-APU event is lost.
+    skip_div_event: bool,
     sample_rate: u32,
     sample_acc: u32,
     /// Weighted mix of the current M-cycle; recomputed only when `dirty`.
@@ -126,6 +128,7 @@ impl Apu {
             powered: true,
             seq_step: 0,
             last_div_bit: false,
+            skip_div_event: false,
             sample_rate: DEFAULT_SAMPLE_RATE,
             sample_acc: 0,
             cur_l: 0,
@@ -268,15 +271,19 @@ impl Apu {
 
     /// NR52 bit 7. Powering off clears NR10..=NR51 and silences every channel;
     /// wave RAM and (on DMG) length counters are kept. Powering on restarts the
-    /// frame sequencer at step 0 (Pan Docs: "Audio Registers", NR52).
+    /// frame sequencer at step 0 (Pan Docs: "Audio Registers", NR52). If DIV
+    /// bit 4 is high at that moment, the first DIV-APU event is skipped (the
+    /// sequencer waits for the following falling edge to run step 0).
     fn set_power(&mut self, on: bool) {
         if on == self.powered {
             return;
         }
         self.powered = on;
         self.dirty = true;
+        self.skip_div_event = false;
         if on {
             self.seq_step = 0;
+            self.skip_div_event = self.last_div_bit;
             self.ch1.power_on();
             self.ch2.power_on();
             self.ch3.power_on();
@@ -297,6 +304,9 @@ impl Apu {
     }
 
     fn clock_sequencer(&mut self) {
+        if std::mem::take(&mut self.skip_div_event) {
+            return;
+        }
         let step = self.seq_step;
         self.seq_step = (step + 1) & 7;
         self.dirty = true;
