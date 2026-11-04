@@ -78,8 +78,8 @@ These are the results on `integration` for macOS arm64 and Linux x86_64 (Docker)
 | dmg-acid2 | 1 / 1 |
 | Mooneye (DMG acceptance subset + MBC1/MBC5) | 87 / 87 |
 | Blargg `dmg_sound` (12 + combined) | 13 / 13 |
-| Homebrew smoke + scripted playability | 4 / 4 |
-| **Total** | **122 / 122** |
+| Homebrew smoke, scripted playability, battery save round-trip | 6 / 6 |
+| **Total** | **124 / 124** |
 
 Every case in the harness passes. Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
@@ -104,7 +104,7 @@ make -C homebrew          # -> roms/homebrew/snake.gb, roms/homebrew/breakout.gb
 - **Snake:** the D-pad steers and Start begins.
 - **Breakout:** left/right move the paddle, A or B launches the ball, and Start begins.
 
-Both have title, score and game-over screens.
+Both have title, score and game-over screens. Each keeps a high score in battery RAM (MBC1+RAM+BATTERY), so it persists in `<rom>.sav`.
 
 ## Known gaps
 
