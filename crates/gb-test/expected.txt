@@ -4,7 +4,7 @@
 #   expect: pass | fail      kind: blargg | blargg-mem | mooneye | acid2 | smoke | play-snake | play-breakout |
 #         save-snake | save-breakout | sfx-snake | sfx-breakout | play-tobu | play-adjustris | play-renegade |
 #         play-cgbdemo
-#   A `-cgb` suffix on the kind (`mooneye-cgb`, `acid2-cgb`) runs the case on a Game Boy Color
+#   A `-cgb` suffix on the kind (`mooneye-cgb`, `acid2-cgb`, `smoke-cgb`) runs the case on a Game Boy Color
 #   (`Model::Cgb`); without it the case runs on a DMG. Only the suffix is special
 #   (`blargg-mem` is its own kind). Comment lines start with `#`.
 #
@@ -165,6 +165,18 @@ pass smoke 600 corpus/brekstascat.gb
 pass smoke 600 corpus/adjustris.gb
 pass smoke 600 corpus/airplanz.gb
 pass smoke 600 corpus/renegade-rush.gb
+
+# --- CGB homebrew corpus, run as a CGB (kind `smoke-cgb`: RGB555 frame has 2+ colours and is not
+# frozen; scripts/fetch-homebrew-corpus.sh, DECISIONS #39) ---
+pass smoke-cgb 600 corpus/tobutobugirl-dx.gb
+pass smoke-cgb 600 corpus/escape-obliterizer-dx.gb
+# Hangs on `LDH (KEY1),A=1; STOP` (the CGB speed switch): KEY1 reads back armed, the STOP never resumes,
+# the LCD stays off (needs double speed; DECISIONS #39).
+fail smoke-cgb 600 corpus/rebound.gb
+pass smoke-cgb 600 corpus/aevilia.gb
+# Same hang: `LDH (KEY1),A=1; STOP` at 0x0205 with IE = 0 and the joypad lines deselected, so nothing can wake it; the LCD stays off.
+fail smoke-cgb 600 corpus/ucity.gb
+pass smoke-cgb 600 corpus/geometrix.gb
 
 # --- Homebrew corpus playability (scripts validated against headless PyBoy) ---
 pass play-tobu 1500 corpus/tobutobugirl.gb

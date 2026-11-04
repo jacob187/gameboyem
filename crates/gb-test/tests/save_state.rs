@@ -44,11 +44,13 @@ fn roms() -> Vec<Case> {
     );
     out.sort();
     let mut cases: Vec<Case> = out.into_iter().map(|p| (p, Model::Dmg)).collect();
-    // CGB colour mode (cgb-acid2: RGB555 frames, palette RAM, attributes) and a
-    // flag-less ROM on a CGB (DMG-compatibility mode).
+    // CGB colour mode (cgb-acid2: RGB555 frames, palette RAM, attributes; Aevilia, a CGB-only
+    // MBC5 RPG with 128 KiB of cartridge RAM, from the corpus) and a flag-less ROM on a CGB
+    // (DMG-compatibility mode).
     cases.extend(
         [
             ("test/cgb-acid2/cgb-acid2.gbc", Model::Cgb),
+            ("corpus/aevilia.gb", Model::Cgb),
             ("test/dmg-acid2/dmg-acid2.gb", Model::Cgb),
         ]
         .map(|(p, m)| (root.join(p), m))

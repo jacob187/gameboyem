@@ -25,7 +25,8 @@ pub enum Kind {
     /// dmg-acid2: framebuffer compared to the reference image. With the `-cgb`
     /// suffix (cgb-acid2) the RGB555 colour framebuffer is compared instead.
     Acid2,
-    /// Homebrew smoke test: framebuffer not blank after N frames.
+    /// Homebrew smoke test: framebuffer not blank after N frames. With the `-cgb` suffix
+    /// (`smoke-cgb`) the RGB555 frame must show 2+ colours and not be frozen (idle, Start, A).
     Smoke,
     /// Homebrew playability: boot snake, press Start, steer, framebuffer must change.
     PlaySnake,
@@ -231,6 +232,7 @@ pub fn run_case(case: &Case) -> Outcome {
         Kind::Blargg => on_machine(&|gb| run_blargg(gb, frames)),
         Kind::Mooneye => on_machine(&|gb| run_mooneye(gb, frames)),
         Kind::Acid2 => on_machine(&|gb| run_acid2(gb, case)),
+        Kind::Smoke if model == Model::Cgb => on_machine(&|gb| run_smoke_cgb(gb, frames)),
         Kind::Smoke => on_machine(&|gb| run_smoke(gb, frames)),
         Kind::BlarggMem => run_blargg_mem(&rom, model, frames),
         Kind::PlaySnake => run_play(&rom, model, PLAY_SNAKE, frames),
@@ -643,6 +645,67 @@ fn run_smoke(gb: &mut GameBoy, frames: u32) -> Outcome {
     } else {
         Outcome::Pass
     }
+}
+
+/// Frames [`run_smoke_cgb`] runs idle, and after each button press (held 5 frames), between samples.
+const SMOKE_CGB_STEP: u32 = 60;
+
+/// Distinct RGB555 values in a colour frame.
+fn distinct_colours(fb: &[u16]) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    seen.extend(fb.iter().copied());
+    seen.len()
+}
+
+/// `smoke` on a CGB: after `frames` frames the colour frame has at least 2 distinct colours, and
+/// the picture is not frozen: it changes by itself over [`SMOKE_CGB_STEP`] idle frames, or after
+/// Start, or after A (menus and dialogue boxes want one or the other). Passing means the game
+/// booted, drew in colour and kept running; the frame hash is not pinned.
+fn run_smoke_cgb(gb: &mut GameBoy, frames: u32) -> Outcome {
+    let step = |gb: &mut GameBoy, n: u32| -> Result<(), Outcome> {
+        for _ in 0..n {
+            gb.step_frame();
+            if gb.cpu_locked() {
+                return Err(Outcome::Fail(locked_message(gb)));
+            }
+        }
+        Ok(())
+    };
+    if let Err(o) = step(gb, frames) {
+        return o;
+    }
+    let mut shots = vec![match cgb_frame(gb) {
+        Ok(f) => f,
+        Err(o) => return o,
+    }];
+    let colours = distinct_colours(&shots[0]);
+    if colours < 2 {
+        return Outcome::Fail(format!(
+            "colour framebuffer blank ({colours} colour) after {frames} frames"
+        ));
+    }
+    for input in [None, Some(Button::Start), Some(Button::A)] {
+        if let Some(b) = input {
+            gb.set_button(b, true);
+        }
+        let run = step(gb, 5);
+        if let Some(b) = input {
+            gb.set_button(b, false);
+        }
+        if let Err(o) = run.and_then(|()| step(gb, SMOKE_CGB_STEP)) {
+            return o;
+        }
+        match cgb_frame(gb) {
+            Ok(f) => shots.push(f),
+            Err(o) => return o,
+        }
+    }
+    if shots.iter().all(|f| *f == shots[0]) {
+        return Outcome::Fail(format!(
+            "picture frozen ({colours} colours): unchanged when idle and after Start and A"
+        ));
+    }
+    Outcome::Pass
 }
 
 /// Frames the title screen gets before the script presses Start.
