@@ -125,6 +125,9 @@ impl Ppu {
     /// Draw the current line into the back buffer.
     pub(super) fn render_line(&mut self) {
         let ly = self.ly;
+        // With LCDC.0 clear the BG and window are colour 0, which BGP still
+        // maps (SameBoy fills the line with BGP[1:0]); Pan Docs' "blank
+        // (white)" is shorthand for that.
         let mut bg_ids = [0u8; SCREEN_WIDTH];
         if self.lcdc & LCDC_BG_ENABLE != 0 {
             self.render_bg(ly, &mut bg_ids);

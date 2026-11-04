@@ -659,6 +659,26 @@ fn lcdc_bit0_off_blanks_bg_but_keeps_sprites() {
     assert_eq!(pixel(&fb, 0, 0), 3);
 }
 
+#[test]
+fn lcdc_bit0_off_maps_bg_colour_0_through_bgp() {
+    // With LCDC.0 clear the BG/window are colour 0, and BGP still applies:
+    // SameBoy fills the line with BGP[1:0]. Pan Docs' "blank (white)" is
+    // shorthand for colour 0 under the usual BGP. Identity BGP cannot tell
+    // this apart from forcing white, so use BGP = $FF (colour 0 -> shade 3).
+    let mut rig = Rig::at_line0();
+    rig.solid_tile(0x10, 2);
+    rig.fill_map(0x1800, 1);
+    rig.write(0xFF47, 0xFF);
+    rig.write(0xFF40, 0x90); // BG off
+    let fb = rig.frame();
+    assert_eq!(pixel(&fb, 20, 20), 3);
+
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF47, 0xFD); // colour 0 -> shade 1
+    rig.write(0xFF40, 0x90);
+    assert_eq!(pixel(&rig.frame(), 0, 0), 1);
+}
+
 // ----------------------------------------------------------------- window
 
 #[test]
