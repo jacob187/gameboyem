@@ -19,14 +19,6 @@ const OAM_LEN: u8 = 160;
 /// M-cycles between the register write and the first copy.
 const START_DELAY: u8 = 2;
 
-/// Which physical bus the transfer source sits on (DMG has two: the external
-/// bus for ROM / cartridge RAM / WRAM, and the video bus for VRAM).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaBus {
-    External,
-    Video,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Transfer {
     source: u16,
@@ -46,8 +38,10 @@ pub struct Dma {
     pending: Option<Pending>,
     /// A byte was copied during the most recent tick (bus locked this cycle).
     busy: bool,
-    /// Source bus of the most recent copy.
-    bus: Option<DmaBus>,
+    /// Whether the most recent copy's source is on the video bus (VRAM); every
+    /// other source (ROM, cartridge RAM, WRAM) is on the external bus. Only
+    /// meaningful while `busy`.
+    video_bus: bool,
     /// Last byte the DMA engine moved; what a conflicting CPU read observes.
     data_byte: u8,
 }
@@ -81,7 +75,8 @@ impl Dma {
     }
 
     /// True if a transfer is running or about to start.
-    pub fn is_active(&self) -> bool {
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
         self.active.is_some() || self.pending.is_some()
     }
 
@@ -92,11 +87,7 @@ impl Dma {
             return false;
         }
         let video = (0x8000..=0x9FFF).contains(&addr);
-        match self.bus {
-            Some(DmaBus::Video) => video,
-            Some(DmaBus::External) => !video,
-            None => false,
-        }
+        video == self.video_bus
     }
 
     /// The byte the DMA engine last moved (what a conflicting read returns).
@@ -126,11 +117,7 @@ impl Dma {
         let t = self.active.as_mut()?;
         let copy = (t.source.wrapping_add(t.index as u16), t.index);
         t.index += 1;
-        self.bus = Some(if (0x80..=0x9F).contains(&(t.source >> 8)) {
-            DmaBus::Video
-        } else {
-            DmaBus::External
-        });
+        self.video_bus = (0x80..=0x9F).contains(&(t.source >> 8));
         if t.index == OAM_LEN {
             self.active = None;
         }

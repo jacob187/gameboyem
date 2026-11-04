@@ -99,7 +99,8 @@ impl Bus {
     pub(crate) fn tick_components(&mut self) {
         self.mcycles += 1;
         self.timer.tick_mcycle(&mut self.interrupts);
-        self.serial.tick_mcycle(&mut self.interrupts);
+        self.serial
+            .tick_mcycle(&mut self.interrupts, self.timer.div_counter());
         self.step_dma();
         self.ppu.tick_mcycle(&mut self.interrupts);
         self.apu.tick_mcycle(self.timer.div_counter());

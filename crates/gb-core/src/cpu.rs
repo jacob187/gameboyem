@@ -122,13 +122,15 @@ impl Cpu {
         std::mem::take(&mut self.ld_b_b)
     }
 
-    /// Interrupt master enable (for debuggers/tests).
-    pub fn ime(&self) -> bool {
+    /// Interrupt master enable (tests only).
+    #[cfg(test)]
+    fn ime(&self) -> bool {
         self.ime
     }
 
-    /// True while halted/stopped.
-    pub fn is_halted(&self) -> bool {
+    /// True while halted/stopped (tests only).
+    #[cfg(test)]
+    fn is_halted(&self) -> bool {
         self.halted || self.stopped
     }
 
@@ -536,10 +538,10 @@ impl Cpu {
         let a = self.regs.a;
         let carry = u8::from(self.regs.f & FLAG_C != 0);
         match op {
-            0 => self.add8(a, v, 0, true),
-            1 => self.add8(a, v, carry, true),
-            2 => self.sub8(a, v, 0, true),
-            3 => self.sub8(a, v, carry, true),
+            0 => self.regs.a = self.add8(v, 0),
+            1 => self.regs.a = self.add8(v, carry),
+            2 => self.regs.a = self.sub8(v, 0),
+            3 => self.regs.a = self.sub8(v, carry),
             4 => {
                 self.regs.a = a & v;
                 self.set_flags(self.regs.a == 0, false, true, false);
@@ -552,27 +554,29 @@ impl Cpu {
                 self.regs.a = a | v;
                 self.set_flags(self.regs.a == 0, false, false, false);
             }
-            _ => self.sub8(a, v, 0, false), // CP: SUB without storing
+            _ => {
+                self.sub8(v, 0); // CP: SUB without storing
+            }
         }
     }
 
-    fn add8(&mut self, a: u8, v: u8, carry: u8, store: bool) {
+    /// `A + v + carry`: sets the flags and returns the result for the caller to store.
+    fn add8(&mut self, v: u8, carry: u8) -> u8 {
+        let a = self.regs.a;
         let r = a as u16 + v as u16 + carry as u16;
         let h = (a & 0x0F) + (v & 0x0F) + carry > 0x0F;
-        if store {
-            self.regs.a = r as u8;
-        }
         self.set_flags(r as u8 == 0, false, h, r > 0xFF);
+        r as u8
     }
 
-    fn sub8(&mut self, a: u8, v: u8, carry: u8, store: bool) {
+    /// `A - v - carry`: sets the flags and returns the result (CP discards it).
+    fn sub8(&mut self, v: u8, carry: u8) -> u8 {
+        let a = self.regs.a;
         let r = (a as u16).wrapping_sub(v as u16).wrapping_sub(carry as u16);
         let h = (a & 0x0F) < (v & 0x0F) + carry;
         let c = (a as u16) < v as u16 + carry as u16;
-        if store {
-            self.regs.a = r as u8;
-        }
         self.set_flags(r as u8 == 0, true, h, c);
+        r as u8
     }
 
     /// CB-group rotate/shift by index `RLC RRC RL RR SLA SRA SWAP SRL`; sets

@@ -7,7 +7,7 @@
 //! C000-DFFF  WRAM
 //! E000-FDFF  echo of C000-DDFF
 //! FE00-FE9F  OAM
-//! FEA0-FEFF  unusable
+//! FEA0-FEFF  unusable (reads 0x00, or 0xFF while OAM is blocked)
 //! FF00-FF7F  I/O registers
 //! FF80-FFFE  HRAM
 //! FFFF       IE
@@ -20,12 +20,12 @@ impl Bus {
     ///
     /// OAM DMA bus conflicts (DMG, Pan Docs "OAM DMA Transfer"), evaluated for
     /// the cycle whose component tick just ran:
-    /// * OAM reads `0xFF`.
+    /// * OAM (and the unusable range after it) reads `0xFF`.
     /// * An access to the bus the DMA source is on (external bus: ROM, cartridge
     ///   RAM, WRAM/echo; video bus: VRAM) reads the byte the DMA engine is moving.
     /// * HRAM, I/O registers (incl. `0xFF46`) and IE are always reachable.
     pub(crate) fn cpu_read(&self, addr: u16) -> u8 {
-        if self.dma.is_blocking() && (0xFE00..=0xFE9F).contains(&addr) {
+        if self.dma.is_blocking() && (0xFE00..=0xFEFF).contains(&addr) {
             return 0xFF;
         }
         if self.dma.conflicts_with(addr) {
@@ -46,13 +46,22 @@ impl Bus {
         self.write_mapped(addr, value);
     }
 
-    /// Source read for an OAM DMA byte. DMA sources above 0xDFFF map onto echo RAM.
+    /// Source read for an OAM DMA byte. DMA sources above 0xDFFF map onto echo
+    /// RAM. The DMA engine is not the CPU, so VRAM is read regardless of the PPU
+    /// mode (Pan Docs documents no mode-3 corruption of DMA reads; SameBoy
+    /// exempts them from the VRAM lockout too).
     pub(crate) fn read_dma_source(&self, addr: u16) -> u8 {
         let addr = if addr >= 0xE000 { addr - 0x2000 } else { addr };
-        self.read_mapped(addr)
+        match addr {
+            0x8000..=0x9FFF => self.ppu.dma_read_vram(addr),
+            _ => self.read_mapped(addr),
+        }
     }
 
-    /// Side-effect-free read of the full memory map (also used by debug tooling).
+    /// Read the memory map as the CPU would see it now, without side effects
+    /// (`&self`: no clock advances). Not a raw dump: VRAM reads 0xFF while the
+    /// PPU is in mode 3, OAM in modes 2 and 3, and cartridge RAM goes through
+    /// the mapper (see `GameBoy::peek`). OAM DMA bus conflicts are not applied.
     pub fn peek(&self, addr: u16) -> u8 {
         self.read_mapped(addr)
     }
@@ -65,7 +74,10 @@ impl Bus {
             0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
             0xE000..=0xFDFF => self.wram[(addr - 0xE000) as usize],
             0xFE00..=0xFE9F => self.ppu.read_oam(addr),
-            0xFEA0..=0xFEFF => 0xFF,
+            // Unusable (Pan Docs "FEA0-FEFF range"): DMG reads 0xFF while OAM is
+            // blocked and 0x00 otherwise. A running DMA is handled in `cpu_read`.
+            0xFEA0..=0xFEFF if self.ppu.oam_blocked() => 0xFF,
+            0xFEA0..=0xFEFF => 0x00,
             0xFF00..=0xFF7F => self.read_io(addr),
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
             0xFFFF => self.interrupts.read_ie(),

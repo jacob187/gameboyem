@@ -560,6 +560,25 @@ fn di_cancels_pending_ei() {
 }
 
 #[test]
+fn dispatch_cancels_a_pending_ei() {
+    // EI with IME already on, an interrupt arriving while EI runs: the
+    // dispatch must clear the stale `ei_pending`, or the first handler
+    // instruction would turn IME back on and allow nesting.
+    let (mut cpu, mut bus) = setup(&[0xFB, 0x00]); // EI ; NOP
+    cpu.ime = true;
+    bus.ie = 0x01;
+    cpu.step(&mut bus); // EI (nothing pending yet)
+    assert!(cpu.ei_pending);
+    bus.iflag = 0x01; // raised during EI's last M-cycle
+    assert_eq!(step_cycles(&mut cpu, &mut bus), 5); // dispatch
+    assert_eq!(cpu.regs.pc, 0x0040);
+    assert!(!cpu.ime());
+    assert!(!cpu.ei_pending);
+    cpu.step(&mut bus); // first handler instruction (NOP at 0x0040)
+    assert!(!cpu.ime(), "IME stays off inside the handler");
+}
+
+#[test]
 fn ei_ei_enables_after_second() {
     let (mut cpu, mut bus) = setup(&[0xFB, 0xFB, 0x00]);
     cpu.step(&mut bus);
