@@ -2,29 +2,31 @@
 //! optional rumble motor.
 //!
 //! Registers:
-//! * `0000-1FFF` RAM enable: exactly `0x0A` enables, any other value disables
-//!   (MBC5 decodes all 8 bits, unlike MBC1's low nibble).
+//! * `0000-1FFF` RAM enable: any value with low nibble `0xA` enables, anything
+//!   else disables (Pan Docs: real MBCs decode only the low 4 bits, as MBC1/MBC3).
 //! * `2000-2FFF` ROM bank, low 8 bits.
 //! * `3000-3FFF` ROM bank, bit 8 (only bit 0 of the written value is used).
 //! * `4000-5FFF` RAM bank, 4 bits. On rumble cartridges bit 3 drives the motor
-//!   instead and is not part of the RAM bank number.
+//!   instead and is not part of the RAM bank number (the motor is not modelled).
 //!
 //! Unlike MBC1, bank 0 is a valid selection for `4000-7FFF`; there is no 0 -> 1
 //! remapping. The ROM bank number is masked to the actual ROM size.
 
-use super::{Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE};
+use super::{
+    Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
+};
 
 pub struct Mbc5 {
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
+    /// See [`Cartridge::battery_generation`].
+    battery_gen: u64,
     rom_bank_mask: usize,
     ram_enabled: bool,
     /// 9-bit ROM bank number.
     rom_bank: u16,
     ram_bank: u8,
-    /// Rumble motor state (bit 3 of the RAM bank register); no effect on emulation.
-    rumble: bool,
 }
 
 impl Mbc5 {
@@ -35,24 +37,19 @@ impl Mbc5 {
             rom,
             ram,
             header,
+            battery_gen: 0,
             rom_bank_mask,
             ram_enabled: false,
             rom_bank: 1,
             ram_bank: 0,
-            rumble: false,
         }
-    }
-
-    /// Whether the rumble motor is currently driven (informational).
-    pub fn rumble_active(&self) -> bool {
-        self.rumble
     }
 
     fn ram_offset(&self, addr: u16) -> Option<usize> {
         if !self.ram_enabled || self.ram.is_empty() {
             return None;
         }
-        let offset = self.ram_bank as usize * RAM_BANK_SIZE + (addr as usize & 0x1FFF);
+        let offset = self.ram_bank as usize * RAM_BANK_SIZE + ram_window_offset(addr);
         Some(offset % self.ram.len())
     }
 }
@@ -73,12 +70,12 @@ impl Cartridge for Mbc5 {
 
     fn write_rom(&mut self, addr: u16, value: u8) {
         match addr {
-            0x0000..=0x1FFF => self.ram_enabled = value == 0x0A,
+            0x0000..=0x1FFF => self.ram_enabled = value & 0x0F == 0x0A,
             0x2000..=0x2FFF => self.rom_bank = (self.rom_bank & 0x100) | value as u16,
             0x3000..=0x3FFF => self.rom_bank = (self.rom_bank & 0x0FF) | ((value as u16 & 1) << 8),
             0x4000..=0x5FFF => {
                 if self.header.has_rumble {
-                    self.rumble = value & 0x08 != 0;
+                    // Bit 3 drives the motor; there is no output to emulate.
                     self.ram_bank = value & 0x07;
                 } else {
                     self.ram_bank = value & 0x0F;
@@ -94,7 +91,10 @@ impl Cartridge for Mbc5 {
 
     fn write_ram(&mut self, addr: u16, value: u8) {
         if let Some(o) = self.ram_offset(addr) {
-            self.ram[o] = value;
+            if self.ram[o] != value {
+                self.ram[o] = value;
+                self.battery_gen += 1;
+            }
         }
     }
 
@@ -103,7 +103,13 @@ impl Cartridge for Mbc5 {
     }
 
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError> {
-        super::load_battery_ram(&self.header, &mut self.ram, data)
+        super::load_battery_ram(&self.header, &mut self.ram, data)?;
+        self.battery_gen += 1;
+        Ok(())
+    }
+
+    fn battery_generation(&self) -> u64 {
+        self.battery_gen
     }
 }
 
@@ -184,19 +190,29 @@ mod tests {
     }
 
     #[test]
-    fn ram_enable_requires_exactly_0x0a() {
+    fn ram_enable_decodes_low_nibble() {
         let mut c = from_rom(banked_rom(2, 0x1A, 0, 0x02)).unwrap();
         c.write_ram(0xA000, 0x42);
         assert_eq!(c.read_ram(0xA000), 0xFF, "disabled at power-on");
         c.write_rom(0x0000, 0x0A);
         c.write_ram(0xA000, 0x42);
         assert_eq!(c.read_ram(0xA000), 0x42);
-        c.write_rom(0x1FFF, 0xFA); // low nibble 0xA but not 0x0A
-        assert_eq!(c.read_ram(0xA000), 0xFF);
-        c.write_rom(0x0000, 0x0A);
-        assert_eq!(c.read_ram(0xA000), 0x42, "contents survive disable");
         c.write_rom(0x0000, 0x00);
         assert_eq!(c.read_ram(0xA000), 0xFF);
+        for v in [0x1A, 0x2A, 0xFA] {
+            c.write_rom(0x1FFF, v); // low nibble 0xA enables
+            assert_eq!(
+                c.read_ram(0xA000),
+                0x42,
+                "{v:#04x} enables; contents survive"
+            );
+            c.write_rom(0x0000, 0x00);
+        }
+        for v in [0x0B, 0x0F, 0xA0, 0x01] {
+            c.write_rom(0x0000, 0x0A);
+            c.write_rom(0x1000, v);
+            assert_eq!(c.read_ram(0xA000), 0xFF, "{v:#04x} disables");
+        }
     }
 
     #[test]

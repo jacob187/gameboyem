@@ -1,10 +1,16 @@
 //! MBC3 (Pan Docs: "MBC3"). Up to 2 MiB ROM / 32 KiB RAM plus a real-time clock.
 //!
+//! The MBC30 variant (Japanese Pokemon Crystal) has an 8-bit ROM bank (4 MiB)
+//! and 8 RAM banks (64 KiB). It shares cartridge types 0x0F-0x13 with MBC3, so
+//! it is detected from the header: the declared ROM size is above 2 MiB or the
+//! declared RAM size is 64 KiB. Anything else keeps the plain MBC3 masks
+//! (7-bit ROM bank, RAM banks 0-3).
+//!
 //! Registers:
 //! * `0000-1FFF` RAM and RTC enable (low nibble `0xA` enables).
-//! * `2000-3FFF` ROM bank, 7 bits; a written 0 is treated as 1.
-//! * `4000-5FFF` `00-03` selects a RAM bank, `08-0C` selects an RTC register
-//!   (S, M, H, DL, DH) for `A000-BFFF`.
+//! * `2000-3FFF` ROM bank, 7 bits (MBC30: 8); a written 0 is treated as 1.
+//! * `4000-5FFF` `00-03` (MBC30: `00-07`) selects a RAM bank, `08-0C` selects
+//!   an RTC register (S, M, H, DL, DH) for `A000-BFFF`.
 //! * `6000-7FFF` latch: writing `00` then `01` copies the live clock into the
 //!   latched registers that reads return.
 //!
@@ -18,8 +24,17 @@
 //! timestamp. We always write 0 for the timestamp (no host clock) and ignore it
 //! on load. Loading also accepts the 44-byte variant (32-bit timestamp) and a
 //! bare RAM image with no footer (clock left at zero).
+//!
+//! The zero timestamp is deliberate: the core is deterministic and never reads
+//! the host clock, and the RTC only advances while the emulator runs. A save
+//! is therefore a snapshot of emulated time; it is not lossless when moved to
+//! an emulator that catches the clock up from the footer timestamp (such a
+//! loader may treat 0 as the epoch and jump the clock far ahead). Importing
+//! saves written by other emulators works, as their timestamp is ignored.
 
-use super::{Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE};
+use super::{
+    Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
+};
 
 /// M-cycles per emulated second (4 194 304 Hz / 4).
 const MCYCLES_PER_SECOND: u32 = 1 << 20;
@@ -110,11 +125,22 @@ impl Rtc {
     }
 }
 
+/// MBC30 detection (see module docs): more than 2 MiB of ROM or 64 KiB of RAM.
+fn is_mbc30(header: &CartridgeHeader) -> bool {
+    header.rom_size > 0x20_0000 || header.ram_size == 0x1_0000
+}
+
 pub struct Mbc3 {
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
+    /// See [`Cartridge::battery_generation`].
+    battery_gen: u64,
     rom_bank_mask: usize,
+    /// Mask applied to values written to the ROM bank register (0x7F or 0xFF).
+    rom_bank_reg_mask: u8,
+    /// Highest RAM bank selector (3 for MBC3, 7 for MBC30).
+    max_ram_select: u8,
     ram_enabled: bool,
     rom_bank: u8,
     /// Raw value of the `4000-5FFF` register.
@@ -131,11 +157,15 @@ impl Mbc3 {
     pub fn new(rom: Vec<u8>, header: CartridgeHeader) -> Self {
         let ram = vec![0; header.ram_size];
         let rom_bank_mask = rom.len() / ROM_BANK_SIZE - 1;
+        let mbc30 = is_mbc30(&header);
         Self {
             rom,
             ram,
             header,
+            battery_gen: 0,
             rom_bank_mask,
+            rom_bank_reg_mask: if mbc30 { 0xFF } else { 0x7F },
+            max_ram_select: if mbc30 { 7 } else { 3 },
             ram_enabled: false,
             rom_bank: 1,
             ram_select: 0,
@@ -150,7 +180,7 @@ impl Mbc3 {
         if self.ram.is_empty() {
             return None;
         }
-        let offset = self.ram_select as usize * RAM_BANK_SIZE + (addr as usize & 0x1FFF);
+        let offset = self.ram_select as usize * RAM_BANK_SIZE + ram_window_offset(addr);
         Some(offset % self.ram.len())
     }
 }
@@ -173,7 +203,7 @@ impl Cartridge for Mbc3 {
         match addr {
             0x0000..=0x1FFF => self.ram_enabled = value & 0x0F == 0x0A,
             0x2000..=0x3FFF => {
-                let v = value & 0x7F;
+                let v = value & self.rom_bank_reg_mask;
                 self.rom_bank = if v == 0 { 1 } else { v };
             }
             0x4000..=0x5FFF => self.ram_select = value,
@@ -182,6 +212,9 @@ impl Cartridge for Mbc3 {
                     self.latch_armed = true;
                 } else {
                     if value == 1 && self.latch_armed && self.header.has_rtc {
+                        if self.latched != self.live {
+                            self.battery_gen += 1;
+                        }
                         self.latched = self.live;
                     }
                     self.latch_armed = false;
@@ -195,7 +228,9 @@ impl Cartridge for Mbc3 {
             return 0xFF;
         }
         match self.ram_select {
-            0x00..=0x03 => self.ram_offset(addr).map_or(0xFF, |o| self.ram[o]),
+            0x00..=0x07 if self.ram_select <= self.max_ram_select => {
+                self.ram_offset(addr).map_or(0xFF, |o| self.ram[o])
+            }
             0x08..=0x0C if self.header.has_rtc => self.latched.get(self.ram_select),
             _ => 0xFF,
         }
@@ -206,9 +241,12 @@ impl Cartridge for Mbc3 {
             return;
         }
         match self.ram_select {
-            0x00..=0x03 => {
+            0x00..=0x07 if self.ram_select <= self.max_ram_select => {
                 if let Some(o) = self.ram_offset(addr) {
-                    self.ram[o] = value;
+                    if self.ram[o] != value {
+                        self.ram[o] = value;
+                        self.battery_gen += 1;
+                    }
                 }
             }
             0x08..=0x0C if self.header.has_rtc => {
@@ -217,6 +255,7 @@ impl Cartridge for Mbc3 {
                     self.subsecond = 0;
                 }
                 self.live.set(self.ram_select, value);
+                self.battery_gen += 1;
             }
             _ => {}
         }
@@ -281,7 +320,12 @@ impl Cartridge for Mbc3 {
             self.latched = Rtc::from_regs(std::array::from_fn(|i| word(5 + i)));
             self.subsecond = 0;
         }
+        self.battery_gen += 1;
         Ok(())
+    }
+
+    fn battery_generation(&self) -> u64 {
+        self.battery_gen
     }
 }
 
@@ -325,6 +369,135 @@ mod tests {
         c.write_rom(0x2000, 0xC5);
         assert_eq!(c.read_rom(0x4000), 0x45);
         assert_eq!(c.read_rom(0x0000), 0, "0000-3FFF is fixed to bank 0");
+    }
+
+    #[test]
+    fn free_running_rtc_does_not_advance_battery_generation() {
+        let mut c = rtc_cart();
+        let g0 = c.battery_generation();
+        let img0 = c.battery_ram().unwrap();
+        tick_seconds(c.as_mut(), 12);
+        assert_eq!(c.battery_generation(), g0, "ticking is not a save event");
+        assert_ne!(c.battery_ram().unwrap(), img0, "but the image does drift");
+
+        // A latch that changes the latched registers is.
+        latch(c.as_mut());
+        let g1 = c.battery_generation();
+        assert!(g1 > g0);
+        latch(c.as_mut());
+        assert_eq!(c.battery_generation(), g1, "no-op latch: nothing changed");
+
+        // Cart RAM write: only a changed byte counts.
+        c.write_rom(0x4000, 1);
+        c.write_ram(0xA000, 0x5A);
+        let g2 = c.battery_generation();
+        assert!(g2 > g1);
+        c.write_ram(0xA000, 0x5A);
+        assert_eq!(c.battery_generation(), g2);
+
+        // RTC register write.
+        c.write_rom(0x4000, 0x0A);
+        c.write_ram(0xA000, 3);
+        let g3 = c.battery_generation();
+        assert!(g3 > g2);
+
+        // Load restores state, so the host's baseline must move too.
+        let save = c.battery_ram().unwrap();
+        c.load_battery_ram(&save).unwrap();
+        assert!(c.battery_generation() > g3);
+
+        // Disabled RAM ignores writes: no generation change.
+        c.write_rom(0x0000, 0x00);
+        let g4 = c.battery_generation();
+        c.write_ram(0xA000, 9);
+        assert_eq!(c.battery_generation(), g4);
+    }
+
+    #[test]
+    fn save_footer_timestamp_is_deliberately_zero_and_ignored_on_load() {
+        let mut c = rtc_cart();
+        tick_seconds(c.as_mut(), 3);
+        let mut save = c.battery_ram().unwrap();
+        let ts = save.len() - 8;
+        assert_eq!(save[ts..], [0u8; 8], "no host clock: timestamp is 0");
+        save[ts..].fill(0xAB); // a foreign emulator's timestamp
+        let mut d = from_rom(banked_rom(4, 0x10, 0x01, 0x03)).unwrap();
+        d.load_battery_ram(&save).unwrap();
+        assert_eq!(&d.battery_ram().unwrap()[ts..], &[0u8; 8]);
+    }
+
+    #[test]
+    fn mbc30_detection() {
+        let det = |banks, ct, rom_code, ram_code| {
+            is_mbc30(&CartridgeHeader::parse(&banked_rom(banks, ct, rom_code, ram_code)).unwrap())
+        };
+        assert!(!det(2, 0x13, 0x00, 0x03), "32 KiB RAM, 32 KiB ROM");
+        assert!(!det(128, 0x13, 0x06, 0x03), "exactly 2 MiB ROM is MBC3");
+        assert!(!det(2, 0x13, 0x00, 0x04), "128 KiB RAM is not MBC30");
+        assert!(det(256, 0x13, 0x07, 0x03), "4 MiB ROM");
+        assert!(det(2, 0x13, 0x00, 0x05), "64 KiB RAM");
+        assert!(det(2, 0x10, 0x00, 0x05), "64 KiB RAM with RTC");
+    }
+
+    #[test]
+    fn mbc30_reaches_rom_banks_128_and_up() {
+        let mut c = from_rom(banked_rom(256, 0x11, 0x07, 0)).unwrap();
+        for bank in [0x80u8, 0xC5, 0xFF, 0x7F, 0x01] {
+            c.write_rom(0x2000, bank);
+            assert_eq!(c.read_rom(0x4000), bank, "bank {bank:#x}");
+        }
+        c.write_rom(0x2000, 0);
+        assert_eq!(c.read_rom(0x4000), 1, "0 still maps to 1");
+        assert_eq!(c.read_rom(0x0000), 0);
+    }
+
+    #[test]
+    fn mbc30_reaches_ram_banks_4_to_7() {
+        // RAM code 5 = 64 KiB = 8 banks.
+        let mut c = from_rom(banked_rom(2, 0x13, 0, 0x05)).unwrap();
+        c.write_rom(0x0000, 0x0A);
+        for bank in 0..8u8 {
+            c.write_rom(0x4000, bank);
+            c.write_ram(0xA000, 0x10 + bank);
+            c.write_ram(0xBFFF, 0x20 + bank);
+        }
+        for bank in 0..8u8 {
+            c.write_rom(0x4000, bank);
+            assert_eq!(c.read_ram(0xA000), 0x10 + bank, "bank {bank}");
+            assert_eq!(c.read_ram(0xBFFF), 0x20 + bank, "bank {bank}");
+        }
+        c.write_rom(0x4000, 0x07);
+        assert_eq!(c.battery_ram().unwrap()[7 * 0x2000], 0x17);
+    }
+
+    #[test]
+    fn mbc30_rtc_registers_still_selectable() {
+        let mut c = from_rom(banked_rom(2, 0x10, 0, 0x05)).unwrap();
+        c.write_rom(0x0000, 0x0A);
+        c.write_rom(0x4000, 0x08);
+        c.write_ram(0xA000, 42);
+        latch(c.as_mut());
+        assert_eq!(c.read_ram(0xA000), 42);
+        c.write_rom(0x4000, 0x0D); // unmapped
+        assert_eq!(c.read_ram(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn plain_mbc3_keeps_four_ram_banks_and_seven_bit_rom_bank() {
+        // 32 KiB RAM: selectors 4-7 are unmapped and must not alias banks 0-3.
+        let mut c = from_rom(banked_rom(128, 0x13, 0x06, 0x03)).unwrap();
+        c.write_rom(0x0000, 0x0A);
+        c.write_rom(0x4000, 0);
+        c.write_ram(0xA000, 0x42);
+        for sel in 4..8u8 {
+            c.write_rom(0x4000, sel);
+            assert_eq!(c.read_ram(0xA000), 0xFF, "selector {sel}");
+            c.write_ram(0xA000, 0x99);
+        }
+        c.write_rom(0x4000, 0);
+        assert_eq!(c.read_ram(0xA000), 0x42);
+        c.write_rom(0x2000, 0x80);
+        assert_eq!(c.read_rom(0x4000), 1, "bit 7 ignored on MBC3");
     }
 
     #[test]
