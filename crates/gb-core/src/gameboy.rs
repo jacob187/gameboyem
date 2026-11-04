@@ -131,7 +131,17 @@ impl GameBoy {
         self.bus.mcycles()
     }
 
-    /// Side-effect-free memory read.
+    /// Read the memory map as the PPU and cartridge mapper currently present it,
+    /// without side effects (`&self`: no clocks advance, nothing is latched or
+    /// acknowledged). It is not a raw dump of the underlying memories:
+    ///
+    /// * With the LCD on, VRAM (0x8000-0x9FFF) reads 0xFF while the PPU is in
+    ///   mode 3 and OAM (0xFE00-0xFE9F) reads 0xFF in modes 2 and 3, as for the CPU.
+    /// * Cartridge RAM (0xA000-0xBFFF) goes through the mapper: 0xFF while the
+    ///   game has RAM disabled (MBC1/3/5), the selected bank, or the latched
+    ///   RTC register on MBC3 when one is mapped.
+    /// * OAM DMA bus conflicts (which the CPU would see) are not applied: a running
+    ///   DMA does not change what `peek` returns.
     pub fn peek(&self, addr: u16) -> u8 {
         self.bus.peek(addr)
     }
