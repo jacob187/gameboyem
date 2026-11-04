@@ -7,12 +7,11 @@ mod audio;
 mod cli;
 mod keymap;
 mod pacer;
+mod rom;
 mod save;
+mod shutdown;
 mod video;
 
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -23,18 +22,7 @@ use crate::app::App;
 use crate::audio::AudioOutput;
 use crate::cli::Command;
 use crate::save::SaveManager;
-
-/// Largest ROM the core accepts (8 MiB); reading stops one byte past it so a
-/// bogus huge file or device node cannot exhaust memory.
-const MAX_ROM_BYTES: u64 = 8 * 1024 * 1024;
-
-fn read_rom(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut data = Vec::new();
-    File::open(path)?
-        .take(MAX_ROM_BYTES + 1)
-        .read_to_end(&mut data)?;
-    Ok(data)
-}
+use crate::shutdown::ShutdownFlag;
 
 fn main() -> ExitCode {
     let opts = match cli::parse(std::env::args_os().skip(1)) {
@@ -49,17 +37,18 @@ fn main() -> ExitCode {
         }
     };
 
-    let rom = match read_rom(&opts.rom) {
+    let rom = match rom::read_rom(&opts.rom) {
         Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {e}", opts.rom.display());
+        Err(msg) => {
+            eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
+    let archive = rom::archive_kind(&rom);
     let mut gb = match GameBoy::new(rom) {
         Ok(gb) => gb,
         Err(e) => {
-            eprintln!("error: {}: not a usable ROM: {e}", opts.rom.display());
+            eprintln!("error: {}", rom::cartridge_message(&opts.rom, &e, archive));
             return ExitCode::FAILURE;
         }
     };
@@ -93,6 +82,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let shutdown = ShutdownFlag::default();
+    {
+        let flag = shutdown.clone();
+        let proxy = event_loop.create_proxy();
+        let installed = ctrlc::set_handler(move || {
+            flag.request();
+            // Wake a paused or idle loop; an error just means it is already gone.
+            let _ = proxy.send_event(());
+        });
+        if let Err(e) = installed {
+            eprintln!("warning: cannot install the Ctrl-C/SIGTERM handler: {e}");
+        }
+    }
     let mut app = App::new(
         gb,
         saves,
@@ -100,6 +102,7 @@ fn main() -> ExitCode {
         opts.palette.colors(),
         opts.scale,
         opts.test_pattern,
+        shutdown,
     );
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {

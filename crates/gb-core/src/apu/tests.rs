@@ -272,6 +272,8 @@ fn wave_plays_ram_high_nibble_first_and_wraps() {
     load_ramp(&mut rig);
     start_wave(&mut rig, 1, 2046); // 4 T-cycles (1 M-cycle) per sample
     assert_eq!(rig.status() & 4, 4);
+    // The first fetch comes 6 T-cycles after the period; skip to just before it.
+    rig.run(2);
     // Trigger does not refetch: the first fetch is nibble 1 (low half of byte
     // 0), nibble 0 is only reached after wrapping (Pan Docs: CH3 trigger).
     let mut out = Vec::new();
@@ -288,8 +290,9 @@ fn wave_high_frequency_fetches_twice_per_mcycle() {
     let mut rig = Rig::new();
     load_ramp(&mut rig);
     start_wave(&mut rig, 1, 2047); // 2 T-cycles per sample
+    // Fetches at T = 8, 10, ..., 16 (6 T trigger delay + 2 T period): nibble 5.
     rig.run(4);
-    assert_eq!(rig.apu.ch3.output(), 8);
+    assert_eq!(rig.apu.ch3.output(), 5);
 }
 
 #[test]
@@ -298,7 +301,7 @@ fn wave_output_levels_shift_sample() {
         let mut rig = Rig::new();
         rig.w(0xFF30, 0x0C);
         start_wave(&mut rig, level, 2046);
-        rig.run(1);
+        rig.run(3); // past the first fetch (10 T after the trigger)
         assert_eq!(rig.apu.ch3.output(), expect, "level code {level}");
     }
 }
@@ -667,4 +670,43 @@ fn output_is_deterministic() {
         drain(&mut rig.apu)
     };
     assert_eq!(run(), run());
+}
+
+/// Wave RAM with byte i = i * 0x11, channel playing.
+fn playing_ramp(freq: u16) -> Rig {
+    let mut rig = Rig::new();
+    for i in 0..16u8 {
+        rig.w(0xFF30 + u16::from(i), i * 0x11);
+    }
+    start_wave(&mut rig, 1, freq);
+    rig
+}
+
+#[test]
+fn wave_ram_access_window_is_the_fetching_half_mcycle() {
+    // Period 6 T: first fetch at T = 12 (end of the third M-cycle), then
+    // T = 18, 24, ... Only an access landing in the second half of a fetch
+    // M-cycle sees data, and it sees the byte being fetched.
+    let mut rig = playing_ramp(2045);
+    rig.run(2);
+    assert_eq!(rig.apu.read(0xFF30), 0xFF, "no fetch yet: blocked");
+    rig.run(1);
+    assert_eq!(rig.apu.read(0xFF3F), 0x00, "fetched nibble 1, byte 0");
+    rig.run(1);
+    assert_eq!(
+        rig.apu.read(0xFF30),
+        0xFF,
+        "fetch at T=18 is in a first half"
+    );
+}
+
+#[test]
+fn wave_retrigger_before_fetch_corrupts_wave_ram() {
+    let mut rig = playing_ramp(2045);
+    // Fetch at T = 12, 18, 24, ... : after 7 M-cycles (T = 28) the next fetch
+    // (T = 30) is within 2 T-cycles; it reads nibble 4, i.e. byte 2, which
+    // overwrites byte 0 (indices below 4 only touch byte 0).
+    rig.run(7);
+    rig.w(0xFF1E, 0x80);
+    assert_eq!(rig.apu.ch3.ram[..4], [0x22, 0x11, 0x22, 0x33]);
 }

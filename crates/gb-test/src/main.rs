@@ -67,8 +67,9 @@ fn main() -> ExitCode {
         if mismatch {
             mismatches += 1;
         }
-        let mut detail = outcome.detail().to_string();
-        detail.truncate(120);
+        // Truncate on a char boundary: details come from from_utf8_lossy, so
+        // a multi-byte U+FFFD can straddle the cut.
+        let detail: String = outcome.detail().chars().take(120).collect();
         println!(
             "{:<width$}  {:<7}  {:>5.1}s  {:<8}  {}",
             case.name(),

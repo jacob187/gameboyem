@@ -33,14 +33,15 @@ cargo build --release
 **Command-line options:**
 
 ```
-usage: gb [options] <rom.gb>
+usage: gb [options] [--] <rom.gb>
   --scale N        integer window scale, 1..=8 (default 4; HiDPI-aware)
   --mute           disable audio output
   --palette NAME   green (default) or grey
   --test-pattern   synthetic pattern + tone instead of running the core
+  --               end of options; the next argument is the ROM path
 ```
 
-Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomically every 5 s when RAM changes, on pause, and on quit.
+Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomically every 5 s when RAM changes, on pause, on quit, and on SIGINT/SIGTERM/SIGHUP (Ctrl-C). If writing fails, a warning is printed at once and then at most once a minute, and the failure is always reported on exit.
 
 ## Controls
 
@@ -77,8 +78,9 @@ These are the results on `integration` for macOS arm64 and Linux x86_64 (Docker)
 | Blargg `mem_timing` (3 + combined) | 4 / 4 |
 | dmg-acid2 | 1 / 1 |
 | Mooneye (DMG acceptance subset + MBC1/MBC5) | 87 / 87 |
-| Homebrew smoke + scripted playability | 4 / 4 |
-| **Total** | **109 / 109** |
+| Blargg `dmg_sound` (12 + combined) | 13 / 13 |
+| Homebrew smoke, scripted playability, battery save round-trip | 6 / 6 |
+| **Total** | **124 / 124** |
 
 Every case in the harness passes. Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
@@ -103,18 +105,15 @@ make -C homebrew          # -> roms/homebrew/snake.gb, roms/homebrew/breakout.gb
 - **Snake:** the D-pad steers and Start begins.
 - **Breakout:** left/right move the paddle, A or B launches the ball, and Start begins.
 
-Both have title, score and game-over screens.
+Both have title, score and game-over screens. Each keeps a high score in battery RAM (MBC1+RAM+BATTERY), so it persists in `<rom>.sav`.
 
 ## Known gaps
 
 - **PPU.** It renders a whole scanline at the start of mode 3, so mid-scanline register writes take effect on the next line. Mode-3 sprite penalties are fitted for SCX=0 with no window.
-- **APU.** All four channels, the frame sequencer, length, envelope, sweep and panning work. Still missing:
+- **APU.** It passes all of Blargg `dmg_sound`. Still missing:
   - DMG zombie mode
-  - the CH3 trigger delay and wave-RAM corruption
   - the envelope trigger quirk
   - the high-pass filter. The output is unipolar, so channel starts and stops can click.
-
-  Blargg `dmg_sound` isn't in the harness yet.
 - **STOP.** Like hardware, it wakes only on a selected joypad line. Unlike hardware, the LCD and timer keep running during STOP.
 - **Not supported:** Game Boy Color, link cable, debugger, rewind and shaders.
 - **No boot ROM.** The emulator starts in the documented post-boot state.

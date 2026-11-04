@@ -24,4 +24,22 @@ void print_uint(uint8_t x, uint8_t y, uint16_t v, uint8_t width);
  * then seed the RNG from DIV and the number of frames waited. */
 void wait_start_and_seed(uint8_t x, uint8_t y);
 
+/* ---- Persistent high score (battery-backed cartridge RAM) ----------------
+ *
+ * Record at the start of SRAM bank 0 (0xA000), 7 bytes:
+ *   +0..3  magic "GBHS"
+ *   +4     score, low byte        (little endian)
+ *   +5     score, high byte
+ *   +6     checksum = ((lo * 31 + hi) & 0xFF) ^ 0xA5
+ * Fresh, erased or corrupt RAM fails the magic/checksum test and reads as 0.
+ * The rest of the 8 KiB is unused. Needs cart type 0x03 (MBC1+RAM+BATTERY).
+ */
+
+/* Load the stored high score; 0 when there is no valid record. */
+uint16_t hiscore_load(void);
+
+/* If `score` beats `*record`, store it in cartridge RAM and in `*record`.
+ * Returns 1 if a new record was written, 0 (and touches no RAM) otherwise. */
+uint8_t hiscore_update(uint16_t *record, uint16_t score);
+
 #endif

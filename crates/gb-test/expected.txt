@@ -1,8 +1,8 @@
 # Test-ROM manifest and expected outcomes (the "ratchet").
 #
 # Format: <expect> <kind> <max_frames> <path relative to the roms dir>
-#   expect: pass | fail      kind: blargg | mooneye | acid2 | smoke | play-snake | play-breakout |
-#         play-tobu | play-adjustris | play-renegade
+#   expect: pass | fail      kind: blargg | blargg-mem | mooneye | acid2 | smoke | play-snake | play-breakout |
+#         save-snake | save-breakout | play-tobu | play-adjustris | play-renegade
 #
 # Each line is one `cargo test -p gb-test --test roms` case. A case FAILS when
 # the actual outcome differs from `expect` in either direction, so flipping a
@@ -27,6 +27,21 @@ pass blargg 1200 test/blargg/mem_timing/mem_timing.gb
 pass blargg 600 test/blargg/mem_timing/individual/01-read_timing.gb
 pass blargg 600 test/blargg/mem_timing/individual/02-write_timing.gb
 pass blargg 600 test/blargg/mem_timing/individual/03-modify_timing.gb
+
+# --- Blargg dmg_sound (result in cartridge RAM at A000) ---
+pass blargg-mem 3000 test/blargg/dmg_sound/dmg_sound.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/01-registers.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/02-len ctr.gb
+pass blargg-mem 1500 test/blargg/dmg_sound/rom_singles/03-trigger.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/04-sweep.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/05-sweep details.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/06-overflow on trigger.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/07-len sweep period sync.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/08-len ctr during power.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/09-wave read while on.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/10-wave trigger while on.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/11-regs after power.gb
+pass blargg-mem 600 test/blargg/dmg_sound/rom_singles/12-wave write while on.gb
 
 # --- Mooneye test suite, DMG-relevant subset (LD B,B + Fibonacci registers) ---
 pass mooneye 600 test/mooneye/acceptance/add_sp_e_timing.gb
@@ -127,6 +142,10 @@ pass smoke 600 homebrew/breakout.gb
 # --- Homebrew playability (boot, press Start, scripted input, framebuffer must change) ---
 pass play-snake 400 homebrew/snake.gb
 pass play-breakout 400 homebrew/breakout.gb
+
+# --- Homebrew saves (play to game over, carry battery RAM into a fresh machine, title HI differs) ---
+pass save-snake 700 homebrew/snake.gb
+pass save-breakout 1200 homebrew/breakout.gb
 
 # --- Homebrew corpus (open-source games, scripts/fetch-homebrew-corpus.sh) ---
 pass smoke 600 corpus/tobutobugirl.gb

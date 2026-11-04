@@ -17,6 +17,9 @@ pub const MANIFEST: &str = include_str!("../expected.txt");
 pub enum Kind {
     /// Blargg: result printed to the serial port.
     Blargg,
+    /// Blargg (newer ROMs): result in cartridge RAM -- signature `DE B0 61` at
+    /// A001-A003, status at A000 (0x80 = running, 0 = pass), text from A004.
+    BlarggMem,
     /// Mooneye: `LD B,B` with Fibonacci registers on pass.
     Mooneye,
     /// dmg-acid2: framebuffer compared to the reference image.
@@ -27,6 +30,11 @@ pub enum Kind {
     PlaySnake,
     /// Homebrew playability: boot breakout, press Start, launch, move the paddle.
     PlayBreakout,
+    /// Homebrew save: play snake to game over, carry its battery RAM into a fresh
+    /// machine, and the title screen must show the saved high score.
+    SaveSnake,
+    /// Same as `SaveSnake` for breakout.
+    SaveBreakout,
     /// Corpus: Tobu Tobu Girl (MBC1). Intro, title, menu, then steer the girl.
     PlayTobu,
     /// Corpus: Adjustris (MBC3). Start, then move and drop the falling piece.
@@ -56,6 +64,7 @@ impl Case {
             | Kind::PlayTobu
             | Kind::PlayAdjustris
             | Kind::PlayRenegade => format!("{p}-play"),
+            Kind::SaveSnake | Kind::SaveBreakout => format!("{p}-save"),
             _ => p.to_string(),
         }
     }
@@ -148,11 +157,14 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
             };
             let kind = match next("kind") {
                 "blargg" => Kind::Blargg,
+                "blargg-mem" => Kind::BlarggMem,
                 "mooneye" => Kind::Mooneye,
                 "acid2" => Kind::Acid2,
                 "smoke" => Kind::Smoke,
                 "play-snake" => Kind::PlaySnake,
                 "play-breakout" => Kind::PlayBreakout,
+                "save-snake" => Kind::SaveSnake,
+                "save-breakout" => Kind::SaveBreakout,
                 "play-tobu" => Kind::PlayTobu,
                 "play-adjustris" => Kind::PlayAdjustris,
                 "play-renegade" => Kind::PlayRenegade,
@@ -181,6 +193,8 @@ pub fn run_case(case: &Case) -> Outcome {
     match case.kind {
         Kind::PlaySnake => return run_play(&rom, PLAY_SNAKE, case.max_frames),
         Kind::PlayBreakout => return run_play(&rom, PLAY_BREAKOUT, case.max_frames),
+        Kind::SaveSnake => return run_save(&rom, drive_snake, case.max_frames),
+        Kind::SaveBreakout => return run_save(&rom, drive_breakout, case.max_frames),
         Kind::PlayTobu => return run_play(&rom, PLAY_TOBU, case.max_frames),
         Kind::PlayAdjustris => return run_play(&rom, PLAY_ADJUSTRIS, case.max_frames),
         Kind::PlayRenegade => return run_play(&rom, PLAY_RENEGADE, case.max_frames),
@@ -192,6 +206,7 @@ pub fn run_case(case: &Case) -> Outcome {
     };
     match case.kind {
         Kind::Blargg => run_blargg(&mut gb, case.max_frames),
+        Kind::BlarggMem => run_blargg_mem(&mut gb, case.max_frames),
         Kind::Mooneye => run_mooneye(&mut gb, case.max_frames),
         Kind::Acid2 => run_acid2(&mut gb, case),
         Kind::Smoke => run_smoke(&mut gb, case.max_frames),
@@ -199,7 +214,9 @@ pub fn run_case(case: &Case) -> Outcome {
         | Kind::PlayBreakout
         | Kind::PlayTobu
         | Kind::PlayAdjustris
-        | Kind::PlayRenegade => unreachable!("handled above"),
+        | Kind::PlayRenegade
+        | Kind::SaveSnake
+        | Kind::SaveBreakout => unreachable!("handled above"),
     }
 }
 
@@ -248,6 +265,48 @@ fn run_blargg(gb: &mut GameBoy, max_frames: u32) -> Outcome {
         }
     }
     Outcome::Timeout(format!("serial: {:?}", serial_tail(gb)))
+}
+
+/// Blargg's memory protocol: `DE B0 61` at A001-A003 marks the block valid,
+/// A000 holds 0x80 while running and then the result code (0 = pass), and a
+/// NUL-terminated report starts at A004.
+fn run_blargg_mem(gb: &mut GameBoy, max_frames: u32) -> Outcome {
+    const STATUS: u16 = 0xA000;
+    const TEXT: u16 = 0xA004;
+    let report = |gb: &GameBoy| {
+        let text: Vec<u8> = (0..0x1000u16)
+            .map(|i| gb.peek(TEXT + i))
+            .take_while(|&b| b != 0)
+            .collect();
+        let text = String::from_utf8_lossy(&text);
+        let mut lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        // The ROM ends with "Passed"/"Failed" lines; keep the tail short.
+        lines.drain(..lines.len().saturating_sub(6));
+        lines.join(" | ")
+    };
+    for _ in 0..max_frames {
+        gb.step_frame();
+        if gb.cpu_locked() {
+            return Outcome::Fail(format!("{}; report: {}", locked_message(gb), report(gb)));
+        }
+        let signed = [0xDE, 0xB0, 0x61]
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| gb.peek(STATUS + 1 + i as u16) == b);
+        if !signed {
+            continue;
+        }
+        match gb.peek(STATUS) {
+            0x80 => {}
+            0 => return Outcome::Pass,
+            code => return Outcome::Fail(format!("code {code:#04X}: {}", report(gb))),
+        }
+    }
+    Outcome::Timeout(format!("status {:#04X}: {}", gb.peek(STATUS), report(gb)))
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -630,7 +689,7 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
     for (i, step) in script.iter().enumerate() {
         match *step {
             Step::Shot { label, moving } => {
-                if moving && shots[shot_idx] == shots[shot_idx - 1] {
+                if moving && shot_idx > 0 && shots[shot_idx] == shots[shot_idx - 1] {
                     return Outcome::Fail(format!("{label}: framebuffer did not change"));
                 }
                 shot_idx += 1;
@@ -662,6 +721,204 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
         }
     }
     Outcome::Pass
+}
+
+/// A homebrew game is driven by a bot until its game-over screen is up.
+type Bot = fn(&mut Session) -> Result<(), Outcome>;
+
+/// A machine plus the frame budget shared by everything run on it.
+struct Session {
+    gb: GameBoy,
+    frame: u32,
+    max_frames: u32,
+}
+
+impl Session {
+    fn new(rom: &[u8], max_frames: u32) -> Result<Self, Outcome> {
+        let gb =
+            GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
+        Ok(Self {
+            gb,
+            frame: 0,
+            max_frames,
+        })
+    }
+
+    fn step(&mut self) -> Result<(), Outcome> {
+        if self.frame >= self.max_frames {
+            return Err(Outcome::Timeout(format!(
+                "save script needs more than {} frames",
+                self.max_frames
+            )));
+        }
+        self.gb.step_frame();
+        self.frame += 1;
+        if self.gb.cpu_locked() {
+            return Err(Outcome::Fail(locked_message(&self.gb)));
+        }
+        Ok(())
+    }
+
+    fn run(&mut self, n: u32) -> Result<(), Outcome> {
+        (0..n).try_for_each(|_| self.step())
+    }
+
+    fn hold(&mut self, button: Button, n: u32) -> Result<(), Outcome> {
+        self.gb.set_button(button, true);
+        let r = self.run(n);
+        self.gb.set_button(button, false);
+        r
+    }
+
+    /// Background tile id at tile position (x, y) of the 0x9800 map.
+    fn bg_tile(&self, x: u16, y: u16) -> u8 {
+        self.gb.peek(0x9800 + y * 32 + x)
+    }
+
+    /// First tile position holding `tile`.
+    fn find_tile(&self, tile: u8) -> Option<(u16, u16)> {
+        (0..18)
+            .flat_map(|y| (0..20).map(move |x| (x, y)))
+            .find(|&(x, y)| self.bg_tile(x, y) == tile)
+    }
+
+    /// True when `text` is printed at tile position (x, y); GBDK's font puts
+    /// ASCII `c` at tile `c - 32`.
+    fn has_text(&self, x: u16, y: u16, text: &str) -> bool {
+        text.bytes()
+            .zip(x..)
+            .all(|(c, x)| self.bg_tile(x, y) == c - 32)
+    }
+
+    /// Run until `text` is on screen at (x, y).
+    fn run_until_text(&mut self, x: u16, y: u16, text: &str) -> Result<(), Outcome> {
+        while !self.has_text(x, y, text) {
+            self.step()?;
+        }
+        Ok(())
+    }
+}
+
+/// Snake: Start, steer to the first food (read from the tile map), then hold a
+/// direction into a wall until GAME OVER. Tile ids are snake's `TILE_BASE + 2/3`.
+fn drive_snake(s: &mut Session) -> Result<(), Outcome> {
+    const HEAD: u8 = 130;
+    const FOOD: u8 = 131;
+    let pads = [Button::Up, Button::Right, Button::Down, Button::Left];
+    s.hold(Button::Start, 5)?;
+    s.run(55)?;
+    let food0 = s
+        .find_tile(FOOD)
+        .ok_or_else(|| Outcome::Fail("no food on the board".into()))?;
+    let mut dir = 1; // index into `pads`: the snake starts heading right
+    loop {
+        match (s.find_tile(HEAD), s.find_tile(FOOD)) {
+            (Some(_), Some(f)) if f == food0 => {}
+            _ => break, // the first food was eaten (a new one appeared elsewhere)
+        }
+        let head = s.find_tile(HEAD).unwrap_or(food0);
+        let want = match (head.0.cmp(&food0.0), head.1.cmp(&food0.1)) {
+            (std::cmp::Ordering::Less, _) => 1,
+            (std::cmp::Ordering::Greater, _) => 3,
+            (_, std::cmp::Ordering::Less) => 2,
+            _ => 0,
+        };
+        // A 180 degree turn is ignored by the game; sidestep instead.
+        let next = if want % 2 == dir % 2 && want != dir {
+            if head.1 > 0 { 0 } else { 2 }
+        } else {
+            want
+        };
+        if next != dir {
+            s.gb.set_button(pads[dir], false);
+            dir = next;
+        }
+        s.gb.set_button(pads[dir], true);
+        s.run(2)?;
+    }
+    // Keep going vertically until the snake hits something.
+    let wall = if dir % 2 == 1 { 0 } else { dir };
+    s.gb.set_button(pads[dir], false);
+    s.gb.set_button(pads[wall], true);
+    s.run_until_text(5, 4, "GAME OVER")?;
+    s.gb.set_button(pads[wall], false);
+    s.run(10)
+}
+
+/// Breakout: Start, then hold Left+A. The paddle sits in the corner and A
+/// (re)serves every ball, which hits a brick on the way up and is then lost;
+/// three lives later the GAME OVER screen is up.
+fn drive_breakout(s: &mut Session) -> Result<(), Outcome> {
+    s.hold(Button::Start, 5)?;
+    s.run(55)?;
+    s.gb.set_button(Button::Left, true);
+    s.gb.set_button(Button::A, true);
+    s.run_until_text(5, 4, "GAME OVER")?;
+    s.gb.set_button(Button::Left, false);
+    s.gb.set_button(Button::A, false);
+    s.run(10)
+}
+
+/// Battery-RAM round trip, validated against headless PyBoy.
+///
+/// 1. Boot a fresh machine; its title screen is the control (no saved score).
+/// 2. `bot` plays a game that scores and ends in GAME OVER.
+/// 3. The battery RAM must be non-empty and loadable into a second fresh
+///    machine, and read back unchanged.
+/// 4. That machine's title screen (after the same boot time) must differ from
+///    the control: the HI digits show the saved score.
+///
+/// No RAM addresses or save format are assumed; only that something persists.
+fn run_save(rom: &[u8], bot: Bot, max_frames: u32) -> Outcome {
+    match save_round_trip(rom, bot, max_frames) {
+        Ok(()) => Outcome::Pass,
+        Err(o) => o,
+    }
+}
+
+fn save_round_trip(rom: &[u8], bot: Bot, max_frames: u32) -> Result<(), Outcome> {
+    let fail = |m: &str| Outcome::Fail(m.to_string());
+    let mut first = Session::new(rom, max_frames)?;
+    first.run(PLAY_BOOT_FRAMES)?;
+    let control = first.gb.framebuffer().to_vec();
+    if control.iter().all(|&x| x == control[0]) {
+        return Err(fail("title screen is blank"));
+    }
+    if first
+        .gb
+        .battery_ram()
+        .is_none_or(|r| r.iter().any(|&b| b != 0))
+    {
+        return Err(fail("fresh cartridge RAM is missing or not zero"));
+    }
+
+    bot(&mut first)?;
+    let Some(saved) = first.gb.battery_ram() else {
+        return Err(fail(
+            "cartridge has no battery RAM (check header 0x147/0x149)",
+        ));
+    };
+    if saved.iter().all(|&b| b == 0) {
+        return Err(fail(
+            "game over reached but nothing was written to cartridge RAM",
+        ));
+    }
+
+    let mut second = Session::new(rom, max_frames)?;
+    second
+        .gb
+        .load_battery_ram(&saved)
+        .map_err(|e| Outcome::Fail(format!("loading the save failed: {e}")))?;
+    if second.gb.battery_ram().as_deref() != Some(&saved[..]) {
+        return Err(fail("battery RAM did not read back as loaded"));
+    }
+    second.run(PLAY_BOOT_FRAMES)?;
+    if second.gb.framebuffer() == &control[..] {
+        return Err(fail(
+            "title screen with a save equals the fresh one (no HI shown)",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
