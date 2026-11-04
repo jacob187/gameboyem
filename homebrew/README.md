@@ -50,7 +50,7 @@ tones are original and simple; CH3 (wave) is unused.
 | Effect | Game | Channel | Sound |
 |--------|------|---------|-------|
 | Start pressed (title, game over) | both | CH2 | ~885 Hz blip, 78 ms |
-| Eat | snake | CH1 | rising sweep ~440 Hz to ~1.8 kHz, about 50 ms |
+| Eat | snake | CH1 | rising sweep ~385 Hz, ~540 Hz, ~1 kHz, about 47 ms |
 | Game over | both | CH1 + CH4 | falling sweep with envelope decay (~0.7 s) over a short noise crunch |
 | Paddle hit | breakout | CH2 | ~440 Hz blip, 39 ms |
 | Brick break | breakout | CH1 | 31 ms blip, one pitch per row (top row C6, bottom row C5) |

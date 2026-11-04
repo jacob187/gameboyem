@@ -95,9 +95,9 @@ void sfx_start(void)
 
 void sfx_eat(void)
 {
-    /* Sweep up every 2 steps (15.6 ms), shift 4: ~440 Hz -> ~1.8 kHz, then the
-     * sweep overflows and stops the channel (about 50 ms). */
-    ch1(0x24u, DUTY50(0x26u), 0xC1u, 0x6D6u, LEN_EN);
+    /* Sweep up every 2 ticks (15.6 ms), shift 4: ~385 Hz, ~540 Hz, ~1 kHz, then
+     * the next step overflows and the hardware stops the channel (~47 ms). */
+    ch1(0x24u, DUTY50(0x26u), 0xC1u, 0x6A4u, LEN_EN);
 }
 
 void sfx_paddle(void)
