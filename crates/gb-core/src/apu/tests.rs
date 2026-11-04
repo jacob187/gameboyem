@@ -1286,3 +1286,90 @@ fn cached_mix_matches_a_per_mcycle_recompute_under_random_writes() {
     assert!(levels.len() > 40, "only {} distinct levels", levels.len());
     assert!(div_resets > 10);
 }
+
+/// Both PCM registers over `mcycles`, ORed together.
+fn pcm_seen(rig: &mut Rig, mcycles: u32) -> (u8, u8) {
+    let (mut a, mut b) = (0, 0);
+    for _ in 0..mcycles {
+        rig.run(1);
+        a |= rig.apu.read_pcm(0xFF76);
+        b |= rig.apu.read_pcm(0xFF77);
+    }
+    (a, b)
+}
+
+/// Starts all four channels at full volume with a fast, audible waveform.
+fn start_all(rig: &mut Rig) {
+    for i in 0..16u16 {
+        rig.w(0xFF30 + i, 0xFF);
+    }
+    rig.w(0xFF12, 0xF0);
+    rig.w(0xFF11, 0x80);
+    rig.w(0xFF14, 0x87);
+    start_ch2(rig);
+    rig.w(0xFF1A, 0x80);
+    rig.w(0xFF1C, 0x20);
+    rig.w(0xFF1E, 0x87);
+    rig.w(0xFF21, 0xF0);
+    rig.w(0xFF22, 0x00);
+    rig.w(0xFF23, 0x80);
+}
+
+#[test]
+fn pcm_registers_report_each_channels_output_in_its_nibble() {
+    let mut rig = Rig::new();
+    start_all(&mut rig);
+    let (pcm12, pcm34) = pcm_seen(&mut rig, 4000);
+    assert_ne!(pcm12 & 0x0F, 0, "CH1");
+    assert_ne!(pcm12 >> 4, 0, "CH2");
+    assert_ne!(pcm34 & 0x0F, 0, "CH3");
+    assert_ne!(pcm34 >> 4, 0, "CH4");
+    // Each nibble is exactly the channel's output.
+    let a = &rig.apu;
+    assert_eq!(a.read_pcm(0xFF76), a.ch1.output() | a.ch2.output() << 4);
+    assert_eq!(a.read_pcm(0xFF77), a.ch3.output() | a.ch4.output() << 4);
+}
+
+#[test]
+fn pcm_registers_read_zero_while_the_apu_is_powered_off() {
+    let mut rig = Rig::new();
+    start_all(&mut rig);
+    assert_ne!(pcm_seen(&mut rig, 4000), (0, 0));
+    rig.w(0xFF26, 0x00);
+    assert_eq!(pcm_seen(&mut rig, 4000), (0, 0));
+    // The power flag itself gates the read, not just the cleared channel state.
+    let mut rig = Rig::new();
+    start_all(&mut rig);
+    assert_ne!(pcm_seen(&mut rig, 4000), (0, 0));
+    rig.apu.powered = false;
+    assert_eq!(rig.apu.read_pcm(0xFF76), 0);
+    assert_eq!(rig.apu.read_pcm(0xFF77), 0);
+}
+
+#[test]
+fn pcm_nibble_is_zero_when_that_channels_dac_is_off() {
+    // (DAC-off write, PCM register, nibble shift) per channel.
+    let cases = [
+        (0xFF12, 0xFF76, 0),
+        (0xFF17, 0xFF76, 4),
+        (0xFF1A, 0xFF77, 0),
+        (0xFF21, 0xFF77, 4),
+    ];
+    for (reg, pcm, shift) in cases {
+        let mut rig = Rig::new();
+        start_all(&mut rig);
+        pcm_seen(&mut rig, 4000);
+        rig.w(reg, 0x00);
+        // Force the inconsistent "enabled with DAC off" state so the DAC
+        // condition itself is what keeps the nibble at 0.
+        rig.apu.ch1.enabled |= reg == 0xFF12;
+        rig.apu.ch2.enabled |= reg == 0xFF17;
+        rig.apu.ch3.enabled |= reg == 0xFF1A;
+        rig.apu.ch4.enabled |= reg == 0xFF21;
+        let (a, b) = pcm_seen(&mut rig, 4000);
+        let seen = if pcm == 0xFF76 { a } else { b };
+        assert_eq!((seen >> shift) & 0x0F, 0, "reg {reg:04X}");
+        // The other channel of the pair is unaffected.
+        assert_ne!((seen >> (4 - shift)) & 0x0F, 0, "reg {reg:04X} sibling");
+    }
+}

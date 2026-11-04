@@ -205,14 +205,27 @@ impl Apu {
     }
 
     /// CGB PCM12 (0xFF76) / PCM34 (0xFF77): the channels' current digital
-    /// outputs, CH1 / CH3 in the low nibble and CH2 / CH4 in the high one. A
-    /// channel that is off outputs 0.
+    /// outputs, CH1 / CH3 in the low nibble and CH2 / CH4 in the high one. Both
+    /// read 0 while the APU is powered off (NR52.7 = 0), and a channel whose DAC
+    /// is off (NRx2 bits 7-3 clear, or NR30.7 clear) outputs 0. A channel with
+    /// its DAC on but disabled (length expiry) also outputs 0, via `output`.
     pub(crate) fn read_pcm(&self, addr: u16) -> u8 {
-        if addr == 0xFF76 {
-            self.ch1.output() | self.ch2.output() << 4
-        } else {
-            self.ch3.output() | self.ch4.output() << 4
+        if !self.powered {
+            return 0;
         }
+        let nibble = |dac: bool, out: u8| if dac { out } else { 0 };
+        let (lo, hi) = if addr == 0xFF76 {
+            (
+                nibble(self.ch1.dac_on(), self.ch1.output()),
+                nibble(self.ch2.dac_on(), self.ch2.output()),
+            )
+        } else {
+            (
+                nibble(self.ch3.dac_on(), self.ch3.output()),
+                nibble(self.ch4.dac_on(), self.ch4.output()),
+            )
+        };
+        lo | hi << 4
     }
 
     pub fn read(&self, addr: u16) -> u8 {
