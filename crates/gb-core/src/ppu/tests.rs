@@ -1236,3 +1236,484 @@ fn lcd_on_oam_and_vram_read_timeline() {
         |p| p.read_vram(0x8000),
     );
 }
+
+// ------------------------------------------------------------ CGB colour
+
+/// Distinct, recognisable RGB555 colours for the test palettes.
+fn bg_col(pal: usize, id: usize) -> u16 {
+    0x0100 * (pal as u16 + 1) + id as u16
+}
+
+fn obj_col(pal: usize, id: usize) -> u16 {
+    0x4000 + bg_col(pal, id)
+}
+
+fn pixel16(fb: &[u16], x: usize, y: usize) -> u16 {
+    fb[y * SCREEN_WIDTH + x]
+}
+
+/// Offset in `vram` of the bank 1 attribute for the tile map entry at `map_off`.
+const ATTR: usize = VRAM_BANK_SIZE;
+
+impl Rig {
+    /// A colour-mode PPU at dot 0 of line 0, with the test palettes loaded.
+    fn cgb() -> Self {
+        let mut ppu = Ppu::new_cgb(true);
+        for pal in 0..8 {
+            for id in 0..4 {
+                let i = (pal * 4 + id) * 2;
+                ppu.bg_pal[i..i + 2].copy_from_slice(&bg_col(pal, id).to_le_bytes());
+                ppu.obj_pal[i..i + 2].copy_from_slice(&obj_col(pal, id).to_le_bytes());
+            }
+        }
+        let mut rig = Self {
+            ppu,
+            ints: Interrupts::default(),
+        };
+        rig.run_to(0, 0);
+        rig
+    }
+
+    fn frame16(&mut self) -> Vec<u16> {
+        let mut guard = 0u32;
+        while !self.ppu.take_frame_ready() {
+            self.tick();
+            guard += 1;
+            assert!(guard < 2 * M_CYCLES_PER_FRAME + 10, "no frame completed");
+        }
+        self.ppu.cgb_framebuffer().expect("colour mode").to_vec()
+    }
+
+    /// Fill the bank 1 attribute map at `map_off` with one attribute byte.
+    fn fill_attr(&mut self, map_off: usize, attr: u8) {
+        self.ppu.vram[ATTR + map_off..ATTR + map_off + 0x400].fill(attr);
+    }
+}
+
+#[test]
+fn palette_index_auto_increments_and_wraps() {
+    let mut ppu = Ppu::new_cgb(true);
+    assert_eq!((ppu.read_bcps(), ppu.read_ocps()), (0xC8, 0xD0));
+    ppu.write_bcps(0x80 | 0x3E);
+    for v in [0x11, 0x22, 0x33] {
+        ppu.write_pal_data(false, v);
+    }
+    assert_eq!(
+        (ppu.bg_pal[62], ppu.bg_pal[63], ppu.bg_pal[0]),
+        (0x11, 0x22, 0x33)
+    );
+    assert_eq!(ppu.read_bcps(), 0xC0 | 0x01, "wrapped to 1, bit 7 kept");
+    // Reading the data port does not advance the index.
+    ppu.write_bcps(0x80 | 0x05);
+    assert_eq!(ppu.read_pal_data(false), ppu.bg_pal[5]);
+    assert_eq!(ppu.read_bcps(), 0xC5);
+    // Without bit 7 the index stays put; OBJ has its own RAM and index.
+    ppu.write_ocps(0x07);
+    ppu.write_pal_data(true, 0xAB);
+    ppu.write_pal_data(true, 0xCD);
+    assert_eq!((ppu.obj_pal[7], ppu.read_ocps()), (0xCD, 0x47));
+    assert_eq!(ppu.bg_pal[7], 0xFF, "BG RAM untouched");
+    // The unused bit 6 is not stored.
+    ppu.write_bcps(0xFF);
+    assert_eq!(ppu.read_bcps(), 0xFF);
+    ppu.write_bcps(0x40);
+    assert_eq!(ppu.read_bcps(), 0x40);
+}
+
+#[test]
+fn post_boot_palettes_are_white() {
+    let ppu = Ppu::new_cgb(true);
+    assert!(ppu.bg_pal.iter().chain(&ppu.obj_pal).all(|&b| b == 0xFF));
+    assert_eq!(ppu.cgb_framebuffer().unwrap()[0], 0x7FFF);
+    assert_eq!(ppu.opri, 0);
+}
+
+#[test]
+fn palette_data_is_locked_in_mode_3_but_the_index_still_advances() {
+    let mut rig = Rig::cgb();
+    rig.ppu.write_bcps(0x80);
+    rig.ppu.bg_pal[0] = 0x5A;
+    rig.ppu.bg_pal[1] = 0x5B;
+    // Mode 3: writes are dropped (the index still increments), reads are 0xFF.
+    rig.run_to(3, 100);
+    assert_eq!(rig.ppu.mode(), 3);
+    rig.ppu.write_pal_data(false, 0x77);
+    assert_eq!(rig.ppu.bg_pal[0], 0x5A);
+    assert_eq!(rig.ppu.read_bcps(), 0xC1);
+    assert_eq!(rig.ppu.read_pal_data(false), 0xFF);
+    // Mode 0: accessible again, the write lands at the advanced index.
+    rig.run_to(3, 300);
+    assert_eq!(rig.ppu.mode(), 0);
+    rig.ppu.write_pal_data(false, 0x78);
+    assert_eq!((rig.ppu.bg_pal[1], rig.ppu.read_bcps()), (0x78, 0xC2));
+    rig.ppu.write_bcps(0x01);
+    assert_eq!(rig.ppu.read_pal_data(false), 0x78);
+    // The OBJ port locks the same way.
+    rig.run_to(4, 100);
+    rig.ppu.write_ocps(0x00);
+    rig.ppu.write_pal_data(true, 0x11);
+    assert_eq!(rig.ppu.obj_pal[0], obj_col(0, 0).to_le_bytes()[0]);
+    assert_eq!(rig.ppu.read_pal_data(true), 0xFF);
+    // With the LCD off nothing is locked.
+    rig.write(0xFF40, 0x11);
+    rig.ppu.write_pal_data(true, 0x11);
+    assert_eq!(rig.ppu.obj_pal[0], 0x11);
+}
+
+#[test]
+fn bg_attribute_selects_palette() {
+    let mut rig = Rig::cgb();
+    rig.set_tile(0x10, [[0, 1, 2, 3, 0, 1, 2, 3]; 8]);
+    rig.fill_map(0x1800, 1);
+    rig.fill_attr(0x1800, 5);
+    let fb = rig.frame16();
+    let want: Vec<u16> = [0, 1, 2, 3].iter().map(|&id| bg_col(5, id)).collect();
+    assert_eq!(&fb[..4], &want[..]);
+}
+
+#[test]
+fn bg_attribute_flips() {
+    let mut rig = Rig::cgb();
+    // Row r is all colour (r % 3) + 1 except the first pixel, so X and Y flips are visible.
+    let mut tile = [[0u8; 8]; 8];
+    for (r, row) in tile.iter_mut().enumerate() {
+        *row = [3, 1, 1, 1, 1, 1, 1, (r % 3) as u8 + 1];
+    }
+    rig.set_tile(0x10, tile);
+    rig.fill_map(0x1800, 1);
+    let rows = |rig: &mut Rig, attr: u8| {
+        rig.fill_attr(0x1800, attr);
+        let mut r = Rig::cgb();
+        r.ppu.vram.copy_from_slice(&rig.ppu.vram[..]);
+        r.frame16()
+    };
+    let plain = rows(&mut rig, 0);
+    assert_eq!(pixel16(&plain, 0, 0), bg_col(0, 3));
+    assert_eq!(pixel16(&plain, 7, 0), bg_col(0, 1));
+    assert_eq!(pixel16(&plain, 7, 1), bg_col(0, 2));
+    let x = rows(&mut rig, 0x20);
+    assert_eq!(pixel16(&x, 7, 0), bg_col(0, 3));
+    assert_eq!(pixel16(&x, 0, 0), bg_col(0, 1));
+    let y = rows(&mut rig, 0x40);
+    // Line 0 shows tile row 7, line 1 row 6: (7 % 3) + 1 = 2, (6 % 3) + 1 = 1.
+    assert_eq!(pixel16(&y, 7, 0), bg_col(0, 2));
+    assert_eq!(pixel16(&y, 7, 1), bg_col(0, 1));
+    assert_eq!(pixel16(&y, 0, 0), bg_col(0, 3));
+    let xy = rows(&mut rig, 0x60);
+    assert_eq!(pixel16(&xy, 0, 0), bg_col(0, 2));
+    assert_eq!(pixel16(&xy, 7, 0), bg_col(0, 3));
+}
+
+#[test]
+fn bg_attribute_selects_the_tile_bank() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 1);
+    rig.solid_tile(ATTR + 0x10, 2);
+    rig.fill_map(0x1800, 1);
+    // Per-tile: tile column 0 uses bank 1, the rest bank 0.
+    rig.fill_attr(0x1800, 0x00);
+    rig.ppu.vram[ATTR + 0x1800] = 0x08;
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 0, 0), bg_col(0, 2));
+    assert_eq!(pixel16(&fb, 7, 0), bg_col(0, 2));
+    assert_eq!(pixel16(&fb, 8, 0), bg_col(0, 1));
+}
+
+#[test]
+fn signed_tile_addressing_honours_the_bank() {
+    let mut rig = Rig::cgb();
+    rig.write(0xFF40, 0x81); // LCDC.4 clear: signed indices from 0x9000
+    rig.solid_tile(0x1000, 1);
+    rig.solid_tile(ATTR + 0x1000, 3);
+    rig.fill_map(0x1800, 0);
+    rig.fill_attr(0x1800, 0x08);
+    assert_eq!(pixel16(&rig.frame16(), 0, 0), bg_col(0, 3));
+}
+
+#[test]
+fn window_uses_its_own_attributes() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 1);
+    rig.fill_map(0x1800, 1); // BG map
+    rig.fill_map(0x1C00, 1); // window map
+    rig.fill_attr(0x1800, 2);
+    rig.fill_attr(0x1C00, 6);
+    rig.write(0xFF40, 0x91 | 0x20 | 0x40); // window on, map 0x9C00
+    rig.write(0xFF4B, 7 + 80);
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 79, 10), bg_col(2, 1));
+    assert_eq!(pixel16(&fb, 80, 10), bg_col(6, 1));
+}
+
+#[test]
+fn sprite_palette_and_tile_bank_come_from_the_attributes() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x20, 1);
+    rig.solid_tile(ATTR + 0x20, 3);
+    rig.write(0xFF40, 0x93);
+    rig.set_sprite(0, 16, 8, 2, 0x03); // palette 3, bank 0
+    rig.set_sprite(1, 16, 24, 2, 0x08 | 0x06); // palette 6, bank 1
+    // Bit 4 is the DMG palette select; CGB ignores it.
+    rig.set_sprite(2, 16, 40, 2, 0x10);
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 0, 0), obj_col(3, 1));
+    assert_eq!(pixel16(&fb, 16, 0), obj_col(6, 3));
+    assert_eq!(pixel16(&fb, 32, 0), obj_col(0, 1));
+}
+
+#[test]
+fn sprite_flips_work_on_a_bank_1_tall_sprite() {
+    let mut rig = Rig::cgb();
+    // 8x16 sprite on tiles 2 / 3 of bank 1: top half id 1, bottom half id 3.
+    rig.solid_tile(ATTR + 0x20, 1);
+    rig.solid_tile(ATTR + 0x30, 3);
+    rig.write(0xFF40, 0x97);
+    rig.set_sprite(0, 16, 8, 3, 0x08); // tile bit 0 ignored
+    rig.set_sprite(1, 48, 8, 2, 0x08 | 0x40); // Y flip: halves swap
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 0, 0), obj_col(0, 1));
+    assert_eq!(pixel16(&fb, 0, 8), obj_col(0, 3));
+    assert_eq!(pixel16(&fb, 0, 32), obj_col(0, 3));
+    assert_eq!(pixel16(&fb, 0, 40), obj_col(0, 1));
+}
+
+/// Pixel (0, 0) with a BG colour id, BG attribute bit 7, OAM attribute bit 7
+/// and LCDC.0 as given: BG tile colour `bg_id` in palette 0, sprite colour 3.
+fn priority_pixel(lcdc0: bool, bg_id: u8, bg_attr7: bool, oam7: bool) -> u16 {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, bg_id);
+    rig.solid_tile(0x20, 3);
+    rig.fill_map(0x1800, 1);
+    rig.fill_attr(0x1800, if bg_attr7 { 0x80 } else { 0 });
+    rig.write(0xFF40, 0x92 | u8::from(lcdc0));
+    rig.set_sprite(0, 16, 8, 2, if oam7 { 0x80 } else { 0 });
+    pixel16(&rig.frame16(), 0, 0)
+}
+
+#[test]
+fn cgb_priority_matrix() {
+    for lcdc0 in [false, true] {
+        for bg_id in 0..4u8 {
+            for bg_attr7 in [false, true] {
+                for oam7 in [false, true] {
+                    let bg_wins = lcdc0 && bg_id != 0 && (bg_attr7 || oam7);
+                    let want = if bg_wins {
+                        bg_col(0, usize::from(bg_id))
+                    } else {
+                        obj_col(0, 3)
+                    };
+                    assert_eq!(
+                        priority_pixel(lcdc0, bg_id, bg_attr7, oam7),
+                        want,
+                        "lcdc0 {lcdc0} bg_id {bg_id} bg_attr7 {bg_attr7} oam7 {oam7}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sprite_hidden_by_the_bg_still_blocks_the_sprite_below_it() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 1);
+    rig.solid_tile(0x20, 3);
+    rig.fill_map(0x1800, 1);
+    rig.write(0xFF40, 0x93);
+    rig.set_sprite(0, 16, 8, 2, 0x80);
+    rig.set_sprite(1, 16, 8, 2, 0x01);
+    assert_eq!(pixel16(&rig.frame16(), 0, 0), bg_col(0, 1));
+}
+
+#[test]
+fn lcdc_bit0_clear_keeps_bg_and_window_drawn_on_cgb() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 2);
+    rig.fill_map(0x1800, 1);
+    rig.fill_map(0x1C00, 1);
+    rig.fill_attr(0x1C00, 4);
+    // BG off (LCDC.0 = 0), window on at map 0x9C00 from x = 80.
+    rig.write(0xFF40, 0x80 | 0x20 | 0x40 | 0x10);
+    rig.write(0xFF4B, 7 + 80);
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 10, 10), bg_col(0, 2));
+    assert_eq!(pixel16(&fb, 90, 10), bg_col(4, 2));
+    // The DMG, in contrast, blanks the BG and the window.
+    let mut dmg = Rig::at_line0();
+    dmg.solid_tile(0x10, 3);
+    dmg.fill_map(0x1800, 1);
+    dmg.write(0xFF40, 0x80 | 0x20 | 0x10);
+    assert_eq!(pixel(&dmg.frame(), 90, 10), 0);
+}
+
+/// Two overlapping sprites, OAM 0 to the right of OAM 1: which one owns the
+/// shared pixel (x = 12) under each OPRI value.
+fn overlap_winner(opri: u8) -> u16 {
+    let mut rig = Rig::cgb();
+    rig.write_opri(opri);
+    rig.solid_tile(0x20, 1);
+    rig.write(0xFF40, 0x93);
+    rig.set_sprite(0, 16, 16, 2, 0x01); // x 8..16, palette 1
+    rig.set_sprite(1, 16, 12, 2, 0x02); // x 4..12, palette 2
+    rig.set_sprite(2, 16, 14, 2, 0x03); // x 6..14, palette 3
+    pixel16(&rig.frame16(), 10, 0)
+}
+
+impl Rig {
+    fn write_opri(&mut self, v: u8) {
+        self.ppu.write_opri(v);
+    }
+}
+
+#[test]
+fn opri_selects_oam_order_or_x_order() {
+    // Pixel 10 is covered by all three sprites (x 8..16, 4..12, 6..14).
+    assert_eq!(
+        overlap_winner(0),
+        obj_col(1, 1),
+        "CGB style: lowest OAM index"
+    );
+    assert_eq!(overlap_winner(1), obj_col(2, 1), "DMG style: lowest X");
+    let mut ppu = Ppu::new_cgb(true);
+    assert_eq!(ppu.read_opri(), 0xFE);
+    ppu.write_opri(0xFF);
+    assert_eq!(ppu.read_opri(), 0xFF);
+}
+
+#[test]
+fn opri_does_not_change_mode_3_length() {
+    let len = |opri| {
+        let mut rig = Rig::cgb();
+        rig.write_opri(opri);
+        rig.write(0xFF40, 0x93);
+        for (i, x) in [60u8, 12, 20, 21, 90].iter().enumerate() {
+            rig.set_sprite(i, 16, *x, 0, 0);
+        }
+        rig.run_to(5, 0);
+        rig.ticks(21);
+        rig.ppu.mode3_len
+    };
+    assert_eq!(len(0), len(1));
+}
+
+#[test]
+fn colour_mode_keeps_the_dmg_framebuffer_zero() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 3);
+    rig.fill_map(0x1800, 1);
+    let fb16 = rig.frame16();
+    assert!(fb16.iter().all(|&c| c == bg_col(0, 3)));
+    assert!(rig.ppu.framebuffer().iter().all(|&s| s == 0));
+}
+
+#[test]
+fn cgb_frame_swaps_at_vblank_and_lcd_off_is_white() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 1);
+    rig.fill_map(0x1800, 1);
+    rig.run_to(100, 0);
+    assert!(
+        rig.ppu
+            .cgb_framebuffer()
+            .unwrap()
+            .iter()
+            .all(|&c| c == 0x7FFF)
+    );
+    let fb = rig.frame16();
+    assert!(fb.iter().all(|&c| c == bg_col(0, 1)));
+    rig.write(0xFF40, 0x11);
+    assert!(
+        rig.ppu
+            .cgb_framebuffer()
+            .unwrap()
+            .iter()
+            .all(|&c| c == 0x7FFF)
+    );
+}
+
+#[test]
+fn palette_words_drop_bit_15() {
+    let mut rig = Rig::cgb();
+    rig.ppu.bg_pal[..2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    assert_eq!(pixel16(&rig.frame16(), 0, 0), 0x7FFF);
+}
+
+#[test]
+fn compat_mode_renders_dmg_output_and_ignores_attributes() {
+    let make = |ppu: Ppu, attrs: bool| {
+        let mut rig = Rig {
+            ppu,
+            ints: Interrupts::default(),
+        };
+        rig.ppu.bgp = 0xE4;
+        rig.ppu.obp0 = 0xE4;
+        rig.ppu.obp1 = 0x1B;
+        rig.set_tile(0x10, [[0, 1, 2, 3, 0, 1, 2, 3]; 8]);
+        rig.solid_tile(0x20, 3);
+        rig.fill_map(0x1800, 1);
+        rig.set_sprite(0, 16, 40, 2, 0x90);
+        rig.write(0xFF40, 0x93);
+        if attrs {
+            // Flips, bank and palette in bank 1 must not matter.
+            rig.fill_attr(0x1800, 0x7F);
+        }
+        rig.run_to(0, 0);
+        rig
+    };
+    let mut compat = make(Ppu::new_cgb(false), true);
+    let mut dmg = make(Ppu::new(), false);
+    assert!(compat.ppu.cgb_framebuffer().is_none());
+    let (fb, want) = (compat.frame(), dmg.frame());
+    assert_eq!(fb, want);
+    assert_eq!(&fb[..8], &[0, 1, 2, 3, 0, 1, 2, 3]);
+    assert_eq!(pixel(&fb, 40, 0), 0, "OBP1 inverts colour 3 to shade 0");
+}
+
+#[test]
+fn cgb_has_no_stat_write_quirk() {
+    for cgb in [false, true] {
+        let mut rig = Rig::at_line0();
+        rig.ppu.cgb = cgb;
+        rig.run_to(5, 252); // mode 0, no select bit set
+        rig.clear_if();
+        rig.write(0xFF41, 0x00);
+        let raised = rig.ints.flags & STAT_BIT != 0;
+        assert_eq!(raised, !cgb, "cgb {cgb}");
+    }
+}
+
+#[test]
+fn colour_ppu_state_round_trips_and_is_range_checked() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 2);
+    rig.fill_map(0x1800, 1);
+    rig.fill_attr(0x1800, 0x23);
+    rig.write_opri(1);
+    rig.ppu.write_bcps(0x80 | 0x11);
+    rig.run_to(70, 100); // mid-frame: the back buffer is half drawn
+    let mut w = StateWriter::new();
+    rig.ppu.save_state(&mut w);
+    let bytes = w.into_bytes();
+
+    let mut loaded = Ppu::new_cgb(true);
+    loaded.load_state(&mut StateReader::new(&bytes)).unwrap();
+    let mut w = StateWriter::new();
+    loaded.save_state(&mut w);
+    assert_eq!(w.into_bytes(), bytes);
+    assert_eq!((loaded.opri, loaded.read_bcps()), (1, 0xD1));
+    let mut other = Rig {
+        ppu: loaded,
+        ints: rig.ints.clone(),
+    };
+    assert_eq!(rig.frame16(), other.frame16());
+
+    // A pixel with bit 15 set is rejected.
+    let mut bad = bytes.clone();
+    let n = bad.len();
+    bad[n - 1] = 0xFF;
+    assert!(
+        Ppu::new_cgb(true)
+            .load_state(&mut StateReader::new(&bad))
+            .is_err()
+    );
+}

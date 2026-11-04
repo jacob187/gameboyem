@@ -87,15 +87,20 @@ impl GameBoy {
         self.cpu.step(&mut self.bus);
     }
 
-    /// Last completed frame: 160x144 shades 0..=3 (0 = lightest).
+    /// Last completed frame: 160x144 shades 0..=3 (0 = lightest). On a CGB
+    /// running in colour mode ([`GameBoy::cgb_framebuffer`] is `Some`) the frame is
+    /// not shades: this buffer is then all zero, never written (DECISIONS #36).
     pub fn framebuffer(&self) -> &Framebuffer {
         self.bus.ppu.framebuffer()
     }
 
-    /// Last completed frame in RGB555, `Some` iff the machine renders in CGB
-    /// colour mode. Stub until the CGB PPU lands: always `None`.
+    /// Last completed frame in RGB555 (`0bbbbbgggggrrrrr`, bit 15 clear), `Some`
+    /// iff the machine renders in CGB colour mode: a [`Model::Cgb`] running a
+    /// CGB-flagged cartridge. A DMG, and a CGB in DMG-compatibility mode, return
+    /// `None` and draw shades into [`GameBoy::framebuffer`]. The LCD-off frame is
+    /// white (0x7FFF).
     pub fn cgb_framebuffer(&self) -> Option<&CgbFramebuffer> {
-        None
+        self.bus.ppu.cgb_framebuffer()
     }
 
     pub fn set_button(&mut self, button: Button, pressed: bool) {

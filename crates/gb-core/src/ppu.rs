@@ -34,16 +34,21 @@
 //! write starts one M-cycle in. The interrupt line and the renderer use the
 //! internal timeline.
 //!
+//! On a CGB in colour mode (`Hw::Cgb`) the line is drawn by `render_cgb` into RGB555
+//! frames instead ([`Ppu::cgb_framebuffer`]); the shade buffer stays zero. In
+//! DMG-compatibility mode the DMG renderer runs unchanged (DECISIONS #36).
+//!
 //! Rendering goes to a back buffer that is swapped to the front on entering
 //! VBlank, so [`Ppu::framebuffer`] never shows a half-drawn frame.
 
 mod render;
+mod render_cgb;
 #[cfg(test)]
 mod tests;
 
 use crate::interrupts::{Interrupt, Interrupts};
 use crate::state::{StateError, StateReader, StateWriter, check};
-use crate::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
+use crate::{CgbFramebuffer, Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 const DOTS_PER_LINE: u16 = 456;
 const LINES_PER_FRAME: u8 = 154;
@@ -64,6 +69,21 @@ const CGB_POST_BOOT_LINE_DOT: u16 = 100;
 
 /// Bytes per VRAM bank.
 const VRAM_BANK_SIZE: usize = 0x2000;
+
+/// Bytes of one CGB palette RAM (8 palettes x 4 colours x 2 bytes).
+const PALETTE_RAM_SIZE: usize = 64;
+/// BCPS / OCPS bit 7: auto-increment the index after a data write.
+const PAL_INDEX_AUTO_INC: u8 = 0x80;
+/// BCPS / OCPS index bits; bit 6 is unused (reads 1).
+const PAL_INDEX_MASK: u8 = 0x3F;
+/// Post-boot index registers as stored (bit 6 reads 1, so they read 0xC8 / 0xD0,
+/// mooneye `boot_hwio-C`): auto-increment on, index 8 (BG) and 16 (OBJ).
+const BCPS_POST_BOOT: u8 = 0x88;
+const OCPS_POST_BOOT: u8 = 0x90;
+/// RGB555 white, what the LCD shows when it is off.
+const CGB_WHITE: u16 = 0x7FFF;
+/// OPRI bit 0: 1 = DMG-style (lower X wins), 0 = CGB-style (lower OAM index wins).
+const OPRI_X_PRIORITY: u8 = 0x01;
 
 const LCDC_BG_ENABLE: u8 = 0x01;
 const LCDC_OBJ_ENABLE: u8 = 0x02;
@@ -132,11 +152,38 @@ pub struct Ppu {
     front: Box<Framebuffer>,
     frame_ready: bool,
     // ---- CGB additions (DECISIONS #31) ----
-    /// CGB hardware (bank 1 exists and is saved).
+    /// CGB hardware (bank 1 exists and is saved), in either CGB mode or
+    /// DMG-compatibility mode.
     cgb: bool,
+    /// CGB colour mode (`Hw::Cgb`): the colour renderer, palette RAM and OPRI
+    /// exist. False on a DMG and in DMG-compatibility mode, whose output is the
+    /// DMG one (DECISIONS #36).
+    colour: bool,
     /// VBK (FF4F) bit 0: the VRAM bank the CPU and OAM DMA see. Always 0 on a DMG
     /// and in DMG-compatibility mode.
     vbk: u8,
+    /// BCPS / OCPS (FF68 / FF6A) as stored: bit 7 auto-increment and the 6-bit
+    /// index; bit 6 is unused and reads 1. Mapped in compat mode too (they are
+    /// plain registers there, the data ports stay unmapped).
+    bcps: u8,
+    ocps: u8,
+    /// OPRI (FF6C) bit 0 (colour mode only).
+    opri: u8,
+    /// Background / object palette RAM, little-endian RGB555 (colour mode only).
+    bg_pal: [u8; PALETTE_RAM_SIZE],
+    obj_pal: [u8; PALETTE_RAM_SIZE],
+    /// RGB555 back / front frames (colour mode only; `None` otherwise). The DMG
+    /// `back` / `front` stay all zero in colour mode.
+    cgb_back: Option<Box<CgbFramebuffer>>,
+    cgb_front: Option<Box<CgbFramebuffer>>,
+}
+
+/// A frame filled with `colour`.
+fn cgb_frame(colour: u16) -> Box<CgbFramebuffer> {
+    vec![colour; SCREEN_WIDTH * SCREEN_HEIGHT]
+        .into_boxed_slice()
+        .try_into()
+        .expect("a frame is SCREEN_WIDTH * SCREEN_HEIGHT pixels")
 }
 
 impl Default for Ppu {
@@ -185,19 +232,39 @@ impl Ppu {
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             frame_ready: false,
             cgb: false,
+            colour: false,
             vbk: 0,
+            bcps: 0,
+            ocps: 0,
+            opri: 0,
+            bg_pal: [0; PALETTE_RAM_SIZE],
+            obj_pal: [0; PALETTE_RAM_SIZE],
+            cgb_back: None,
+            cgb_front: None,
         }
     }
 
     /// CGB post-boot state: the DMG one, but VBlank (line 144) instead of the
-    /// line-153 quirk window, and two VRAM banks.
-    pub(crate) fn new_cgb() -> Self {
+    /// line-153 quirk window, and two VRAM banks. `colour` selects CGB mode (the
+    /// colour PPU) over DMG-compatibility mode.
+    ///
+    /// Palette RAM is white (the boot ROM clears it; SameBoy randomises it before
+    /// the boot ROM runs, Pan Docs leaves the OBJ half undefined): both halves
+    /// are 0xFF so the state is deterministic. DECISIONS #36.
+    pub(crate) fn new_cgb(colour: bool) -> Self {
         Self {
             ly: CGB_POST_BOOT_LINE,
             line_dot: CGB_POST_BOOT_LINE_DOT,
             // LYC (0) != 144, and the STAT select bits are clear.
             lyc_flag: false,
             cgb: true,
+            colour,
+            bcps: BCPS_POST_BOOT,
+            ocps: OCPS_POST_BOOT,
+            bg_pal: [0xFF; PALETTE_RAM_SIZE],
+            obj_pal: [0xFF; PALETTE_RAM_SIZE],
+            cgb_back: colour.then(|| cgb_frame(CGB_WHITE)),
+            cgb_front: colour.then(|| cgb_frame(CGB_WHITE)),
             ..Self::new()
         }
     }
@@ -223,6 +290,62 @@ impl Ppu {
 
     pub(crate) fn write_vbk(&mut self, value: u8) {
         self.vbk = value & 1;
+    }
+
+    /// BCPS / OCPS as read: bit 6 is unused and reads 1.
+    pub(crate) fn read_bcps(&self) -> u8 {
+        0x40 | self.bcps
+    }
+
+    pub(crate) fn read_ocps(&self) -> u8 {
+        0x40 | self.ocps
+    }
+
+    pub(crate) fn write_bcps(&mut self, value: u8) {
+        self.bcps = value & (PAL_INDEX_AUTO_INC | PAL_INDEX_MASK);
+    }
+
+    pub(crate) fn write_ocps(&mut self, value: u8) {
+        self.ocps = value & (PAL_INDEX_AUTO_INC | PAL_INDEX_MASK);
+    }
+
+    /// BCPD (FF69) / OCPD (FF6B) read: 0xFF while palette RAM is locked. It is
+    /// locked exactly like VRAM (Pan Docs: "inaccessible during mode 3").
+    pub(crate) fn read_pal_data(&self, obj: bool) -> u8 {
+        if self.vram_read_blocked() {
+            return 0xFF;
+        }
+        if obj {
+            self.obj_pal[usize::from(self.ocps & PAL_INDEX_MASK)]
+        } else {
+            self.bg_pal[usize::from(self.bcps & PAL_INDEX_MASK)]
+        }
+    }
+
+    /// BCPD / OCPD write. While locked the byte is dropped but the index still
+    /// auto-increments (SameBoy `cgb_palettes_blocked`).
+    pub(crate) fn write_pal_data(&mut self, obj: bool, value: u8) {
+        let blocked = self.vram_write_blocked();
+        let (index, ram) = if obj {
+            (&mut self.ocps, &mut self.obj_pal)
+        } else {
+            (&mut self.bcps, &mut self.bg_pal)
+        };
+        if !blocked {
+            ram[usize::from(*index & PAL_INDEX_MASK)] = value;
+        }
+        if *index & PAL_INDEX_AUTO_INC != 0 {
+            *index = PAL_INDEX_AUTO_INC | (*index).wrapping_add(1) & PAL_INDEX_MASK;
+        }
+    }
+
+    /// OPRI (FF6C) as read.
+    pub(crate) fn read_opri(&self) -> u8 {
+        0xFE | self.opri
+    }
+
+    pub(crate) fn write_opri(&mut self, value: u8) {
+        self.opri = value & OPRI_X_PRIORITY;
     }
 
     fn lcd_on(&self) -> bool {
@@ -323,6 +446,7 @@ impl Ppu {
                     self.skip_frame = false;
                 } else {
                     std::mem::swap(&mut self.front, &mut self.back);
+                    std::mem::swap(&mut self.cgb_front, &mut self.cgb_back);
                 }
                 interrupts.request(Interrupt::VBlank);
                 self.frame_ready = true;
@@ -392,8 +516,15 @@ impl Ppu {
         std::mem::take(&mut self.frame_ready)
     }
 
+    /// The last completed frame as shades. In CGB colour mode this is all zero:
+    /// the frame is [`Ppu::cgb_framebuffer`] (DECISIONS #36).
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.front
+    }
+
+    /// The last completed frame in RGB555; `Some` only in CGB colour mode.
+    pub fn cgb_framebuffer(&self) -> Option<&CgbFramebuffer> {
+        self.cgb_front.as_deref()
     }
 
     /// The mode seen by CPU reads of STAT; 0 while the LCD is off.
@@ -501,8 +632,13 @@ impl Ppu {
             0xFF41 => {
                 // DMG quirk (Pan Docs "STAT"): the write behaves as if $FF
                 // were written for one M-cycle before the real value, so any
-                // source that is currently true raises the line.
-                if self.lcd_on() && !self.stat_line && self.stat_line_level_for(STAT_WRITABLE) {
+                // source that is currently true raises the line. A CGB (in
+                // either mode) does not have it (SameBoy, DECISIONS #36).
+                if !self.cgb
+                    && self.lcd_on()
+                    && !self.stat_line
+                    && self.stat_line_level_for(STAT_WRITABLE)
+                {
                     interrupts.request(Interrupt::Stat);
                     self.stat_line = true;
                 }
@@ -535,6 +671,12 @@ impl Ppu {
         self.win_line = 0;
         self.back.fill(0);
         self.front.fill(0);
+        for fb in [&mut self.cgb_back, &mut self.cgb_front]
+            .into_iter()
+            .flatten()
+        {
+            fb.fill(CGB_WHITE);
+        }
         self.update_stat_line(interrupts);
     }
 
@@ -604,6 +746,16 @@ impl Ppu {
         // CGB additions.
         if self.cgb {
             w.u8(self.vbk);
+            w.u8(self.bcps);
+            w.u8(self.ocps);
+        }
+        if let (true, Some(back), Some(front)) = (self.colour, &self.cgb_back, &self.cgb_front) {
+            w.u8(self.opri);
+            w.bytes(&self.bg_pal);
+            w.bytes(&self.obj_pal);
+            for &c in back.iter().chain(front.iter()) {
+                w.u16(c);
+            }
         }
     }
 
@@ -672,6 +824,25 @@ impl Ppu {
         if self.cgb {
             self.vbk = r.u8()?;
             check(self.vbk <= 1, "VBK")?;
+            self.bcps = r.u8()?;
+            self.ocps = r.u8()?;
+            check(
+                (self.bcps | self.ocps) & !(PAL_INDEX_AUTO_INC | PAL_INDEX_MASK) == 0,
+                "palette index",
+            )?;
+        }
+        if self.colour {
+            self.opri = r.u8()?;
+            check(self.opri <= OPRI_X_PRIORITY, "OPRI")?;
+            r.bytes_into(&mut self.bg_pal)?;
+            r.bytes_into(&mut self.obj_pal)?;
+            for fb in [&mut self.cgb_back, &mut self.cgb_front] {
+                let fb = fb.as_deref_mut().expect("colour mode has RGB555 frames");
+                for c in fb.iter_mut() {
+                    *c = r.u16()?;
+                    check(*c <= CGB_WHITE, "framebuffer colour")?;
+                }
+            }
         }
         Ok(())
     }

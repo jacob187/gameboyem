@@ -139,8 +139,7 @@ pass mooneye 600 test/mooneye/emulator-only/mbc5/rom_8Mb.gb
 pass acid2 120 test/dmg-acid2/dmg-acid2.gb
 
 # --- cgb-acid2 (RGB555 framebuffer -> RGB888 vs reference.png; DECISIONS #10, #35) ---
-# Fails until the CGB PPU lands: cgb_framebuffer() is None and the case says so.
-fail acid2-cgb 120 test/cgb-acid2/cgb-acid2.gbc
+pass acid2-cgb 120 test/cgb-acid2/cgb-acid2.gbc
 
 # --- Homebrew smoke tests (600 frames, framebuffer not blank) ---
 pass smoke 600 homebrew/snake.gb
@@ -175,10 +174,9 @@ pass sfx-breakout 1500 homebrew/breakout.gb
 # --- Mooneye, CGB subset, run as a CGB (kind `mooneye-cgb`; DECISIONS #32) ---
 # These ROMs have no CGB flag, so the CGB boot ROM runs them in DMG-compatibility mode (#33).
 pass mooneye-cgb 600 test/mooneye/misc/boot_regs-cgb.gb
-# Fails at FF68: BCPS must read 0xC8 after boot, palette registers come with colour rendering.
-# Every register before it matches (checked via mismatch_addr; a unit test pins the rest of the table).
-fail mooneye-cgb 600 test/mooneye/misc/boot_hwio-C.gb
+pass mooneye-cgb 600 test/mooneye/misc/boot_hwio-C.gb
 pass mooneye-cgb 600 test/mooneye/misc/bits/unused_hwio-C.gb
 pass mooneye-cgb 600 test/mooneye/misc/boot_div-cgbABCDE.gb
-# Cause not diagnosed (likely CGB PPU timing, which P0 does not touch: it keeps the DMG PPU timing).
+# Cause not diagnosed (likely CGB PPU timing: the colour PPU keeps the DMG line timing, and removing
+# the DMG STAT-write quirk for a CGB did not change the result).
 fail mooneye-cgb 600 test/mooneye/misc/ppu/vblank_stat_intr-C.gb
