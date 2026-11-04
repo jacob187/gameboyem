@@ -7,9 +7,20 @@
 //! * `6000-7FFF` mode: 0 = BANK2 only affects 4000-7FFF; 1 = BANK2 also
 //!   selects the 0000-3FFF ROM bank and the RAM bank.
 //!
-//! MBC1M multicarts (different BANK2 wiring) are not detected.
+//! MBC1M multicarts (1 MiB, BANK2 wired to ROM address bit 18 instead of 19, so
+//! only the low 4 bits of BANK1 are used) are detected heuristically: the ROM is
+//! exactly 1 MiB and the Nintendo logo from the header also appears at the start
+//! of bank 0x10, as the sub-game headers of a multicart do.
 
 use super::{Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE};
+
+/// Offset of the Nintendo logo in a header.
+const LOGO: std::ops::Range<usize> = 0x104..0x134;
+
+fn is_multicart(rom: &[u8]) -> bool {
+    const BANK_0X10: usize = 0x10 * ROM_BANK_SIZE;
+    rom.len() == 0x10_0000 && rom[BANK_0X10 + LOGO.start..BANK_0X10 + LOGO.end] == rom[LOGO]
+}
 
 pub struct Mbc1 {
     rom: Vec<u8>,
@@ -20,12 +31,15 @@ pub struct Mbc1 {
     bank1: u8,
     bank2: u8,
     mode: bool,
+    /// MBC1M wiring: BANK2 shifted by 4 and BANK1 limited to 4 bits.
+    multicart: bool,
 }
 
 impl Mbc1 {
     pub fn new(rom: Vec<u8>, header: CartridgeHeader) -> Self {
         let ram = vec![0; header.ram_size];
         let rom_bank_mask = rom.len() / ROM_BANK_SIZE - 1;
+        let multicart = is_multicart(&rom);
         Self {
             rom,
             ram,
@@ -35,12 +49,17 @@ impl Mbc1 {
             bank1: 1,
             bank2: 0,
             mode: false,
+            multicart,
         }
+    }
+
+    fn bank2_shift(&self) -> u32 {
+        if self.multicart { 4 } else { 5 }
     }
 
     fn low_bank(&self) -> usize {
         let bank = if self.mode {
-            (self.bank2 as usize) << 5
+            (self.bank2 as usize) << self.bank2_shift()
         } else {
             0
         };
@@ -48,7 +67,12 @@ impl Mbc1 {
     }
 
     fn high_bank(&self) -> usize {
-        (((self.bank2 as usize) << 5) | self.bank1 as usize) & self.rom_bank_mask
+        let bank1 = if self.multicart {
+            self.bank1 & 0x0F
+        } else {
+            self.bank1
+        };
+        (((self.bank2 as usize) << self.bank2_shift()) | bank1 as usize) & self.rom_bank_mask
     }
 
     fn ram_offset(&self, addr: u16) -> Option<usize> {
@@ -160,5 +184,32 @@ mod tests {
         let save = c.battery_ram().unwrap();
         assert_eq!(save.len(), 0x8000);
         assert_eq!(save[2 * 0x2000], 0x34);
+    }
+
+    #[test]
+    fn multicart_wiring() {
+        let mut rom = banked_rom(64, 0x01, 0x05, 0);
+        // Distinct logo so the all-same-bytes heuristic can't match by accident.
+        for (i, b) in rom[0x104..0x134].iter_mut().enumerate() {
+            *b = 0x80 + i as u8;
+        }
+        let logo: Vec<u8> = rom[0x104..0x134].to_vec();
+        let plain = rom.clone();
+        rom[0x10 * 0x4000 + 0x104..0x10 * 0x4000 + 0x134].copy_from_slice(&logo);
+        let mut c = from_rom(rom).unwrap();
+        c.write_rom(0x4000, 1);
+        c.write_rom(0x2000, 0x13); // bit 4 of BANK1 is not wired
+        assert_eq!(c.read_rom(0x4000), 0x10 | 3);
+        c.write_rom(0x6000, 1);
+        assert_eq!(
+            c.read_rom(0x0000),
+            0x10,
+            "mode 1: BANK2 << 4 selects bank 0"
+        );
+        // Without the logo at bank 0x10 it is a plain MBC1.
+        let mut c = from_rom(plain).unwrap();
+        c.write_rom(0x4000, 1);
+        c.write_rom(0x2000, 0x13);
+        assert_eq!(c.read_rom(0x4000), 0x20 | 0x13);
     }
 }
