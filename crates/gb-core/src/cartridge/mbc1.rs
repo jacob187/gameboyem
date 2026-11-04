@@ -12,7 +12,9 @@
 //! exactly 1 MiB and the Nintendo logo from the header also appears at the start
 //! of bank 0x10, as the sub-game headers of a multicart do.
 
-use super::{Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE};
+use super::{
+    Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
+};
 
 /// Offset of the Nintendo logo in a header.
 const LOGO: std::ops::Range<usize> = 0x104..0x134;
@@ -26,6 +28,8 @@ pub struct Mbc1 {
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
+    /// See [`Cartridge::battery_generation`].
+    battery_gen: u64,
     rom_bank_mask: usize,
     ram_enabled: bool,
     bank1: u8,
@@ -44,6 +48,7 @@ impl Mbc1 {
             rom,
             ram,
             header,
+            battery_gen: 0,
             rom_bank_mask,
             ram_enabled: false,
             bank1: 1,
@@ -84,7 +89,7 @@ impl Mbc1 {
         } else {
             0
         };
-        Some((bank * RAM_BANK_SIZE + (addr as usize - 0xA000)) % self.ram.len())
+        Some((bank * RAM_BANK_SIZE + ram_window_offset(addr)) % self.ram.len())
     }
 }
 
@@ -121,7 +126,10 @@ impl Cartridge for Mbc1 {
 
     fn write_ram(&mut self, addr: u16, value: u8) {
         if let Some(o) = self.ram_offset(addr) {
-            self.ram[o] = value;
+            if self.ram[o] != value {
+                self.ram[o] = value;
+                self.battery_gen += 1;
+            }
         }
     }
 
@@ -130,7 +138,13 @@ impl Cartridge for Mbc1 {
     }
 
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError> {
-        super::load_battery_ram(&self.header, &mut self.ram, data)
+        super::load_battery_ram(&self.header, &mut self.ram, data)?;
+        self.battery_gen += 1;
+        Ok(())
+    }
+
+    fn battery_generation(&self) -> u64 {
+        self.battery_gen
     }
 }
 

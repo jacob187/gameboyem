@@ -19,6 +19,13 @@ pub const ROM_BANK_SIZE: usize = 0x4000;
 /// Size of one switchable external RAM bank.
 pub const RAM_BANK_SIZE: usize = 0x2000;
 
+/// Offset of a CPU address (`0xA000..=0xBFFF`) within the 8 KiB RAM window.
+/// Masks rather than subtracts, so it can never underflow.
+#[inline]
+pub(crate) fn ram_window_offset(addr: u16) -> usize {
+    addr as usize & (RAM_BANK_SIZE - 1)
+}
+
 /// The memory-bank controller interface every cartridge implements.
 ///
 /// # Contract (frozen; propose changes to the orchestrator)
@@ -41,6 +48,23 @@ pub trait Cartridge: Send {
 
     /// Persistent RAM contents, or `None` if the cartridge has no battery.
     fn battery_ram(&self) -> Option<Vec<u8>>;
+
+    /// Monotonic counter, meaningful only when [`Cartridge::battery_ram`] is
+    /// `Some`. It advances when the program changes the persistent state: a
+    /// cart-RAM write that changes a byte, an RTC register write, an RTC latch
+    /// that changes the latched registers, or a successful
+    /// [`Cartridge::load_battery_ram`].
+    ///
+    /// It deliberately does **not** advance while the MBC3 RTC free-runs, so a
+    /// host can poll it to skip pointless periodic saves (the live clock makes
+    /// every `battery_ram()` image differ) and still write one final
+    /// `battery_ram()` image on quit, which captures the live clock.
+    ///
+    /// The default (constant 0) means "unknown"; every built-in mapper
+    /// overrides it.
+    fn battery_generation(&self) -> u64 {
+        0
+    }
 
     /// Restore persistent RAM from a `.sav` file.
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError>;
@@ -98,7 +122,11 @@ pub enum MbcKind {
 /// Parsed cartridge header (0x0100..=0x014F).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CartridgeHeader {
-    /// Title (0x0134..=0x0143), trailing NULs stripped, non-ASCII replaced.
+    /// Title: 0x0134 up to the first NUL, at most 15 bytes (0x0134..=0x0142), or
+    /// 11 bytes (0x0134..=0x013E) when the CGB flag is 0x80/0xC0, since the
+    /// 4 bytes before the flag are then the manufacturer code. Byte 0x0143 is
+    /// included only on old DMG carts where it is a printable title character.
+    /// Trailing spaces are stripped and non-ASCII bytes replaced by `?`.
     pub title: String,
     pub cart_type: u8,
     pub mbc: MbcKind,
@@ -112,7 +140,9 @@ pub struct CartridgeHeader {
     pub ram_size: usize,
     /// Header checksum (0x014D) matches the computed one.
     pub header_checksum_ok: bool,
-    /// CGB flag (0x0143). Kept for future CGB support; DMG ignores it.
+    /// Raw CGB flag byte (0x0143): 0x80 = CGB-enhanced, 0xC0 = CGB-only. On old
+    /// carts this byte may be a title character. Kept for future CGB support;
+    /// DMG ignores it.
     pub cgb_flag: u8,
 }
 
@@ -161,7 +191,15 @@ impl CartridgeHeader {
         let checksum = rom[0x134..=0x14C]
             .iter()
             .fold(0u8, |acc, &b| acc.wrapping_sub(b).wrapping_sub(1));
-        let title = rom[0x134..0x144]
+        let cgb_flag = rom[0x143];
+        let title_end = if matches!(cgb_flag, 0x80 | 0xC0) {
+            0x13F // 0x13F..=0x142 is the manufacturer code, 0x143 the flag
+        } else if cgb_flag.is_ascii_graphic() || cgb_flag == b' ' {
+            0x144 // pre-CGB cart with a full 16-character title
+        } else {
+            0x143
+        };
+        let title = rom[0x134..title_end]
             .iter()
             .take_while(|&&b| b != 0)
             .map(|&b| {
@@ -185,7 +223,7 @@ impl CartridgeHeader {
             rom_size,
             ram_size: if has_ram { ram_size } else { 0 },
             header_checksum_ok: checksum == rom[0x14D],
-            cgb_flag: rom[0x143],
+            cgb_flag,
         })
     }
 }
@@ -296,6 +334,84 @@ mod tests {
     }
 
     #[test]
+    fn title_excludes_cgb_flag_and_manufacturer_code() {
+        // Unterminated "POKEMON_GLD" + manufacturer code "AAUE" + CGB flag 0x80.
+        let mut rom = test_util::banked_rom(2, 0x00, 0, 0);
+        rom[0x134..0x144].copy_from_slice(b"POKEMON_GLDAAUE\x80");
+        let h = CartridgeHeader::parse(&rom).unwrap();
+        assert_eq!(h.title, "POKEMON_GLD");
+        assert_eq!(h.cgb_flag, 0x80);
+        rom[0x143] = 0xC0;
+        assert_eq!(CartridgeHeader::parse(&rom).unwrap().title, "POKEMON_GLD");
+        // Non-CGB flag byte that is not a title character: 15-byte title.
+        rom[0x143] = 0x00;
+        let h = CartridgeHeader::parse(&rom).unwrap();
+        assert_eq!(h.title, "POKEMON_GLDAAUE");
+        assert_eq!(h.cgb_flag, 0x00);
+        // Old DMG cart with a full 16-character title keeps its last character.
+        rom[0x134..0x144].copy_from_slice(b"ABCDEFGHIJKLMNOP");
+        let h = CartridgeHeader::parse(&rom).unwrap();
+        assert_eq!(h.title, "ABCDEFGHIJKLMNOP");
+        // NUL still terminates early.
+        rom[0x134..0x144].copy_from_slice(b"HI\0JUNKJUNKJUNK\x80");
+        assert_eq!(CartridgeHeader::parse(&rom).unwrap().title, "HI");
+    }
+
+    #[test]
+    fn ram_window_offset_never_underflows() {
+        assert_eq!(ram_window_offset(0xA000), 0);
+        assert_eq!(ram_window_offset(0xBFFF), 0x1FFF);
+        assert_eq!(ram_window_offset(0x0000), 0, "out-of-window addr is safe");
+    }
+
+    /// All mappers must decode A000-BFFF identically, including for RAM sizes
+    /// that are not a multiple of the window (2 KiB) and for stray addresses.
+    #[test]
+    fn all_mappers_decode_ram_addresses_alike() {
+        for cart_type in [0x08u8, 0x02, 0x12, 0x1A] {
+            let mut c = from_rom(test_util::banked_rom(2, cart_type, 0, 0x01)).unwrap();
+            c.write_rom(0x0000, 0x0A);
+            c.write_ram(0xA005, 0x77);
+            assert_eq!(c.read_ram(0xA005), 0x77, "type {cart_type:#04x}");
+            assert_eq!(
+                c.read_ram(0xA805),
+                0x77,
+                "2 KiB mirror, type {cart_type:#04x}"
+            );
+            // Addresses below the window (never sent by the bus) must not panic.
+            let _ = c.read_ram(0x0000);
+            c.write_ram(0x0000, 1);
+        }
+    }
+
+    /// Writing a changed RAM byte advances the generation; rewriting the same
+    /// value, writing while disabled, and reads do not; loading a save does.
+    #[test]
+    fn battery_generation_tracks_ram_changes() {
+        for cart_type in [0x09u8, 0x03, 0x13, 0x1B] {
+            let mut c = from_rom(test_util::banked_rom(2, cart_type, 0, 0x02)).unwrap();
+            let t = format!("type {cart_type:#04x}");
+            let g0 = c.battery_generation();
+            if cart_type != 0x09 {
+                // ROM-only RAM has no enable register.
+                c.write_ram(0xA000, 1);
+                assert_eq!(c.battery_generation(), g0, "disabled write, {t}");
+            }
+            c.write_rom(0x0000, 0x0A);
+            c.write_ram(0xA000, 1);
+            let g1 = c.battery_generation();
+            assert!(g1 > g0, "{t}");
+            c.write_ram(0xA000, 1);
+            c.read_ram(0xA000);
+            c.tick_mcycle();
+            assert_eq!(c.battery_generation(), g1, "{t}");
+            let save = c.battery_ram().unwrap();
+            c.load_battery_ram(&save).unwrap();
+            assert!(c.battery_generation() > g1, "{t}");
+        }
+    }
+
+    #[test]
     fn truncated_rom_is_padded() {
         let rom = normalize_rom(vec![0; 0x150], 0x8000);
         assert_eq!(rom.len(), 0x8000);
@@ -334,27 +450,55 @@ mod tests {
         }
     }
 
+    /// Random ROM content with a *valid* header (supported type, ROM size
+    /// <= 512 KiB, any RAM size), so every mapper is actually constructed and
+    /// exercised with random register writes, reads, ticks and saves.
     #[test]
     fn random_bytes_never_panic() {
-        // Deterministic xorshift noise as ROM content, header bytes included.
+        const TYPES: [u8; 17] = [
+            0x00, 0x08, 0x09, 0x01, 0x02, 0x03, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x19, 0x1A, 0x1B,
+            0x1C, 0x1D, 0x1E,
+        ];
         let mut x = 0x2545_F491u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let (mut built, mut per_kind) = (0usize, [0usize; 4]);
         for len in [0x150usize, 0x4000, 0x8000, 0x2_0000] {
             for _ in 0..200 {
-                let rom: Vec<u8> = (0..len)
-                    .map(|_| {
-                        x ^= x << 13;
-                        x ^= x >> 17;
-                        x ^= x << 5;
-                        x as u8
-                    })
-                    .collect();
-                if let Ok(mut c) = from_rom(rom) {
-                    c.write_rom(0x2000, 0xFF);
-                    c.write_rom(0x4000, 0xFF);
-                    c.read_rom(0x7FFF);
-                    c.read_ram(0xA000);
+                let mut rom: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                rom[0x147] = TYPES[next() as usize % TYPES.len()];
+                rom[0x148] = (next() % 6) as u8;
+                rom[0x149] = (next() % 6) as u8;
+                let mut c = from_rom(rom).expect("valid header must load");
+                built += 1;
+                per_kind[c.header().mbc as usize] += 1;
+                for _ in 0..64 {
+                    let r = next();
+                    match r % 5 {
+                        0 => c.write_rom((r >> 8) as u16 & 0x7FFF, (r >> 24) as u8),
+                        1 => c.write_ram(0xA000 | (r >> 8) as u16 & 0x1FFF, (r >> 24) as u8),
+                        2 => {
+                            c.read_rom((r >> 8) as u16 & 0x7FFF);
+                        }
+                        3 => {
+                            c.read_ram(0xA000 | (r >> 8) as u16 & 0x1FFF);
+                        }
+                        _ => c.tick_mcycle(),
+                    }
+                }
+                if let Some(save) = c.battery_ram() {
+                    c.load_battery_ram(&save).expect("own save must reload");
                 }
             }
         }
+        assert_eq!(built, 800, "every valid-header ROM must construct");
+        assert!(
+            per_kind.iter().all(|&n| n > 100),
+            "mapper mix: {per_kind:?}"
+        );
     }
 }
