@@ -2,6 +2,7 @@
 //! register state, no CPU or cartridge involved.
 
 use super::*;
+use crate::M_CYCLES_PER_FRAME;
 
 const STAT_BIT: u8 = Interrupt::Stat as u8;
 const VBLANK_BIT: u8 = Interrupt::VBlank as u8;
@@ -47,7 +48,10 @@ impl Rig {
         while !(self.ppu.ly == ly && self.ppu.line_dot == dot) {
             self.tick();
             guard += 1;
-            assert!(guard < 2 * 17_556 + 10, "never reached ly={ly} dot={dot}");
+            assert!(
+                guard < 2 * M_CYCLES_PER_FRAME + 10,
+                "never reached ly={ly} dot={dot}"
+            );
         }
     }
 
@@ -57,7 +61,7 @@ impl Rig {
         while !self.ppu.take_frame_ready() {
             self.tick();
             guard += 1;
-            assert!(guard < 2 * 17_556 + 10, "no frame completed");
+            assert!(guard < 2 * M_CYCLES_PER_FRAME + 10, "no frame completed");
         }
         self.ppu.framebuffer().to_vec()
     }
@@ -152,7 +156,7 @@ fn vblank_interrupt_and_frame_ready_every_70224_dots() {
     let mut vblanks = 0;
     let mut gaps = Vec::new();
     let mut since = 0u32;
-    for _ in 0..(3 * 17_556) {
+    for _ in 0..(3 * M_CYCLES_PER_FRAME) {
         rig.tick();
         since += 4;
         if rig.ints.flags & VBLANK_BIT != 0 {
@@ -238,6 +242,83 @@ fn mode3_is_extended_by_scx_window_and_sprites() {
     assert_eq!(rig.ppu.mode3_len, 172 + 8);
 }
 
+/// Mode 3 length for sprites at the given OAM X values on line 8 (Y = 24),
+/// with `scx` and OBJ enabled/disabled, straight from the OAM scan.
+fn mode3_len_with_sprites(xs: &[u8], scx: u8, obj: bool) -> u16 {
+    let mut rig = Rig::new();
+    for (i, &x) in xs.iter().enumerate() {
+        rig.set_sprite(i, 16 + 8, x, 0, 0);
+    }
+    rig.ppu.ly = 8;
+    rig.ppu.scx = scx;
+    rig.ppu.lcdc = if obj { 0x93 } else { 0x91 };
+    rig.ppu.scan_oam();
+    rig.ppu.compute_mode3_len()
+}
+
+#[test]
+fn sprite_penalty_table() {
+    // Per sprite: 6 dots, plus `5 - x % 8` (floored at 0) for the first sprite
+    // in each BG tile (x = OAM X + SCX); the sum is then reduced by 3. These
+    // are the values the mooneye-validated model (DECISIONS.md #20) produces.
+    const BASE: u16 = 172;
+    let table: [(&[u8], u8, u16); 13] = [
+        // One sprite per alignment: 11, 10, 9, 8, 7, 6 (clamp), 6, 6 minus 3.
+        (&[8], 0, BASE + 8),
+        (&[9], 0, BASE + 7),
+        (&[12], 0, BASE + 4),
+        (&[13], 0, BASE + 3),
+        (&[15], 0, BASE + 3),
+        (&[0], 0, BASE + 8),
+        // Same BG tile: the second sprite pays 6 only (11 + 6 - 3).
+        (&[8, 12], 0, BASE + 14),
+        // Different tiles: both pay the alignment term (11 + 11 - 3).
+        (&[8, 16], 0, BASE + 19),
+        // Same tile, later sprite less aligned than the first: still dedupes.
+        (&[9, 8], 0, BASE + 14),
+        // SCX moves a sprite across a tile boundary: 4 and 11 are two tiles
+        // (7 + 8 - 3) but 8 and 15 (SCX = 4) share one (11 + 6 - 3, +4 SCX).
+        (&[4, 11], 0, BASE + 12),
+        (&[4, 11], 4, BASE + 4 + 14),
+        // Ten sprites: one tile (6 * 10 + 5 - 3) and ten tiles (110 - 3).
+        (&[8; 10], 0, BASE + 62),
+        (&[8, 16, 24, 32, 40, 48, 56, 64, 72, 80], 0, BASE + 107),
+    ];
+    for (xs, scx, want) in table {
+        assert_eq!(
+            mode3_len_with_sprites(xs, scx, true),
+            want,
+            "OAM X {xs:?}, SCX {scx}"
+        );
+    }
+    // The 11th sprite on a line is not selected, so it costs nothing.
+    assert_eq!(mode3_len_with_sprites(&[8; 12], 0, true), BASE + 62);
+    // Sprites at X >= 168 cost nothing, wherever they sit in the list.
+    assert_eq!(mode3_len_with_sprites(&[168, 8, 255], 0, true), BASE + 8);
+    // OBJ disabled: no penalty at all.
+    assert_eq!(mode3_len_with_sprites(&[8, 16], 0, false), BASE);
+}
+
+#[test]
+fn first_line_after_lcd_on_has_no_oam_scan_or_sprite_penalty() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x93);
+    for i in 0..10 {
+        rig.set_sprite(i, 16, 8 + 8 * i as u8, 0, 0);
+    }
+    rig.write(0xFF40, 0x13);
+    rig.write(0xFF40, 0x93);
+    assert!(rig.ppu.first_line);
+    rig.ticks(25); // past dot 80 of line 0
+    assert_eq!(rig.ppu.ly, 0);
+    assert_eq!(rig.ppu.line_sprite_count, 0);
+    assert_eq!(rig.ppu.mode3_len, 172);
+    // Line 1 scans OAM normally: the same sprites (Y = 16 spans lines 0..8).
+    rig.run_to(1, 84);
+    assert_eq!(rig.ppu.line_sprite_count, 10);
+    assert_eq!(rig.ppu.mode3_len, 172 + 107);
+}
+
 // ------------------------------------------------------- LY/LYC and STAT
 
 #[test]
@@ -281,7 +362,7 @@ fn count_stat_interrupts_over_frame(select: u8) -> u32 {
     rig.write(0xFF41, select);
     rig.clear_if();
     let mut n = 0;
-    for _ in 0..17_556 {
+    for _ in 0..M_CYCLES_PER_FRAME {
         rig.tick();
         if rig.ints.flags & STAT_BIT != 0 {
             n += 1;
@@ -320,6 +401,65 @@ fn stat_write_with_asserted_source_raises_once() {
     assert_ne!(rig.ints.flags & STAT_BIT, 0);
     rig.clear_if();
     rig.write(0xFF41, 0x08 | 0x40); // already high: blocked
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
+
+#[test]
+fn dmg_stat_write_raises_spurious_interrupt_outside_mode_3() {
+    // Pan Docs "STAT": a write (even $00) behaves as if $FF were written for
+    // one M-cycle first, so any currently true source raises the line.
+    for (ly, dot, what) in [(5, 4, "mode 2"), (5, 252, "mode 0"), (150, 100, "mode 1")] {
+        let mut rig = Rig::at_line0();
+        rig.run_to(ly, dot);
+        rig.clear_if();
+        rig.write(0xFF41, 0x00);
+        assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT, "{what}");
+    }
+
+    // The line fell back with the real value, so selecting HBlank afterwards
+    // is a fresh edge.
+    let mut rig = Rig::at_line0();
+    rig.run_to(5, 252);
+    rig.write(0xFF41, 0x00);
+    rig.clear_if();
+    rig.write(0xFF41, 0x08);
+    assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT);
+
+    // LY == LYC counts too.
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF45, 5);
+    rig.run_to(5, 100); // mode 3, coincidence set
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
+    assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT, "LY == LYC");
+}
+
+#[test]
+fn dmg_stat_write_is_quiet_in_mode_3_with_no_coincidence() {
+    let mut rig = Rig::at_line0();
+    rig.run_to(5, 100);
+    assert_eq!(rig.ppu.mode(), 3);
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
+
+#[test]
+fn dmg_stat_write_does_not_re_raise_a_line_that_is_already_high() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF41, 0x08);
+    rig.run_to(5, 252); // HBlank source holds the line
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
+
+#[test]
+fn dmg_stat_write_with_lcd_off_raises_nothing() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x11);
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
     assert_eq!(rig.ints.flags & STAT_BIT, 0);
 }
 
@@ -377,7 +517,7 @@ fn lcd_off_still_produces_a_frame_every_70224_dots() {
     rig.clear_if();
     let mut mcycles = 0u32;
     let mut gaps = Vec::new();
-    for _ in 0..(3 * 17_556) {
+    for _ in 0..(3 * M_CYCLES_PER_FRAME) {
         rig.tick();
         mcycles += 1;
         if rig.ppu.take_frame_ready() {
@@ -517,6 +657,26 @@ fn lcdc_bit0_off_blanks_bg_but_keeps_sprites() {
     assert_eq!(pixel(&fb, 20, 20), 0);
     // BG colour is 0 so even a BG-priority sprite shows.
     assert_eq!(pixel(&fb, 0, 0), 3);
+}
+
+#[test]
+fn lcdc_bit0_off_maps_bg_colour_0_through_bgp() {
+    // With LCDC.0 clear the BG/window are colour 0, and BGP still applies:
+    // SameBoy fills the line with BGP[1:0]. Pan Docs' "blank (white)" is
+    // shorthand for colour 0 under the usual BGP. Identity BGP cannot tell
+    // this apart from forcing white, so use BGP = $FF (colour 0 -> shade 3).
+    let mut rig = Rig::at_line0();
+    rig.solid_tile(0x10, 2);
+    rig.fill_map(0x1800, 1);
+    rig.write(0xFF47, 0xFF);
+    rig.write(0xFF40, 0x90); // BG off
+    let fb = rig.frame();
+    assert_eq!(pixel(&fb, 20, 20), 3);
+
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF47, 0xFD); // colour 0 -> shade 1
+    rig.write(0xFF40, 0x90);
+    assert_eq!(pixel(&rig.frame(), 0, 0), 1);
 }
 
 // ----------------------------------------------------------------- window
@@ -897,6 +1057,50 @@ fn blocked_oam_does_not_stop_sprites_from_the_scan() {
 }
 
 // ------------------------------------------------ LCD on/off and VBlank STAT
+
+#[test]
+fn first_line_blank_mode_0_does_not_raise_the_hblank_source() {
+    // HBlank select set while the LCD is off survives into the next LCD-on.
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x11);
+    rig.write(0xFF41, 0x08);
+    rig.clear_if();
+    rig.write(0xFF40, 0x91);
+    assert_eq!(
+        rig.ppu.mode(),
+        0,
+        "line 0 reports mode 0 for its first 80 dots"
+    );
+    assert_eq!(rig.ints.flags & STAT_BIT, 0, "no request in the LCDC write");
+    // The real HBlank of line 0 is the only edge on that line.
+    let mut edges = 0;
+    while rig.ppu.ly == 0 {
+        rig.tick();
+        if rig.ints.flags & STAT_BIT != 0 {
+            edges += 1;
+            assert!(
+                rig.ppu.line_dot >= 80 + 172,
+                "edge at dot {}",
+                rig.ppu.line_dot
+            );
+            rig.clear_if();
+        }
+    }
+    assert_eq!(edges, 1);
+}
+
+#[test]
+fn stat_write_with_lcd_off_latches_the_line_without_an_interrupt() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x11);
+    rig.clear_if();
+    assert!(rig.ppu.lyc_flag, "LY == LYC == 0 is latched across LCD off");
+    rig.write(0xFF41, 0x40);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+    // The level is still latched: turning the LCD on is not a new edge.
+    rig.write(0xFF40, 0x91);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
 
 #[test]
 fn lyc_flag_is_retained_while_lcd_is_off() {

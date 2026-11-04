@@ -281,7 +281,13 @@ impl Ppu {
         if self.ly == self.wy {
             self.wy_triggered = true;
         }
-        self.scan_oam();
+        if self.first_line {
+            // No OAM scan on the first line after LCD on: no sprites are
+            // selected, so there are no sprite penalties either.
+            self.line_sprite_count = 0;
+        } else {
+            self.scan_oam();
+        }
         self.mode3_len = self.compute_mode3_len();
         self.render_line();
     }
@@ -294,9 +300,12 @@ impl Ppu {
     /// LCD being off (mooneye `stat_lyc_onoff`). The mode sources need the LCD
     /// on. Line 144 also pulses the mode 2 (OAM) source as VBlank begins
     /// (mooneye `vblank_stat_intr-GS`).
+    ///
+    /// The level is latched even with the LCD off (the LYC term survives it),
+    /// but a rising edge only requests the interrupt while the LCD is on.
     fn update_stat_line(&mut self, interrupts: &mut Interrupts) {
         let line = self.stat_line_level();
-        if line && !self.stat_line {
+        if line && !self.stat_line && self.lcd_on() {
             interrupts.request(Interrupt::Stat);
         }
         self.stat_line = line;
@@ -304,8 +313,16 @@ impl Ppu {
 
     /// The current level of the STAT interrupt line (see [`Self::update_stat_line`]).
     fn stat_line_level(&self) -> bool {
-        let sel = self.stat_select;
-        let mode_line = self.lcd_on() && {
+        self.stat_line_level_for(self.stat_select)
+    }
+
+    /// The STAT line level if the select bits were `sel`.
+    ///
+    /// The first 80 dots of the first line after LCD on report mode 0 to the
+    /// CPU but feed no mode source into the line (SameBoy runs them with
+    /// `mode_for_interrupt = -1`), so an HBlank select does not fire there.
+    fn stat_line_level_for(&self, sel: u8) -> bool {
+        let mode_line = self.lcd_on() && !(self.first_line && self.line_dot < OAM_SCAN_DOTS) && {
             let mode = self.mode();
             let vblank_oam = self.ly == VBLANK_LINE && self.line_dot < 4;
             (sel & STAT_HBLANK_IRQ != 0 && mode == 0)
@@ -425,6 +442,13 @@ impl Ppu {
                 }
             }
             0xFF41 => {
+                // DMG quirk (Pan Docs "STAT"): the write behaves as if $FF
+                // were written for one M-cycle before the real value, so any
+                // source that is currently true raises the line.
+                if self.lcd_on() && !self.stat_line && self.stat_line_level_for(STAT_WRITABLE) {
+                    interrupts.request(Interrupt::Stat);
+                    self.stat_line = true;
+                }
                 self.stat_select = value & STAT_WRITABLE;
                 self.update_stat_line(interrupts);
             }

@@ -30,6 +30,16 @@ struct SpriteRow {
     flags: u8,
 }
 
+/// Colour id (0..=3) of the pixel at `bit` of a tile row's bitplanes.
+fn color_id(lo: u8, hi: u8, bit: u8) -> u8 {
+    ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1)
+}
+
+/// Shade (0..=3) a palette register assigns to a colour id.
+fn shade(palette: u8, id: u8) -> u8 {
+    (palette >> (id * 2)) & 3
+}
+
 impl Ppu {
     fn sprite_height(&self) -> u8 {
         if self.lcdc & LCDC_OBJ_TALL != 0 {
@@ -125,13 +135,16 @@ impl Ppu {
     /// Draw the current line into the back buffer.
     pub(super) fn render_line(&mut self) {
         let ly = self.ly;
+        // With LCDC.0 clear the BG and window are colour 0, which BGP still
+        // maps (SameBoy fills the line with BGP[1:0]); Pan Docs' "blank
+        // (white)" is shorthand for that.
         let mut bg_ids = [0u8; SCREEN_WIDTH];
         if self.lcdc & LCDC_BG_ENABLE != 0 {
             self.render_bg(ly, &mut bg_ids);
         }
         let mut line = [0u8; SCREEN_WIDTH];
         for (out, &id) in line.iter_mut().zip(&bg_ids) {
-            *out = (self.bgp >> (id * 2)) & 3;
+            *out = shade(self.bgp, id);
         }
         if self.lcdc & LCDC_OBJ_ENABLE != 0 {
             self.render_sprites(ly, &bg_ids, &mut line);
@@ -159,16 +172,23 @@ impl Ppu {
         let win_y = self.win_line;
         let bg_y = ly.wrapping_add(self.scy);
 
+        // The tile map entry and bitplanes only change every 8 pixels or when
+        // the window takes over, so fetch them once per run.
+        let (mut lo, mut hi) = (0, 0);
+        let mut in_window = false;
         for (x, id) in ids.iter_mut().enumerate() {
-            let (map, px, py) = if window && x as i16 >= win_left {
+            let win_here = window && x as i16 >= win_left;
+            let (map, px, py) = if win_here {
                 (win_map, (x as i16 - win_left) as u8, win_y)
             } else {
                 (bg_map, (x as u8).wrapping_add(self.scx), bg_y)
             };
-            let tile = self.vram[map + usize::from(py / 8) * 32 + usize::from(px / 8)];
-            let (lo, hi) = self.bg_tile_row(unsigned, tile, py % 8);
-            let bit = 7 - (px % 8);
-            *id = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+            if x == 0 || px % 8 == 0 || win_here != in_window {
+                in_window = win_here;
+                let tile = self.vram[map + usize::from(py / 8) * 32 + usize::from(px / 8)];
+                (lo, hi) = self.bg_tile_row(unsigned, tile, py % 8);
+            }
+            *id = color_id(lo, hi, 7 - (px % 8));
         }
         if window {
             self.win_line = self.win_line.wrapping_add(1);
@@ -197,11 +217,12 @@ impl Ppu {
             if height == 16 {
                 tile &= 0xFE;
             }
-            let a = usize::from(tile) * 16 + (r as usize) * 2;
+            // Sprites always use the 0x8000 addressing mode.
+            let (lo, hi) = self.bg_tile_row(true, tile, r as u8);
             *row = SpriteRow {
                 x: i16::from(self.oam[o + 1]) - 8,
-                lo: self.vram[a],
-                hi: self.vram[a + 1],
+                lo,
+                hi,
                 flags,
             };
         }
@@ -218,7 +239,7 @@ impl Ppu {
                 } else {
                     7 - col
                 };
-                let id = ((row.lo >> bit) & 1) | (((row.hi >> bit) & 1) << 1);
+                let id = color_id(row.lo, row.hi, bit as u8);
                 if id == 0 {
                     continue;
                 }
@@ -229,7 +250,7 @@ impl Ppu {
                     } else {
                         self.obp0
                     };
-                    *out = (pal >> (id * 2)) & 3;
+                    *out = shade(pal, id);
                 }
                 break;
             }
