@@ -9,8 +9,13 @@
 //! the counter's phase at *reset*, not with the moment SC is written (mooneye
 //! `boot_sclk_align`). The bus does not hand the timer's counter to this unit,
 //! so it keeps its own copy, started at the post-boot value and advanced every
-//! M-cycle. It therefore ignores DIV resets (a DIV write or STOP); passing
-//! `timer.div_counter()` into [`Serial::tick_mcycle`] from `Bus` would fix that.
+//! M-cycle. It therefore ignores DIV resets (a DIV write or STOP).
+//!
+//! To make it exact, `Bus::tick_components` would pass the timer's counter
+//! (`timer.div_counter()`, ticked before serial) and the edge would be detected
+//! on `counter.wrapping_add(4)`: the mirror below runs 4 T-cycles ahead of the
+//! timer's counter, a calibration against `boot_sclk_align` with no hardware
+//! explanation yet. Passing the raw counter would be one M-cycle late.
 
 use crate::interrupts::{Interrupt, Interrupts};
 
@@ -20,8 +25,8 @@ const CLOCK_BIT: u16 = 1 << 8;
 const BITS_PER_BYTE: u8 = 8;
 /// Phase of this unit's counter copy at power-on. The timer's own post-boot
 /// counter is 0xABC8; this one runs a further M-cycle ahead, which is what
-/// mooneye `boot_sclk_align` measures (IRQ one M-cycle before the 8th edge of
-/// the timer's counter).
+/// mooneye `boot_sclk_align` needs (IRQ one M-cycle before the 8th edge of the
+/// timer's counter). A calibration, not a derived hardware value.
 const POST_BOOT_COUNTER: u16 = 0xABCC;
 /// Cap captured output so a ROM spamming the port can't grow memory unboundedly.
 const MAX_CAPTURE: usize = 64 * 1024;
