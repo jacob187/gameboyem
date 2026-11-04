@@ -96,6 +96,16 @@ impl GameBoy {
         self.bus.cart.battery_ram()
     }
 
+    /// Counter that advances only when the game changes battery-backed state
+    /// (a cart-RAM byte, an RTC register, a latch that changes the latched
+    /// registers) or a save is loaded; never on RTC ticks. Cheap to poll, so a
+    /// host can skip cloning `battery_ram()` and rewriting the `.sav` while it
+    /// is unchanged, and still write one final image on quit to capture the
+    /// free-running RTC. Only meaningful when `battery_ram()` is `Some`.
+    pub fn battery_generation(&self) -> u64 {
+        self.bus.cart.battery_generation()
+    }
+
     /// Restore battery-backed RAM from a `.sav` file.
     pub fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError> {
         self.bus.cart.load_battery_ram(data)
@@ -131,7 +141,17 @@ impl GameBoy {
         self.bus.mcycles()
     }
 
-    /// Side-effect-free memory read.
+    /// Read the memory map as the PPU and cartridge mapper currently present it,
+    /// without side effects (`&self`: no clocks advance, nothing is latched or
+    /// acknowledged). It is not a raw dump of the underlying memories:
+    ///
+    /// * With the LCD on, VRAM (0x8000-0x9FFF) reads 0xFF while the PPU is in
+    ///   mode 3 and OAM (0xFE00-0xFE9F) reads 0xFF in modes 2 and 3, as for the CPU.
+    /// * Cartridge RAM (0xA000-0xBFFF) goes through the mapper: 0xFF while the
+    ///   game has RAM disabled (MBC1/3/5), the selected bank, or the latched
+    ///   RTC register on MBC3 when one is mapped.
+    /// * OAM DMA bus conflicts (which the CPU would see) are not applied: a running
+    ///   DMA does not change what `peek` returns.
     pub fn peek(&self, addr: u16) -> u8 {
         self.bus.peek(addr)
     }

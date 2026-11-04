@@ -355,6 +355,7 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn zero_sized_surface_is_not_drawable() {
@@ -363,5 +364,56 @@ mod tests {
         assert_eq!(surface_extent(160, 0), None);
         assert_eq!(surface_extent(1, 1), Some((1, 1)));
         assert_eq!(surface_extent(640, 576), Some((640, 576)));
+    }
+
+    /// A headless `App` (no window, graphics or audio) on a battery cartridge,
+    /// saving next to `dir/g.gb`.
+    fn headless_app(dir: &std::path::Path) -> App {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x03; // MBC1+RAM+BATTERY
+        rom[0x149] = 0x02; // 8 KiB
+        let mut gb = GameBoy::new(rom).unwrap();
+        let mut saves = SaveManager::new(&dir.join("g.gb"), Instant::now());
+        saves.load(&mut gb); // no .sav yet: the blank RAM is the baseline
+        App::new(
+            gb,
+            saves,
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+    }
+
+    fn change_ram(app: &mut App, first_byte: u8) {
+        let mut ram = app.gb.battery_ram().unwrap();
+        ram[0] = first_byte;
+        app.gb.load_battery_ram(&ram).unwrap();
+    }
+
+    #[test]
+    fn pausing_flushes_battery_ram_but_resuming_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let sav = dir.path().join("g.sav");
+        let mut app = headless_app(dir.path());
+
+        change_ram(&mut app, 0xAB);
+        app.toggle_pause();
+        assert!(app.paused);
+        assert_eq!(fs::read(&sav).unwrap()[0], 0xAB, "written on pause");
+
+        change_ram(&mut app, 0xCD);
+        app.toggle_pause();
+        assert!(!app.paused);
+        assert_eq!(fs::read(&sav).unwrap()[0], 0xAB, "not written on resume");
+    }
+
+    #[test]
+    fn pausing_without_a_ram_change_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.toggle_pause();
+        assert!(!dir.path().join("g.sav").exists());
     }
 }
