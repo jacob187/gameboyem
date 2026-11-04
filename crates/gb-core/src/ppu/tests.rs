@@ -237,8 +237,11 @@ fn lyc_coincidence_flag_and_interrupt() {
     rig.run_to(4, 452);
     assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0);
     assert_eq!(rig.ints.flags & STAT_BIT, 0);
-    rig.tick(); // LY becomes 5
+    rig.tick(); // LY becomes 5; the STAT bit stays blanked for one M-cycle
     assert_eq!(rig.ppu.ly, 5);
+    assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0);
+    assert_ne!(rig.ints.flags & STAT_BIT, 0);
+    rig.tick();
     assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0x04);
     assert_ne!(rig.ints.flags & STAT_BIT, 0);
 
@@ -256,7 +259,7 @@ fn lyc_flag_is_set_without_interrupt_when_source_disabled() {
     let mut rig = Rig::at_line0();
     rig.write(0xFF45, 3);
     rig.clear_if();
-    rig.run_to(3, 0);
+    rig.run_to(3, 4);
     assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0x04);
     assert_eq!(rig.ints.flags & STAT_BIT, 0);
 }
@@ -323,6 +326,7 @@ fn lyc_irq_is_blocked_while_mode_source_holds_line() {
 fn stat_read_has_bit7_and_select_bits() {
     let mut rig = Rig::at_line0();
     rig.write(0xFF41, 0xFF);
+    rig.tick(); // the mode bits lag the internal mode by one M-cycle
     let stat = rig.ppu.read_reg(0xFF41);
     assert_eq!(stat & 0xF8, 0xF8);
     assert_eq!(stat & 0x03, 2);
@@ -382,7 +386,7 @@ fn lcd_on_restarts_line_0_and_first_frame_is_blank() {
     rig.write(0xFF40, 0x11);
     rig.ticks(1000);
     rig.write(0xFF40, 0x91);
-    assert_eq!((rig.ppu.ly, rig.ppu.line_dot), (0, 0));
+    assert_eq!((rig.ppu.ly, rig.ppu.line_dot), (0, 4));
     // First line has no OAM scan: mode 0 for its first 80 dots.
     assert_eq!(rig.ppu.mode(), 0);
     rig.ticks(20);
@@ -805,22 +809,25 @@ fn bg_priority_sprite_does_not_hide_a_lower_priority_sprite() {
 fn vram_blocked_in_mode_3_only() {
     let mut rig = Rig::at_line0();
     rig.ppu.vram[0x100] = 0x5A;
-    for (dot, blocked) in [
-        (0u16, false),
-        (76, false),
-        (80, true),
-        (248, true),
-        (252, false),
+    // (dot, read blocked, write blocked): reads lock a cycle before writes.
+    for (dot, read_blocked, write_blocked) in [
+        (0u16, false, false),
+        (76, false, false),
+        (80, true, false),
+        (84, true, true),
+        (248, true, true),
+        (252, true, true),
+        (256, false, false),
     ] {
         rig.run_to(3, dot);
         assert_eq!(
             rig.ppu.read_vram(0x8100),
-            if blocked { 0xFF } else { 0x5A },
+            if read_blocked { 0xFF } else { 0x5A },
             "dot {dot}"
         );
         rig.ppu.write_vram(0x8100, 0x11);
         let written = rig.ppu.vram[0x100] == 0x11;
-        assert_eq!(written, !blocked, "dot {dot}");
+        assert_eq!(written, !write_blocked, "dot {dot}");
         rig.ppu.vram[0x100] = 0x5A;
     }
 }
@@ -829,22 +836,27 @@ fn vram_blocked_in_mode_3_only() {
 fn oam_blocked_in_modes_2_and_3() {
     let mut rig = Rig::at_line0();
     rig.ppu.oam[0] = 0x77;
-    // mode 2, 3 blocked; mode 0 and mode 1 open.
+    // (line, dot, read blocked, write blocked). Reads lock from the first
+    // cycle of the line; writes follow the mode bits, with a gap at dot 80.
     let cases = [
-        (5u8, 0u16, true),
-        (5, 100, true),
-        (5, 300, false),
-        (150, 100, false),
+        (5u8, 0u16, true, false),
+        (5, 4, true, true),
+        (5, 76, true, true),
+        (5, 80, true, false),
+        (5, 84, true, true),
+        (5, 252, true, true),
+        (5, 256, false, false),
+        (150, 100, false, false),
     ];
-    for (ly, dot, blocked) in cases {
+    for (ly, dot, read_blocked, write_blocked) in cases {
         rig.run_to(ly, dot);
         assert_eq!(
             rig.ppu.read_oam(0xFE00),
-            if blocked { 0xFF } else { 0x77 },
+            if read_blocked { 0xFF } else { 0x77 },
             "{ly}/{dot}"
         );
         rig.ppu.write_oam(0xFE00, 0x11);
-        assert_eq!(rig.ppu.oam[0] == 0x11, !blocked, "{ly}/{dot}");
+        assert_eq!(rig.ppu.oam[0] == 0x11, !write_blocked, "{ly}/{dot}");
         rig.ppu.oam[0] = 0x77;
     }
 }
@@ -878,7 +890,7 @@ fn blocked_oam_does_not_stop_sprites_from_the_scan() {
 fn lyc_flag_is_retained_while_lcd_is_off() {
     let mut rig = Rig::at_line0();
     rig.write(0xFF45, 0x90);
-    rig.run_to(0x90, 0);
+    rig.run_to(0x90, 4);
     assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0x04);
     rig.write(0xFF40, 0x11);
     assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0x04);
@@ -924,4 +936,87 @@ fn oam_source_pulses_with_vblank_on_line_144() {
     rig.tick();
     assert_eq!(rig.ints.flags & VBLANK_BIT, VBLANK_BIT);
     assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT);
+}
+
+/// Reads taken after an LCD-on write, as in mooneye `lcdon_timing-GS`: each
+/// pass delays the first read by 0/1/2 extra M-cycles, `READ_CYCLES` are the
+/// M-cycle gaps of the eight reads, and the tables list the expected value of
+/// each read for the three passes.
+const READ_CYCLES: [u32; 8] = [0, 17, 60, 110, 130, 174, 224, 244];
+
+fn lcd_on_read(pass: u32, cycles: u32, read: impl Fn(&Ppu) -> u8, lyc: u8) -> u8 {
+    let mut rig = Rig::new();
+    rig.write(0xFF40, 0x01);
+    rig.write(0xFF45, lyc);
+    rig.write(0xFF40, 0x81);
+    // The write's own M-cycle is already spent; the read is 2 cycles later.
+    rig.ticks(2 + pass + cycles);
+    read(&rig.ppu)
+}
+
+fn check_lcd_on_table(table: [[u8; 8]; 3], lyc: u8, read: impl Fn(&Ppu) -> u8 + Copy) {
+    for (pass, row) in table.iter().enumerate() {
+        for (&cycles, &want) in READ_CYCLES.iter().zip(row) {
+            let got = lcd_on_read(pass as u32, cycles, read, lyc);
+            assert_eq!(got, want, "pass {pass} cycle {}", cycles + pass as u32);
+        }
+    }
+}
+
+#[test]
+fn lcd_on_ly_timeline() {
+    check_lcd_on_table(
+        [
+            [0, 0, 0, 0, 1, 1, 1, 2],
+            [0, 0, 0, 1, 1, 1, 2, 2],
+            [0, 0, 0, 1, 1, 1, 2, 2],
+        ],
+        0,
+        |p| p.read_reg(0xFF44),
+    );
+}
+
+#[test]
+fn lcd_on_stat_timeline() {
+    let stat = |p: &Ppu| p.read_reg(0xFF41);
+    check_lcd_on_table(
+        [
+            [0x84, 0x84, 0x87, 0x84, 0x82, 0x83, 0x80, 0x82],
+            [0x84, 0x87, 0x84, 0x80, 0x82, 0x80, 0x80, 0x82],
+            [0x84, 0x87, 0x84, 0x82, 0x83, 0x80, 0x82, 0x83],
+        ],
+        0,
+        stat,
+    );
+    check_lcd_on_table(
+        [
+            [0x80, 0x80, 0x83, 0x80, 0x86, 0x87, 0x84, 0x82],
+            [0x80, 0x83, 0x80, 0x80, 0x86, 0x84, 0x80, 0x82],
+            [0x80, 0x83, 0x80, 0x86, 0x87, 0x84, 0x82, 0x83],
+        ],
+        1,
+        stat,
+    );
+}
+
+#[test]
+fn lcd_on_oam_and_vram_read_timeline() {
+    check_lcd_on_table(
+        [
+            [0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0xFF],
+            [0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0xFF],
+            [0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0xFF, 0xFF],
+        ],
+        0,
+        |p| p.read_oam(0xFE00),
+    );
+    check_lcd_on_table(
+        [
+            [0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00],
+            [0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF],
+            [0x00, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0x00, 0xFF],
+        ],
+        0,
+        |p| p.read_vram(0x8000),
+    );
 }

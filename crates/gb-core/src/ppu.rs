@@ -26,6 +26,13 @@
 //! extended by `SCX % 8`, the window and sprites using an approximation of the
 //! penalties documented in Pan Docs ("Mode 3 length").
 //!
+//! The CPU-visible STAT mode bits and the VRAM/OAM access locks follow the
+//! internal mode with the offsets measured by mooneye `lcdon_timing-GS` and
+//! `lcdon_write_timing-GS`: the mode bits lag the internal mode by one M-cycle
+//! (`vis_mode`), OAM reads lock at the line start, and line 0 after an LCD-on
+//! write starts one M-cycle in. The interrupt line and the renderer use the
+//! internal timeline.
+//!
 //! Rendering goes to a back buffer that is swapped to the front on entering
 //! VBlank, so [`Ppu::framebuffer`] never shows a half-drawn frame.
 
@@ -42,6 +49,10 @@ const DOTS_PER_FRAME: u32 = crate::T_CYCLES_PER_FRAME;
 const VBLANK_LINE: u8 = SCREEN_HEIGHT as u8;
 const OAM_SCAN_DOTS: u16 = 80;
 const MODE3_BASE_DOTS: u16 = 172;
+/// Dot of line 0 the PPU starts at when the LCD is switched on. The write's
+/// own M-cycle has already been ticked, so the line begins one M-cycle in
+/// (mooneye `lcdon_timing-GS`: LY, STAT and VRAM/OAM access after LCD on).
+const LCD_ON_LINE_DOT: u16 = 4;
 
 const LCDC_BG_ENABLE: u8 = 0x01;
 const LCDC_OBJ_ENABLE: u8 = 0x02;
@@ -96,6 +107,11 @@ pub struct Ppu {
     /// LCD is on (the comparison clock stops with it), so it is retained
     /// across LCD off and LYC writes made while the LCD is off.
     lyc_flag: bool,
+    /// The mode the CPU sees in STAT bits 0-1: the internal [`Ppu::mode`] as it
+    /// was one M-cycle (4 dots) ago. The mode bits lag the timeline the
+    /// interrupt line and the renderer use (mooneye `lcdon_timing-GS`,
+    /// `intr_2_mode0_timing`, `intr_2_mode3_timing`).
+    vis_mode: u8,
     /// Previous level of the STAT interrupt line (for rising-edge detection).
     stat_line: bool,
     back: Box<Framebuffer>,
@@ -139,6 +155,7 @@ impl Ppu {
             line_sprites: [0; 10],
             line_sprite_count: 0,
             lyc_flag: true,
+            vis_mode: 1,
             stat_line: false,
             back: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
@@ -183,6 +200,16 @@ impl Ppu {
         }
     }
 
+    /// STAT bit 2 as the CPU reads it: the comparator output is blanked
+    /// during the first M-cycle of every line, so it reads 0 there even if the
+    /// new LY equals LYC (mooneye `lcdon_timing-GS`). Line 153 is exempt: its
+    /// LY=153 compare happens in that first M-cycle (LY then reads 0). The
+    /// interrupt source uses the unblanked flag.
+    fn coincidence(&self) -> bool {
+        let blanked = self.lcd_on() && self.line_dot < 4 && self.ly != LINES_PER_FRAME - 1;
+        self.lyc_flag && !blanked
+    }
+
     /// Advance the PPU by one M-cycle (4 dots).
     pub fn tick_mcycle(&mut self, interrupts: &mut Interrupts) {
         if !self.lcd_on() {
@@ -193,6 +220,7 @@ impl Ppu {
             }
             return;
         }
+        self.vis_mode = self.mode();
         for _ in 0..4 {
             self.step_dot(interrupts);
         }
@@ -265,9 +293,42 @@ impl Ppu {
         &self.front
     }
 
+    /// The mode seen by CPU reads of STAT; 0 while the LCD is off.
+    fn stat_mode(&self) -> u8 {
+        if self.lcd_on() { self.vis_mode } else { 0 }
+    }
+
+    /// VRAM is locked to CPU reads while the displayed mode is 3, and from the
+    /// internal mode 3 start too, except on the first line after LCD on where
+    /// the lock starts with the displayed mode (mooneye `lcdon_timing-GS`).
+    fn vram_read_blocked(&self) -> bool {
+        self.stat_mode() == 3 || (self.mode() == 3 && !self.first_line)
+    }
+
+    /// VRAM writes are locked exactly while the displayed mode is 3.
+    fn vram_write_blocked(&self) -> bool {
+        self.stat_mode() == 3
+    }
+
+    /// OAM reads are locked from the internal mode 2 start (a cycle before the
+    /// mode bits change) through displayed mode 3.
+    fn oam_read_blocked(&self) -> bool {
+        self.stat_mode() >= 2 || self.mode() == 2
+    }
+
+    /// OAM writes are locked during displayed mode 2 and 3, except for a
+    /// one-cycle gap where displayed mode 2 meets internal mode 3.
+    fn oam_write_blocked(&self) -> bool {
+        match self.stat_mode() {
+            3 => true,
+            2 => self.mode() == 2,
+            _ => false,
+        }
+    }
+
     /// CPU VRAM read: 0xFF while the PPU is drawing (mode 3).
     pub fn read_vram(&self, addr: u16) -> u8 {
-        if self.mode() == 3 {
+        if self.vram_read_blocked() {
             0xFF
         } else {
             self.vram[(addr & 0x1FFF) as usize]
@@ -276,14 +337,14 @@ impl Ppu {
 
     /// CPU VRAM write: ignored while the PPU is drawing (mode 3).
     pub fn write_vram(&mut self, addr: u16, value: u8) {
-        if self.mode() != 3 {
+        if !self.vram_write_blocked() {
             self.vram[(addr & 0x1FFF) as usize] = value;
         }
     }
 
     /// CPU OAM read: 0xFF during modes 2 and 3.
     pub fn read_oam(&self, addr: u16) -> u8 {
-        if self.mode() >= 2 {
+        if self.oam_read_blocked() {
             0xFF
         } else {
             self.oam[(addr - 0xFE00) as usize % 0xA0]
@@ -292,7 +353,7 @@ impl Ppu {
 
     /// CPU OAM write: ignored during modes 2 and 3.
     pub fn write_oam(&mut self, addr: u16, value: u8) {
-        if self.mode() < 2 {
+        if !self.oam_write_blocked() {
             self.oam[(addr - 0xFE00) as usize % 0xA0] = value;
         }
     }
@@ -306,8 +367,8 @@ impl Ppu {
         match addr {
             0xFF40 => self.lcdc,
             0xFF41 => {
-                let coincidence = if self.lyc_flag { 0x04 } else { 0 };
-                0x80 | self.stat_select | coincidence | self.mode()
+                let coincidence = if self.coincidence() { 0x04 } else { 0 };
+                0x80 | self.stat_select | coincidence | self.stat_mode()
             }
             0xFF42 => self.scy,
             0xFF43 => self.scx,
@@ -370,7 +431,8 @@ impl Ppu {
     /// the first frame is not displayed (it stays blank).
     fn lcd_turned_on(&mut self, interrupts: &mut Interrupts) {
         self.ly = 0;
-        self.line_dot = 0;
+        self.line_dot = LCD_ON_LINE_DOT;
+        self.vis_mode = 0;
         self.first_line = true;
         self.skip_frame = true;
         self.wy_triggered = false;
