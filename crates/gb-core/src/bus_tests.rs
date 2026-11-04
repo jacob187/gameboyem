@@ -179,19 +179,46 @@ fn div_write_glitch_increments_tima() {
     assert_eq!(b.peek(TIMA), 1, "write while bit 3 high is a falling edge");
 }
 
-/// DIV write overflowing TIMA goes through the normal reload pipeline.
+/// A DIV write overflowing TIMA reloads and raises the IRQ at the write itself.
 #[test]
 fn div_write_glitch_overflow_reloads_next_cycle() {
     let mut b = new_bus();
-    b.write(DIV, 0);
     b.write(TMA, 0x33);
-    b.write(TIMA, 0xFF);
     b.write(TAC, 0x05);
-    assert_eq!(b.timer.div_counter() & 0x08, 0x08);
-    b.write(DIV, 0);
-    // Overflow cycle is the write itself; this read is the reload cycle.
+    b.write(IF, 0);
+    while b.timer.div_counter() & 0xF != 4 {
+        b.tick();
+    }
+    b.write(TIMA, 0xFF); // counter 8: selected bit 3 high
+    assert_eq!(b.peek(TIMA), 0xFF);
+    b.write(DIV, 0); // counter 12 (still high) -> reset: falling edge
+    // The write is the overflow cycle; its end already reloads and requests
+    // the interrupt so the CPU can take it before the next instruction.
+    assert_eq!(b.peek(IF) & 0x04, 0x04);
+    assert_eq!(b.peek(TIMA), 0x33);
+    // The next cycle is the reload cycle: TIMA writes are ignored.
+    b.write(TIMA, 0x99);
     assert_eq!(b.read(TIMA), 0x33);
     assert_eq!(b.read(IF) & 0x04, 0x04);
+}
+
+/// mooneye `timer/rapid_toggle`: a TAC-disable glitch that overflows TIMA
+/// requests the interrupt in the write cycle itself.
+#[test]
+fn tac_disable_glitch_overflow_requests_irq_immediately() {
+    let mut b = new_bus();
+    b.write(TMA, 0x44);
+    b.write(TAC, 0x00);
+    b.write(IF, 0);
+    while b.timer.div_counter() & 0xF != 0 {
+        b.tick();
+    }
+    b.write(TIMA, 0xFF); // counter 4
+    b.write(TAC, 0x05); // counter 8: bit 3 high, enabling is not an edge
+    assert_eq!(b.peek(IF) & 0x04, 0);
+    b.write(TAC, 0x00); // counter 12: still high, disabling is a falling edge
+    assert_eq!(b.peek(IF) & 0x04, 0x04);
+    assert_eq!(b.peek(TIMA), 0x44);
 }
 
 /// TAC write: disabling the timer while the selected bit is high is a falling
