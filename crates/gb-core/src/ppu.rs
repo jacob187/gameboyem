@@ -172,6 +172,13 @@ pub struct Ppu {
     /// Background / object palette RAM, little-endian RGB555 (colour mode only).
     bg_pal: [u8; PALETTE_RAM_SIZE],
     obj_pal: [u8; PALETTE_RAM_SIZE],
+    /// `bg_pal` / `obj_pal` decoded to RGB555 words for the renderer, rebuilt
+    /// lazily when the matching `*_stale` flag is set (a BCPD / OCPD write or a
+    /// state load). Derived data: never saved.
+    bg_decoded: render_cgb::Palettes,
+    obj_decoded: render_cgb::Palettes,
+    bg_stale: bool,
+    obj_stale: bool,
     /// RGB555 back / front frames (colour mode only; `None` otherwise). The DMG
     /// `back` / `front` stay all zero in colour mode.
     cgb_back: Option<Box<CgbFramebuffer>>,
@@ -239,6 +246,10 @@ impl Ppu {
             opri: 0,
             bg_pal: [0; PALETTE_RAM_SIZE],
             obj_pal: [0; PALETTE_RAM_SIZE],
+            bg_decoded: [[0; 4]; 8],
+            obj_decoded: [[0; 4]; 8],
+            bg_stale: true,
+            obj_stale: true,
             cgb_back: None,
             cgb_front: None,
         }
@@ -326,13 +337,14 @@ impl Ppu {
     /// auto-increments (SameBoy `cgb_palettes_blocked`).
     pub(crate) fn write_pal_data(&mut self, obj: bool, value: u8) {
         let blocked = self.vram_write_blocked();
-        let (index, ram) = if obj {
-            (&mut self.ocps, &mut self.obj_pal)
+        let (index, ram, stale) = if obj {
+            (&mut self.ocps, &mut self.obj_pal, &mut self.obj_stale)
         } else {
-            (&mut self.bcps, &mut self.bg_pal)
+            (&mut self.bcps, &mut self.bg_pal, &mut self.bg_stale)
         };
         if !blocked {
             ram[usize::from(*index & PAL_INDEX_MASK)] = value;
+            *stale = true;
         }
         if *index & PAL_INDEX_AUTO_INC != 0 {
             *index = PAL_INDEX_AUTO_INC | (*index).wrapping_add(1) & PAL_INDEX_MASK;
@@ -836,6 +848,8 @@ impl Ppu {
             check(self.opri <= OPRI_X_PRIORITY, "OPRI")?;
             r.bytes_into(&mut self.bg_pal)?;
             r.bytes_into(&mut self.obj_pal)?;
+            self.bg_stale = true;
+            self.obj_stale = true;
             for fb in [&mut self.cgb_back, &mut self.cgb_front] {
                 let fb = fb.as_deref_mut().expect("colour mode has RGB555 frames");
                 for c in fb.iter_mut() {

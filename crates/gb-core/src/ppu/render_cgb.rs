@@ -19,7 +19,7 @@ const ATTR_BANK: u8 = 0x08;
 const ATTR_PALETTE_MASK: u8 = 0x07;
 
 /// Eight palettes of four RGB555 colours.
-type Palettes = [[u16; 4]; 8];
+pub(super) type Palettes = [[u16; 4]; 8];
 
 /// Decode a palette RAM (little-endian words; bit 15 is not stored).
 fn decode(ram: &[u8; PALETTE_RAM_SIZE]) -> Palettes {
@@ -61,12 +61,22 @@ impl Ppu {
         // LCDC.0 clear does not blank the BG on a CGB; it only removes its
         // priority over sprites (see `render_sprites_cgb`).
         self.render_bg_cgb(ly, &mut ids, &mut attrs);
-        let bg = decode(&self.bg_pal);
+        if self.bg_stale {
+            self.bg_decoded = decode(&self.bg_pal);
+            self.bg_stale = false;
+        }
+        let bg = &self.bg_decoded;
         let mut line = [0u16; SCREEN_WIDTH];
         for ((out, &id), &attr) in line.iter_mut().zip(&ids).zip(&attrs) {
             *out = bg[usize::from(attr & ATTR_PALETTE_MASK)][usize::from(id)];
         }
-        if self.lcdc & LCDC_OBJ_ENABLE != 0 {
+        // A line with no selected sprites skips the OBJ palette decode and the
+        // row set-up entirely.
+        if self.lcdc & LCDC_OBJ_ENABLE != 0 && self.line_sprite_count != 0 {
+            if self.obj_stale {
+                self.obj_decoded = decode(&self.obj_pal);
+                self.obj_stale = false;
+            }
             self.render_sprites_cgb(ly, &ids, &attrs, &mut line);
         }
         let start = usize::from(ly) * SCREEN_WIDTH;
@@ -150,7 +160,7 @@ impl Ppu {
     ) {
         let height = i16::from(self.sprite_height());
         let master = self.lcdc & LCDC_BG_ENABLE != 0;
-        let obj = decode(&self.obj_pal);
+        let obj = &self.obj_decoded;
         let mut rows = [SpriteRow {
             x: 0,
             lo: 0,

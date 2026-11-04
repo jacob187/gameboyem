@@ -1445,6 +1445,100 @@ fn window_uses_its_own_attributes() {
     assert_eq!(pixel16(&fb, 80, 10), bg_col(6, 1));
 }
 
+/// Window with WX < 7 (active from x = 0, clipping the first tile) and WX = 166
+/// (a single column), in colour mode with an X-flipped, palette-6 window tile over
+/// a solid palette-2 BG.
+#[test]
+fn cgb_window_with_wx_below_7_and_wx_166() {
+    let mut rig = Rig::cgb();
+    rig.set_tile(0x10, [[0, 1, 2, 3, 0, 1, 2, 3]; 8]); // window tile 1
+    rig.solid_tile(0x20, 1); // BG tile 2
+    rig.fill_map(0x1800, 2);
+    rig.fill_attr(0x1800, 2);
+    rig.fill_map(0x1C00, 1);
+    rig.fill_attr(0x1C00, 6 | 0x20); // palette 6, X flip
+    rig.write(0xFF40, 0x91 | 0x20 | 0x40); // window on, map 0x9C00
+    rig.write(0xFF4A, 0);
+    let flipped = |col: usize| bg_col(6, [3, 2, 1, 0, 3, 2, 1, 0][col]);
+
+    // WX = 3: the window starts at x = -4, so screen x shows window column
+    // x + 4. Flipped, column c reads pattern id [3,2,1,0,3,2,1,0][c % 8]:
+    // x = 0..8 -> columns 4..12 -> 3,2,1,0,3,2,1,0.
+    rig.write(0xFF4B, 3);
+    let fb = rig.frame16();
+    for x in 0..12 {
+        assert_eq!(pixel16(&fb, x, 5), flipped((x + 4) % 8), "x={x}");
+    }
+    assert_eq!(pixel16(&fb, 0, 5), bg_col(6, 3));
+    assert_eq!(pixel16(&fb, 159, 143), flipped((159 + 4) % 8)); // bg_col(6, 3)
+
+    // WX = 166: the window is only column 0 at x = 159; the rest is BG.
+    rig.write(0xFF4B, 166);
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 158, 20), bg_col(2, 1));
+    assert_eq!(pixel16(&fb, 159, 20), bg_col(6, 3));
+    assert_eq!(pixel16(&fb, 0, 20), bg_col(2, 1));
+
+    // WX = 167 is off the screen.
+    rig.write(0xFF4B, 167);
+    let fb = rig.frame16();
+    assert!(fb.iter().all(|&c| c == bg_col(2, 1)));
+}
+
+#[test]
+fn decoded_palettes_follow_palette_writes_and_state_loads() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 1);
+    rig.fill_map(0x1800, 1);
+    rig.set_sprite(0, 16, 8, 1, 0); // covers (0..8, 0..8)
+    rig.write(0xFF40, 0x93);
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 0, 0), obj_col(0, 1));
+    assert_eq!(pixel16(&fb, 20, 0), bg_col(0, 1));
+
+    // Now in VBlank: rewrite BG palette 0 colour 1 and OBJ palette 0 colour 1.
+    rig.ppu.write_bcps(0x80 | 2);
+    rig.ppu.write_pal_data(false, 0x34);
+    rig.ppu.write_pal_data(false, 0x12);
+    rig.ppu.write_ocps(0x80 | 2);
+    rig.ppu.write_pal_data(true, 0x78);
+    rig.ppu.write_pal_data(true, 0x1B);
+    let fb = rig.frame16();
+    assert_eq!(pixel16(&fb, 0, 0), 0x1B78);
+    assert_eq!(pixel16(&fb, 20, 0), 0x1234);
+
+    // A state load rebuilds both tables from the restored palette RAM.
+    let mut other = Rig::cgb();
+    other.solid_tile(0x10, 1);
+    other.fill_map(0x1800, 1);
+    other.set_sprite(0, 16, 8, 1, 0);
+    other.write(0xFF40, 0x93);
+    other.frame16(); // fills the caches with the test palettes
+    let mut w = StateWriter::new();
+    rig.ppu.save_state(&mut w);
+    let bytes = w.into_bytes();
+    other.ppu.load_state(&mut StateReader::new(&bytes)).unwrap();
+    let (a, b) = (rig.frame16(), other.frame16());
+    assert_eq!(pixel16(&b, 0, 0), 0x1B78);
+    assert_eq!(pixel16(&b, 20, 0), 0x1234);
+    assert!(a == b);
+}
+
+#[test]
+fn obj_palette_decode_is_skipped_on_lines_without_sprites() {
+    let mut rig = Rig::cgb();
+    rig.solid_tile(0x10, 1);
+    rig.fill_map(0x1800, 1);
+    rig.write(0xFF40, 0x93); // OBJ on, but OAM is empty
+    rig.frame16();
+    assert!(!rig.ppu.bg_stale);
+    assert!(rig.ppu.obj_stale, "no sprite, no OBJ palette decode");
+    rig.set_sprite(0, 16, 8, 1, 0);
+    let fb = rig.frame16();
+    assert!(!rig.ppu.obj_stale);
+    assert_eq!(pixel16(&fb, 0, 0), obj_col(0, 1));
+}
+
 #[test]
 fn sprite_palette_and_tile_bank_come_from_the_attributes() {
     let mut rig = Rig::cgb();
