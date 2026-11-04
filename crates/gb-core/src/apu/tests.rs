@@ -332,3 +332,106 @@ fn wave_ram_is_gated_while_channel_plays() {
     rig.w(0xFF1A, 0x00);
     assert_eq!(rig.apu.read(0xFF35), 0x5A, "write while playing was lost");
 }
+
+/// Independent LFSR model in the other common convention (state complemented):
+/// starts at $7FFF, shifts in the XOR of bits 0 and 1, and is high when bit 0
+/// is clear. It must match the Pan Docs XNOR/init-0 formulation bit for bit.
+fn reference_noise(short: bool, clocks: usize) -> Vec<bool> {
+    let mut l: u16 = 0x7FFF;
+    let mut out = Vec::new();
+    for _ in 0..clocks {
+        let x = (l ^ (l >> 1)) & 1;
+        l >>= 1;
+        l = l & !(1 << 14) | x << 14;
+        if short {
+            l = l & !(1 << 6) | x << 6;
+        }
+        out.push(l & 1 == 0);
+    }
+    out
+}
+
+/// Trigger CH4 at volume 15 with shift 0 / divisor code 1 (16 T = 4 M-cycles
+/// per LFSR clock) and sample the output after each clock.
+fn noise_outputs(short: bool, clocks: usize) -> Vec<bool> {
+    let mut rig = Rig::new();
+    rig.w(0xFF21, 0xF0);
+    rig.w(0xFF22, 0x01 | if short { 0x08 } else { 0 });
+    rig.w(0xFF23, 0x80);
+    (0..clocks)
+        .map(|_| {
+            rig.run(4);
+            rig.apu.ch4.output() == 15
+        })
+        .collect()
+}
+
+#[test]
+fn lfsr_7bit_hand_computed_start() {
+    // From state 0 each clock shifts in XNOR(b0, b1) at bit 6: six 1s are
+    // shifted in before bit 0 is reached, then the pattern continues.
+    let got = noise_outputs(true, 9);
+    assert_eq!(
+        got,
+        [false, false, false, false, false, false, true, true, true]
+    );
+}
+
+#[test]
+fn lfsr_matches_reference_in_both_widths() {
+    assert_eq!(noise_outputs(false, 400), reference_noise(false, 400));
+    assert_eq!(noise_outputs(true, 400), reference_noise(true, 400));
+}
+
+#[test]
+fn lfsr_period_is_127_short_and_32767_long() {
+    let mut rig = Rig::new();
+    rig.w(0xFF21, 0xF0);
+    // In 7-bit mode only the low 7 bits form the register; the upper bits are
+    // shifted-out history.
+    for (nr43, period, mask) in [(0x09u8, 127u32, 0x7Fu16), (0x01, 32767, 0x7FFF)] {
+        rig.w(0xFF22, nr43);
+        rig.w(0xFF23, 0x80);
+        let start = rig.apu.ch4.lfsr & mask;
+        for n in 1..=period {
+            rig.apu.ch4.clock_lfsr();
+            let back = rig.apu.ch4.lfsr & mask == start;
+            assert_eq!(back, n == period, "nr43 {nr43:#x} n {n}");
+        }
+    }
+}
+
+#[test]
+fn noise_clock_shift_14_and_15_never_clock() {
+    let mut rig = Rig::new();
+    rig.w(0xFF21, 0xF0);
+    rig.w(0xFF22, 0xE0);
+    rig.w(0xFF23, 0x80);
+    rig.run(100_000);
+    assert_eq!(rig.apu.ch4.lfsr, 0);
+    assert_eq!(rig.apu.ch4.output(), 0);
+}
+
+#[test]
+fn noise_period_follows_divisor_and_shift() {
+    // Divisor code 0 = 8 T, shift 2 -> 32 T = 8 M-cycles per clock.
+    let mut rig = Rig::new();
+    rig.w(0xFF21, 0xF0);
+    rig.w(0xFF22, 0x20);
+    rig.w(0xFF23, 0x80);
+    rig.run(7);
+    assert_eq!(rig.apu.ch4.lfsr, 0);
+    rig.run(1);
+    assert_eq!(rig.apu.ch4.lfsr, 0x4000);
+}
+
+#[test]
+fn length_expires_for_noise() {
+    let mut rig = Rig::new();
+    rig.w(0xFF21, 0xF0);
+    rig.w(0xFF20, 0x3E);
+    rig.w(0xFF23, 0xC0);
+    assert_eq!(rig.status() & 8, 8);
+    rig.seq_ticks(3);
+    assert_eq!(rig.status() & 8, 0);
+}

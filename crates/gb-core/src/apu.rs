@@ -11,9 +11,11 @@
 //! output period (integer accumulation, one float division per sample).
 
 mod common;
+mod noise;
 mod square;
 mod wave;
 
+use noise::Noise;
 use square::Square;
 use wave::Wave;
 
@@ -41,6 +43,7 @@ pub struct Apu {
     ch1: Square,
     ch2: Square,
     ch3: Wave,
+    ch4: Noise,
     powered: bool,
     /// Frame-sequencer step that will run on the next DIV-APU tick.
     seq_step: u8,
@@ -66,6 +69,7 @@ impl Apu {
             ch1: Square::new(true),
             ch2: Square::new(false),
             ch3: Wave::new(),
+            ch4: Noise::new(),
             powered: true,
             seq_step: 0,
             last_div_bit: false,
@@ -116,6 +120,7 @@ impl Apu {
         u8::from(self.ch1.enabled)
             | u8::from(self.ch2.enabled) << 1
             | u8::from(self.ch3.enabled) << 2
+            | u8::from(self.ch4.enabled) << 3
     }
 
     pub fn read(&self, addr: u16) -> u8 {
@@ -146,6 +151,7 @@ impl Apu {
                         0xFF11 => self.ch1.length.load(value & 0x3F),
                         0xFF16 => self.ch2.length.load(value & 0x3F),
                         0xFF1B => self.ch3.write_length(value),
+                        0xFF20 => self.ch4.write_length(value),
                         _ => {}
                     }
                 }
@@ -178,6 +184,10 @@ impl Apu {
             0x0C => self.ch3.write_level(v),
             0x0D => self.ch3.write_freq_lo(v),
             0x0E => self.ch3.write_freq_hi_ctrl(v, odd),
+            0x10 => self.ch4.write_length(v),
+            0x11 => self.ch4.write_envelope(v),
+            0x12 => self.ch4.write_nr43(v),
+            0x13 => self.ch4.write_ctrl(v, odd),
             _ => {}
         }
     }
@@ -200,6 +210,7 @@ impl Apu {
             self.ch1.power_off();
             self.ch2.power_off();
             self.ch3.power_off();
+            self.ch4.power_off();
         }
     }
 
@@ -210,6 +221,7 @@ impl Apu {
             self.ch1.clock_length();
             self.ch2.clock_length();
             self.ch3.clock_length();
+            self.ch4.clock_length();
         }
         if step == 2 || step == 6 {
             self.ch1.clock_sweep();
@@ -217,6 +229,7 @@ impl Apu {
         if step == 7 {
             self.ch1.clock_envelope();
             self.ch2.clock_envelope();
+            self.ch4.clock_envelope();
         }
     }
 
@@ -236,6 +249,7 @@ impl Apu {
             self.ch1.tick_mcycle();
             self.ch2.tick_mcycle();
             self.ch3.tick_mcycle();
+            self.ch4.tick_mcycle();
             self.accumulate_mix();
         }
 
@@ -247,7 +261,12 @@ impl Apu {
     }
 
     fn accumulate_mix(&mut self) {
-        let outs = [self.ch1.output(), self.ch2.output(), self.ch3.output(), 0];
+        let outs = [
+            self.ch1.output(),
+            self.ch2.output(),
+            self.ch3.output(),
+            self.ch4.output(),
+        ];
         let nr51 = self.regs[0x15];
         let nr50 = self.regs[0x14];
         let (mut l, mut r) = (0u32, 0u32);
