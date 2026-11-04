@@ -2,6 +2,8 @@
 //!
 //! Usage: `cargo run -p gb-test --release -- [FILTER...] [--fail-on-mismatch]`
 //!
+//! `-- --bench [FRAMES] [REPEATS]` instead runs the speed benchmark (`bench.rs`).
+//!
 //! Exit status is nonzero with `--fail-on-mismatch` if any result differs from
 //! `expected.txt` (or a ROM is missing in CI).
 
@@ -10,12 +12,17 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::Instant;
 
+mod bench;
+
 use gb_test::{Case, Outcome, in_ci, load_manifest, run_case};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fail_on_mismatch = args.iter().any(|a| a == "--fail-on-mismatch");
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    if args.iter().any(|a| a == "--bench") {
+        return bench::run(&filters);
+    }
     let cases: Vec<Case> = load_manifest()
         .into_iter()
         .filter(|c| filters.is_empty() || filters.iter().any(|f| c.path.contains(f.as_str())))
