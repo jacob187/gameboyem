@@ -95,16 +95,22 @@ impl Noise {
         self.env.clock();
     }
 
-    pub fn tick_mcycle(&mut self) {
+    /// Advance one M-cycle; returns `true` if the output level changed.
+    pub fn tick_mcycle(&mut self) -> bool {
         // Shifts 14 and 15 never clock the LFSR (Pan Docs: CH4).
         if !self.enabled || self.shift() >= 14 {
-            return;
+            return false;
         }
         self.timer -= 4;
+        if self.timer > 0 {
+            return false;
+        }
+        let before = self.output();
         while self.timer <= 0 {
             self.timer += self.period();
             self.clock_lfsr();
         }
+        self.output() != before
     }
 
     /// Digital output 0..=15.

@@ -186,15 +186,20 @@ impl Square {
         }
     }
 
-    pub fn tick_mcycle(&mut self) {
+    /// Advance one M-cycle; returns `true` if the output level changed.
+    pub fn tick_mcycle(&mut self) -> bool {
         if !self.enabled {
-            return;
+            return false;
         }
         self.timer -= 1;
-        if self.timer == 0 {
-            self.timer = 2048 - self.freq;
-            self.pos = (self.pos + 1) & 7;
+        if self.timer != 0 {
+            return false;
         }
+        self.timer = 2048 - self.freq;
+        let before = self.output();
+        self.pos = (self.pos + 1) & 7;
+        // Volume 0 is silent whatever the duty step, so nothing changed.
+        self.env.volume != 0 && self.output() != before
     }
 
     /// Digital output 0..=15.

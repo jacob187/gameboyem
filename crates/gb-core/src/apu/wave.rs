@@ -93,11 +93,13 @@ impl Wave {
         }
     }
 
-    pub fn tick_mcycle(&mut self) {
+    /// Advance one M-cycle; returns `true` if the output level changed.
+    pub fn tick_mcycle(&mut self) -> bool {
         self.just_read = false;
         if !self.enabled {
-            return;
+            return false;
         }
+        let before = self.output();
         self.timer -= 4;
         while self.timer <= 0 {
             self.timer += self.period();
@@ -111,6 +113,7 @@ impl Wave {
             };
             self.just_read = true;
         }
+        self.output() != before
     }
 
     /// Digital output 0..=15.

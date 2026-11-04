@@ -50,6 +50,10 @@ pub struct Apu {
     last_div_bit: bool,
     sample_rate: u32,
     sample_acc: u32,
+    /// Weighted mix of the current M-cycle; recomputed only when `dirty`.
+    cur_l: u32,
+    cur_r: u32,
+    dirty: bool,
     mix_l: u32,
     mix_r: u32,
     mix_n: u32,
@@ -75,6 +79,9 @@ impl Apu {
             last_div_bit: false,
             sample_rate: DEFAULT_SAMPLE_RATE,
             sample_acc: 0,
+            cur_l: 0,
+            cur_r: 0,
+            dirty: true,
             mix_l: 0,
             mix_r: 0,
             mix_n: 0,
@@ -139,6 +146,7 @@ impl Apu {
     }
 
     pub fn write(&mut self, addr: u16, value: u8) {
+        self.dirty = true;
         match addr {
             0xFF26 => self.set_power(value & 0x80 != 0),
             0xFF10..=0xFF25 => {
@@ -200,6 +208,7 @@ impl Apu {
             return;
         }
         self.powered = on;
+        self.dirty = true;
         if on {
             self.seq_step = 0;
             self.ch1.power_on();
@@ -217,6 +226,7 @@ impl Apu {
     fn clock_sequencer(&mut self) {
         let step = self.seq_step;
         self.seq_step = (step + 1) & 7;
+        self.dirty = true;
         if step & 1 == 0 {
             self.ch1.clock_length();
             self.ch2.clock_length();
@@ -246,11 +256,18 @@ impl Apu {
         self.last_div_bit = bit;
 
         if self.powered {
-            self.ch1.tick_mcycle();
-            self.ch2.tick_mcycle();
-            self.ch3.tick_mcycle();
-            self.ch4.tick_mcycle();
-            self.accumulate_mix();
+            // Non-short-circuiting `|`: every channel must be ticked.
+            self.dirty |= self.ch1.tick_mcycle()
+                | self.ch2.tick_mcycle()
+                | self.ch3.tick_mcycle()
+                | self.ch4.tick_mcycle();
+            if self.dirty {
+                self.dirty = false;
+                self.update_mix();
+            }
+            self.mix_l += self.cur_l;
+            self.mix_r += self.cur_r;
+            self.mix_n += 1;
         }
 
         self.sample_acc += self.sample_rate;
@@ -260,7 +277,8 @@ impl Apu {
         }
     }
 
-    fn accumulate_mix(&mut self) {
+    /// Recompute the weighted per-side mix (0..=60 x master volume 1..=8).
+    fn update_mix(&mut self) {
         let outs = [
             self.ch1.output(),
             self.ch2.output(),
@@ -278,9 +296,8 @@ impl Apu {
                 r += u32::from(o);
             }
         }
-        self.mix_l += l * u32::from(((nr50 >> 4) & 7) + 1);
-        self.mix_r += r * u32::from((nr50 & 7) + 1);
-        self.mix_n += 1;
+        self.cur_l = l * u32::from(((nr50 >> 4) & 7) + 1);
+        self.cur_r = r * u32::from((nr50 & 7) + 1);
     }
 
     fn emit_sample(&mut self) {
