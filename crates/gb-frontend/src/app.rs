@@ -22,6 +22,12 @@ use crate::video::{Palette, blit, test_pattern};
 /// Speed multiplier while Tab is held.
 const FAST_FORWARD_SPEED: f64 = 4.0;
 
+/// The size to configure the surface with, or `None` while the window has no
+/// drawable area (minimised: a zero dimension makes wgpu panic or error).
+fn surface_extent(width: u32, height: u32) -> Option<(u32, u32)> {
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 /// State for `--test-pattern`: the core is bypassed.
 struct TestMode {
     frame: u32,
@@ -167,14 +173,19 @@ impl App {
     }
 
     fn resize(&mut self, width: u32, height: u32) {
-        self.surface_ok = width > 0 && height > 0;
-        if !self.surface_ok {
-            return;
-        }
+        let extent = surface_extent(width, height);
+        self.surface_ok = extent.is_some();
+        let Some((width, height)) = extent else {
+            return; // minimised: keep the old surface and skip drawing until restored
+        };
         if let Some(p) = self.pixels.as_mut()
             && let Err(e) = p.resize_surface(width, height)
         {
             eprintln!("warning: cannot resize surface to {width}x{height}: {e}");
+        }
+        // Restored from minimised while paused: nothing else would repaint.
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -240,6 +251,8 @@ impl ApplicationHandler for App {
             Err(e) => return self.fail(event_loop, format!("cannot initialise graphics: {e}")),
         };
         pixels.clear_color(pixels::wgpu::Color::BLACK);
+        // The window may already be minimised (zero-sized) when it is created.
+        self.surface_ok = surface_extent(size.width, size.height).is_some();
         self.window = Some(window);
         self.pixels = Some(pixels);
         self.upload();
@@ -317,7 +330,9 @@ impl ApplicationHandler for App {
         let n = self.pacer.advance(dt);
         if n > 0 {
             self.run_frames(n);
-            if let Some(w) = &self.window {
+            if self.surface_ok
+                && let Some(w) = &self.window
+            {
                 w.request_redraw();
             }
         }
@@ -330,5 +345,19 @@ impl ApplicationHandler for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.saves.flush_final(&self.gb);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_sized_surface_is_not_drawable() {
+        assert_eq!(surface_extent(0, 0), None);
+        assert_eq!(surface_extent(0, 144), None);
+        assert_eq!(surface_extent(160, 0), None);
+        assert_eq!(surface_extent(1, 1), Some((1, 1)));
+        assert_eq!(surface_extent(640, 576), Some((640, 576)));
     }
 }
