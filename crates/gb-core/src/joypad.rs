@@ -53,9 +53,10 @@ pub struct Joypad {
 }
 
 impl Joypad {
+    /// Post-boot P1 reads 0xCF (Pan Docs "Power Up Sequence"): both groups selected.
     pub fn new() -> Self {
         Self {
-            select: 0x30,
+            select: 0x00,
             dpad: 0,
             action: 0,
         }
@@ -70,6 +71,11 @@ impl Joypad {
             pressed |= self.action;
         }
         !pressed & 0x0F
+    }
+
+    /// True while a selected input line is low; wakes the CPU from STOP.
+    pub fn any_selected_low(&self) -> bool {
+        self.low_nibble() != 0x0F
     }
 
     pub fn read(&self) -> u8 {
@@ -109,6 +115,8 @@ mod tests {
         let mut j = Joypad::new();
         let mut i = Interrupts::new();
         i.write_if(0);
+        assert_eq!(j.read(), 0xCF, "post-boot P1");
+        j.write(0x30); // deselect both groups
         j.set_button(Button::Start, true, &mut i);
         assert_eq!(i.read_if() & 0x10, 0, "no interrupt when group unselected");
         j.write(0x10); // select action buttons
