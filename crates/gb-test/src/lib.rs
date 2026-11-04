@@ -674,8 +674,9 @@ fn run_smoke_cgb(gb: &mut GameBoy, frames: u32) -> Outcome {
     if let Err(o) = step(gb, frames) {
         return o;
     }
+    // Owned copies: the snapshots must outlive further stepping.
     let mut shots = vec![match cgb_frame(gb) {
-        Ok(f) => f,
+        Ok(f) => f.to_vec(),
         Err(o) => return o,
     }];
     let colours = distinct_colours(&shots[0]);
@@ -696,7 +697,7 @@ fn run_smoke_cgb(gb: &mut GameBoy, frames: u32) -> Outcome {
             return o;
         }
         match cgb_frame(gb) {
-            Ok(f) => shots.push(f),
+            Ok(f) => shots.push(f.to_vec()),
             Err(o) => return o,
         }
     }
