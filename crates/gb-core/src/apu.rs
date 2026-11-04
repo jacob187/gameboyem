@@ -12,8 +12,10 @@
 
 mod common;
 mod square;
+mod wave;
 
 use square::Square;
+use wave::Wave;
 
 /// Default output sample rate in Hz.
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
@@ -36,9 +38,9 @@ const READ_MASK: [u8; 0x20] = [
 pub struct Apu {
     /// Raw NR10..=NR51 as written (index = addr - 0xFF10); NR52 is derived.
     regs: [u8; 0x20],
-    wave_ram: [u8; 0x10],
     ch1: Square,
     ch2: Square,
+    ch3: Wave,
     powered: bool,
     /// Frame-sequencer step that will run on the next DIV-APU tick.
     seq_step: u8,
@@ -61,9 +63,9 @@ impl Apu {
     pub fn new() -> Self {
         let mut apu = Self {
             regs: [0; 0x20],
-            wave_ram: [0; 0x10],
             ch1: Square::new(true),
             ch2: Square::new(false),
+            ch3: Wave::new(),
             powered: true,
             seq_step: 0,
             last_div_bit: false,
@@ -111,7 +113,9 @@ impl Apu {
     }
 
     fn status_bits(&self) -> u8 {
-        u8::from(self.ch1.enabled) | u8::from(self.ch2.enabled) << 1
+        u8::from(self.ch1.enabled)
+            | u8::from(self.ch2.enabled) << 1
+            | u8::from(self.ch3.enabled) << 2
     }
 
     pub fn read(&self, addr: u16) -> u8 {
@@ -121,7 +125,10 @@ impl Apu {
                 let i = (addr - 0xFF10) as usize;
                 self.regs[i] | READ_MASK[i]
             }
-            0xFF30..=0xFF3F => self.wave_ram[(addr - 0xFF30) as usize],
+            0xFF30..=0xFF3F => self
+                .ch3
+                .ram_index((addr - 0xFF30) as usize)
+                .map_or(0xFF, |i| self.ch3.ram[i]),
             _ => 0xFF,
         }
     }
@@ -138,11 +145,16 @@ impl Apu {
                     match addr {
                         0xFF11 => self.ch1.length.load(value & 0x3F),
                         0xFF16 => self.ch2.length.load(value & 0x3F),
+                        0xFF1B => self.ch3.write_length(value),
                         _ => {}
                     }
                 }
             }
-            0xFF30..=0xFF3F => self.wave_ram[(addr - 0xFF30) as usize] = value,
+            0xFF30..=0xFF3F => {
+                if let Some(i) = self.ch3.ram_index((addr - 0xFF30) as usize) {
+                    self.ch3.ram[i] = value;
+                }
+            }
             _ => {}
         }
     }
@@ -161,6 +173,11 @@ impl Apu {
             0x07 => self.ch2.write_envelope(v),
             0x08 => self.ch2.write_freq_lo(v),
             0x09 => self.ch2.write_freq_hi_ctrl(v, odd),
+            0x0A => self.ch3.write_nr30(v),
+            0x0B => self.ch3.write_length(v),
+            0x0C => self.ch3.write_level(v),
+            0x0D => self.ch3.write_freq_lo(v),
+            0x0E => self.ch3.write_freq_hi_ctrl(v, odd),
             _ => {}
         }
     }
@@ -177,10 +194,12 @@ impl Apu {
             self.seq_step = 0;
             self.ch1.power_on();
             self.ch2.power_on();
+            self.ch3.power_on();
         } else {
             self.regs = [0; 0x20];
             self.ch1.power_off();
             self.ch2.power_off();
+            self.ch3.power_off();
         }
     }
 
@@ -190,6 +209,7 @@ impl Apu {
         if step & 1 == 0 {
             self.ch1.clock_length();
             self.ch2.clock_length();
+            self.ch3.clock_length();
         }
         if step == 2 || step == 6 {
             self.ch1.clock_sweep();
@@ -215,6 +235,7 @@ impl Apu {
         if self.powered {
             self.ch1.tick_mcycle();
             self.ch2.tick_mcycle();
+            self.ch3.tick_mcycle();
             self.accumulate_mix();
         }
 
@@ -226,7 +247,7 @@ impl Apu {
     }
 
     fn accumulate_mix(&mut self) {
-        let outs = [self.ch1.output(), self.ch2.output(), 0, 0];
+        let outs = [self.ch1.output(), self.ch2.output(), self.ch3.output(), 0];
         let nr51 = self.regs[0x15];
         let nr50 = self.regs[0x14];
         let (mut l, mut r) = (0u32, 0u32);

@@ -249,3 +249,86 @@ fn square_duty_and_frequency_drive_output() {
     }
     assert_eq!(seen, [15, 0, 0, 0, 0, 15, 15, 15]);
 }
+
+/// Wave RAM holding nibbles 0,1,2,...,15,0,1,...,15.
+fn load_ramp(rig: &mut Rig) {
+    for i in 0..16u8 {
+        let hi = (2 * i) & 15;
+        let lo = (2 * i + 1) & 15;
+        rig.w(0xFF30 + u16::from(i), hi << 4 | lo);
+    }
+}
+
+fn start_wave(rig: &mut Rig, level: u8, freq: u16) {
+    rig.w(0xFF1A, 0x80);
+    rig.w(0xFF1C, level << 5);
+    rig.w(0xFF1D, freq as u8);
+    rig.w(0xFF1E, 0x80 | (freq >> 8) as u8);
+}
+
+#[test]
+fn wave_plays_ram_high_nibble_first_and_wraps() {
+    let mut rig = Rig::new();
+    load_ramp(&mut rig);
+    start_wave(&mut rig, 1, 2046); // 4 T-cycles (1 M-cycle) per sample
+    assert_eq!(rig.status() & 4, 4);
+    // Trigger does not refetch: the first fetch is nibble 1 (low half of byte
+    // 0), nibble 0 is only reached after wrapping (Pan Docs: CH3 trigger).
+    let mut out = Vec::new();
+    for _ in 0..40 {
+        rig.run(1);
+        out.push(rig.apu.ch3.output());
+    }
+    let expect: Vec<u8> = (1..=40u8).map(|n| n & 15).collect();
+    assert_eq!(out, expect);
+}
+
+#[test]
+fn wave_high_frequency_fetches_twice_per_mcycle() {
+    let mut rig = Rig::new();
+    load_ramp(&mut rig);
+    start_wave(&mut rig, 1, 2047); // 2 T-cycles per sample
+    rig.run(4);
+    assert_eq!(rig.apu.ch3.output(), 8);
+}
+
+#[test]
+fn wave_output_levels_shift_sample() {
+    for (level, expect) in [(0u8, 0u8), (1, 12), (2, 6), (3, 3)] {
+        let mut rig = Rig::new();
+        rig.w(0xFF30, 0x0C);
+        start_wave(&mut rig, level, 2046);
+        rig.run(1);
+        assert_eq!(rig.apu.ch3.output(), expect, "level code {level}");
+    }
+}
+
+#[test]
+fn wave_length_is_256_and_dac_off_disables() {
+    let mut rig = Rig::new();
+    rig.w(0xFF1A, 0x80);
+    rig.w(0xFF1B, 0xFE); // 256 - 254 = 2
+    rig.w(0xFF1E, 0xC0);
+    assert_eq!(rig.status() & 4, 4);
+    rig.seq_ticks(3);
+    assert_eq!(rig.status() & 4, 0);
+    rig.w(0xFF1B, 0x00);
+    rig.w(0xFF1E, 0x80);
+    assert_eq!(rig.apu.ch3.length.counter, 256);
+    assert_eq!(rig.status() & 4, 4);
+    rig.w(0xFF1A, 0x00);
+    assert_eq!(rig.status() & 4, 0);
+}
+
+#[test]
+fn wave_ram_is_gated_while_channel_plays() {
+    let mut rig = Rig::new();
+    rig.w(0xFF35, 0x5A);
+    assert_eq!(rig.apu.read(0xFF35), 0x5A);
+    start_wave(&mut rig, 1, 0); // slow: a fetch every 4096 M-cycles
+    rig.run(10);
+    assert_eq!(rig.apu.read(0xFF35), 0xFF);
+    rig.w(0xFF35, 0x11);
+    rig.w(0xFF1A, 0x00);
+    assert_eq!(rig.apu.read(0xFF35), 0x5A, "write while playing was lost");
+}
