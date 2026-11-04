@@ -65,7 +65,7 @@ make -C homebrew                             # needed for the homebrew cases (th
 ./scripts/fetch-homebrew-corpus.sh           # open-source homebrew corpus -> roms/corpus
 cargo test --workspace                       # unit tests + one test per ROM
 cargo run -p gb-test --release               # pass/fail table
-scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job, locally in Docker
+scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job in Docker; builds homebrew with Linux GBDK (tools/gbdk-linux/), needs roms/test + roms/corpus
 ```
 
 `crates/gb-test/expected.txt` is a ratchet. A case fails if its outcome changes in either direction, so a regression or an unrecorded fix both break the build.
