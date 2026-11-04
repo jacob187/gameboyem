@@ -115,7 +115,7 @@ uint8_t hiscore_update(uint16_t *record, uint16_t score)
     p[HS_HI] = hi;
     p[HS_SUM] = hs_checksum(lo, hi);
     for (i = 0; i < 4u; i++) {
-        p[i] = hs_magic[i]; /* magic last: a torn write leaves no valid record */
+        p[i] = hs_magic[i]; /* magic last: a torn first write has no valid magic */
     }
     DISABLE_RAM;
     return 1u;
