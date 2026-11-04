@@ -132,12 +132,6 @@ impl Bus {
         self.key1_prepare = false;
         self.double_speed = !self.double_speed;
         self.ppu.set_double_speed(self.double_speed);
-        let counter = self.timer.div_counter();
-        self.apu.sync_sequencer(if self.double_speed {
-            counter >> 1
-        } else {
-            counter
-        });
         self.refresh_slow();
         // An interrupt that is (or becomes) pending ends the pause, like a HALT.
         for _ in 0..SPEED_SWITCH_MCYCLES {
