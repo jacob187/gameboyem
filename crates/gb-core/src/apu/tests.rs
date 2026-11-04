@@ -644,8 +644,13 @@ fn sample_count_matches_configured_rate() {
 fn undrained_buffer_is_capped() {
     let mut rig = Rig::new();
     rig.run(2_200_000); // > 2 s at 48 kHz
-    assert!(rig.apu.samples.len() <= MAX_BUFFERED);
+    assert!(rig.apu.samples.len() <= rig.apu.max_buffered());
     assert_eq!(rig.apu.samples.len() % 2, 0);
+    // The cap is one second at whatever rate is configured.
+    let mut rig = Rig::new();
+    rig.apu.set_sample_rate(8_000);
+    rig.run(2_200_000);
+    assert_eq!(rig.apu.samples.len(), 2 * 8_000);
 }
 
 #[test]

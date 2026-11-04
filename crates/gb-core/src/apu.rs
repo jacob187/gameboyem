@@ -23,8 +23,8 @@ use wave::Wave;
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 /// M-cycles per second; the resampling accumulator's denominator.
 const MCYCLES_PER_SECOND: u32 = crate::T_CYCLES_PER_SECOND / 4;
-/// Upper bound on buffered samples (~1 s of stereo) if the host never drains.
-const MAX_BUFFERED: usize = 2 * 48_000;
+/// Seconds of audio kept if the host never drains (the cap scales with rate).
+const MAX_BUFFERED_SECS: usize = 1;
 /// Bit of the 16-bit system counter that is DIV bit 4 (Pan Docs: "Audio Details").
 const SEQUENCER_DIV_BIT: u16 = 1 << 12;
 /// Largest per-M-cycle mix: 4 channels x 15 x master volume 8.
@@ -121,6 +121,11 @@ impl Apu {
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Upper bound on buffered interleaved stereo samples.
+    fn max_buffered(&self) -> usize {
+        2 * self.sample_rate as usize * MAX_BUFFERED_SECS
     }
 
     fn status_bits(&self) -> u8 {
@@ -310,7 +315,7 @@ impl Apu {
         self.mix_l = 0;
         self.mix_r = 0;
         self.mix_n = 0;
-        if self.samples.len() < MAX_BUFFERED {
+        if self.samples.len() < self.max_buffered() {
             self.samples.extend_from_slice(&[l, r]);
         }
     }
