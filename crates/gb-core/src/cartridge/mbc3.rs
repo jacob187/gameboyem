@@ -24,6 +24,13 @@
 //! timestamp. We always write 0 for the timestamp (no host clock) and ignore it
 //! on load. Loading also accepts the 44-byte variant (32-bit timestamp) and a
 //! bare RAM image with no footer (clock left at zero).
+//!
+//! The zero timestamp is deliberate: the core is deterministic and never reads
+//! the host clock, and the RTC only advances while the emulator runs. A save
+//! is therefore a snapshot of emulated time; it is not lossless when moved to
+//! an emulator that catches the clock up from the footer timestamp (such a
+//! loader may treat 0 as the epoch and jump the clock far ahead). Importing
+//! saves written by other emulators works, as their timestamp is ignored.
 
 use super::{
     Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
@@ -404,6 +411,19 @@ mod tests {
         let g4 = c.battery_generation();
         c.write_ram(0xA000, 9);
         assert_eq!(c.battery_generation(), g4);
+    }
+
+    #[test]
+    fn save_footer_timestamp_is_deliberately_zero_and_ignored_on_load() {
+        let mut c = rtc_cart();
+        tick_seconds(c.as_mut(), 3);
+        let mut save = c.battery_ram().unwrap();
+        let ts = save.len() - 8;
+        assert_eq!(save[ts..], [0u8; 8], "no host clock: timestamp is 0");
+        save[ts..].fill(0xAB); // a foreign emulator's timestamp
+        let mut d = from_rom(banked_rom(4, 0x10, 0x01, 0x03)).unwrap();
+        d.load_battery_ram(&save).unwrap();
+        assert_eq!(&d.battery_ram().unwrap()[ts..], &[0u8; 8]);
     }
 
     #[test]
