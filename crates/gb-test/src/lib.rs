@@ -8,7 +8,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use gb_core::{GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gb_core::{Button, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// The manifest, compiled in so tests and the CLI always agree.
 pub const MANIFEST: &str = include_str!("../expected.txt");
@@ -23,6 +23,10 @@ pub enum Kind {
     Acid2,
     /// Homebrew smoke test: framebuffer not blank after N frames.
     Smoke,
+    /// Homebrew playability: boot snake, press Start, steer, framebuffer must change.
+    PlaySnake,
+    /// Homebrew playability: boot breakout, press Start, launch, move the paddle.
+    PlayBreakout,
 }
 
 #[derive(Clone, Debug)]
@@ -38,7 +42,12 @@ impl Case {
     /// Short display name, e.g. `blargg/cpu_instrs/individual/01-special`.
     pub fn name(&self) -> String {
         let p = self.path.strip_prefix("test/").unwrap_or(&self.path);
-        p.strip_suffix(".gb").unwrap_or(p).to_string()
+        let p = p.strip_suffix(".gb").unwrap_or(p);
+        match self.kind {
+            // Same ROM as the smoke case; keep the names unique.
+            Kind::PlaySnake | Kind::PlayBreakout => format!("{p}-play"),
+            _ => p.to_string(),
+        }
     }
 
     pub fn rom_path(&self) -> PathBuf {
@@ -132,6 +141,8 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "mooneye" => Kind::Mooneye,
                 "acid2" => Kind::Acid2,
                 "smoke" => Kind::Smoke,
+                "play-snake" => Kind::PlaySnake,
+                "play-breakout" => Kind::PlayBreakout,
                 o => panic!("expected.txt:{}: bad kind {o:?}", n + 1),
             };
             let max_frames = next("max_frames")
@@ -163,6 +174,8 @@ pub fn run_case(case: &Case) -> Outcome {
         Kind::Mooneye => run_mooneye(&mut gb, case.max_frames),
         Kind::Acid2 => run_acid2(&mut gb, case),
         Kind::Smoke => run_smoke(&mut gb, case.max_frames),
+        Kind::PlaySnake => run_play_snake(&mut gb, case.max_frames),
+        Kind::PlayBreakout => run_play_breakout(&mut gb, case.max_frames),
     }
 }
 
@@ -344,6 +357,126 @@ fn run_smoke(gb: &mut GameBoy, frames: u32) -> Outcome {
         ))
     } else {
         Outcome::Pass
+    }
+}
+
+/// Frames the title screen gets before the script presses Start.
+const PLAY_BOOT_FRAMES: u32 = 120;
+
+/// Scripted-input driver: counts frames and stops the run at `max_frames`.
+struct Player<'a> {
+    gb: &'a mut GameBoy,
+    frame: u32,
+    max_frames: u32,
+}
+
+impl Player<'_> {
+    /// Advance `n` frames. Err if the frame budget is exhausted or the CPU locks up.
+    fn run(&mut self, n: u32) -> Result<(), Outcome> {
+        for _ in 0..n {
+            if self.frame >= self.max_frames {
+                return Err(Outcome::Timeout(format!(
+                    "play script needs more than {} frames",
+                    self.max_frames
+                )));
+            }
+            self.gb.step_frame();
+            self.frame += 1;
+            if self.gb.cpu_locked() {
+                return Err(Outcome::Fail(locked_message(self.gb)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Press `b` for `n` frames, then release it.
+    fn hold(&mut self, b: Button, n: u32) -> Result<(), Outcome> {
+        self.gb.set_button(b, true);
+        let r = self.run(n);
+        self.gb.set_button(b, false);
+        r
+    }
+
+    fn shot(&self) -> Vec<u8> {
+        self.gb.framebuffer().to_vec()
+    }
+}
+
+fn pixels_differing(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).filter(|(x, y)| x != y).count()
+}
+
+/// `Err(Fail)` unless the two snapshots differ.
+fn expect_change(what: &str, before: &[u8], after: &[u8]) -> Result<(), Outcome> {
+    if pixels_differing(before, after) == 0 {
+        Err(Outcome::Fail(format!("{what}: framebuffer did not change")))
+    } else {
+        Ok(())
+    }
+}
+
+/// Title -> Start -> game running -> D-pad input accepted.
+///
+/// The script (and its pixel-diff expectations) was validated against headless
+/// PyBoy first. No RAM addresses are used, so it survives rebuilding the ROM.
+fn run_play_snake(gb: &mut GameBoy, max_frames: u32) -> Outcome {
+    let mut p = Player {
+        gb,
+        frame: 0,
+        max_frames,
+    };
+    let script = |p: &mut Player| -> Result<(), Outcome> {
+        p.run(PLAY_BOOT_FRAMES)?;
+        let title = p.shot();
+        if title.iter().all(|&x| x == title[0]) {
+            return Err(Outcome::Fail("title screen is blank".into()));
+        }
+        p.hold(Button::Start, 5)?;
+        p.run(55)?;
+        let playing = p.shot();
+        expect_change("Start did not leave the title screen", &title, &playing)?;
+        // The snake auto-advances every <= 14 frames: 30 frames is >= 2 steps.
+        p.run(30)?;
+        let later = p.shot();
+        expect_change("snake did not move on its own", &playing, &later)?;
+        // Steer down; 4+ steps later the picture must have changed again.
+        p.hold(Button::Down, 3)?;
+        p.run(60)?;
+        expect_change("snake stopped after steering", &later, &p.shot())
+    };
+    match script(&mut p) {
+        Ok(()) => Outcome::Pass,
+        Err(o) => o,
+    }
+}
+
+/// Title -> Start -> serve -> launch ball -> move paddle.
+fn run_play_breakout(gb: &mut GameBoy, max_frames: u32) -> Outcome {
+    let mut p = Player {
+        gb,
+        frame: 0,
+        max_frames,
+    };
+    let script = |p: &mut Player| -> Result<(), Outcome> {
+        p.run(PLAY_BOOT_FRAMES)?;
+        let title = p.shot();
+        if title.iter().all(|&x| x == title[0]) {
+            return Err(Outcome::Fail("title screen is blank".into()));
+        }
+        p.hold(Button::Start, 5)?;
+        p.run(55)?;
+        let serve = p.shot();
+        expect_change("Start did not leave the title screen", &title, &serve)?;
+        p.hold(Button::A, 3)?;
+        p.run(30)?;
+        let launched = p.shot();
+        expect_change("ball did not launch", &serve, &launched)?;
+        p.hold(Button::Right, 30)?;
+        expect_change("paddle/ball frozen after D-pad input", &launched, &p.shot())
+    };
+    match script(&mut p) {
+        Ok(()) => Outcome::Pass,
+        Err(o) => o,
     }
 }
 
