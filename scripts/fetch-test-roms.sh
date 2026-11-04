@@ -31,6 +31,12 @@ fetch "$B/mem_timing/mem_timing.gb" blargg/mem_timing/mem_timing.gb
 for f in 01-read_timing 02-write_timing 03-modify_timing; do
   fetch "$B/mem_timing/individual/$f.gb" "blargg/mem_timing/individual/$f.gb"
 done
+fetch "$B/dmg_sound/dmg_sound.gb" blargg/dmg_sound/dmg_sound.gb
+for f in 01-registers 02-len\ ctr 03-trigger 04-sweep 05-sweep\ details 06-overflow\ on\ trigger \
+         07-len\ sweep\ period\ sync 08-len\ ctr\ during\ power 09-wave\ read\ while\ on \
+         10-wave\ trigger\ while\ on 11-regs\ after\ power 12-wave\ write\ while\ on; do
+  fetch "$B/dmg_sound/rom_singles/${f// /%20}.gb" "blargg/dmg_sound/rom_singles/$f.gb"
+done
 
 # Mooneye test suite (prebuilt)
 if [ ! -d mooneye ]; then
