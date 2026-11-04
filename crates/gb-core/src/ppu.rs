@@ -442,6 +442,13 @@ impl Ppu {
                 }
             }
             0xFF41 => {
+                // DMG quirk (Pan Docs "STAT"): the write behaves as if $FF
+                // were written for one M-cycle before the real value, so any
+                // source that is currently true raises the line.
+                if self.lcd_on() && !self.stat_line && self.stat_line_level_for(STAT_WRITABLE) {
+                    interrupts.request(Interrupt::Stat);
+                    self.stat_line = true;
+                }
                 self.stat_select = value & STAT_WRITABLE;
                 self.update_stat_line(interrupts);
             }

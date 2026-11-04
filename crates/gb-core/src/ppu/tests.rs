@@ -405,6 +405,65 @@ fn stat_write_with_asserted_source_raises_once() {
 }
 
 #[test]
+fn dmg_stat_write_raises_spurious_interrupt_outside_mode_3() {
+    // Pan Docs "STAT": a write (even $00) behaves as if $FF were written for
+    // one M-cycle first, so any currently true source raises the line.
+    for (ly, dot, what) in [(5, 4, "mode 2"), (5, 252, "mode 0"), (150, 100, "mode 1")] {
+        let mut rig = Rig::at_line0();
+        rig.run_to(ly, dot);
+        rig.clear_if();
+        rig.write(0xFF41, 0x00);
+        assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT, "{what}");
+    }
+
+    // The line fell back with the real value, so selecting HBlank afterwards
+    // is a fresh edge.
+    let mut rig = Rig::at_line0();
+    rig.run_to(5, 252);
+    rig.write(0xFF41, 0x00);
+    rig.clear_if();
+    rig.write(0xFF41, 0x08);
+    assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT);
+
+    // LY == LYC counts too.
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF45, 5);
+    rig.run_to(5, 100); // mode 3, coincidence set
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
+    assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT, "LY == LYC");
+}
+
+#[test]
+fn dmg_stat_write_is_quiet_in_mode_3_with_no_coincidence() {
+    let mut rig = Rig::at_line0();
+    rig.run_to(5, 100);
+    assert_eq!(rig.ppu.mode(), 3);
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
+
+#[test]
+fn dmg_stat_write_does_not_re_raise_a_line_that_is_already_high() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF41, 0x08);
+    rig.run_to(5, 252); // HBlank source holds the line
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
+
+#[test]
+fn dmg_stat_write_with_lcd_off_raises_nothing() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x11);
+    rig.clear_if();
+    rig.write(0xFF41, 0x00);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
+
+#[test]
 fn lyc_irq_is_blocked_while_mode_source_holds_line() {
     let mut rig = Rig::at_line0();
     rig.write(0xFF41, 0x48); // HBlank + LYC
