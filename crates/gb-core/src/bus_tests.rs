@@ -514,3 +514,58 @@ fn every_access_costs_one_mcycle() {
     b.tick();
     assert_eq!(b.mcycles() - start, 3);
 }
+
+// ---- STOP wake-up through the real Bus and Joypad ----
+
+/// A real CPU on a real bus running `STOP; INC B; JR -2` from 0x0100.
+fn stop_rig() -> (crate::cpu::Cpu, Bus) {
+    let mut rom = vec![0u8; 0x8000];
+    rom[0x100..0x105].copy_from_slice(&[0x10, 0x00, 0x04, 0x18, 0xFE]);
+    let mut b = Bus::new(cartridge::from_rom(rom).unwrap());
+    b.write(0xFF40, 0);
+    b.interrupts.write_if(0);
+    (crate::cpu::Cpu::new(), b)
+}
+
+#[test]
+fn stop_wakes_only_on_a_selected_joypad_line() {
+    use crate::joypad::Button;
+    let (mut cpu, mut b) = stop_rig();
+    b.write(0xFF00, 0x20); // select the d-pad group (bit 4 low)
+    cpu.step(&mut b); // STOP
+    for _ in 0..20 {
+        cpu.step(&mut b);
+    }
+    assert_eq!((cpu.regs.b, cpu.regs.pc), (0, 0x0102), "idles in STOP");
+    // A button in the unselected (action) group leaves the line high.
+    b.joypad.set_button(Button::A, true, &mut b.interrupts);
+    for _ in 0..5 {
+        cpu.step(&mut b);
+    }
+    assert_eq!(cpu.regs.b, 0, "unselected group does not wake");
+    // A d-pad press pulls a selected line low.
+    b.joypad.set_button(Button::Down, true, &mut b.interrupts);
+    assert!(b.joypad_line_low());
+    cpu.step(&mut b);
+    assert_eq!(cpu.regs.b, 1, "INC B ran after waking");
+}
+
+#[test]
+fn p1_select_write_through_the_bus_requests_the_joypad_irq_and_wakes_stop() {
+    use crate::joypad::Button;
+    let (mut cpu, mut b) = stop_rig();
+    b.write(0xFF00, 0x30); // select nothing
+    b.joypad.set_button(Button::Start, true, &mut b.interrupts);
+    assert_eq!(b.interrupts.read_if() & 0x10, 0, "nothing selected: no IRQ");
+    cpu.step(&mut b); // STOP
+    for _ in 0..5 {
+        cpu.step(&mut b);
+    }
+    assert_eq!(cpu.regs.b, 0);
+    assert!(!b.joypad_line_low());
+    b.write(0xFF00, 0x10); // select the action group: Start's line drops
+    assert_ne!(b.interrupts.read_if() & 0x10, 0, "IRQ reaches the real IF");
+    assert!(b.joypad_line_low());
+    cpu.step(&mut b);
+    assert_eq!(cpu.regs.b, 1);
+}
