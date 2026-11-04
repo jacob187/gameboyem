@@ -1,6 +1,6 @@
-//! Framebuffer presentation: DMG shade -> RGBA and a synthetic test pattern.
+//! Framebuffer presentation: DMG shade or CGB RGB555 -> RGBA and a synthetic test pattern.
 
-use gb_core::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gb_core::{CgbFramebuffer, Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteKind {
@@ -36,6 +36,22 @@ pub fn blit(fb: &Framebuffer, palette: &Palette, out: &mut [u8]) {
     let (pixels, _) = out.as_chunks_mut::<4>();
     for (shade, px) in fb.iter().zip(pixels) {
         *px = palette[usize::from(shade & 3)];
+    }
+}
+
+/// Convert an RGB555 (`0bbbbbgggggrrrrr`) colour frame to RGBA8 in `out`
+/// (`160*144*4` bytes). Each 5-bit channel `c` widens to `(c << 3) | (c >> 2)`,
+/// with no colour correction (the cgb-acid2 rule); the DMG palette is not used.
+pub fn blit_cgb(fb: &CgbFramebuffer, out: &mut [u8]) {
+    let widen = |c: u16| ((c << 3) | (c >> 2)) as u8;
+    let (pixels, _) = out.as_chunks_mut::<4>();
+    for (&px, out) in fb.iter().zip(pixels) {
+        *out = [
+            widen(px & 0x1F),
+            widen((px >> 5) & 0x1F),
+            widen((px >> 10) & 0x1F),
+            0xFF,
+        ];
     }
 }
 
@@ -80,6 +96,24 @@ mod tests {
         assert_eq!(&out[8..12], &[0x55, 0x55, 0x55, 0xFF]);
         assert_eq!(&out[12..16], &[0, 0, 0, 0xFF]);
         assert_eq!(&out[16..20], &[0, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn blit_cgb_widens_rgb555_without_correction() {
+        let mut fb = [0u16; SCREEN_WIDTH * SCREEN_HEIGHT];
+        fb[1] = 0x7FFF;
+        fb[2] = 0x001F; // red is the low 5 bits
+        fb[3] = 0x7C00; // blue the high
+        fb[4] = 0b01111_00001_10000;
+        fb[5] = 0x8000; // bit 15 ignored
+        let mut out = vec![0x11u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4];
+        blit_cgb(&fb, &mut out);
+        assert_eq!(&out[0..4], &[0, 0, 0, 0xFF]);
+        assert_eq!(&out[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(&out[8..12], &[0xFF, 0, 0, 0xFF]);
+        assert_eq!(&out[12..16], &[0, 0, 0xFF, 0xFF]);
+        assert_eq!(&out[16..20], &[0x84, 0x08, 0x7B, 0xFF]);
+        assert_eq!(&out[20..24], &[0, 0, 0, 0xFF]);
     }
 
     #[test]
