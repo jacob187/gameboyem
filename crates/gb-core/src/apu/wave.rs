@@ -3,8 +3,16 @@
 use super::common::Length;
 
 /// T-cycles between a trigger and the first sample fetch, on top of the
-/// period (three 2 MHz ticks). Calibrated against Blargg `dmg_sound` 09/12.
+/// period (three 2 MHz ticks). Empirical, not derived from a hardware trace:
+/// Blargg `dmg_sound` 09 (wave read while on), 10 (wave trigger while on) and
+/// 12 (wave write while on) pass for 5 and 6 and all three fail for 7, so 6 is
+/// the upper edge of the passing range and matches the three-tick figure.
 const TRIGGER_DELAY: i32 = 6;
+
+/// A retrigger corrupts wave RAM only if the next fetch is at most this many
+/// T-cycles away (one 2 MHz tick). Empirical: `dmg_sound` 10 fails for a
+/// window of 1 and passes for 2 and 3; 2 is the narrowest value that passes.
+const CORRUPTION_WINDOW: i32 = 2;
 
 #[derive(Clone, Debug)]
 pub(super) struct Wave {
@@ -83,7 +91,7 @@ impl Wave {
             // DMG: retriggering just before the channel fetches a sample
             // corrupts wave RAM: the byte about to be read overwrites byte 0
             // (index < 4) or the first four bytes (Pan Docs: "Wave Pattern RAM").
-            if self.enabled && self.timer <= 2 {
+            if self.enabled && self.timer <= CORRUPTION_WINDOW {
                 let byte = usize::from(((self.pos + 1) & 31) >> 1);
                 if byte < 4 {
                     self.ram[0] = self.ram[byte];
@@ -159,7 +167,9 @@ impl Wave {
     /// Wave RAM byte reached by a CPU access. While the channel plays, DMG
     /// exposes only the byte being fetched, and only in the M-cycle of the
     /// fetch; otherwise reads give $FF and writes are lost (Pan Docs: "Wave
-    /// Pattern RAM"). Timing is approximate: M-cycle rather than T-cycle.
+    /// Pattern RAM"). The wave timer runs at 2 MHz, two half-steps per
+    /// M-cycle, and only a fetch in the second half counts as "just read" (see
+    /// `tick_mcycle`), so the window is half an M-cycle (2 T-cycles) wide.
     pub fn ram_index(&self, offset: usize) -> Option<usize> {
         if !self.enabled {
             Some(offset)
