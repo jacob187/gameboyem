@@ -52,7 +52,10 @@ impl Bus {
         self.read_mapped(addr)
     }
 
-    /// Side-effect-free read of the full memory map (also used by debug tooling).
+    /// Read the memory map as the CPU would see it now, without side effects
+    /// (`&self`: no clock advances). Not a raw dump: VRAM reads 0xFF while the
+    /// PPU is in mode 3, OAM in modes 2 and 3, and cartridge RAM goes through
+    /// the mapper (see `GameBoy::peek`). OAM DMA bus conflicts are not applied.
     pub fn peek(&self, addr: u16) -> u8 {
         self.read_mapped(addr)
     }
