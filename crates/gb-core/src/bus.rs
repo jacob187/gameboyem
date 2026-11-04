@@ -85,8 +85,9 @@ pub struct Bus {
     /// KEY1 (FF4D) bit 0: a speed switch is armed for the next STOP. The speed
     /// itself (bit 7) is not implemented yet and always reads 0.
     pub(crate) key1_prepare: bool,
-    /// Undocumented read/write registers FF72, FF73 and FF75 (bits 4-6 only).
-    pub(crate) cgb_scratch: [u8; 3],
+    /// Undocumented read/write registers FF72, FF73, FF75 (bits 4-6 only) and
+    /// FF74, in that order. FF74 is mapped in CGB mode only.
+    pub(crate) cgb_scratch: [u8; 4],
 }
 
 impl Bus {
@@ -100,35 +101,34 @@ impl Bus {
         let header = cart.header();
         let cart_ticks = header.mbc == MbcKind::Mbc3 && header.has_rtc;
         let hw = Hw::new(model, header);
-        let mut bus = Self {
+        let cgb = hw.is_cgb();
+        Self {
             cart,
             wram: Box::new([0; CGB_WRAM_SIZE]),
             hram: [0; HRAM_SIZE],
             interrupts: Interrupts::new(),
-            timer: Timer::new(),
-            ppu: Ppu::new(),
-            dma: Dma::new(),
+            timer: if cgb { Timer::new_cgb() } else { Timer::new() },
+            ppu: if cgb { Ppu::new_cgb() } else { Ppu::new() },
+            dma: if cgb { Dma::new_cgb() } else { Dma::new() },
             apu: Apu::new(),
-            joypad: Joypad::new(),
-            serial: Serial::new(),
+            joypad: if cgb {
+                Joypad::new_cgb(hw == Hw::CgbCompat)
+            } else {
+                Joypad::new()
+            },
+            serial: if hw == Hw::Cgb {
+                Serial::new_cgb_mode()
+            } else {
+                Serial::new()
+            },
             mcycles: 0,
             cart_ticks,
             hw,
             svbk: 0,
             wram_hi: WRAM_BANK1,
             key1_prepare: false,
-            cgb_scratch: [0; 3],
-        };
-        if hw.is_cgb() {
-            bus.timer = Timer::new_cgb();
-            bus.ppu = Ppu::new_cgb();
-            bus.dma = Dma::new_cgb();
-            bus.joypad = Joypad::new_cgb(hw == Hw::CgbCompat);
-            if hw == Hw::Cgb {
-                bus.serial = Serial::new_cgb_mode();
-            }
+            cgb_scratch: [0; 4],
         }
-        bus
     }
 
     /// The registers the CPU starts with: the model's post-boot hand-off state.

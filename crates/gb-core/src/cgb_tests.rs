@@ -29,9 +29,9 @@ fn compat() -> Bus {
 }
 
 /// CGB-only registers a DMG must leave unmapped (reads 0xFF, writes dropped).
-const CGB_ONLY: [u16; 13] = [
-    0xFF4D, 0xFF4F, 0xFF70, 0xFF72, 0xFF73, 0xFF75, 0xFF76, 0xFF77, 0xFF68, 0xFF69, 0xFF6A, 0xFF6B,
-    0xFF51,
+const CGB_ONLY: [u16; 14] = [
+    0xFF4D, 0xFF4F, 0xFF70, 0xFF72, 0xFF73, 0xFF74, 0xFF75, 0xFF76, 0xFF77, 0xFF68, 0xFF69, 0xFF6A,
+    0xFF6B, 0xFF51,
 ];
 
 #[test]
@@ -183,6 +183,27 @@ fn key1_is_a_prepare_bit_with_unused_bits_set() {
     b.write(0xFF4D, 1);
     b.stop();
     assert_eq!(b.read(0xFF4D), 0x7F);
+}
+
+#[test]
+fn ff74_is_a_plain_register_in_cgb_mode_only() {
+    let mut b = cgb();
+    assert_eq!(b.read(0xFF74), 0x00);
+    for v in [0xA5, 0xFF, 0x00, 0x81] {
+        b.write(0xFF74, v);
+        assert_eq!(b.read(0xFF74), v);
+        assert_eq!(b.peek(0xFF74), v);
+    }
+    // It is independent of its neighbours.
+    b.write(0xFF74, 0x3C);
+    b.write(0xFF73, 0x11);
+    b.write(0xFF75, 0x70);
+    assert_eq!(b.read(0xFF74), 0x3C);
+    for model_hw in [bus(Model::Dmg, 0x80), compat()] {
+        let mut b = model_hw;
+        b.write(0xFF74, 0x3C);
+        assert_eq!(b.read(0xFF74), 0xFF);
+    }
 }
 
 #[test]

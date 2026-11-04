@@ -137,8 +137,8 @@ impl Bus {
 
     /// Reads in the range a DMG leaves unmapped. In DMG-compatibility mode a CGB
     /// maps only VBK (locked to bank 0), the palette index registers' unused
-    /// bit and FF72-FF77 (mooneye `unused_hwio-C`, `boot_hwio-C`); the rest
-    /// (KEY1, SVBK, HDMA, RP, ...) stays unmapped.
+    /// bit and FF72, FF73, FF75-FF77 (mooneye `unused_hwio-C`, `boot_hwio-C`); the
+    /// rest (KEY1, SVBK, FF74, HDMA, RP, ...) stays unmapped. CGB mode adds those.
     fn read_cgb_io(&self, addr: u16) -> u8 {
         match (self.hw, addr) {
             (Hw::Dmg, _) => 0xFF,
@@ -147,6 +147,8 @@ impl Bus {
             (Hw::Cgb, 0xFF70) => 0xF8 | self.svbk,
             (_, 0xFF72) => self.cgb_scratch[0],
             (_, 0xFF73) => self.cgb_scratch[1],
+            // Plain read/write in CGB mode only (Pan Docs "Undocumented registers").
+            (Hw::Cgb, 0xFF74) => self.cgb_scratch[3],
             (_, 0xFF75) => 0x8F | self.cgb_scratch[2],
             (_, 0xFF76 | 0xFF77) => self.apu.read_pcm(addr),
             _ => 0xFF,
@@ -170,13 +172,16 @@ impl Bus {
     fn write_cgb_io(&mut self, addr: u16, value: u8) {
         match (self.hw, addr) {
             (Hw::Dmg, _) => {}
-            // Compat mode: VBK stays on bank 0 (the bank-1 tiles and attributes
-            // are CGB-mode features), so the write is dropped.
+            // Assumption (DECISIONS #33): in compat mode VBK is locked to bank 0,
+            // so the write is dropped. Nothing pins this: the mooneye tests mask
+            // bit 0 of VBK.
+            (Hw::CgbCompat, 0xFF4F) => {}
             (Hw::Cgb, 0xFF4F) => self.ppu.write_vbk(value),
             (Hw::Cgb, 0xFF4D) => self.key1_prepare = value & 1 != 0,
             (Hw::Cgb, 0xFF70) => self.set_svbk(value),
             (_, 0xFF72) => self.cgb_scratch[0] = value,
             (_, 0xFF73) => self.cgb_scratch[1] = value,
+            (Hw::Cgb, 0xFF74) => self.cgb_scratch[3] = value,
             (_, 0xFF75) => self.cgb_scratch[2] = value & 0x70,
             _ => {}
         }
