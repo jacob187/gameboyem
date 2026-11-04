@@ -218,12 +218,24 @@ fn mode3_is_extended_by_scx_window_and_sprites() {
     rig.tick();
     assert_eq!(rig.ppu.mode3_len, 178);
 
-    // One sprite at OAM X=8 (alignment 0) adds 6 + 5.
+    // One sprite at OAM X=8 (alignment 0) adds 6 + 5, less the 3-dot phase.
     rig.write(0xFF40, 0x93);
     rig.set_sprite(0, 16 + 8, 8, 0, 0);
     rig.run_to(8, 76);
     rig.tick();
-    assert_eq!(rig.ppu.mode3_len, 172 + 11);
+    assert_eq!(rig.ppu.mode3_len, 172 + 8);
+
+    // A second sprite in another tile adds another 6 + 5.
+    rig.set_sprite(1, 16 + 8, 16, 0, 0);
+    rig.run_to(9, 76);
+    rig.tick();
+    assert_eq!(rig.ppu.mode3_len, 172 + 19);
+
+    // Sprites at X >= 168 take an OAM slot but cost nothing.
+    rig.set_sprite(1, 16 + 8, 168, 0, 0);
+    rig.run_to(10, 76);
+    rig.tick();
+    assert_eq!(rig.ppu.mode3_len, 172 + 8);
 }
 
 // ------------------------------------------------------- LY/LYC and STAT

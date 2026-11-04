@@ -15,6 +15,10 @@ const ATTR_X_FLIP: u8 = 0x20;
 const ATTR_PALETTE: u8 = 0x10;
 
 const MAX_SPRITES_PER_LINE: usize = 10;
+/// OAM X values from here on place a sprite fully off the right edge.
+const SPRITE_X_OFFSCREEN: u16 = 168;
+/// See [`Ppu::compute_mode3_len`].
+const SPRITE_PENALTY_PHASE: u16 = 3;
 
 /// One sprite's decoded row for the current line.
 #[derive(Clone, Copy)]
@@ -72,6 +76,11 @@ impl Ppu {
     /// (Pan Docs: "Mode 3 length"). The sprite penalty is the commonly used
     /// approximation: 6 dots per sprite, plus up to 5 more for the first sprite
     /// that lands in a given BG tile depending on its alignment within it.
+    /// Sprites with X >= 168 are never fetched and cost nothing, and the sum is
+    /// 3 dots short of that model: the table in mooneye
+    /// `intr_2_mode0_timing_sprites` (ceil of the penalty in M-cycles, measured
+    /// against the 4-dot mode 0 edge) fits `floor(penalty / 4)` for every
+    /// sprite layout it covers.
     pub(super) fn compute_mode3_len(&self) -> u16 {
         let mut len = MODE3_BASE_DOTS + u16::from(self.scx % 8);
         if self.window_on_line() {
@@ -79,18 +88,24 @@ impl Ppu {
         }
         if self.lcdc & LCDC_OBJ_ENABLE != 0 {
             let mut seen_tiles = [u16::MAX; MAX_SPRITES_PER_LINE];
+            let mut penalty = 0;
             for (n, &i) in self.line_sprites[..usize::from(self.line_sprite_count)]
                 .iter()
                 .enumerate()
             {
-                let x = u16::from(self.oam[usize::from(i) * 4 + 1]) + u16::from(self.scx);
+                let oam_x = u16::from(self.oam[usize::from(i) * 4 + 1]);
+                if oam_x >= SPRITE_X_OFFSCREEN {
+                    continue;
+                }
+                let x = oam_x + u16::from(self.scx);
                 let tile = x / 8;
-                len += 6;
+                penalty += 6;
                 if !seen_tiles[..n].contains(&tile) {
-                    len += 5u16.saturating_sub(x % 8);
+                    penalty += 5u16.saturating_sub(x % 8);
                 }
                 seen_tiles[n] = tile;
             }
+            len += penalty.saturating_sub(SPRITE_PENALTY_PHASE);
         }
         len
     }

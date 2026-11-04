@@ -64,7 +64,7 @@ pass mooneye 600 test/mooneye/acceptance/pop_timing.gb
 pass mooneye 600 test/mooneye/acceptance/ppu/hblank_ly_scx_timing-GS.gb
 pass mooneye 600 test/mooneye/acceptance/ppu/intr_1_2_timing-GS.gb
 pass mooneye 600 test/mooneye/acceptance/ppu/intr_2_0_timing.gb
-fail mooneye 600 test/mooneye/acceptance/ppu/intr_2_mode0_timing_sprites.gb
+pass mooneye 600 test/mooneye/acceptance/ppu/intr_2_mode0_timing_sprites.gb
 pass mooneye 600 test/mooneye/acceptance/ppu/intr_2_mode0_timing.gb
 pass mooneye 600 test/mooneye/acceptance/ppu/intr_2_mode3_timing.gb
 pass mooneye 600 test/mooneye/acceptance/ppu/intr_2_oam_ok_timing.gb
