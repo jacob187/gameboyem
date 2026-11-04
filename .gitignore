@@ -2,6 +2,7 @@
 **/target/
 /tools/
 /roms/
+/games/
 *.sav
 .DS_Store
 .claude/
