@@ -6,6 +6,20 @@
 //! `counter[bit(TAC)] & TAC.enable`, which naturally reproduces the DIV-write
 //! and TAC-write glitches. On overflow TIMA reads 0 for one M-cycle, then is
 //! reloaded from TMA and the timer interrupt is requested.
+//!
+//! # M-cycle ordering (see `bus.rs`)
+//!
+//! Every CPU access is `tick_mcycle` first, then the register access. Using
+//! `T` for the tick in which the falling edge overflows TIMA (verified against
+//! mooneye `tima_reload`, `tima_write_reloading`, `tma_write_reloading`):
+//!
+//! | access in tick | TIMA reads | TIMA write         | TMA write                |
+//! |----------------|------------|--------------------|--------------------------|
+//! | `T`            | `0x00`     | cancels reload+IRQ | picked up by the reload  |
+//! | `T + 1`        | `TMA`      | ignored            | too late for TIMA        |
+//! | `T + 2`        | normal     | normal             | normal                   |
+//!
+//! (Pan Docs calls the `T` row the cycle where "TMA writes propagate".)
 
 use crate::interrupts::{Interrupt, Interrupts};
 
@@ -21,7 +35,7 @@ pub struct Timer {
     /// TIMA overflowed during the previous M-cycle; reload happens this cycle.
     overflow_pending: bool,
     /// TIMA was reloaded from TMA during the current M-cycle; CPU writes to TIMA
-    /// in this cycle are ignored and TMA writes are copied into TIMA.
+    /// in this cycle are ignored.
     reloaded_this_cycle: bool,
 }
 
@@ -115,12 +129,7 @@ impl Timer {
                     self.overflow_pending = false;
                 }
             }
-            0xFF06 => {
-                self.tma = value;
-                if self.reloaded_this_cycle {
-                    self.tima = value;
-                }
-            }
+            0xFF06 => self.tma = value,
             0xFF07 => {
                 let before = self.timer_signal();
                 self.tac = value | 0xF8;
