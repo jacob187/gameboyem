@@ -472,3 +472,16 @@ impl Ppu {
         self.update_stat_line(interrupts);
     }
 }
+
+/// Bus-facing queries for OAM DMA and the unusable FEA0-FEFF range.
+impl Ppu {
+    /// VRAM read for the OAM DMA engine, which is not gated by PPU mode (Pan Docs "OAM DMA Transfer").
+    pub(crate) fn dma_read_vram(&self, addr: u16) -> u8 {
+        self.vram[(addr & 0x1FFF) as usize]
+    }
+
+    /// True while the CPU cannot read OAM (modes 2 and 3; Pan Docs "FEA0-FEFF range").
+    pub(crate) fn oam_blocked(&self) -> bool {
+        self.oam_read_blocked()
+    }
+}
