@@ -13,7 +13,6 @@
 
 /* ---- tiles ---------------------------------------------------------- */
 
-#define TILE_EMPTY (TILE_BASE + 0u)
 #define TILE_BODY  (TILE_BASE + 1u)
 #define TILE_HEAD  (TILE_BASE + 2u)
 #define TILE_FOOD  (TILE_BASE + 3u)
@@ -110,8 +109,7 @@ static void draw_field(void)
 {
     uint8_t i;
 
-    cls();
-    fill_bkg_rect(0, 1, 20, 17, TILE_EMPTY);
+    screen_clear();
     for (i = 0; i < 20; i++) {
         set_bkg_tile_xy(i, 1, TILE_WALL);
         set_bkg_tile_xy(i, 17, TILE_WALL);
@@ -236,18 +234,14 @@ static void play(void)
     sfx_game_over();
     hiscore_update(&best, score);
     /* Hold the final frame briefly so the collision is visible. */
-    for (frames = 0; frames < 45; frames++) {
-        wait_vbl_done();
-    }
+    hold_final_frame();
 }
 
 static void title_screen(void)
 {
     uint8_t i;
 
-    DISPLAY_OFF;
-    cls();
-    fill_bkg_rect(0, 0, 20, 18, TILE_EMPTY);
+    screen_clear();
     print_at(7, 4, "SNAKE");
     for (i = 4; i < 15; i++) {
         set_bkg_tile_xy(i, 8, TILE_BODY);
@@ -263,9 +257,7 @@ static void title_screen(void)
 
 static void game_over_screen(void)
 {
-    DISPLAY_OFF;
-    cls();
-    fill_bkg_rect(0, 0, 20, 18, TILE_EMPTY);
+    screen_clear();
     print_at(won ? 6 : 5, 4, won ? "YOU WIN" : "GAME OVER");
     print_at(4, 8, "SCORE");
     print_uint(10, 8, score, 5);
