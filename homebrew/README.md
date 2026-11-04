@@ -38,6 +38,33 @@ The headless harness cases `save-snake` / `save-breakout` (`crates/gb-test`) pla
 game to game over, load the resulting battery RAM into a fresh machine and check
 that its title screen differs from a fresh-RAM one.
 
+## Sounds
+
+Both games have sound effects, written straight to the APU registers by
+`common/sfx.c` (`sfx_init()` at boot sets NR52=0x80, NR50=0x77, NR51=0xFF and
+silences every channel). Effects are fire and forget: the length counter,
+envelope or hardware sweep ends each one, so game code never waits on them.
+Only the level-clear arpeggio is stepped, by `sfx_update()` once per frame. The
+tones are original and simple; CH3 (wave) is unused.
+
+| Effect | Game | Channel | Sound |
+|--------|------|---------|-------|
+| Start pressed (title, game over) | both | CH2 | ~885 Hz blip, 78 ms |
+| Eat | snake | CH1 | rising sweep ~440 Hz to ~1.8 kHz, about 50 ms |
+| Game over | both | CH1 + CH4 | falling sweep with envelope decay (~0.7 s) over a short noise crunch |
+| Paddle hit | breakout | CH2 | ~440 Hz blip, 39 ms |
+| Brick break | breakout | CH1 | 31 ms blip, one pitch per row (top row C6, bottom row C5) |
+| Life lost | breakout | CH4 | 190 ms of low decaying noise |
+| Level clear | breakout | CH1 + CH2 | C5 E5 G5 C6 arpeggio, 6 frames a note, CH2 echoing one note behind |
+
+The harness cases `sfx-snake` / `sfx-breakout` (`crates/gb-test`) drain
+`audio_samples()` every frame and compare peak-to-peak levels (so they do not
+depend on the APU's DC offset or filtering). The title and the game running
+must be silent; Start, eat, game over (snake) and Start, brick, paddle, life
+lost, game over (breakout) must be loud; and control runs without the input (no
+Start press, no steering to the food, no launch) must be quiet over the same
+frames. Level clear is not reached by the bot, so it is not in the harness.
+
 ## Build
 
 GBDK-2020 4.5.0 must be unpacked so that `$(GBDK_HOME)/bin/lcc` exists.
@@ -55,5 +82,6 @@ are copied to `$(OUT)`.
 ## Layout
 
 - `common/`: text/number printing, palette init, blinking PRESS START wait that seeds the RNG, high-score save/load.
+- `common/sfx.c`: sound effects (APU registers).
 - `snake/src/main.c`, `breakout/src/main.c`: one file per game.
 - Tiles 0..101 are GBDK's font; game art starts at tile 128.
