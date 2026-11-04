@@ -933,7 +933,40 @@ const fn rgb555(r: u16, g: u16, b: u16) -> u16 {
     r | g << 5 | b << 10
 }
 
-/// The ROM's eight BG palettes (`bkg_pal` in homebrew/cgbdemo/src/main.c), colours 0-3.
+// Everything the cgbdemo case expects is written out by hand from
+// homebrew/cgbdemo/src/main.c, independently of the C tables. Each constant below
+// names the C symbol it mirrors: change one side and you must change the other (the ROM
+// only rebuilds in CI, so a drift shows up there as a failing case).
+
+/// One 8x8 tile: 2 bytes per row, low bitplane then high (colour = hi * 2 + lo).
+type Tile = [u8; 16];
+
+/// `bkg_tiles[0]` (TILE_EMPTY).
+const CGBDEMO_TILE_EMPTY: Tile = [0; 16];
+/// `bkg_tiles` TILE_SOLID + 0..=2: solid colours 1, 2, 3.
+const CGBDEMO_TILE_SOLID: [Tile; 3] = [
+    [
+        0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00,
+    ],
+    [
+        0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00,
+        0xFF,
+    ],
+    [0xFF; 16],
+];
+/// `bkg_tiles` TILE_QUAD: quadrants top left 1, top right 2, bottom left 3, bottom right 0.
+const CGBDEMO_TILE_QUAD: Tile = [
+    0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0,
+];
+/// `spr_tile` (bank 1 of VRAM): colour 3 core, colour 1 rim. (`spr_decoy` is the bank 0
+/// tile of the same number, solid colour 1.)
+const CGBDEMO_TILE_SPRITE: Tile = [
+    0xFF, 0x00, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x00,
+];
+
+/// `bkg_pal`: the ROM's eight BG palettes, colours 0-3. Palette 7 colour 3 is the one A
+/// steps (`CYCLED_PAL`, `CYCLED_COLOR`); here it holds `CYCLE[0]`, its power-on value.
 const CGBDEMO_BKG_PAL: [[u16; 4]; 8] = [
     [
         rgb555(2, 2, 6),
@@ -984,32 +1017,124 @@ const CGBDEMO_BKG_PAL: [[u16; 4]; 8] = [
         rgb555(31, 8, 31),
     ],
 ];
-/// What A writes to BG palette 7, colour 3, in order (`CYCLE` in the ROM); index 0 is the
-/// power-on colour.
-const CGBDEMO_CYCLE: [u16; 3] = [rgb555(31, 8, 31), rgb555(22, 31, 4), rgb555(10, 22, 31)];
-/// Sprite core (OBJ palette 1, colour 3) and rim (colour 1).
+/// `CYCLE`: what the A presses write to BG palette 7, colour 3, in order. Press n shows
+/// `CYCLE[n % len]`; index 0 is the power-on colour and the wrap back to it is checked.
+const CGBDEMO_CYCLE: [u16; 5] = [
+    rgb555(31, 8, 31),
+    rgb555(22, 31, 4),
+    rgb555(10, 22, 31),
+    rgb555(31, 14, 10),
+    rgb555(31, 31, 31),
+];
+/// `CYCLED_PAL`, `CYCLED_COLOR`: the BG palette entry A writes.
+const CGBDEMO_CYCLED: (usize, usize) = (7, 3);
+/// `obj_pal`: the sprite's OBJ palette 1 (colour 0 is transparent). Core is colour 3, rim
+/// colour 1.
 const CGBDEMO_CORE: u16 = rgb555(31, 12, 24);
 const CGBDEMO_RIM: u16 = rgb555(28, 28, 31);
+const CGBDEMO_OBJ_PAL: [u16; 4] = [0, CGBDEMO_RIM, rgb555(0, 0, 0), CGBDEMO_CORE];
+/// `SPR_START_X`, `SPR_START_Y` (screen pixels of the sprite's top left) and `SPR_SPEED`
+/// (pixels per ROM poll with a D-pad direction held).
+const CGBDEMO_START: (usize, usize) = (80, 96);
+const CGBDEMO_SPEED: usize = 2;
 /// 8 swatch palettes x 3 colours, the quad tile's black, the backdrop, the colour 0 of
 /// palettes 3-5 (shown by the quad tiles) and the two sprite colours.
 const CGBDEMO_MIN_COLOURS: usize = 31;
-/// Where the ROM puts the sprite (screen pixels of its top-left) and how far one D-pad
-/// frame moves it.
-const CGBDEMO_START: (usize, usize) = (80, 96);
-const CGBDEMO_SPEED: usize = 2;
 
-/// A copy of the colour frame, or the failure if the machine is not in CGB colour mode.
-fn cgb_frame(gb: &GameBoy) -> Result<Vec<u16>, Outcome> {
-    gb.cgb_framebuffer().map(|f| f.to_vec()).ok_or_else(|| {
+/// One BG map cell that is not the empty tile in palette 0: the layout of `draw_card`.
+struct Cell {
+    tile: (usize, usize),
+    data: &'static Tile,
+    pal: usize,
+    flip: (bool, bool),
+    name: &'static str,
+}
+
+fn cgbdemo_cells() -> Vec<Cell> {
+    let mut cells = Vec::new();
+    // Rows 1..=3: palette p, colours 1..=3, in columns 2 + 2p and 3 + 2p.
+    for pal in 0..8 {
+        for (row, data) in CGBDEMO_TILE_SOLID.iter().enumerate() {
+            for col in [2 + 2 * pal, 3 + 2 * pal] {
+                cells.push(Cell {
+                    tile: (col, 1 + row),
+                    data,
+                    pal,
+                    flip: (false, false),
+                    name: "swatch",
+                });
+            }
+        }
+    }
+    // Row 6: palette 1 plain, X, Y, X+Y; then the same tile in palettes 3, 4, 5.
+    for (tx, pal, flip, name) in [
+        (2, 1, (false, false), "quad plain"),
+        (5, 1, (true, false), "quad X flip"),
+        (8, 1, (false, true), "quad Y flip"),
+        (11, 1, (true, true), "quad X+Y flip"),
+        (14, 3, (false, false), "quad palette 3"),
+        (16, 4, (false, false), "quad palette 4"),
+        (18, 5, (false, false), "quad palette 5"),
+    ] {
+        cells.push(Cell {
+            tile: (tx, 6),
+            data: &CGBDEMO_TILE_QUAD,
+            pal,
+            flip,
+            name,
+        });
+    }
+    cells
+}
+
+/// Colour index (0-3) of pixel (x, y) of a tile.
+fn tile_colour(tile: &Tile, x: usize, y: usize) -> usize {
+    let bit = 7 - x;
+    (usize::from((tile[2 * y + 1] >> bit) & 1) << 1) | usize::from((tile[2 * y] >> bit) & 1)
+}
+
+/// The whole colour frame the ROM should show: the BG cells, the empty tile elsewhere, the
+/// sprite with its top left at `sprite`, and `cycled` in BG palette 7 colour 3.
+fn cgbdemo_expected(sprite: (usize, usize), cycled: u16) -> Vec<u16> {
+    let colour = |pal: usize, c: usize| {
+        if (pal, c) == CGBDEMO_CYCLED {
+            cycled
+        } else {
+            CGBDEMO_BKG_PAL[pal][c]
+        }
+    };
+    // The empty tile in palette 0 is colour 0 of palette 0 everywhere.
+    let empty = colour(0, tile_colour(&CGBDEMO_TILE_EMPTY, 0, 0));
+    let mut fb = vec![empty; SCREEN_WIDTH * SCREEN_HEIGHT];
+    for cell in cgbdemo_cells() {
+        for y in 0..8 {
+            for x in 0..8 {
+                let sx = if cell.flip.0 { 7 - x } else { x };
+                let sy = if cell.flip.1 { 7 - y } else { y };
+                let c = tile_colour(cell.data, sx, sy);
+                fb[(cell.tile.1 * 8 + y) * SCREEN_WIDTH + cell.tile.0 * 8 + x] =
+                    colour(cell.pal, c);
+            }
+        }
+    }
+    for y in 0..8 {
+        for x in 0..8 {
+            let c = tile_colour(&CGBDEMO_TILE_SPRITE, x, y);
+            if c != 0 {
+                fb[(sprite.1 + y) * SCREEN_WIDTH + sprite.0 + x] = CGBDEMO_OBJ_PAL[c];
+            }
+        }
+    }
+    fb
+}
+
+/// A borrow of the colour frame, or the failure if the machine is not in CGB colour mode.
+fn cgb_frame(gb: &GameBoy) -> Result<&[u16], Outcome> {
+    gb.cgb_framebuffer().map(|f| f.as_slice()).ok_or_else(|| {
         Outcome::Fail(
             "cgb_framebuffer() is None: the machine is not rendering in CGB colour mode".into(),
         )
     })
-}
-
-/// The pixel at (x, y) of a colour frame.
-fn cgb_px(fb: &[u16], x: usize, y: usize) -> u16 {
-    fb[y * SCREEN_WIDTH + x]
 }
 
 /// Bounding box `(min_x, min_y, max_x, max_y)` of the pixels equal to `colour`.
@@ -1032,47 +1157,68 @@ fn check(ok: bool, what: impl FnOnce() -> String) -> Result<(), Outcome> {
     }
 }
 
-/// `want` at offset (`dx`, `dy`) inside BG tile (`tx`, `ty`).
-fn check_tile_px(
-    fb: &[u16],
-    (tx, ty): (usize, usize),
-    (dx, dy): (usize, usize),
-    want: u16,
-    what: &str,
-) -> Result<(), Outcome> {
-    let (x, y) = (tx * 8 + dx, ty * 8 + dy);
-    let got = cgb_px(fb, x, y);
-    check(got == want, || {
-        format!("{what}: pixel ({x}, {y}) is {got:#06x}, want {want:#06x}")
-    })
+/// Every pixel of `got` equals `want`; the failure names the first differing pixel and
+/// the cell (tile) it is in.
+fn check_frame(got: &[u16], want: &[u16], cells: &[Cell], what: &str) -> Result<(), Outcome> {
+    let mut bad = (0..got.len()).filter(|&i| got[i] != want[i]);
+    let Some(first) = bad.next() else {
+        return Ok(());
+    };
+    let n = 1 + bad.count();
+    let (x, y) = (first % SCREEN_WIDTH, first / SCREEN_WIDTH);
+    let tile = (x / 8, y / 8);
+    let name = cells
+        .iter()
+        .find(|c| c.tile == tile)
+        .map_or("backdrop or sprite", |c| c.name);
+    Err(Outcome::Fail(format!(
+        "{what}: {n} pixels differ; first at ({x}, {y}) in tile {tile:?} ({name}): {:#06x}, want {:#06x}",
+        got[first], want[first]
+    )))
 }
 
-/// The four quadrants (top left, top right, bottom left, bottom right) of the ROM's
-/// asymmetric tile hold palette colours 1, 2, 3, 0; `flip` is (X, Y).
-fn check_quad(
-    fb: &[u16],
-    tile: (usize, usize),
-    pal: usize,
-    flip: (bool, bool),
-    what: &str,
-) -> Result<(), Outcome> {
-    let c = CGBDEMO_BKG_PAL[pal];
-    let plain = [c[1], c[2], c[3], c[0]];
-    // Quadrant index: bit 0 = right, bit 1 = bottom; a flip mirrors that bit.
-    for (q, off) in [(2, 2), (6, 2), (2, 6), (6, 6)].into_iter().enumerate() {
-        let src = q ^ usize::from(flip.0) ^ (usize::from(flip.1) << 1);
-        check_tile_px(fb, tile, off, plain[src], what)?;
+/// Top left of the sprite's colour 3 core, which must be 6x6.
+fn cgbdemo_core(fb: &[u16]) -> Result<(usize, usize), Outcome> {
+    let (x0, y0, x1, y1) = cgb_bbox(fb, CGBDEMO_CORE)
+        .ok_or_else(|| Outcome::Fail("sprite core colour not on screen".into()))?;
+    check((x1 - x0, y1 - y0) == (5, 5), || {
+        format!(
+            "sprite core is {}x{}, want 6x6 (bank 1 tile?)",
+            x1 - x0 + 1,
+            y1 - y0 + 1
+        )
+    })?;
+    Ok((x0, y0))
+}
+
+/// Holds `button` for `frames` frames, releases it and runs `settle` more. Returns the
+/// sprite core position after every one of those frames.
+fn cgbdemo_track(
+    s: &mut Session,
+    button: Button,
+    frames: u32,
+    settle: u32,
+) -> Result<Vec<(usize, usize)>, Outcome> {
+    let mut at = Vec::new();
+    s.gb.set_button(button, true);
+    for i in 0..frames + settle {
+        if i == frames {
+            s.gb.set_button(button, false);
+        }
+        s.step()?;
+        at.push(cgbdemo_core(cgb_frame(&s.gb)?)?);
     }
-    Ok(())
+    Ok(at)
 }
 
 /// homebrew/cgbdemo (header 0x143 = 0xC0), on a CGB:
-/// 1. the colour frame exists and has many distinct colours;
-/// 2. every swatch shows its palette's colours, and the asymmetric tile shows the right
-///    quadrants plain, X-flipped, Y-flipped and both (VRAM bank 1 attributes);
-/// 3. the sprite (bank 1 tile data, OBJ palette 1) is where the ROM puts it, and each
-///    D-pad direction moves it that way and no other;
-/// 4. A steps BG palette 7 colour 3 once per press and nothing else changes colour.
+/// 1. the colour frame exists, has many distinct colours, and matches the expected card
+///    pixel for pixel (every swatch and flip variant of the asymmetric tile, VRAM bank 1
+///    attributes, the backdrop, and the bank 1 sprite at its start position);
+/// 2. each D-pad direction moves the sprite that way and no other, in steps of exactly
+///    the ROM's speed, whatever the phase of the ROM's poll against the frame boundary;
+/// 3. each A press steps BG palette 7 colour 3 along all of `CYCLE` and back round to its
+///    first entry, and no other pixel of the frame changes.
 fn run_cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Outcome {
     match cgbdemo(rom, model, max_frames) {
         Ok(()) => Outcome::Pass,
@@ -1083,11 +1229,10 @@ fn run_cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Outcome {
 fn cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Result<(), Outcome> {
     let mut s = Session::new(rom, model, max_frames)?;
     s.run(30)?;
+    let cells = cgbdemo_cells();
     let fb = cgb_frame(&s.gb)?;
 
-    let mut seen = fb.clone();
-    seen.sort_unstable();
-    seen.dedup();
+    let seen: std::collections::HashSet<u16> = fb.iter().copied().collect();
     check(seen.len() >= CGBDEMO_MIN_COLOURS, || {
         format!(
             "{} distinct colours, want at least {CGBDEMO_MIN_COLOURS}",
@@ -1095,94 +1240,102 @@ fn cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Result<(), Outcome> {
         )
     })?;
 
-    // Swatch columns 2 + 2p, rows 1..=3 show colours 1..=3 of palette p. Palette 7's
-    // colour 3 is the one A steps.
-    for (p, pal) in CGBDEMO_BKG_PAL.iter().enumerate() {
-        for row in 0..3 {
-            let want = if (p, row) == (7, 2) {
-                CGBDEMO_CYCLE[0]
-            } else {
-                pal[row + 1]
-            };
-            let what = format!("swatch palette {p} colour {}", row + 1);
-            check_tile_px(&fb, (2 + 2 * p, 1 + row), (4, 4), want, &what)?;
-        }
-    }
-    // Row 6: palette 1 plain, X, Y, X+Y; then the same tile in palettes 3, 4, 5.
-    for (tx, flip, what) in [
-        (2, (false, false), "plain"),
-        (5, (true, false), "X flip"),
-        (8, (false, true), "Y flip"),
-        (11, (true, true), "X+Y flip"),
-    ] {
-        check_quad(&fb, (tx, 6), 1, flip, what)?;
-    }
-    for (tx, pal) in [(14, 3), (16, 4), (18, 5)] {
-        check_quad(&fb, (tx, 6), pal, (false, false), &format!("palette {pal}"))?;
-    }
-
-    // The sprite: a 6x6 core inside a rim, at the ROM's start position.
-    let core = |fb: &[u16]| {
-        let (x0, y0, x1, y1) = cgb_bbox(fb, CGBDEMO_CORE)
-            .ok_or_else(|| Outcome::Fail("sprite core colour not on screen".into()))?;
-        check((x1 - x0, y1 - y0) == (5, 5), || {
-            format!(
-                "sprite core is {}x{}, want 6x6 (bank 1 tile?)",
-                x1 - x0 + 1,
-                y1 - y0 + 1
-            )
-        })?;
-        Ok::<_, Outcome>((x0, y0))
-    };
+    // The sprite's core starts one pixel in from the rim, at the ROM's start position.
     let start = (CGBDEMO_START.0 + 1, CGBDEMO_START.1 + 1);
-    let at = core(&fb)?;
+    let at = cgbdemo_core(fb)?;
     check(at == start, || {
         format!("sprite core starts at {at:?}, want {start:?}")
     })?;
-    check(
-        cgb_px(&fb, CGBDEMO_START.0, CGBDEMO_START.1) == CGBDEMO_RIM,
-        || "sprite rim colour missing".into(),
+    check_frame(
+        fb,
+        &cgbdemo_expected(CGBDEMO_START, CGBDEMO_CYCLE[0]),
+        &cells,
+        "power-on card",
     )?;
 
-    // Hold each direction for 8 frames: the sprite moves 8 steps that way. Left and Up
-    // undo Right and Down.
-    let frames = 8;
-    let d = (frames * CGBDEMO_SPEED) as isize;
-    for (button, want) in [
-        (Button::Right, (d, 0)),
-        (Button::Left, (-d, 0)),
-        (Button::Down, (0, d)),
-        (Button::Up, (0, -d)),
+    // Hold each direction for 8 frames, then release. The ROM polls once per frame, but
+    // where that poll falls against the harness's frame boundary decides whether 7, 8 or
+    // 9 of them see the button, so count the steps instead of assuming 8: every frame
+    // moves the sprite by 0 or exactly one step along the axis (never sideways), and the
+    // total is 7..=9 steps. The sprite must be still again by the last two frames.
+    // Left and Up undo Right and Down.
+    let (frames, settle) = (8, 3);
+    let speed = CGBDEMO_SPEED as isize;
+    for (button, dir) in [
+        (Button::Right, (1, 0)),
+        (Button::Left, (-1, 0)),
+        (Button::Down, (0, 1)),
+        (Button::Up, (0, -1)),
     ] {
-        let (bx, by) = core(&cgb_frame(&s.gb)?)?;
-        s.hold(button, frames as u32)?;
-        s.run(2)?;
-        let (nx, ny) = core(&cgb_frame(&s.gb)?)?;
-        let moved = (nx as isize - bx as isize, ny as isize - by as isize);
-        check(moved == want, || {
-            format!("{button:?} moved the sprite by {moved:?}, want {want:?}")
+        let mut prev = cgbdemo_core(cgb_frame(&s.gb)?)?;
+        let track = cgbdemo_track(&mut s, button, frames, settle)?;
+        let mut steps = Vec::new();
+        for &now in &track {
+            let d = (
+                now.0 as isize - prev.0 as isize,
+                now.1 as isize - prev.1 as isize,
+            );
+            let one = (dir.0 * speed, dir.1 * speed);
+            check(d == (0, 0) || d == one, || {
+                format!("{button:?}: a frame moved the sprite by {d:?}, want (0, 0) or {one:?}")
+            })?;
+            steps.push(d != (0, 0));
+            prev = now;
+        }
+        let n = steps.iter().filter(|&&m| m).count();
+        check((7..=9).contains(&n), || {
+            format!("{button:?}: the sprite stepped {n} times in {frames} held frames, want 7 to 9")
         })?;
+        check(!steps[steps.len() - 2..].iter().any(|&m| m), || {
+            format!("{button:?}: the sprite was still moving after the button was released")
+        })?;
+        // Wherever it stopped, the whole frame is the card with the sprite there.
+        let (sx, sy) = (prev.0 - 1, prev.1 - 1);
+        check_frame(
+            cgb_frame(&s.gb)?,
+            &cgbdemo_expected((sx, sy), CGBDEMO_CYCLE[0]),
+            &cells,
+            &format!("after {button:?}"),
+        )?;
     }
 
-    // A: each press steps palette 7 colour 3 along CYCLE; a held press steps once.
-    let swatch =
-        |fb: &[u16], p: usize, row: usize| cgb_px(fb, (2 + 2 * p) * 8 + 4, (1 + row) * 8 + 4);
-    let before = cgb_frame(&s.gb)?;
-    for (n, want) in CGBDEMO_CYCLE.iter().enumerate().skip(1) {
+    // A: each press steps palette 7 colour 3 along CYCLE (a held press steps once), five
+    // presses to go through every entry and wrap back to the first. Against the frame
+    // before the press, exactly the pixels showing the old colour (the swatch's 16x8
+    // area) become the new one and every other pixel is unchanged, so a BCPS
+    // auto-increment slip into a neighbouring entry shows up.
+    let (pal, col) = CGBDEMO_CYCLED;
+    // Colour c is in swatch row c - 1, which is map row 1 + (c - 1).
+    let (swatch_x, swatch_y) = ((2 + 2 * pal) * 8, col * 8);
+    let len = CGBDEMO_CYCLE.len();
+    for n in 1..=len {
+        let (old, new) = (CGBDEMO_CYCLE[(n - 1) % len], CGBDEMO_CYCLE[n % len]);
+        let before = cgb_frame(&s.gb)?.to_vec();
         s.hold(Button::A, 4)?;
         s.run(2)?;
-        let fb = cgb_frame(&s.gb)?;
-        let got = swatch(&fb, 7, 2);
-        check(got == *want, || {
-            format!("after A press {n}, palette 7 colour 3 is {got:#06x}, want {want:#06x}")
+        let after = cgb_frame(&s.gb)?;
+        let showing: Vec<usize> = (0..before.len()).filter(|&i| before[i] == old).collect();
+        let area: Vec<usize> = (swatch_y..swatch_y + 8)
+            .flat_map(|y| (swatch_x..swatch_x + 16).map(move |x| y * SCREEN_WIDTH + x))
+            .collect();
+        check(showing == area, || {
+            format!(
+                "before A press {n}, {} pixels show {old:#06x}, want exactly the {} of the swatch",
+                showing.len(),
+                area.len()
+            )
         })?;
-        // Only that palette entry changed: every other swatch is as before.
-        for (p, row) in (0..8).flat_map(|p| (0..3).map(move |r| (p, r))) {
-            if (p, row) != (7, 2) {
-                check(swatch(&fb, p, row) == swatch(&before, p, row), || {
-                    format!("A press {n} also changed swatch palette {p} row {row}")
-                })?;
-            }
+        for i in 0..before.len() {
+            let want = if before[i] == old { new } else { before[i] };
+            check(after[i] == want, || {
+                format!(
+                    "A press {n}: pixel ({}, {}) is {:#06x}, want {want:#06x} (was {:#06x})",
+                    i % SCREEN_WIDTH,
+                    i / SCREEN_WIDTH,
+                    after[i],
+                    before[i]
+                )
+            })?;
         }
     }
     Ok(())
