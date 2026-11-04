@@ -34,8 +34,10 @@ pub(crate) fn ram_window_offset(addr: u16) -> usize {
 ///   Writes to this range are MBC register writes.
 /// * `read_ram`/`write_ram` receive CPU addresses `0xA000..=0xBFFF`.
 ///   Disabled or absent RAM reads `0xFF` and ignores writes.
-/// * `tick_mcycle` is called once per M-cycle (for MBC3 RTC); default no-op.
-///   It must not read the host clock: RTC time advances with emulated time only.
+/// * `tick_mcycle` is called once per M-cycle by [`crate::bus::Bus`], but only
+///   for a header with `mbc == Mbc3 && has_rtc` (the bus skips the virtual call
+///   otherwise); default no-op. It must not read the host clock: RTC time
+///   advances with emulated time only.
 /// * Battery RAM: [`Cartridge::battery_ram`] returns the bytes to persist (only
 ///   if the cartridge has a battery); [`Cartridge::load_battery_ram`] restores them.
 pub trait Cartridge: Send {

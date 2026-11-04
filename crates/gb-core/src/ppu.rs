@@ -227,8 +227,27 @@ impl Ppu {
             return;
         }
         self.vis_mode = self.mode();
-        for _ in 0..4 {
-            self.step_dot(interrupts);
+        let dot = self.line_dot;
+        let next = dot + 4;
+        if next < DOTS_PER_LINE && !(dot < OAM_SCAN_DOTS && next >= OAM_SCAN_DOTS) {
+            // None of the 4 dots ends the line or starts mode 3, so every
+            // `step_dot` would only have incremented `line_dot`.
+            self.line_dot = next;
+            // The LYC flag and STAT line were last evaluated at `dot` (every
+            // state change calls `refresh_lyc_flag` / `update_stat_line`).
+            // They depend on `line_dot` only through the line-start window
+            // (dots 0..4), the mode 2 -> 3 edge (excluded above) and the mode
+            // 3 -> 0 edge, so with none of those crossed they cannot change.
+            let mode3_end = OAM_SCAN_DOTS + self.mode3_len;
+            if dot >= 4 && !(dot < mode3_end && next >= mode3_end) {
+                debug_assert_eq!(self.lyc_flag, self.lyc == self.visible_ly());
+                debug_assert_eq!(self.stat_line, self.stat_line_level());
+                return;
+            }
+        } else {
+            for _ in 0..4 {
+                self.step_dot(interrupts);
+            }
         }
         self.refresh_lyc_flag();
         self.update_stat_line(interrupts);
@@ -276,6 +295,15 @@ impl Ppu {
     /// on. Line 144 also pulses the mode 2 (OAM) source as VBlank begins
     /// (mooneye `vblank_stat_intr-GS`).
     fn update_stat_line(&mut self, interrupts: &mut Interrupts) {
+        let line = self.stat_line_level();
+        if line && !self.stat_line {
+            interrupts.request(Interrupt::Stat);
+        }
+        self.stat_line = line;
+    }
+
+    /// The current level of the STAT interrupt line (see [`Self::update_stat_line`]).
+    fn stat_line_level(&self) -> bool {
         let sel = self.stat_select;
         let mode_line = self.lcd_on() && {
             let mode = self.mode();
@@ -284,11 +312,7 @@ impl Ppu {
                 || (sel & STAT_VBLANK_IRQ != 0 && mode == 1)
                 || (sel & STAT_OAM_IRQ != 0 && (mode == 2 || vblank_oam))
         };
-        let line = mode_line || (sel & STAT_LYC_IRQ != 0 && self.lyc_flag);
-        if line && !self.stat_line {
-            interrupts.request(Interrupt::Stat);
-        }
-        self.stat_line = line;
+        mode_line || (sel & STAT_LYC_IRQ != 0 && self.lyc_flag)
     }
 
     pub fn take_frame_ready(&mut self) -> bool {
