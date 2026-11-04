@@ -1,10 +1,16 @@
 //! MBC3 (Pan Docs: "MBC3"). Up to 2 MiB ROM / 32 KiB RAM plus a real-time clock.
 //!
+//! The MBC30 variant (Japanese Pokemon Crystal) has an 8-bit ROM bank (4 MiB)
+//! and 8 RAM banks (64 KiB). It shares cartridge types 0x0F-0x13 with MBC3, so
+//! it is detected from the header: the declared ROM size is above 2 MiB or the
+//! declared RAM size is 64 KiB. Anything else keeps the plain MBC3 masks
+//! (7-bit ROM bank, RAM banks 0-3).
+//!
 //! Registers:
 //! * `0000-1FFF` RAM and RTC enable (low nibble `0xA` enables).
-//! * `2000-3FFF` ROM bank, 7 bits; a written 0 is treated as 1.
-//! * `4000-5FFF` `00-03` selects a RAM bank, `08-0C` selects an RTC register
-//!   (S, M, H, DL, DH) for `A000-BFFF`.
+//! * `2000-3FFF` ROM bank, 7 bits (MBC30: 8); a written 0 is treated as 1.
+//! * `4000-5FFF` `00-03` (MBC30: `00-07`) selects a RAM bank, `08-0C` selects
+//!   an RTC register (S, M, H, DL, DH) for `A000-BFFF`.
 //! * `6000-7FFF` latch: writing `00` then `01` copies the live clock into the
 //!   latched registers that reads return.
 //!
@@ -112,11 +118,20 @@ impl Rtc {
     }
 }
 
+/// MBC30 detection (see module docs): more than 2 MiB of ROM or 64 KiB of RAM.
+fn is_mbc30(header: &CartridgeHeader) -> bool {
+    header.rom_size > 0x20_0000 || header.ram_size == 0x1_0000
+}
+
 pub struct Mbc3 {
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
     rom_bank_mask: usize,
+    /// Mask applied to values written to the ROM bank register (0x7F or 0xFF).
+    rom_bank_reg_mask: u8,
+    /// Highest RAM bank selector (3 for MBC3, 7 for MBC30).
+    max_ram_select: u8,
     ram_enabled: bool,
     rom_bank: u8,
     /// Raw value of the `4000-5FFF` register.
@@ -133,11 +148,14 @@ impl Mbc3 {
     pub fn new(rom: Vec<u8>, header: CartridgeHeader) -> Self {
         let ram = vec![0; header.ram_size];
         let rom_bank_mask = rom.len() / ROM_BANK_SIZE - 1;
+        let mbc30 = is_mbc30(&header);
         Self {
             rom,
             ram,
             header,
             rom_bank_mask,
+            rom_bank_reg_mask: if mbc30 { 0xFF } else { 0x7F },
+            max_ram_select: if mbc30 { 7 } else { 3 },
             ram_enabled: false,
             rom_bank: 1,
             ram_select: 0,
@@ -175,7 +193,7 @@ impl Cartridge for Mbc3 {
         match addr {
             0x0000..=0x1FFF => self.ram_enabled = value & 0x0F == 0x0A,
             0x2000..=0x3FFF => {
-                let v = value & 0x7F;
+                let v = value & self.rom_bank_reg_mask;
                 self.rom_bank = if v == 0 { 1 } else { v };
             }
             0x4000..=0x5FFF => self.ram_select = value,
@@ -197,7 +215,9 @@ impl Cartridge for Mbc3 {
             return 0xFF;
         }
         match self.ram_select {
-            0x00..=0x03 => self.ram_offset(addr).map_or(0xFF, |o| self.ram[o]),
+            0x00..=0x07 if self.ram_select <= self.max_ram_select => {
+                self.ram_offset(addr).map_or(0xFF, |o| self.ram[o])
+            }
             0x08..=0x0C if self.header.has_rtc => self.latched.get(self.ram_select),
             _ => 0xFF,
         }
@@ -208,7 +228,7 @@ impl Cartridge for Mbc3 {
             return;
         }
         match self.ram_select {
-            0x00..=0x03 => {
+            0x00..=0x07 if self.ram_select <= self.max_ram_select => {
                 if let Some(o) = self.ram_offset(addr) {
                     self.ram[o] = value;
                 }
@@ -327,6 +347,80 @@ mod tests {
         c.write_rom(0x2000, 0xC5);
         assert_eq!(c.read_rom(0x4000), 0x45);
         assert_eq!(c.read_rom(0x0000), 0, "0000-3FFF is fixed to bank 0");
+    }
+
+    #[test]
+    fn mbc30_detection() {
+        let det = |banks, ct, rom_code, ram_code| {
+            is_mbc30(&CartridgeHeader::parse(&banked_rom(banks, ct, rom_code, ram_code)).unwrap())
+        };
+        assert!(!det(2, 0x13, 0x00, 0x03), "32 KiB RAM, 32 KiB ROM");
+        assert!(!det(128, 0x13, 0x06, 0x03), "exactly 2 MiB ROM is MBC3");
+        assert!(!det(2, 0x13, 0x00, 0x04), "128 KiB RAM is not MBC30");
+        assert!(det(256, 0x13, 0x07, 0x03), "4 MiB ROM");
+        assert!(det(2, 0x13, 0x00, 0x05), "64 KiB RAM");
+        assert!(det(2, 0x10, 0x00, 0x05), "64 KiB RAM with RTC");
+    }
+
+    #[test]
+    fn mbc30_reaches_rom_banks_128_and_up() {
+        let mut c = from_rom(banked_rom(256, 0x11, 0x07, 0)).unwrap();
+        for bank in [0x80u8, 0xC5, 0xFF, 0x7F, 0x01] {
+            c.write_rom(0x2000, bank);
+            assert_eq!(c.read_rom(0x4000), bank, "bank {bank:#x}");
+        }
+        c.write_rom(0x2000, 0);
+        assert_eq!(c.read_rom(0x4000), 1, "0 still maps to 1");
+        assert_eq!(c.read_rom(0x0000), 0);
+    }
+
+    #[test]
+    fn mbc30_reaches_ram_banks_4_to_7() {
+        // RAM code 5 = 64 KiB = 8 banks.
+        let mut c = from_rom(banked_rom(2, 0x13, 0, 0x05)).unwrap();
+        c.write_rom(0x0000, 0x0A);
+        for bank in 0..8u8 {
+            c.write_rom(0x4000, bank);
+            c.write_ram(0xA000, 0x10 + bank);
+            c.write_ram(0xBFFF, 0x20 + bank);
+        }
+        for bank in 0..8u8 {
+            c.write_rom(0x4000, bank);
+            assert_eq!(c.read_ram(0xA000), 0x10 + bank, "bank {bank}");
+            assert_eq!(c.read_ram(0xBFFF), 0x20 + bank, "bank {bank}");
+        }
+        c.write_rom(0x4000, 0x07);
+        assert_eq!(c.battery_ram().unwrap()[7 * 0x2000], 0x17);
+    }
+
+    #[test]
+    fn mbc30_rtc_registers_still_selectable() {
+        let mut c = from_rom(banked_rom(2, 0x10, 0, 0x05)).unwrap();
+        c.write_rom(0x0000, 0x0A);
+        c.write_rom(0x4000, 0x08);
+        c.write_ram(0xA000, 42);
+        latch(c.as_mut());
+        assert_eq!(c.read_ram(0xA000), 42);
+        c.write_rom(0x4000, 0x0D); // unmapped
+        assert_eq!(c.read_ram(0xA000), 0xFF);
+    }
+
+    #[test]
+    fn plain_mbc3_keeps_four_ram_banks_and_seven_bit_rom_bank() {
+        // 32 KiB RAM: selectors 4-7 are unmapped and must not alias banks 0-3.
+        let mut c = from_rom(banked_rom(128, 0x13, 0x06, 0x03)).unwrap();
+        c.write_rom(0x0000, 0x0A);
+        c.write_rom(0x4000, 0);
+        c.write_ram(0xA000, 0x42);
+        for sel in 4..8u8 {
+            c.write_rom(0x4000, sel);
+            assert_eq!(c.read_ram(0xA000), 0xFF, "selector {sel}");
+            c.write_ram(0xA000, 0x99);
+        }
+        c.write_rom(0x4000, 0);
+        assert_eq!(c.read_ram(0xA000), 0x42);
+        c.write_rom(0x2000, 0x80);
+        assert_eq!(c.read_rom(0x4000), 1, "bit 7 ignored on MBC3");
     }
 
     #[test]
