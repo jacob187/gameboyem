@@ -39,6 +39,8 @@ pub struct App {
     gb: GameBoy,
     saves: SaveManager,
     audio: Option<AudioOutput>,
+    /// Reused every frame to carry samples from the core to the ring.
+    audio_buf: Vec<f32>,
     palette: Palette,
     scale: u32,
     title: String,
@@ -89,6 +91,7 @@ impl App {
             gb,
             saves,
             audio,
+            audio_buf: Vec::new(),
             palette,
             scale,
             title,
@@ -192,22 +195,23 @@ impl App {
     /// Run `n` emulated frames, feed audio, and upload the last picture.
     fn run_frames(&mut self, n: u32) {
         for _ in 0..n {
-            let samples = match self.test.as_mut() {
+            self.audio_buf.clear();
+            match self.test.as_mut() {
                 Some(t) => {
                     test_pattern(t.frame, &mut t.fb);
                     t.frame = t.frame.wrapping_add(1);
-                    t.tone.next_frame()
+                    self.audio_buf.extend_from_slice(&t.tone.next_frame());
                 }
                 None => {
                     self.gb.step_frame();
                     // Always drain so the core's buffer cannot grow unbounded.
-                    self.gb.audio_samples()
+                    self.gb.drain_audio_into(&mut self.audio_buf);
                 }
-            };
+            }
             if !self.fast_forward
                 && let Some(a) = &self.audio
             {
-                a.ring.push(&samples);
+                a.ring.push(&self.audio_buf);
             }
         }
         if n > 0 {
