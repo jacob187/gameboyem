@@ -121,6 +121,10 @@ impl App {
 
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
+        if self.paused {
+            // The periodic save tick doesn't run while paused; persist now.
+            self.saves.flush(&self.gb);
+        }
         self.clear_audio();
         self.reset_clock();
         self.update_title();
@@ -298,7 +302,7 @@ impl ApplicationHandler for App {
         }
         self.saves.tick(&self.gb, now);
 
-        // Never sleep past the next save check or frame deadline.
+        // Never sleep past the next frame deadline (saves are checked once per wake).
         let wait = self.pacer.time_until_next().max(Duration::from_micros(200));
         event_loop.set_control_flow(ControlFlow::WaitUntil(now + wait));
     }
