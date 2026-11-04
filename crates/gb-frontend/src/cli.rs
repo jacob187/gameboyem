@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::video::PaletteKind;
 
 pub const USAGE: &str = "\
-usage: gb [options] <rom.gb>
+usage: gb [options] [--] <rom.gb>
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)
@@ -15,6 +15,7 @@ options:
   --palette NAME     green (default) or grey
   --test-pattern     show a synthetic test pattern and tone instead of running the core
   -h, --help         show this help
+  --                 end of options; the next argument is the ROM path, even if it starts with `-`
 
 controls:
   arrows = D-pad    X = A    Z = B    Enter = Start    Backspace / Right Shift = Select
@@ -56,16 +57,22 @@ where
             continue;
         };
         match text {
+            "--" => {
+                // Everything after the terminator is a ROM path, whatever it looks like.
+                for rest in args.by_ref() {
+                    set_rom(&mut rom, rest)?;
+                }
+            }
             "-h" | "--help" => return Ok(Command::Help),
             "--mute" => mute = true,
             "--test-pattern" => test_pattern = true,
             "--scale" => {
-                let value = args.next().ok_or("--scale needs a value")?;
-                scale = parse_scale(&value.to_string_lossy())?;
+                let value = option_value("--scale", args.next())?;
+                scale = parse_scale(&value)?;
             }
             "--palette" => {
-                let value = args.next().ok_or("--palette needs a value")?;
-                palette = parse_palette(&value.to_string_lossy())?;
+                let value = option_value("--palette", args.next())?;
+                palette = parse_palette(&value)?;
             }
             _ if text.starts_with("--scale=") => scale = parse_scale(&text["--scale=".len()..])?,
             _ if text.starts_with("--palette=") => {
@@ -86,6 +93,23 @@ where
         palette,
         test_pattern,
     }))
+}
+
+/// The argument after `name`, which must exist and must not look like another
+/// option (`--scale --mute` means the value is missing, not that it is `--mute`).
+/// A bare `-` is not option-like.
+fn option_value(name: &str, value: Option<OsString>) -> Result<String, String> {
+    match value {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            if v.starts_with('-') && v.len() > 1 {
+                Err(format!("{name} is missing a value (found option `{v}`)"))
+            } else {
+                Ok(v.into_owned())
+            }
+        }
+        None => Err(format!("{name} is missing a value")),
+    }
 }
 
 fn set_rom(slot: &mut Option<PathBuf>, arg: OsString) -> Result<(), String> {
@@ -165,9 +189,60 @@ mod tests {
         assert!(p(&["--scale", "9", "g.gb"]).is_err());
         assert!(p(&["--scale", "x", "g.gb"]).is_err());
         assert!(p(&["--scale"]).is_err());
+        assert!(p(&["g.gb", "--palette"]).is_err());
         assert!(p(&["--palette", "pink", "g.gb"]).is_err());
         assert!(p(&["--bogus", "g.gb"]).is_err());
         assert!(p(&["a.gb", "b.gb"]).is_err());
+    }
+
+    #[test]
+    fn double_dash_ends_options() {
+        assert_eq!(run(&["--", "g.gb"]).rom, PathBuf::from("g.gb"));
+        assert!(run(&["--mute", "--", "g.gb"]).mute);
+        assert_eq!(run(&["--", "-weird.gb"]).rom, PathBuf::from("-weird.gb"));
+        assert_eq!(run(&["--", "--mute"]).rom, PathBuf::from("--mute"));
+        // Even `--help` and a second `--` are plain ROM paths after the first.
+        assert_eq!(run(&["--", "--help"]).rom, PathBuf::from("--help"));
+        assert_eq!(run(&["--", "--"]).rom, PathBuf::from("--"));
+        // Options before the terminator still apply; none are parsed after it.
+        let o = run(&["--scale", "2", "--", "-x.gb"]);
+        assert_eq!((o.scale, o.rom), (2, PathBuf::from("-x.gb")));
+        assert!(!run(&["--", "--mute"]).mute);
+    }
+
+    #[test]
+    fn double_dash_still_needs_exactly_one_rom() {
+        assert!(p(&["--"]).is_err());
+        assert!(p(&["--", "a.gb", "b.gb"]).is_err());
+        assert!(p(&["a.gb", "--", "b.gb"]).is_err());
+        assert!(p(&["--mute"]).is_err());
+    }
+
+    #[test]
+    fn option_value_must_not_look_like_a_flag() {
+        for args in [
+            &["--scale", "--mute", "g.gb"][..],
+            &["--scale", "-2", "g.gb"],
+            &["--palette", "--", "g.gb"],
+            &["--palette", "-h", "g.gb"],
+            &["g.gb", "--scale", "--test-pattern"],
+        ] {
+            let e = p(args).unwrap_err();
+            assert!(e.contains("missing a value"), "{args:?}: {e}");
+        }
+        assert!(p(&["--scale"]).unwrap_err().contains("missing a value"));
+        // `--opt=value` is unambiguous, so a dashed value is just invalid.
+        assert!(
+            p(&["--scale=-2", "g.gb"])
+                .unwrap_err()
+                .contains("--scale must be")
+        );
+        // A bare `-` is not option-like; it is rejected as a value, not as "missing".
+        assert!(
+            p(&["--scale", "-", "g.gb"])
+                .unwrap_err()
+                .contains("--scale must be")
+        );
     }
 
     #[cfg(unix)]
