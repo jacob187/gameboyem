@@ -2,8 +2,8 @@
 //! optional rumble motor.
 //!
 //! Registers:
-//! * `0000-1FFF` RAM enable: exactly `0x0A` enables, any other value disables
-//!   (MBC5 decodes all 8 bits, unlike MBC1's low nibble).
+//! * `0000-1FFF` RAM enable: any value with low nibble `0xA` enables, anything
+//!   else disables (Pan Docs: real MBCs decode only the low 4 bits, as MBC1/MBC3).
 //! * `2000-2FFF` ROM bank, low 8 bits.
 //! * `3000-3FFF` ROM bank, bit 8 (only bit 0 of the written value is used).
 //! * `4000-5FFF` RAM bank, 4 bits. On rumble cartridges bit 3 drives the motor
@@ -73,7 +73,7 @@ impl Cartridge for Mbc5 {
 
     fn write_rom(&mut self, addr: u16, value: u8) {
         match addr {
-            0x0000..=0x1FFF => self.ram_enabled = value == 0x0A,
+            0x0000..=0x1FFF => self.ram_enabled = value & 0x0F == 0x0A,
             0x2000..=0x2FFF => self.rom_bank = (self.rom_bank & 0x100) | value as u16,
             0x3000..=0x3FFF => self.rom_bank = (self.rom_bank & 0x0FF) | ((value as u16 & 1) << 8),
             0x4000..=0x5FFF => {
@@ -184,19 +184,29 @@ mod tests {
     }
 
     #[test]
-    fn ram_enable_requires_exactly_0x0a() {
+    fn ram_enable_decodes_low_nibble() {
         let mut c = from_rom(banked_rom(2, 0x1A, 0, 0x02)).unwrap();
         c.write_ram(0xA000, 0x42);
         assert_eq!(c.read_ram(0xA000), 0xFF, "disabled at power-on");
         c.write_rom(0x0000, 0x0A);
         c.write_ram(0xA000, 0x42);
         assert_eq!(c.read_ram(0xA000), 0x42);
-        c.write_rom(0x1FFF, 0xFA); // low nibble 0xA but not 0x0A
-        assert_eq!(c.read_ram(0xA000), 0xFF);
-        c.write_rom(0x0000, 0x0A);
-        assert_eq!(c.read_ram(0xA000), 0x42, "contents survive disable");
         c.write_rom(0x0000, 0x00);
         assert_eq!(c.read_ram(0xA000), 0xFF);
+        for v in [0x1A, 0x2A, 0xFA] {
+            c.write_rom(0x1FFF, v); // low nibble 0xA enables
+            assert_eq!(
+                c.read_ram(0xA000),
+                0x42,
+                "{v:#04x} enables; contents survive"
+            );
+            c.write_rom(0x0000, 0x00);
+        }
+        for v in [0x0B, 0x0F, 0xA0, 0x01] {
+            c.write_rom(0x0000, 0x0A);
+            c.write_rom(0x1000, v);
+            assert_eq!(c.read_ram(0xA000), 0xFF, "{v:#04x} disables");
+        }
     }
 
     #[test]
