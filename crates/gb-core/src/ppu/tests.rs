@@ -980,6 +980,37 @@ fn blocked_oam_does_not_stop_sprites_from_the_scan() {
 // ------------------------------------------------ LCD on/off and VBlank STAT
 
 #[test]
+fn first_line_blank_mode_0_does_not_raise_the_hblank_source() {
+    // HBlank select set while the LCD is off survives into the next LCD-on.
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x11);
+    rig.write(0xFF41, 0x08);
+    rig.clear_if();
+    rig.write(0xFF40, 0x91);
+    assert_eq!(
+        rig.ppu.mode(),
+        0,
+        "line 0 reports mode 0 for its first 80 dots"
+    );
+    assert_eq!(rig.ints.flags & STAT_BIT, 0, "no request in the LCDC write");
+    // The real HBlank of line 0 is the only edge on that line.
+    let mut edges = 0;
+    while rig.ppu.ly == 0 {
+        rig.tick();
+        if rig.ints.flags & STAT_BIT != 0 {
+            edges += 1;
+            assert!(
+                rig.ppu.line_dot >= 80 + 172,
+                "edge at dot {}",
+                rig.ppu.line_dot
+            );
+            rig.clear_if();
+        }
+    }
+    assert_eq!(edges, 1);
+}
+
+#[test]
 fn stat_write_with_lcd_off_latches_the_line_without_an_interrupt() {
     let mut rig = Rig::at_line0();
     rig.write(0xFF40, 0x11);
