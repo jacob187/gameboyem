@@ -569,3 +569,69 @@ fn p1_select_write_through_the_bus_requests_the_joypad_irq_and_wakes_stop() {
     cpu.step(&mut b);
     assert_eq!(cpu.regs.b, 1);
 }
+
+// ---- Unusable range FEA0-FEFF and VRAM-sourced DMA (review #6, #5) ----
+
+/// Tick until the STAT mode bits read `mode` (bounded to one frame).
+fn run_to_stat_mode(b: &mut Bus, mode: u8) {
+    for _ in 0..17_556 {
+        if b.read(0xFF41) & 3 == mode {
+            return;
+        }
+    }
+    panic!("STAT mode {mode} never reached");
+}
+
+#[test]
+fn unusable_range_reads_zero_unless_oam_is_blocked() {
+    let mut b = new_bus(); // LCD off
+    for addr in [0xFEA0, 0xFEC3, 0xFEFF] {
+        assert_eq!(b.read(addr), 0x00, "{addr:#06X}, LCD off");
+        assert_eq!(b.peek(addr), 0x00);
+    }
+    b.write(0xFF40, 0x91);
+    run_to_stat_mode(&mut b, 3);
+    assert_eq!(b.read(0xFEA0), 0xFF, "mode 3: OAM blocked");
+    assert_eq!(b.peek(0xFEFF), 0xFF);
+    run_to_stat_mode(&mut b, 2);
+    assert_eq!(b.read(0xFEC3), 0xFF, "mode 2: OAM blocked");
+    run_to_stat_mode(&mut b, 0);
+    assert_eq!(b.read(0xFEA0), 0x00, "HBlank");
+    run_to_stat_mode(&mut b, 1);
+    assert_eq!(b.read(0xFEFF), 0x00, "VBlank");
+    // Writes are still ignored.
+    b.write(0xFEA0, 0x12);
+    assert_eq!(b.read(0xFEA0), 0x00);
+}
+
+#[test]
+fn unusable_range_reads_ff_while_dma_owns_oam() {
+    let mut b = new_bus(); // LCD off: only the DMA can block
+    b.write(DMA, 0xC0);
+    assert_eq!(b.read(0xFEA0), 0x00, "+1: not copying yet");
+    assert_eq!(b.read(0xFEA0), 0xFF, "+2: DMA copying");
+    nops(&mut b, 170);
+    assert_eq!(b.read(0xFEA0), 0x00, "DMA finished");
+}
+
+#[test]
+fn dma_from_vram_ignores_the_ppu_mode_lockout() {
+    let mut b = new_bus(); // LCD off: VRAM is writable
+    for i in 0..0xA0u16 {
+        b.write(0x8000 + i, i as u8 + 1); // never 0xFF
+    }
+    b.write(0xFF40, 0x91);
+    run_to_stat_mode(&mut b, 0);
+    b.write(DMA, 0x80);
+    // The transfer spans several mode-3 windows; confirm the CPU is locked out.
+    let mut saw_mode3 = false;
+    for _ in 0..170 {
+        b.tick();
+        saw_mode3 |= b.read(0xFF41) & 3 == 3;
+    }
+    assert!(saw_mode3, "the copy must overlap mode 3");
+    b.write(0xFF40, 0); // LCD off so OAM is readable
+    for i in 0..0xA0u16 {
+        assert_eq!(b.read(0xFE00 + i), i as u8 + 1, "OAM[{i}]");
+    }
+}
