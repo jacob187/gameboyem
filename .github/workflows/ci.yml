@@ -84,6 +84,22 @@ jobs:
       - name: Test-ROM table
         run: cargo run -p gb-test --release -- --fail-on-mismatch
 
+  # gb-core must stay portable (no std I/O, threads or platform deps).
+  wasm32:
+    name: gb-core-wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and lint gb-core for wasm32
+        run: |
+          cargo build -p gb-core --target wasm32-unknown-unknown
+          cargo clippy -p gb-core --target wasm32-unknown-unknown -- -D warnings
+
   # Phase 8. Non-blocking: a Windows failure never fails the workflow.
   # Homebrew ROMs come from the Linux leg (GBDK + make on Windows runners
   # would add a second toolchain path for no extra coverage of our code).
