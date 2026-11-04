@@ -14,6 +14,22 @@ void hb_init(void)
     OBP0_REG = PALETTE_DEFAULT;
 }
 
+void screen_clear(void)
+{
+    DISPLAY_OFF;
+    cls();
+    fill_bkg_rect(0, 0, 20, 18, TILE_EMPTY);
+}
+
+void hold_final_frame(void)
+{
+    uint8_t i;
+
+    for (i = 0; i < 45u; i++) {
+        wait_vbl_done();
+    }
+}
+
 void print_at(uint8_t x, uint8_t y, const char *s)
 {
     gotoxy(x, y);
