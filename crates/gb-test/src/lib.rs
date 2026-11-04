@@ -211,7 +211,7 @@ pub fn run_case(case: &Case) -> Outcome {
         Kind::Mooneye => on_machine(&|gb| run_mooneye(gb, frames)),
         Kind::Acid2 => on_machine(&|gb| run_acid2(gb, case)),
         Kind::Smoke => on_machine(&|gb| run_smoke(gb, frames)),
-        Kind::BlarggMem => on_machine(&|gb| run_blargg_mem(gb, frames)),
+        Kind::BlarggMem => run_blargg_mem(&rom, frames),
         Kind::PlaySnake => run_play(&rom, PLAY_SNAKE, frames),
         Kind::PlayBreakout => run_play(&rom, PLAY_BREAKOUT, frames),
         Kind::PlayTobu => run_play(&rom, PLAY_TOBU, frames),
@@ -271,15 +271,54 @@ fn run_blargg(gb: &mut GameBoy, max_frames: u32) -> Outcome {
     Outcome::Timeout(format!("serial: {:?}", serial_tail(gb)))
 }
 
+/// Cartridge RAM as the ROM left it, read around the MBC's RAM-enable gate.
+///
+/// `GameBoy::peek` goes through the gate and returns 0xFF once a ROM has
+/// disabled SRAM again, so a ROM that does so after writing its result would
+/// time out. `battery_ram()` hands back the raw contents (RAM bank 0 starts at
+/// offset 0 on every mapper, which is the bank Blargg's ROMs use). It only
+/// exists for battery-backed carts; for any other cart this falls back to the
+/// gated `peek`, which is a known limitation (gb-core has no ungated read).
+struct Sram(Option<Vec<u8>>);
+
+impl Sram {
+    fn of(gb: &GameBoy) -> Self {
+        Sram(gb.battery_ram())
+    }
+
+    fn read(&self, gb: &GameBoy, addr: u16) -> u8 {
+        match &self.0 {
+            Some(ram) => ram
+                .get(usize::from(addr.wrapping_sub(0xA000)))
+                .copied()
+                .unwrap_or(0xFF),
+            None => gb.peek(addr),
+        }
+    }
+}
+
 /// Blargg's memory protocol: `DE B0 61` at A001-A003 marks the block valid,
-/// A000 holds 0x80 while running and then the result code (0 = pass), and a
-/// NUL-terminated report starts at A004.
-fn run_blargg_mem(gb: &mut GameBoy, max_frames: u32) -> Outcome {
+/// A000 holds 0x80 while running and then the result code (0 = pass, 0x81 =
+/// "needs reset"), and a NUL-terminated report starts at A004.
+///
+/// On 0x81 the ROM wants a reset after >= 0.1 s with its SRAM kept (it is
+/// battery-backed on real carts): the machine is re-created from the ROM, the
+/// RAM carried over, and the run continues, at most `MAX_RESETS` times.
+fn run_blargg_mem(rom: &[u8], max_frames: u32) -> Outcome {
     const STATUS: u16 = 0xA000;
     const TEXT: u16 = 0xA004;
-    let report = |gb: &GameBoy| {
+    const RUNNING: u8 = 0x80;
+    const NEEDS_RESET: u8 = 0x81;
+    const MAX_RESETS: u32 = 5;
+    /// Frames to wait before resetting (>= 0.1 s).
+    const RESET_DELAY: u32 = 7;
+    /// Frames after a reset during which a leftover 0x81 is not a new request:
+    /// the ROM has not rewritten the status byte yet.
+    const BOOT_GRACE: u32 = 30;
+    let boot = || GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")));
+    let report = |gb: &GameBoy, sram: &Sram| {
         let text: Vec<u8> = (0..0x1000u16)
-            .map(|i| gb.peek(TEXT + i))
+            .map(|i| sram.read(gb, TEXT + i))
             .take_while(|&b| b != 0)
             .collect();
         let text = String::from_utf8_lossy(&text);
@@ -292,25 +331,62 @@ fn run_blargg_mem(gb: &mut GameBoy, max_frames: u32) -> Outcome {
         lines.drain(..lines.len().saturating_sub(6));
         lines.join(" | ")
     };
-    for _ in 0..max_frames {
+    let mut gb = match boot() {
+        Ok(gb) => gb,
+        Err(o) => return o,
+    };
+    let mut resets = 0;
+    let mut grace_until = 0;
+    for frame in 0..max_frames {
         gb.step_frame();
+        let sram = Sram::of(&gb);
         if gb.cpu_locked() {
-            return Outcome::Fail(format!("{}; report: {}", locked_message(gb), report(gb)));
+            return Outcome::Fail(format!(
+                "{}; report: {}",
+                locked_message(&gb),
+                report(&gb, &sram)
+            ));
         }
         let signed = [0xDE, 0xB0, 0x61]
             .iter()
             .enumerate()
-            .all(|(i, &b)| gb.peek(STATUS + 1 + i as u16) == b);
+            .all(|(i, &b)| sram.read(&gb, STATUS + 1 + i as u16) == b);
         if !signed {
             continue;
         }
-        match gb.peek(STATUS) {
-            0x80 => {}
+        match sram.read(&gb, STATUS) {
+            RUNNING => {}
+            NEEDS_RESET if frame < grace_until => {}
+            NEEDS_RESET => {
+                if resets == MAX_RESETS {
+                    return Outcome::Fail(format!("needs reset more than {MAX_RESETS} times"));
+                }
+                resets += 1;
+                for _ in 0..RESET_DELAY {
+                    gb.step_frame();
+                }
+                let saved = Sram::of(&gb).0;
+                gb = match boot() {
+                    Ok(gb) => gb,
+                    Err(o) => return o,
+                };
+                if let Some(ram) = saved {
+                    if let Err(e) = gb.load_battery_ram(&ram) {
+                        return Outcome::Fail(format!("carrying SRAM across reset: {e}"));
+                    }
+                }
+                grace_until = frame + BOOT_GRACE;
+            }
             0 => return Outcome::Pass,
-            code => return Outcome::Fail(format!("code {code:#04X}: {}", report(gb))),
+            code => return Outcome::Fail(format!("code {code:#04X}: {}", report(&gb, &sram))),
         }
     }
-    Outcome::Timeout(format!("status {:#04X}: {}", gb.peek(STATUS), report(gb)))
+    let sram = Sram::of(&gb);
+    Outcome::Timeout(format!(
+        "status {:#04X}: {}",
+        sram.read(&gb, STATUS),
+        report(&gb, &sram)
+    ))
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
