@@ -1,0 +1,19 @@
+[package]
+name = "gb-test"
+description = "Headless test-ROM harness for gb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+gb-core.workspace = true
+png = "0.18"
+
+[dev-dependencies]
+libtest-mimic = "0.8"
+
+[[test]]
+name = "roms"
+harness = false
