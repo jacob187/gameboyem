@@ -98,7 +98,11 @@ pub enum MbcKind {
 /// Parsed cartridge header (0x0100..=0x014F).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CartridgeHeader {
-    /// Title (0x0134..=0x0143), trailing NULs stripped, non-ASCII replaced.
+    /// Title: 0x0134 up to the first NUL, at most 15 bytes (0x0134..=0x0142), or
+    /// 11 bytes (0x0134..=0x013E) when the CGB flag is 0x80/0xC0, since the
+    /// 4 bytes before the flag are then the manufacturer code. Byte 0x0143 is
+    /// included only on old DMG carts where it is a printable title character.
+    /// Trailing spaces are stripped and non-ASCII bytes replaced by `?`.
     pub title: String,
     pub cart_type: u8,
     pub mbc: MbcKind,
@@ -112,7 +116,9 @@ pub struct CartridgeHeader {
     pub ram_size: usize,
     /// Header checksum (0x014D) matches the computed one.
     pub header_checksum_ok: bool,
-    /// CGB flag (0x0143). Kept for future CGB support; DMG ignores it.
+    /// Raw CGB flag byte (0x0143): 0x80 = CGB-enhanced, 0xC0 = CGB-only. On old
+    /// carts this byte may be a title character. Kept for future CGB support;
+    /// DMG ignores it.
     pub cgb_flag: u8,
 }
 
@@ -161,7 +167,15 @@ impl CartridgeHeader {
         let checksum = rom[0x134..=0x14C]
             .iter()
             .fold(0u8, |acc, &b| acc.wrapping_sub(b).wrapping_sub(1));
-        let title = rom[0x134..0x144]
+        let cgb_flag = rom[0x143];
+        let title_end = if matches!(cgb_flag, 0x80 | 0xC0) {
+            0x13F // 0x13F..=0x142 is the manufacturer code, 0x143 the flag
+        } else if cgb_flag.is_ascii_graphic() || cgb_flag == b' ' {
+            0x144 // pre-CGB cart with a full 16-character title
+        } else {
+            0x143
+        };
+        let title = rom[0x134..title_end]
             .iter()
             .take_while(|&&b| b != 0)
             .map(|&b| {
@@ -185,7 +199,7 @@ impl CartridgeHeader {
             rom_size,
             ram_size: if has_ram { ram_size } else { 0 },
             header_checksum_ok: checksum == rom[0x14D],
-            cgb_flag: rom[0x143],
+            cgb_flag,
         })
     }
 }
@@ -293,6 +307,30 @@ mod tests {
         assert!(h.has_ram && h.has_battery && !h.has_rtc);
         assert_eq!(h.rom_size, 0x10000);
         assert_eq!(h.ram_size, 0x8000);
+    }
+
+    #[test]
+    fn title_excludes_cgb_flag_and_manufacturer_code() {
+        // Unterminated "POKEMON_GLD" + manufacturer code "AAUE" + CGB flag 0x80.
+        let mut rom = test_util::banked_rom(2, 0x00, 0, 0);
+        rom[0x134..0x144].copy_from_slice(b"POKEMON_GLDAAUE\x80");
+        let h = CartridgeHeader::parse(&rom).unwrap();
+        assert_eq!(h.title, "POKEMON_GLD");
+        assert_eq!(h.cgb_flag, 0x80);
+        rom[0x143] = 0xC0;
+        assert_eq!(CartridgeHeader::parse(&rom).unwrap().title, "POKEMON_GLD");
+        // Non-CGB flag byte that is not a title character: 15-byte title.
+        rom[0x143] = 0x00;
+        let h = CartridgeHeader::parse(&rom).unwrap();
+        assert_eq!(h.title, "POKEMON_GLDAAUE");
+        assert_eq!(h.cgb_flag, 0x00);
+        // Old DMG cart with a full 16-character title keeps its last character.
+        rom[0x134..0x144].copy_from_slice(b"ABCDEFGHIJKLMNOP");
+        let h = CartridgeHeader::parse(&rom).unwrap();
+        assert_eq!(h.title, "ABCDEFGHIJKLMNOP");
+        // NUL still terminates early.
+        rom[0x134..0x144].copy_from_slice(b"HI\0JUNKJUNKJUNK\x80");
+        assert_eq!(CartridgeHeader::parse(&rom).unwrap().title, "HI");
     }
 
     #[test]
