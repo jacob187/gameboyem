@@ -72,7 +72,7 @@ scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job in Docker; build
 
 ### Test-ROM results
 
-These are the results on `integration`, run on macOS arm64. Linux x86_64 was checked with `scripts/docker-linux-test.sh amd64` (fmt, clippy, tests, ROM table) at `59db0b6` (109/109). GitHub Actions has not run yet, because this build had no push access.
+These are the results on `integration`, run on macOS arm64. Linux x86_64 was checked with `scripts/docker-linux-test.sh amd64` (fmt, clippy, tests, ROM table) at `0160611` (136/136). GitHub Actions has not run yet, because this build had no push access.
 
 | Suite | Pass / total |
 |-------|--------------|
