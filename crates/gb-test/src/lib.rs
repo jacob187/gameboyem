@@ -193,42 +193,34 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
 }
 
 /// Run one case to completion (or its frame limit).
+///
+/// Kinds that script their own machines (play, save, sfx, blargg-mem with its
+/// reset protocol) take the ROM bytes; the rest run on one booted `GameBoy`.
 pub fn run_case(case: &Case) -> Outcome {
     let path = case.rom_path();
     let Ok(rom) = std::fs::read(&path) else {
         return Outcome::Missing;
     };
-    match case.kind {
-        Kind::PlaySnake => return run_play(&rom, PLAY_SNAKE, case.max_frames),
-        Kind::PlayBreakout => return run_play(&rom, PLAY_BREAKOUT, case.max_frames),
-        Kind::SaveSnake => return run_save(&rom, drive_snake, case.max_frames),
-        Kind::SaveBreakout => return run_save(&rom, drive_breakout, case.max_frames),
-        Kind::PlayTobu => return run_play(&rom, PLAY_TOBU, case.max_frames),
-        Kind::PlayAdjustris => return run_play(&rom, PLAY_ADJUSTRIS, case.max_frames),
-        Kind::PlayRenegade => return run_play(&rom, PLAY_RENEGADE, case.max_frames),
-        Kind::SfxSnake => return run_sfx(&rom, sfx_snake, case.max_frames),
-        Kind::SfxBreakout => return run_sfx(&rom, sfx_breakout, case.max_frames),
-        _ => {}
-    }
-    let mut gb = match GameBoy::new(rom) {
-        Ok(gb) => gb,
-        Err(e) => return Outcome::Fail(format!("load error: {e}")),
+    let frames = case.max_frames;
+    let on_machine = |run: &dyn Fn(&mut GameBoy) -> Outcome| match GameBoy::new(rom.clone()) {
+        Ok(mut gb) => run(&mut gb),
+        Err(e) => Outcome::Fail(format!("load error: {e}")),
     };
     match case.kind {
-        Kind::Blargg => run_blargg(&mut gb, case.max_frames),
-        Kind::BlarggMem => run_blargg_mem(&mut gb, case.max_frames),
-        Kind::Mooneye => run_mooneye(&mut gb, case.max_frames),
-        Kind::Acid2 => run_acid2(&mut gb, case),
-        Kind::Smoke => run_smoke(&mut gb, case.max_frames),
-        Kind::PlaySnake
-        | Kind::PlayBreakout
-        | Kind::PlayTobu
-        | Kind::PlayAdjustris
-        | Kind::PlayRenegade
-        | Kind::SaveSnake
-        | Kind::SaveBreakout
-        | Kind::SfxSnake
-        | Kind::SfxBreakout => unreachable!("handled above"),
+        Kind::Blargg => on_machine(&|gb| run_blargg(gb, frames)),
+        Kind::Mooneye => on_machine(&|gb| run_mooneye(gb, frames)),
+        Kind::Acid2 => on_machine(&|gb| run_acid2(gb, case)),
+        Kind::Smoke => on_machine(&|gb| run_smoke(gb, frames)),
+        Kind::BlarggMem => on_machine(&|gb| run_blargg_mem(gb, frames)),
+        Kind::PlaySnake => run_play(&rom, PLAY_SNAKE, frames),
+        Kind::PlayBreakout => run_play(&rom, PLAY_BREAKOUT, frames),
+        Kind::PlayTobu => run_play(&rom, PLAY_TOBU, frames),
+        Kind::PlayAdjustris => run_play(&rom, PLAY_ADJUSTRIS, frames),
+        Kind::PlayRenegade => run_play(&rom, PLAY_RENEGADE, frames),
+        Kind::SaveSnake => run_save(&rom, drive_snake, frames),
+        Kind::SaveBreakout => run_save(&rom, drive_breakout, frames),
+        Kind::SfxSnake => run_sfx(&rom, sfx_snake, frames),
+        Kind::SfxBreakout => run_sfx(&rom, sfx_breakout, frames),
     }
 }
 
