@@ -76,14 +76,11 @@ These are the results on `integration` for macOS arm64 and Linux x86_64 (Docker)
 | Blargg `instr_timing` | 1 / 1 |
 | Blargg `mem_timing` (3 + combined) | 4 / 4 |
 | dmg-acid2 | 1 / 1 |
-| Mooneye (DMG acceptance subset + MBC1/MBC5) | 77 / 87 |
+| Mooneye (DMG acceptance subset + MBC1/MBC5) | 87 / 87 |
 | Homebrew smoke + scripted playability | 4 / 4 |
-| **Total** | **99 / 109** |
+| **Total** | **109 / 109** |
 
-Mooneye failures still open:
-- 8 PPU timing tests: `intr_2_*`, `lcdon_*`, `stat_lyc_onoff`, `vblank_stat_intr`
-- `boot_hwio` (STAT phase at boot)
-- `serial/boot_sclk_align`
+Every case in the harness passes. Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
 ## Cartridges
 
@@ -110,7 +107,7 @@ Both have title, score and game-over screens.
 
 ## Known gaps
 
-- **PPU.** It renders a whole scanline at the start of mode 3, so mid-scanline register writes take effect on the next line. Mode-3 length penalties are approximate.
+- **PPU.** It renders a whole scanline at the start of mode 3, so mid-scanline register writes take effect on the next line. Mode-3 sprite penalties are fitted for SCX=0 with no window.
 - **APU.** All four channels, the frame sequencer, length, envelope, sweep and panning work. Still missing:
   - DMG zombie mode
   - the CH3 trigger delay and wave-RAM corruption
