@@ -159,7 +159,7 @@ impl GameBoy {
     /// Host configuration and buffers are not included: the audio sample rate,
     /// undrained audio samples and captured serial output.
     pub fn save_state(&self) -> Vec<u8> {
-        let mut w = StateWriter::new();
+        let mut w = StateWriter::with_capacity(self.state_size_hint());
         w.bytes(&state::MAGIC);
         w.u16(state::VERSION);
         w.u64(self.rom_hash);
@@ -172,6 +172,19 @@ impl GameBoy {
         self.cpu.save_state(&mut w);
         self.bus.save_state(&mut w);
         w.into_bytes()
+    }
+
+    /// Upper bound on the size of [`GameBoy::save_state`]'s output, so the
+    /// writer allocates once: the machine's fixed state (measured: 63 025 bytes
+    /// on a DMG, 95 802 in compatibility mode, 142 011 in colour mode, each
+    /// rounded up) plus the cartridge RAM.
+    fn state_size_hint(&self) -> usize {
+        let fixed = match self.bus.hw {
+            Hw::Dmg => 64 * 1024,
+            Hw::CgbCompat => 96 * 1024,
+            Hw::Cgb => 140 * 1024,
+        };
+        fixed + self.bus.cart.header().ram_size + 1024
     }
 
     /// Restore a snapshot from [`GameBoy::save_state`] taken with the same ROM

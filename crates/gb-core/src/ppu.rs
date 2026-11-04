@@ -752,8 +752,12 @@ impl Ppu {
         w.bool(self.lyc_flag);
         w.u8(self.vis_mode);
         w.bool(self.stat_line);
-        w.bytes(&self.back[..]);
-        w.bytes(&self.front[..]);
+        // In colour mode the shade frames are all zero by design (DECISIONS
+        // #36), so they are not saved; the RGB555 frames below carry the picture.
+        if !self.colour {
+            w.bytes(&self.back[..]);
+            w.bytes(&self.front[..]);
+        }
         w.bool(self.frame_ready);
         // CGB additions.
         if self.cgb {
@@ -826,12 +830,17 @@ impl Ppu {
         self.vis_mode = r.u8()?;
         check(self.vis_mode <= 3, "STAT mode")?;
         self.stat_line = r.bool()?;
-        r.bytes_into(&mut self.back[..])?;
-        r.bytes_into(&mut self.front[..])?;
-        check(
-            self.back.iter().chain(self.front.iter()).all(|&s| s <= 3),
-            "framebuffer shade",
-        )?;
+        if self.colour {
+            self.back.fill(0);
+            self.front.fill(0);
+        } else {
+            r.bytes_into(&mut self.back[..])?;
+            r.bytes_into(&mut self.front[..])?;
+            check(
+                self.back.iter().chain(self.front.iter()).all(|&s| s <= 3),
+                "framebuffer shade",
+            )?;
+        }
         self.frame_ready = r.bool()?;
         if self.cgb {
             self.vbk = r.u8()?;

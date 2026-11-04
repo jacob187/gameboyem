@@ -12,9 +12,12 @@ use crate::save::{append_ext, backup_without_overwrite, read_capped, save_path, 
 pub const FIRST_SLOT: u8 = 1;
 pub const LAST_SLOT: u8 = 9;
 
-/// Larger than any state the core produces: about 72 KiB of fixed machine
-/// state plus at most 128 KiB of cart RAM (a test checks the largest case).
-const MAX_STATE_BYTES: u64 = 256 * 1024;
+/// Larger than any state the core produces. The fixed machine state is about
+/// 62 KiB on a DMG and 139 KiB in CGB colour mode (both VRAM and WRAM banks plus
+/// the RGB555 back and front frames), plus at most 128 KiB of cart RAM: 267 KiB
+/// at worst, which is why this is 512 KiB and not 256 KiB. A test checks the
+/// largest cases.
+const MAX_STATE_BYTES: u64 = 512 * 1024;
 
 /// `game.gb` -> `game.ss<slot>`. Like the battery save, the extension is
 /// appended instead if that would name the ROM itself.
@@ -105,6 +108,7 @@ impl StateSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gb_core::Model;
     use std::fs;
 
     fn battery_rom(ram_code: u8) -> Vec<u8> {
@@ -135,6 +139,36 @@ mod tests {
         let gb = GameBoy::new(battery_rom(0x04)).unwrap(); // 128 KiB RAM
         let len = gb.save_state().len() as u64;
         assert!(len <= MAX_STATE_BYTES, "{len}");
+    }
+
+    /// A CGB-only cartridge (header flag 0xC0) so the machine runs in colour mode.
+    fn cgb_rom(ram_code: u8) -> Vec<u8> {
+        let mut rom = battery_rom(ram_code);
+        rom[0x143] = 0xC0;
+        rom
+    }
+
+    #[test]
+    fn cgb_states_fit_the_cap_with_margin() {
+        // Measured: 142 011 bytes with no cart RAM, 273 083 with 128 KiB (the
+        // MBC5 maximum). Both must stay under the cap, and the largest keeps
+        // at least ~100 KiB of room for future state.
+        for (ram_code, ram_len) in [(0x00, 0), (0x04, 128 * 1024)] {
+            let gb = GameBoy::with_model(cgb_rom(ram_code), Model::Cgb).unwrap();
+            assert!(gb.cgb_framebuffer().is_some(), "colour mode");
+            let len = gb.save_state().len() as u64;
+            assert!(len < MAX_STATE_BYTES, "{len}");
+            assert!(len < 150_000 + ram_len, "{len}: the fixed part grew");
+        }
+        let largest = GameBoy::with_model(cgb_rom(0x04), Model::Cgb)
+            .unwrap()
+            .save_state()
+            .len() as u64;
+        assert!(
+            MAX_STATE_BYTES - largest >= 100 * 1024,
+            "margin {}",
+            MAX_STATE_BYTES - largest
+        );
     }
 
     #[test]
