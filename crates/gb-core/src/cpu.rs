@@ -21,9 +21,10 @@
 //! * Every instruction is written as the exact sequence of bus calls it makes,
 //!   so memory accesses land on the right M-cycle (mooneye `*_timing` tests).
 //! * `STOP` is simplified: it calls [`CpuBus::stop`], consumes its padding byte
-//!   without a bus access and then idles exactly like `HALT` until any
-//!   interrupt is pending (`IE & IF != 0`). Real hardware wakes on a joypad
-//!   line going low regardless of IE; that nuance is not modelled.
+//!   without a bus access and idles until a selected joypad line is low
+//!   (Pan Docs "Joypad Input": wakes from STOP regardless of IE) or, as a
+//!   fallback for our still-running peripherals, any interrupt is pending.
+//!   The LCD/timer are not halted during STOP.
 
 use crate::bus::CpuBus;
 use crate::interrupts::Interrupt;
@@ -77,8 +78,11 @@ pub struct Cpu {
     ime: bool,
     /// `EI` executed; IME turns on after the *next* instruction completes.
     ei_pending: bool,
-    /// HALTed (or STOPped, see module docs): idle until an interrupt is pending.
+    /// HALTed: idle until an interrupt is pending.
     halted: bool,
+    /// STOPped (see module docs): idle until a joypad line is low or an
+    /// interrupt is pending.
+    stopped: bool,
     /// HALT bug: the next opcode fetch does not increment PC.
     halt_bug: bool,
     locked: bool,
@@ -98,6 +102,7 @@ impl Cpu {
             ime: false,
             ei_pending: false,
             halted: false,
+            stopped: false,
             halt_bug: false,
             locked: false,
             ld_b_b: false,
@@ -125,13 +130,20 @@ impl Cpu {
 
     /// True while halted/stopped.
     pub fn is_halted(&self) -> bool {
-        self.halted
+        self.halted || self.stopped
     }
 
     pub fn step<B: CpuBus>(&mut self, bus: &mut B) {
         if self.locked {
             bus.tick();
             return;
+        }
+        if self.stopped {
+            if !bus.joypad_line_low() && bus.pending_interrupts() == 0 {
+                bus.tick();
+                return;
+            }
+            self.stopped = false;
         }
         if self.halted {
             // Pan Docs "halt": wakes when IE & IF != 0, regardless of IME.
@@ -371,7 +383,7 @@ impl Cpu {
                     // STOP (simplified, see module docs): skip padding byte.
                     self.regs.pc = self.regs.pc.wrapping_add(1);
                     bus.stop();
-                    self.halted = true;
+                    self.stopped = true;
                 }
                 3 => {
                     // JR e

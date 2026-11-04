@@ -38,6 +38,11 @@ pub trait CpuBus {
     fn acknowledge_interrupt(&mut self, mask: u8);
     /// Called when the CPU executes `STOP` (DMG: resets DIV). No cycle cost.
     fn stop(&mut self) {}
+    /// True while any *selected* P1 input line is low (button held). This is
+    /// the STOP wake-up condition and is independent of IE. No cycle cost.
+    fn joypad_line_low(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) const WRAM_SIZE: usize = 0x2000;
@@ -130,6 +135,10 @@ impl CpuBus for Bus {
 
     fn stop(&mut self) {
         self.timer.reset_div(&mut self.interrupts);
+    }
+
+    fn joypad_line_low(&self) -> bool {
+        self.joypad.any_selected_low()
     }
 }
 

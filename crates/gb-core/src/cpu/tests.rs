@@ -17,6 +17,7 @@ struct TestBus {
     iflag: u8,
     log: Vec<Ev>,
     stopped: bool,
+    joypad_low: bool,
 }
 
 impl TestBus {
@@ -27,6 +28,7 @@ impl TestBus {
             iflag: 0,
             log: Vec::new(),
             stopped: false,
+            joypad_low: false,
         }
     }
 
@@ -68,6 +70,10 @@ impl CpuBus for TestBus {
 
     fn stop(&mut self) {
         self.stopped = true;
+    }
+
+    fn joypad_line_low(&self) -> bool {
+        self.joypad_low
     }
 }
 
@@ -655,6 +661,22 @@ fn stop_calls_bus_and_idles() {
     assert!(cpu.is_halted());
     assert_eq!(step_cycles(&mut cpu, &mut bus), 1);
     assert_eq!(cpu.regs.pc, START + 2);
+}
+
+#[test]
+fn stop_wakes_on_joypad_line_with_ie_zero() {
+    // STOP; INC B. IE = 0, so no interrupt can wake it: only the joypad can.
+    let (mut cpu, mut bus) = setup(&[0x10, 0x00, 0x04]);
+    cpu.step(&mut bus);
+    for _ in 0..10 {
+        cpu.step(&mut bus);
+    }
+    assert!(cpu.is_halted());
+    assert_eq!(cpu.regs.pc, START + 2);
+    bus.joypad_low = true;
+    cpu.step(&mut bus);
+    assert!(!cpu.is_halted());
+    assert_eq!(cpu.regs.pc, START + 3, "INC B executed after waking");
 }
 
 #[test]
