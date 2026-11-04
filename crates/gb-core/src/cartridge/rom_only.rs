@@ -1,6 +1,6 @@
 //! No MBC ("MBC0"): 32 KiB ROM, optional 8 KiB RAM (types 0x00, 0x08, 0x09).
 
-use super::{Cartridge, CartridgeError, CartridgeHeader};
+use super::{Cartridge, CartridgeError, CartridgeHeader, ram_window_offset};
 
 pub struct RomOnly {
     rom: Vec<u8>,
@@ -30,13 +30,13 @@ impl Cartridge for RomOnly {
         if self.ram.is_empty() {
             return 0xFF;
         }
-        self.ram[(addr as usize - 0xA000) % self.ram.len()]
+        self.ram[ram_window_offset(addr) % self.ram.len()]
     }
 
     fn write_ram(&mut self, addr: u16, value: u8) {
         if !self.ram.is_empty() {
             let len = self.ram.len();
-            self.ram[(addr as usize - 0xA000) % len] = value;
+            self.ram[ram_window_offset(addr) % len] = value;
         }
     }
 

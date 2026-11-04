@@ -19,6 +19,13 @@ pub const ROM_BANK_SIZE: usize = 0x4000;
 /// Size of one switchable external RAM bank.
 pub const RAM_BANK_SIZE: usize = 0x2000;
 
+/// Offset of a CPU address (`0xA000..=0xBFFF`) within the 8 KiB RAM window.
+/// Masks rather than subtracts, so it can never underflow.
+#[inline]
+pub(crate) fn ram_window_offset(addr: u16) -> usize {
+    addr as usize & (RAM_BANK_SIZE - 1)
+}
+
 /// The memory-bank controller interface every cartridge implements.
 ///
 /// # Contract (frozen; propose changes to the orchestrator)
@@ -331,6 +338,33 @@ mod tests {
         // NUL still terminates early.
         rom[0x134..0x144].copy_from_slice(b"HI\0JUNKJUNKJUNK\x80");
         assert_eq!(CartridgeHeader::parse(&rom).unwrap().title, "HI");
+    }
+
+    #[test]
+    fn ram_window_offset_never_underflows() {
+        assert_eq!(ram_window_offset(0xA000), 0);
+        assert_eq!(ram_window_offset(0xBFFF), 0x1FFF);
+        assert_eq!(ram_window_offset(0x0000), 0, "out-of-window addr is safe");
+    }
+
+    /// All mappers must decode A000-BFFF identically, including for RAM sizes
+    /// that are not a multiple of the window (2 KiB) and for stray addresses.
+    #[test]
+    fn all_mappers_decode_ram_addresses_alike() {
+        for cart_type in [0x08u8, 0x02, 0x12, 0x1A] {
+            let mut c = from_rom(test_util::banked_rom(2, cart_type, 0, 0x01)).unwrap();
+            c.write_rom(0x0000, 0x0A);
+            c.write_ram(0xA005, 0x77);
+            assert_eq!(c.read_ram(0xA005), 0x77, "type {cart_type:#04x}");
+            assert_eq!(
+                c.read_ram(0xA805),
+                0x77,
+                "2 KiB mirror, type {cart_type:#04x}"
+            );
+            // Addresses below the window (never sent by the bus) must not panic.
+            let _ = c.read_ram(0x0000);
+            c.write_ram(0x0000, 1);
+        }
     }
 
     #[test]

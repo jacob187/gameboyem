@@ -19,7 +19,9 @@
 //! on load. Loading also accepts the 44-byte variant (32-bit timestamp) and a
 //! bare RAM image with no footer (clock left at zero).
 
-use super::{Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE};
+use super::{
+    Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
+};
 
 /// M-cycles per emulated second (4 194 304 Hz / 4).
 const MCYCLES_PER_SECOND: u32 = 1 << 20;
@@ -150,7 +152,7 @@ impl Mbc3 {
         if self.ram.is_empty() {
             return None;
         }
-        let offset = self.ram_select as usize * RAM_BANK_SIZE + (addr as usize & 0x1FFF);
+        let offset = self.ram_select as usize * RAM_BANK_SIZE + ram_window_offset(addr);
         Some(offset % self.ram.len())
     }
 }

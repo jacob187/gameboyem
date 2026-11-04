@@ -12,7 +12,9 @@
 //! exactly 1 MiB and the Nintendo logo from the header also appears at the start
 //! of bank 0x10, as the sub-game headers of a multicart do.
 
-use super::{Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE};
+use super::{
+    Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
+};
 
 /// Offset of the Nintendo logo in a header.
 const LOGO: std::ops::Range<usize> = 0x104..0x134;
@@ -84,7 +86,7 @@ impl Mbc1 {
         } else {
             0
         };
-        Some((bank * RAM_BANK_SIZE + (addr as usize - 0xA000)) % self.ram.len())
+        Some((bank * RAM_BANK_SIZE + ram_window_offset(addr)) % self.ram.len())
     }
 }
 

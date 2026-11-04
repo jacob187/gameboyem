@@ -12,7 +12,9 @@
 //! Unlike MBC1, bank 0 is a valid selection for `4000-7FFF`; there is no 0 -> 1
 //! remapping. The ROM bank number is masked to the actual ROM size.
 
-use super::{Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE};
+use super::{
+    Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
+};
 
 pub struct Mbc5 {
     rom: Vec<u8>,
@@ -44,7 +46,7 @@ impl Mbc5 {
         if !self.ram_enabled || self.ram.is_empty() {
             return None;
         }
-        let offset = self.ram_bank as usize * RAM_BANK_SIZE + (addr as usize & 0x1FFF);
+        let offset = self.ram_bank as usize * RAM_BANK_SIZE + ram_window_offset(addr);
         Some(offset % self.ram.len())
     }
 }
