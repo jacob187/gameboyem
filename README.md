@@ -95,6 +95,7 @@ Every case in the harness passes. Some PPU timing is fitted to mooneye rather th
 | ROM only (MBC0) | supported |
 | MBC1 (+RAM, battery; MBC1M multicart detection) | supported, passes mooneye `mbc1/*` |
 | MBC3 (+RAM, battery, RTC) | supported. The RTC is driven by emulated time, not the host clock, and is saved in the VBA/BGB footer format |
+| MBC30 (MBC3 with >2 MiB ROM or 64 KiB RAM) | supported (detected from header); no test ROM |
 | MBC5 (+RAM, battery; rumble ignored) | supported, passes mooneye `mbc5/*` |
 | MBC2, MMM01, HuC*, camera | not supported (load error) |
 
