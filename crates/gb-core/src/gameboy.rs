@@ -96,6 +96,16 @@ impl GameBoy {
         self.bus.cart.battery_ram()
     }
 
+    /// Counter that advances only when the game changes battery-backed state
+    /// (a cart-RAM byte, an RTC register, a latch that changes the latched
+    /// registers) or a save is loaded; never on RTC ticks. Cheap to poll, so a
+    /// host can skip cloning `battery_ram()` and rewriting the `.sav` while it
+    /// is unchanged, and still write one final image on quit to capture the
+    /// free-running RTC. Only meaningful when `battery_ram()` is `Some`.
+    pub fn battery_generation(&self) -> u64 {
+        self.bus.cart.battery_generation()
+    }
+
     /// Restore battery-backed RAM from a `.sav` file.
     pub fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError> {
         self.bus.cart.load_battery_ram(data)
