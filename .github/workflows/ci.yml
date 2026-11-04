@@ -48,6 +48,15 @@ jobs:
       - name: Fetch test ROMs
         run: ./scripts/fetch-test-roms.sh
 
+      - name: Cache homebrew corpus
+        uses: actions/cache@v4
+        with:
+          path: roms/corpus
+          key: homebrew-corpus-${{ hashFiles('scripts/fetch-homebrew-corpus.sh') }}
+
+      - name: Fetch homebrew corpus
+        run: ./scripts/fetch-homebrew-corpus.sh
+
       - name: Cache GBDK
         if: hashFiles('homebrew/Makefile') != ''
         uses: actions/cache@v4
@@ -128,6 +137,15 @@ jobs:
 
       - name: Fetch test ROMs
         run: ./scripts/fetch-test-roms.sh
+
+      - name: Cache homebrew corpus
+        uses: actions/cache@v4
+        with:
+          path: roms/corpus
+          key: homebrew-corpus-${{ hashFiles('scripts/fetch-homebrew-corpus.sh') }}
+
+      - name: Fetch homebrew corpus
+        run: ./scripts/fetch-homebrew-corpus.sh
 
       - name: Download homebrew ROMs
         uses: actions/download-artifact@v4

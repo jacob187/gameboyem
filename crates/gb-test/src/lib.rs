@@ -35,6 +35,12 @@ pub enum Kind {
     SaveSnake,
     /// Same as `SaveSnake` for breakout.
     SaveBreakout,
+    /// Corpus: Tobu Tobu Girl (MBC1). Intro, title, menu, then steer the girl.
+    PlayTobu,
+    /// Corpus: Adjustris (MBC3). Start, then move and drop the falling piece.
+    PlayAdjustris,
+    /// Corpus: Renegade Rush (MBC5). Title, menu, A starts a race, steer the car.
+    PlayRenegade,
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +59,11 @@ impl Case {
         let p = p.strip_suffix(".gb").unwrap_or(p);
         match self.kind {
             // Same ROM as the smoke case; keep the names unique.
-            Kind::PlaySnake | Kind::PlayBreakout => format!("{p}-play"),
+            Kind::PlaySnake
+            | Kind::PlayBreakout
+            | Kind::PlayTobu
+            | Kind::PlayAdjustris
+            | Kind::PlayRenegade => format!("{p}-play"),
             Kind::SaveSnake | Kind::SaveBreakout => format!("{p}-save"),
             _ => p.to_string(),
         }
@@ -155,6 +165,9 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "play-breakout" => Kind::PlayBreakout,
                 "save-snake" => Kind::SaveSnake,
                 "save-breakout" => Kind::SaveBreakout,
+                "play-tobu" => Kind::PlayTobu,
+                "play-adjustris" => Kind::PlayAdjustris,
+                "play-renegade" => Kind::PlayRenegade,
                 o => panic!("expected.txt:{}: bad kind {o:?}", n + 1),
             };
             let max_frames = next("max_frames")
@@ -182,6 +195,9 @@ pub fn run_case(case: &Case) -> Outcome {
         Kind::PlayBreakout => return run_play(&rom, PLAY_BREAKOUT, case.max_frames),
         Kind::SaveSnake => return run_save(&rom, drive_snake, case.max_frames),
         Kind::SaveBreakout => return run_save(&rom, drive_breakout, case.max_frames),
+        Kind::PlayTobu => return run_play(&rom, PLAY_TOBU, case.max_frames),
+        Kind::PlayAdjustris => return run_play(&rom, PLAY_ADJUSTRIS, case.max_frames),
+        Kind::PlayRenegade => return run_play(&rom, PLAY_RENEGADE, case.max_frames),
         _ => {}
     }
     let mut gb = match GameBoy::new(rom) {
@@ -194,9 +210,13 @@ pub fn run_case(case: &Case) -> Outcome {
         Kind::Mooneye => run_mooneye(&mut gb, case.max_frames),
         Kind::Acid2 => run_acid2(&mut gb, case),
         Kind::Smoke => run_smoke(&mut gb, case.max_frames),
-        Kind::PlaySnake | Kind::PlayBreakout | Kind::SaveSnake | Kind::SaveBreakout => {
-            unreachable!("handled above")
-        }
+        Kind::PlaySnake
+        | Kind::PlayBreakout
+        | Kind::PlayTobu
+        | Kind::PlayAdjustris
+        | Kind::PlayRenegade
+        | Kind::SaveSnake
+        | Kind::SaveBreakout => unreachable!("handled above"),
     }
 }
 
@@ -490,6 +510,117 @@ const PLAY_BREAKOUT: &[Step] = &[
     Step::Hold(Button::Right, 30),
     Step::Shot {
         label: "Right moves the paddle",
+        moving: false,
+    },
+];
+
+/// Tobu Tobu Girl (MIT, MBC1+RAM+BATTERY). The Tangram/potato-tan intro runs
+/// ~700 frames; Start then walks title -> main menu -> level, and Right/Left
+/// move the girl. Validated against headless PyBoy (which boots through the
+/// boot ROM, so the intro ends a little later than here; 900 frames is past it
+/// in both).
+const PLAY_TOBU: &[Step] = &[
+    Step::Run(900),
+    Step::Shot {
+        label: "intro",
+        moving: false,
+    },
+    Step::Hold(Button::Start, 5),
+    Step::Run(60),
+    Step::Shot {
+        label: "Start skips the intro to the title",
+        moving: false,
+    },
+    Step::Hold(Button::Start, 5),
+    Step::Run(120),
+    Step::Shot {
+        label: "Start opens the main menu",
+        moving: false,
+    },
+    Step::Hold(Button::Start, 5),
+    Step::Run(180),
+    Step::Shot {
+        label: "Start begins the level",
+        moving: false,
+    },
+    Step::Hold(Button::Right, 20),
+    Step::Run(10),
+    Step::Shot {
+        label: "Right moves the girl",
+        moving: false,
+    },
+    Step::Hold(Button::Left, 20),
+    Step::Run(10),
+    Step::Shot {
+        label: "Left moves the girl",
+        moving: false,
+    },
+];
+
+/// Adjustris (CC0, MBC3+RAM+BATTERY). The piece type depends on timing, so the
+/// script only relies on D-pad moves, which work for every piece.
+const PLAY_ADJUSTRIS: &[Step] = &[
+    Step::Run(120),
+    Step::Shot {
+        label: "title",
+        moving: false,
+    },
+    Step::Hold(Button::Start, 5),
+    Step::Run(60),
+    Step::Shot {
+        label: "Start begins the game",
+        moving: false,
+    },
+    Step::Hold(Button::Left, 12),
+    Step::Run(5),
+    Step::Shot {
+        label: "Left moves the piece",
+        moving: false,
+    },
+    Step::Hold(Button::Right, 12),
+    Step::Run(5),
+    Step::Shot {
+        label: "Right moves the piece",
+        moving: false,
+    },
+    Step::Hold(Button::Down, 30),
+    Step::Run(5),
+    Step::Shot {
+        label: "Down drops the piece",
+        moving: false,
+    },
+];
+
+/// Renegade Rush (MIT, MBC5+RAM+BATTERY). The Start press needs ~100 frames to
+/// reach the menu; A on PLAY starts a race; Left/Right steer the car.
+const PLAY_RENEGADE: &[Step] = &[
+    Step::Run(200),
+    Step::Shot {
+        label: "title",
+        moving: false,
+    },
+    Step::Hold(Button::Start, 5),
+    Step::Run(120),
+    Step::Shot {
+        label: "Start opens the menu",
+        moving: false,
+    },
+    Step::Hold(Button::A, 3),
+    Step::Run(240),
+    Step::Shot {
+        label: "A starts the race",
+        moving: false,
+    },
+    Step::Hold(Button::Left, 30),
+    Step::Run(5),
+    Step::Shot {
+        label: "Left steers the car",
+        moving: false,
+    },
+    Step::Hold(Button::Right, 60),
+    Step::Run(5),
+    Step::Shot {
+        label: "Right steers the car",
         moving: false,
     },
 ];
