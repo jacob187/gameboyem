@@ -22,7 +22,8 @@ pub enum Kind {
     BlarggMem,
     /// Mooneye: `LD B,B` with Fibonacci registers on pass.
     Mooneye,
-    /// dmg-acid2: framebuffer compared to the reference image.
+    /// dmg-acid2: framebuffer compared to the reference image. With the `-cgb`
+    /// suffix (cgb-acid2) the RGB555 colour framebuffer is compared instead.
     Acid2,
     /// Homebrew smoke test: framebuffer not blank after N frames.
     Smoke,
@@ -63,7 +64,10 @@ impl Case {
     /// Short display name, e.g. `blargg/cpu_instrs/individual/01-special`.
     pub fn name(&self) -> String {
         let p = self.path.strip_prefix("test/").unwrap_or(&self.path);
-        let p = p.strip_suffix(".gb").unwrap_or(p);
+        let p = p
+            .strip_suffix(".gbc")
+            .or_else(|| p.strip_suffix(".gb"))
+            .unwrap_or(p);
         match self.kind {
             // Same ROM as the smoke case; keep the names unique.
             Kind::PlaySnake
@@ -478,21 +482,103 @@ pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Expand one RGB555 pixel (`0bbbbbgggggrrrrr`) to RGB888 the way the cgb-acid2
+/// README does: each 5-bit channel `c` becomes `(c << 3) | (c >> 2)`, with no
+/// colour correction.
+pub fn rgb555_to_rgb888(px: u16) -> [u8; 3] {
+    let widen = |c: u16| ((c << 3) | (c >> 2)) as u8;
+    [
+        widen(px & 0x1F),
+        widen((px >> 5) & 0x1F),
+        widen((px >> 10) & 0x1F),
+    ]
+}
+
+/// Load a 160x144 reference PNG as RGB888. Indexed (palette), greyscale and
+/// RGB(A) images are all expanded; alpha is dropped.
+pub fn load_reference_rgb(path: &Path) -> Result<Vec<[u8; 3]>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    decode_reference_rgb(std::io::BufReader::new(file))
+}
+
+fn decode_reference_rgb(
+    src: impl std::io::BufRead + std::io::Seek,
+) -> Result<Vec<[u8; 3]>, String> {
+    let mut decoder = png::Decoder::new(src);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
+        return Err(format!("reference is {}x{}", info.width, info.height));
+    }
+    let channels = info.color_type.samples();
+    let to_rgb: fn(&[u8]) -> [u8; 3] = match info.color_type {
+        png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => |px| [px[0]; 3],
+        png::ColorType::Rgb | png::ColorType::Rgba => |px| [px[0], px[1], px[2]],
+        png::ColorType::Indexed => return Err("palette was not expanded".into()),
+    };
+    Ok(buf[..info.buffer_size()]
+        .chunks_exact(channels)
+        .map(to_rgb)
+        .collect())
+}
+
+/// Write an RGB888 framebuffer as a PNG (for debugging failed comparisons).
+pub fn save_rgb_png(fb: &[[u8; 3]], path: &Path) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        SCREEN_WIDTH as u32,
+        SCREEN_HEIGHT as u32,
+    );
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let rgb: Vec<u8> = fb.iter().flatten().copied().collect();
+    enc.write_header()
+        .and_then(|mut w| w.write_image_data(&rgb))
+        .map_err(|e| e.to_string())
+}
+
 /// Where failing-test artifacts (actual framebuffers) are written.
 pub fn artifact_dir() -> PathBuf {
     workspace_root().join("target").join("gb-test-out")
 }
 
 fn run_acid2(gb: &mut GameBoy, case: &Case) -> Outcome {
+    if case.model == Model::Cgb {
+        return run_acid2_cgb(gb, case);
+    }
     let reference_path = case.rom_path().with_file_name("reference-dmg.png");
     let reference = match load_reference(&reference_path) {
         Ok(r) => r,
         Err(e) => return Outcome::Fail(format!("reference image: {e}")),
     };
-    // The test finishes setup within a few frames and signals with LD B,B;
-    // render a couple more frames after it (or stop at the frame limit).
+    if let Some(fail) = run_to_acid2_signal(gb, case.max_frames) {
+        return fail;
+    }
+    let fb = gb.framebuffer();
+    let diff = fb.iter().zip(&reference).filter(|(a, b)| a != b).count();
+    if diff == 0 {
+        Outcome::Pass
+    } else {
+        let out = acid2_failure_path(case);
+        let saved = save_framebuffer_png(fb, &out)
+            .map(|()| format!("; actual frame written to {}", out.display()))
+            .unwrap_or_default();
+        Outcome::Fail(format!("{diff} pixels differ from reference{saved}"))
+    }
+}
+
+/// The test finishes setup within a few frames and signals with LD B,B;
+/// render a couple more frames after it (or stop at the frame limit).
+/// Returns the failure if the CPU locks up.
+fn run_to_acid2_signal(gb: &mut GameBoy, max_frames: u32) -> Option<Outcome> {
     let mut frames_after_signal = None;
-    for _ in 0..case.max_frames {
+    for _ in 0..max_frames {
         gb.step_frame();
         if gb.take_ld_b_b_breakpoint() && frames_after_signal.is_none() {
             frames_after_signal = Some(0);
@@ -504,16 +590,43 @@ fn run_acid2(gb: &mut GameBoy, case: &Case) -> Outcome {
             }
         }
         if gb.cpu_locked() {
-            return Outcome::Fail(locked_message(gb));
+            return Some(Outcome::Fail(locked_message(gb)));
         }
     }
-    let fb = gb.framebuffer();
-    let diff = fb.iter().zip(&reference).filter(|(a, b)| a != b).count();
+    None
+}
+
+fn acid2_failure_path(case: &Case) -> PathBuf {
+    artifact_dir().join(format!("{}.png", case.name().replace('/', "_")))
+}
+
+/// cgb-acid2: the RGB555 framebuffer expanded to RGB888 (no colour correction)
+/// must equal `reference.png` exactly.
+fn run_acid2_cgb(gb: &mut GameBoy, case: &Case) -> Outcome {
+    let reference_path = case.rom_path().with_file_name("reference.png");
+    let reference = match load_reference_rgb(&reference_path) {
+        Ok(r) => r,
+        Err(e) => return Outcome::Fail(format!("reference image: {e}")),
+    };
+    if let Some(fail) = run_to_acid2_signal(gb, case.max_frames) {
+        return fail;
+    }
+    let Some(fb) = gb.cgb_framebuffer() else {
+        return Outcome::Fail(
+            "cgb_framebuffer() is None: the machine is not rendering in CGB colour mode".into(),
+        );
+    };
+    let actual: Vec<[u8; 3]> = fb.iter().map(|&px| rgb555_to_rgb888(px)).collect();
+    let diff = actual
+        .iter()
+        .zip(&reference)
+        .filter(|(a, b)| a != b)
+        .count();
     if diff == 0 {
         Outcome::Pass
     } else {
-        let out = artifact_dir().join(format!("{}.png", case.name().replace('/', "_")));
-        let saved = save_framebuffer_png(fb, &out)
+        let out = acid2_failure_path(case);
+        let saved = save_rgb_png(&actual, &out)
             .map(|()| format!("; actual frame written to {}", out.display()))
             .unwrap_or_default();
         Outcome::Fail(format!("{diff} pixels differ from reference{saved}"))
@@ -1354,7 +1467,8 @@ mod tests {
             "pass mooneye 10 a b.gb\n\
              fail mooneye-cgb 20 c d.gb\n\
              pass blargg-mem-cgb 30 e.gb\n\
-             pass blargg-mem 40 f.gb\n",
+             pass blargg-mem 40 f.gb\n\
+             fail acid2-cgb 50 g.gbc\n",
         );
         let got: Vec<_> = cases
             .iter()
@@ -1367,9 +1481,94 @@ mod tests {
                 (Kind::Mooneye, Model::Cgb, 20),
                 (Kind::BlarggMem, Model::Cgb, 30),
                 (Kind::BlarggMem, Model::Dmg, 40),
+                (Kind::Acid2, Model::Cgb, 50),
             ]
         );
         assert_eq!(cases[1].path, "c d.gb");
+    }
+
+    #[test]
+    fn rgb555_expands_with_the_readme_rule() {
+        assert_eq!(rgb555_to_rgb888(0x0000), [0, 0, 0]);
+        assert_eq!(rgb555_to_rgb888(0x7FFF), [255, 255, 255]);
+        // Red is the low 5 bits, blue the high.
+        assert_eq!(rgb555_to_rgb888(0x001F), [255, 0, 0]);
+        assert_eq!(rgb555_to_rgb888(0x03E0), [0, 255, 0]);
+        assert_eq!(rgb555_to_rgb888(0x7C00), [0, 0, 255]);
+        // (c << 3) | (c >> 2): 0x10 -> 0x84, 0x01 -> 0x08, 0x0F -> 0x7B.
+        assert_eq!(rgb555_to_rgb888(0b01111_00001_10000), [0x84, 0x08, 0x7B]);
+        // Bit 15 is ignored.
+        assert_eq!(rgb555_to_rgb888(0x8000), [0, 0, 0]);
+    }
+
+    /// A 160x144 4-bit palette PNG (the cgb-acid2 reference format) in memory.
+    fn indexed_png(width: u32, height: u32, palette: &[u8], indices: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, width, height);
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_depth(png::BitDepth::Four);
+        enc.set_palette(palette.to_vec());
+        let mut w = enc.write_header().unwrap();
+        // Two 4-bit pixels per byte, rows byte-aligned.
+        let row_bytes = (width as usize).div_ceil(2);
+        let mut packed = vec![0u8; row_bytes * height as usize];
+        for (i, &idx) in indices.iter().enumerate() {
+            let (y, x) = (i / width as usize, i % width as usize);
+            packed[y * row_bytes + x / 2] |= idx << (if x % 2 == 0 { 4 } else { 0 });
+        }
+        w.write_image_data(&packed).unwrap();
+        w.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn indexed_reference_png_loads_as_rgb888() {
+        let palette = [0xFF, 0x00, 0x00, 0x00, 0x80, 0x00, 0x12, 0x34, 0x56];
+        let indices: Vec<u8> = (0..SCREEN_WIDTH * SCREEN_HEIGHT)
+            .map(|i| (i % 3) as u8)
+            .collect();
+        let png = indexed_png(
+            SCREEN_WIDTH as u32,
+            SCREEN_HEIGHT as u32,
+            &palette,
+            &indices,
+        );
+        let px = decode_reference_rgb(std::io::Cursor::new(png)).unwrap();
+        assert_eq!(px.len(), SCREEN_WIDTH * SCREEN_HEIGHT);
+        assert_eq!(
+            &px[..4],
+            &[[255, 0, 0], [0, 128, 0], [0x12, 0x34, 0x56], [255, 0, 0]]
+        );
+        assert_eq!(px[SCREEN_WIDTH * SCREEN_HEIGHT - 1], {
+            let i = (SCREEN_WIDTH * SCREEN_HEIGHT - 1) % 3;
+            [palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]]
+        });
+    }
+
+    #[test]
+    fn reference_png_of_the_wrong_size_is_rejected() {
+        let png = indexed_png(4, 2, &[0, 0, 0, 255, 255, 255], &[0, 1, 0, 1, 1, 0, 1, 0]);
+        let err = decode_reference_rgb(std::io::Cursor::new(png)).unwrap_err();
+        assert!(err.contains("4x2"), "{err}");
+    }
+
+    #[test]
+    fn gbc_and_gb_extensions_are_stripped_from_names() {
+        let case = |path: &str| Case {
+            path: path.into(),
+            kind: Kind::Acid2,
+            expect_pass: true,
+            max_frames: 1,
+            model: Model::Cgb,
+        };
+        assert_eq!(
+            case("test/cgb-acid2/cgb-acid2.gbc").name(),
+            "cgb-acid2/cgb-acid2"
+        );
+        assert_eq!(
+            case("test/dmg-acid2/dmg-acid2.gb").name(),
+            "dmg-acid2/dmg-acid2"
+        );
     }
 
     /// A 32 KiB ROM with `code` at 0x150 (entry jumps there).
