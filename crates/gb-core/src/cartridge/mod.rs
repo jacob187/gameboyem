@@ -10,6 +10,8 @@ mod rom_only;
 use std::fmt;
 
 pub use mbc1::Mbc1;
+pub use mbc3::Mbc3;
+pub use mbc5::Mbc5;
 pub use rom_only::RomOnly;
 
 /// Size of one switchable ROM bank.
@@ -215,9 +217,8 @@ pub fn from_rom(rom: Vec<u8>) -> Result<Box<dyn Cartridge>, CartridgeError> {
     Ok(match header.mbc {
         MbcKind::RomOnly => Box::new(RomOnly::new(rom, header)),
         MbcKind::Mbc1 => Box::new(Mbc1::new(rom, header)),
-        MbcKind::Mbc3 | MbcKind::Mbc5 => {
-            return Err(CartridgeError::UnsupportedType(header.cart_type));
-        }
+        MbcKind::Mbc5 => Box::new(Mbc5::new(rom, header)),
+        MbcKind::Mbc3 => Box::new(Mbc3::new(rom, header)),
     })
 }
 
@@ -300,5 +301,60 @@ mod tests {
         assert_eq!(rom.len(), 0x8000);
         let rom = normalize_rom(vec![0; 3 * ROM_BANK_SIZE], 0x8000);
         assert_eq!(rom.len(), 4 * ROM_BANK_SIZE);
+    }
+
+    /// Every combination of the three variable header bytes, on ROMs shorter
+    /// and longer than declared, must either be rejected or be fully usable.
+    #[test]
+    fn garbage_headers_never_panic() {
+        for cart_type in 0..=255u8 {
+            for rom_code in [0x00, 0x01, 0x05, 0x08, 0x09, 0x52, 0xFF] {
+                for ram_code in [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xFF] {
+                    for banks in [2usize, 3] {
+                        let rom = test_util::banked_rom(banks, cart_type, rom_code, ram_code);
+                        let Ok(mut c) = from_rom(rom) else { continue };
+                        for v in [0x00, 0x01, 0x0A, 0x7F, 0xFF] {
+                            for a in [0x0000u16, 0x2000, 0x3000, 0x4000, 0x6000, 0x7FFF] {
+                                c.write_rom(a, v);
+                                for r in [0x0000u16, 0x3FFF, 0x4000, 0x7FFF] {
+                                    c.read_rom(r);
+                                }
+                            }
+                            for r in [0xA000u16, 0xA7FF, 0xBFFF] {
+                                c.write_ram(r, v);
+                                c.read_ram(r);
+                            }
+                            c.tick_mcycle();
+                        }
+                        let _ = c.battery_ram();
+                        let _ = c.load_battery_ram(&[0xFF; 7]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_bytes_never_panic() {
+        // Deterministic xorshift noise as ROM content, header bytes included.
+        let mut x = 0x2545_F491u32;
+        for len in [0x150usize, 0x4000, 0x8000, 0x2_0000] {
+            for _ in 0..200 {
+                let rom: Vec<u8> = (0..len)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        x as u8
+                    })
+                    .collect();
+                if let Ok(mut c) = from_rom(rom) {
+                    c.write_rom(0x2000, 0xFF);
+                    c.write_rom(0x4000, 0xFF);
+                    c.read_rom(0x7FFF);
+                    c.read_ram(0xA000);
+                }
+            }
+        }
     }
 }
