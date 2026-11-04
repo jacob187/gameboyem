@@ -1,7 +1,8 @@
 # Test-ROM manifest and expected outcomes (the "ratchet").
 #
 # Format: <expect> <kind> <max_frames> <path relative to the roms dir>
-#   expect: pass | fail      kind: blargg | mooneye | acid2 | smoke | play-snake | play-breakout
+#   expect: pass | fail      kind: blargg | mooneye | acid2 | smoke | play-snake | play-breakout |
+#         play-tobu | play-adjustris | play-renegade
 #
 # Each line is one `cargo test -p gb-test --test roms` case. A case FAILS when
 # the actual outcome differs from `expect` in either direction, so flipping a
@@ -126,3 +127,18 @@ pass smoke 600 homebrew/breakout.gb
 # --- Homebrew playability (boot, press Start, scripted input, framebuffer must change) ---
 pass play-snake 400 homebrew/snake.gb
 pass play-breakout 400 homebrew/breakout.gb
+
+# --- Homebrew corpus (open-source games, scripts/fetch-homebrew-corpus.sh) ---
+pass smoke 600 corpus/tobutobugirl.gb
+pass smoke 600 corpus/squishy-the-turtle.gb
+pass smoke 600 corpus/porklike.gb
+pass smoke 600 corpus/sushi-nights.gb
+pass smoke 600 corpus/brekstascat.gb
+pass smoke 600 corpus/adjustris.gb
+pass smoke 400 corpus/max-pirate-extra-boom.gb
+pass smoke 600 corpus/renegade-rush.gb
+
+# --- Homebrew corpus playability (scripts validated against headless PyBoy) ---
+pass play-tobu 1500 corpus/tobutobugirl.gb
+pass play-adjustris 400 corpus/adjustris.gb
+pass play-renegade 700 corpus/renegade-rush.gb
