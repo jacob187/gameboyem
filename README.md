@@ -43,6 +43,8 @@ usage: gb [options] [--] <rom.gb>
 
 Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomically every 5 s when RAM changes, on pause, on quit, and on SIGINT/SIGTERM/SIGHUP (Ctrl-C). If writing fails, a warning is printed at once and then at most once a minute, and the failure is always reported on exit.
 
+If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than any valid save (128 KiB + 48 bytes), or is a wrong-size save that couldn't be copied to a backup, it's left untouched. Saving is then disabled for that session, with a warning at startup and "progress NOT saved" on exit. A wrong-size save that can be copied is backed up to `<rom>.sav.bak` (then `.bak1`, ...) before it's replaced. For MBC3 carts with a clock, periodic and pause saves happen only when the game changes cart RAM or an RTC register. The running clock is written on quit.
+
 ## Controls
 
 | Game Boy | Keyboard |
