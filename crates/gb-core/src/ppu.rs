@@ -300,9 +300,12 @@ impl Ppu {
     /// LCD being off (mooneye `stat_lyc_onoff`). The mode sources need the LCD
     /// on. Line 144 also pulses the mode 2 (OAM) source as VBlank begins
     /// (mooneye `vblank_stat_intr-GS`).
+    ///
+    /// The level is latched even with the LCD off (the LYC term survives it),
+    /// but a rising edge only requests the interrupt while the LCD is on.
     fn update_stat_line(&mut self, interrupts: &mut Interrupts) {
         let line = self.stat_line_level();
-        if line && !self.stat_line {
+        if line && !self.stat_line && self.lcd_on() {
             interrupts.request(Interrupt::Stat);
         }
         self.stat_line = line;

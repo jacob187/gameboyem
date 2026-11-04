@@ -980,6 +980,19 @@ fn blocked_oam_does_not_stop_sprites_from_the_scan() {
 // ------------------------------------------------ LCD on/off and VBlank STAT
 
 #[test]
+fn stat_write_with_lcd_off_latches_the_line_without_an_interrupt() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x11);
+    rig.clear_if();
+    assert!(rig.ppu.lyc_flag, "LY == LYC == 0 is latched across LCD off");
+    rig.write(0xFF41, 0x40);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+    // The level is still latched: turning the LCD on is not a new edge.
+    rig.write(0xFF40, 0x91);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0);
+}
+
+#[test]
 fn lyc_flag_is_retained_while_lcd_is_off() {
     let mut rig = Rig::at_line0();
     rig.write(0xFF45, 0x90);
