@@ -1,0 +1,9 @@
+[package]
+name = "gb-core"
+description = "Platform-independent, deterministic Game Boy (DMG) emulation core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
