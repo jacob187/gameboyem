@@ -127,6 +127,8 @@ pub struct Mbc3 {
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
+    /// See [`Cartridge::battery_generation`].
+    battery_gen: u64,
     rom_bank_mask: usize,
     /// Mask applied to values written to the ROM bank register (0x7F or 0xFF).
     rom_bank_reg_mask: u8,
@@ -153,6 +155,7 @@ impl Mbc3 {
             rom,
             ram,
             header,
+            battery_gen: 0,
             rom_bank_mask,
             rom_bank_reg_mask: if mbc30 { 0xFF } else { 0x7F },
             max_ram_select: if mbc30 { 7 } else { 3 },
@@ -202,6 +205,9 @@ impl Cartridge for Mbc3 {
                     self.latch_armed = true;
                 } else {
                     if value == 1 && self.latch_armed && self.header.has_rtc {
+                        if self.latched != self.live {
+                            self.battery_gen += 1;
+                        }
                         self.latched = self.live;
                     }
                     self.latch_armed = false;
@@ -230,7 +236,10 @@ impl Cartridge for Mbc3 {
         match self.ram_select {
             0x00..=0x07 if self.ram_select <= self.max_ram_select => {
                 if let Some(o) = self.ram_offset(addr) {
-                    self.ram[o] = value;
+                    if self.ram[o] != value {
+                        self.ram[o] = value;
+                        self.battery_gen += 1;
+                    }
                 }
             }
             0x08..=0x0C if self.header.has_rtc => {
@@ -239,6 +248,7 @@ impl Cartridge for Mbc3 {
                     self.subsecond = 0;
                 }
                 self.live.set(self.ram_select, value);
+                self.battery_gen += 1;
             }
             _ => {}
         }
@@ -303,7 +313,12 @@ impl Cartridge for Mbc3 {
             self.latched = Rtc::from_regs(std::array::from_fn(|i| word(5 + i)));
             self.subsecond = 0;
         }
+        self.battery_gen += 1;
         Ok(())
+    }
+
+    fn battery_generation(&self) -> u64 {
+        self.battery_gen
     }
 }
 
@@ -347,6 +362,48 @@ mod tests {
         c.write_rom(0x2000, 0xC5);
         assert_eq!(c.read_rom(0x4000), 0x45);
         assert_eq!(c.read_rom(0x0000), 0, "0000-3FFF is fixed to bank 0");
+    }
+
+    #[test]
+    fn free_running_rtc_does_not_advance_battery_generation() {
+        let mut c = rtc_cart();
+        let g0 = c.battery_generation();
+        let img0 = c.battery_ram().unwrap();
+        tick_seconds(c.as_mut(), 12);
+        assert_eq!(c.battery_generation(), g0, "ticking is not a save event");
+        assert_ne!(c.battery_ram().unwrap(), img0, "but the image does drift");
+
+        // A latch that changes the latched registers is.
+        latch(c.as_mut());
+        let g1 = c.battery_generation();
+        assert!(g1 > g0);
+        latch(c.as_mut());
+        assert_eq!(c.battery_generation(), g1, "no-op latch: nothing changed");
+
+        // Cart RAM write: only a changed byte counts.
+        c.write_rom(0x4000, 1);
+        c.write_ram(0xA000, 0x5A);
+        let g2 = c.battery_generation();
+        assert!(g2 > g1);
+        c.write_ram(0xA000, 0x5A);
+        assert_eq!(c.battery_generation(), g2);
+
+        // RTC register write.
+        c.write_rom(0x4000, 0x0A);
+        c.write_ram(0xA000, 3);
+        let g3 = c.battery_generation();
+        assert!(g3 > g2);
+
+        // Load restores state, so the host's baseline must move too.
+        let save = c.battery_ram().unwrap();
+        c.load_battery_ram(&save).unwrap();
+        assert!(c.battery_generation() > g3);
+
+        // Disabled RAM ignores writes: no generation change.
+        c.write_rom(0x0000, 0x00);
+        let g4 = c.battery_generation();
+        c.write_ram(0xA000, 9);
+        assert_eq!(c.battery_generation(), g4);
     }
 
     #[test]

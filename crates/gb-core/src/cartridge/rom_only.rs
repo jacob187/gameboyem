@@ -6,12 +6,18 @@ pub struct RomOnly {
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
+    battery_gen: u64,
 }
 
 impl RomOnly {
     pub fn new(rom: Vec<u8>, header: CartridgeHeader) -> Self {
         let ram = vec![0; header.ram_size.min(0x2000)];
-        Self { rom, ram, header }
+        Self {
+            rom,
+            ram,
+            header,
+            battery_gen: 0,
+        }
     }
 }
 
@@ -35,8 +41,11 @@ impl Cartridge for RomOnly {
 
     fn write_ram(&mut self, addr: u16, value: u8) {
         if !self.ram.is_empty() {
-            let len = self.ram.len();
-            self.ram[ram_window_offset(addr) % len] = value;
+            let o = ram_window_offset(addr) % self.ram.len();
+            if self.ram[o] != value {
+                self.ram[o] = value;
+                self.battery_gen += 1;
+            }
         }
     }
 
@@ -45,6 +54,12 @@ impl Cartridge for RomOnly {
     }
 
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError> {
-        super::load_battery_ram(&self.header, &mut self.ram, data)
+        super::load_battery_ram(&self.header, &mut self.ram, data)?;
+        self.battery_gen += 1;
+        Ok(())
+    }
+
+    fn battery_generation(&self) -> u64 {
+        self.battery_gen
     }
 }

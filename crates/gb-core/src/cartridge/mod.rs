@@ -49,6 +49,23 @@ pub trait Cartridge: Send {
     /// Persistent RAM contents, or `None` if the cartridge has no battery.
     fn battery_ram(&self) -> Option<Vec<u8>>;
 
+    /// Monotonic counter, meaningful only when [`Cartridge::battery_ram`] is
+    /// `Some`. It advances when the program changes the persistent state: a
+    /// cart-RAM write that changes a byte, an RTC register write, an RTC latch
+    /// that changes the latched registers, or a successful
+    /// [`Cartridge::load_battery_ram`].
+    ///
+    /// It deliberately does **not** advance while the MBC3 RTC free-runs, so a
+    /// host can poll it to skip pointless periodic saves (the live clock makes
+    /// every `battery_ram()` image differ) and still write one final
+    /// `battery_ram()` image on quit, which captures the live clock.
+    ///
+    /// The default (constant 0) means "unknown"; every built-in mapper
+    /// overrides it.
+    fn battery_generation(&self) -> u64 {
+        0
+    }
+
     /// Restore persistent RAM from a `.sav` file.
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError>;
 }
@@ -364,6 +381,33 @@ mod tests {
             // Addresses below the window (never sent by the bus) must not panic.
             let _ = c.read_ram(0x0000);
             c.write_ram(0x0000, 1);
+        }
+    }
+
+    /// Writing a changed RAM byte advances the generation; rewriting the same
+    /// value, writing while disabled, and reads do not; loading a save does.
+    #[test]
+    fn battery_generation_tracks_ram_changes() {
+        for cart_type in [0x09u8, 0x03, 0x13, 0x1B] {
+            let mut c = from_rom(test_util::banked_rom(2, cart_type, 0, 0x02)).unwrap();
+            let t = format!("type {cart_type:#04x}");
+            let g0 = c.battery_generation();
+            if cart_type != 0x09 {
+                // ROM-only RAM has no enable register.
+                c.write_ram(0xA000, 1);
+                assert_eq!(c.battery_generation(), g0, "disabled write, {t}");
+            }
+            c.write_rom(0x0000, 0x0A);
+            c.write_ram(0xA000, 1);
+            let g1 = c.battery_generation();
+            assert!(g1 > g0, "{t}");
+            c.write_ram(0xA000, 1);
+            c.read_ram(0xA000);
+            c.tick_mcycle();
+            assert_eq!(c.battery_generation(), g1, "{t}");
+            let save = c.battery_ram().unwrap();
+            c.load_battery_ram(&save).unwrap();
+            assert!(c.battery_generation() > g1, "{t}");
         }
     }
 

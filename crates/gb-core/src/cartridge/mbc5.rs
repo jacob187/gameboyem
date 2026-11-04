@@ -20,6 +20,8 @@ pub struct Mbc5 {
     rom: Vec<u8>,
     ram: Vec<u8>,
     header: CartridgeHeader,
+    /// See [`Cartridge::battery_generation`].
+    battery_gen: u64,
     rom_bank_mask: usize,
     ram_enabled: bool,
     /// 9-bit ROM bank number.
@@ -35,6 +37,7 @@ impl Mbc5 {
             rom,
             ram,
             header,
+            battery_gen: 0,
             rom_bank_mask,
             ram_enabled: false,
             rom_bank: 1,
@@ -88,7 +91,10 @@ impl Cartridge for Mbc5 {
 
     fn write_ram(&mut self, addr: u16, value: u8) {
         if let Some(o) = self.ram_offset(addr) {
-            self.ram[o] = value;
+            if self.ram[o] != value {
+                self.ram[o] = value;
+                self.battery_gen += 1;
+            }
         }
     }
 
@@ -97,7 +103,13 @@ impl Cartridge for Mbc5 {
     }
 
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError> {
-        super::load_battery_ram(&self.header, &mut self.ram, data)
+        super::load_battery_ram(&self.header, &mut self.ram, data)?;
+        self.battery_gen += 1;
+        Ok(())
+    }
+
+    fn battery_generation(&self) -> u64 {
+        self.battery_gen
     }
 }
 
