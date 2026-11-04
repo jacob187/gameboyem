@@ -96,6 +96,10 @@ fn run_at_rate(rom: &[u8], rate: u32, frames: usize) -> Vec<f32> {
         gb.step_frame();
         let dm = gb.mcycles() - before;
         total_mc += dm;
+        if f > 0 {
+            // Literal per-frame rate: rate / 59.7275 stereo samples.
+            assert_eq!(dm, u64::from(M_CYCLES_PER_FRAME), "frame {f} length");
+        }
         let s = gb.audio_samples();
         assert_eq!(s.len() % 2, 0, "rate {rate}: odd sample count");
         assert_in_range(&s, &format!("rate {rate} frame {f}"));

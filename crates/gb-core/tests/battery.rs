@@ -140,8 +140,8 @@ fn writer_rom(case: Case, rng: &mut Rng) -> (Vec<u8>, Vec<u8>) {
         }
     }
     p.spin();
-    // 1 MiB ROM keeps the MBC1 high-bank bits harmless for code in bank 0:
-    // MBC1 advanced mode only remaps bank 0 for ROMs >= 1 MiB.
+    // 128 KiB ROM (< 1 MiB): MBC1 advanced mode only remaps bank 0 for ROMs
+    // of 1 MiB or more, so the RAM-bank writes cannot move the code.
     let rom = make_rom(0x2_0000, case.cart_type, 2, case.ram_code, &p.0);
     (rom, model)
 }
