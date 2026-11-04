@@ -64,8 +64,60 @@ jobs:
           fi
           make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"
 
+      - name: Upload homebrew ROMs (consumed by the Windows job)
+        if: matrix.name == 'linux-x86_64' && hashFiles('homebrew/Makefile') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-roms
+          path: roms/homebrew/*.gb
+          if-no-files-found: error
+
       - name: cargo fmt
         run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Test-ROM table
+        run: cargo run -p gb-test --release -- --fail-on-mismatch
+
+  # Phase 8. Non-blocking: a Windows failure never fails the workflow.
+  # Homebrew ROMs come from the Linux leg (GBDK + make on Windows runners
+  # would add a second toolchain path for no extra coverage of our code).
+  windows:
+    name: windows-x86_64
+    needs: test
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache test ROMs
+        uses: actions/cache@v4
+        with:
+          path: roms/test
+          key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh') }}
+
+      - name: Fetch test ROMs
+        run: ./scripts/fetch-test-roms.sh
+
+      - name: Download homebrew ROMs
+        uses: actions/download-artifact@v4
+        with:
+          name: homebrew-roms
+          path: roms/homebrew
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
