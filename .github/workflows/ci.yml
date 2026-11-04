@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  GBDK_VERSION: "4.5.0"
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            gbdk: gbdk-linux64.tar.gz
+          - name: macos-arm64
+            os: macos-14
+            gbdk: gbdk-macos-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies (X11, Wayland, ALSA, udev)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libwayland-dev libasound2-dev libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache test ROMs
+        uses: actions/cache@v4
+        with:
+          path: roms/test
+          key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh') }}
+
+      - name: Fetch test ROMs
+        run: ./scripts/fetch-test-roms.sh
+
+      - name: Cache GBDK
+        if: hashFiles('homebrew/Makefile') != ''
+        uses: actions/cache@v4
+        with:
+          path: tools/gbdk
+          key: gbdk-${{ env.GBDK_VERSION }}-${{ matrix.gbdk }}
+
+      - name: Build homebrew ROMs (GBDK-2020)
+        if: hashFiles('homebrew/Makefile') != ''
+        run: |
+          if [ ! -x tools/gbdk/bin/lcc ]; then
+            mkdir -p tools
+            curl -fsSL "https://github.com/gbdk-2020/gbdk-2020/releases/download/${GBDK_VERSION}/${{ matrix.gbdk }}" | tar -xz -C tools
+          fi
+          make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Test-ROM table
+        run: cargo run -p gb-test --release -- --fail-on-mismatch
