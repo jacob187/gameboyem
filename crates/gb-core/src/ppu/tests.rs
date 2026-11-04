@@ -299,6 +299,26 @@ fn sprite_penalty_table() {
     assert_eq!(mode3_len_with_sprites(&[8, 16], 0, false), BASE);
 }
 
+#[test]
+fn first_line_after_lcd_on_has_no_oam_scan_or_sprite_penalty() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF40, 0x93);
+    for i in 0..10 {
+        rig.set_sprite(i, 16, 8 + 8 * i as u8, 0, 0);
+    }
+    rig.write(0xFF40, 0x13);
+    rig.write(0xFF40, 0x93);
+    assert!(rig.ppu.first_line);
+    rig.ticks(25); // past dot 80 of line 0
+    assert_eq!(rig.ppu.ly, 0);
+    assert_eq!(rig.ppu.line_sprite_count, 0);
+    assert_eq!(rig.ppu.mode3_len, 172);
+    // Line 1 scans OAM normally: the same sprites (Y = 16 spans lines 0..8).
+    rig.run_to(1, 84);
+    assert_eq!(rig.ppu.line_sprite_count, 10);
+    assert_eq!(rig.ppu.mode3_len, 172 + 107);
+}
+
 // ------------------------------------------------------- LY/LYC and STAT
 
 #[test]

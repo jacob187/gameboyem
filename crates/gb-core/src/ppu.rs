@@ -281,7 +281,13 @@ impl Ppu {
         if self.ly == self.wy {
             self.wy_triggered = true;
         }
-        self.scan_oam();
+        if self.first_line {
+            // No OAM scan on the first line after LCD on: no sprites are
+            // selected, so there are no sprite penalties either.
+            self.line_sprite_count = 0;
+        } else {
+            self.scan_oam();
+        }
         self.mode3_len = self.compute_mode3_len();
         self.render_line();
     }
