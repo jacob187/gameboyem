@@ -4,7 +4,7 @@ description = "Desktop frontend (window, input, audio) for the gb emulator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.88" # pixels 0.17 (wgpu 29) needs 1.88; workspace MSRV stays 1.85 for gb-core
 
 [[bin]]
 name = "gb"
@@ -12,3 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 gb-core.workspace = true
+winit = "0.30.13"
+pixels = "0.17.2"
+cpal = "0.18.2"
+
+[dev-dependencies]
+tempfile = "3"
