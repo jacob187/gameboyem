@@ -1066,3 +1066,93 @@ fn wave_retrigger_before_fetch_corrupts_wave_ram() {
     rig.w(0xFF1E, 0x80);
     assert_eq!(rig.apu.ch3.ram[..4], [0x22, 0x11, 0x22, 0x33]);
 }
+
+/// Digital output of every channel with the DAC gating applied, summed per
+/// NR51 side and scaled by NR50, written out independently of `update_mix`
+/// (explicit per-bit tables instead of the shift loop).
+fn expected_mix(apu: &Apu) -> (i32, i32) {
+    if !apu.powered {
+        return (0, 0);
+    }
+    let outs = [
+        (apu.ch1.dac_on(), apu.ch1.output()),
+        (apu.ch2.dac_on(), apu.ch2.output()),
+        (apu.ch3.dac_on(), apu.ch3.output()),
+        (apu.ch4.dac_on(), apu.ch4.output()),
+    ];
+    // NR51: bits 7..4 = CH4..CH1 left, bits 3..0 = CH4..CH1 right.
+    let left_bit = [0x10u8, 0x20, 0x40, 0x80];
+    let right_bit = [0x01u8, 0x02, 0x04, 0x08];
+    let (mut l, mut r) = (0, 0);
+    for (c, &(dac, o)) in outs.iter().enumerate() {
+        let analog = if dac { 15 - 2 * i32::from(o) } else { 0 };
+        if apu.regs[0x15] & left_bit[c] != 0 {
+            l += analog;
+        }
+        if apu.regs[0x15] & right_bit[c] != 0 {
+            r += analog;
+        }
+    }
+    (
+        l * (i32::from(apu.regs[0x14] >> 4 & 7) + 1),
+        r * (i32::from(apu.regs[0x14] & 7) + 1),
+    )
+}
+
+#[test]
+fn mix_is_refreshed_at_a_sequencer_step_that_changes_a_channel() {
+    // Length expiry at step 0 silences CH2 with no register write and no
+    // channel-reported change: only the sequencer's `dirty` refreshes the mix.
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF16, 0x80 | 0x3F); // 50% duty (step 0 high), length counter 1
+    rig.w(0xFF18, 0x00);
+    rig.w(0xFF19, 0xC0); // trigger, length on, freq 0: no duty step for 2048 M-cycles
+    rig.run(1);
+    let playing = rig.apu.cur_l;
+    assert_eq!(rig.status() & 2, 2);
+    assert_ne!(playing, 15 * 8, "CH2 output must be non-zero here");
+    rig.run(SEQ_PERIOD - 2); // right before the step-0 DIV-APU event
+    assert_eq!(rig.apu.cur_l, playing);
+    rig.run(1); // sequencer step 0 clocks length: CH2 off
+    assert_eq!(rig.status() & 2, 0);
+    assert_eq!(rig.apu.cur_l, 15 * 8, "stale mix after the sequencer step");
+    assert_eq!((rig.apu.cur_l, rig.apu.cur_r), expected_mix(&rig.apu));
+}
+
+#[test]
+fn ch4_volume_decays_through_the_envelope_clock() {
+    let mut rig = Rig::new();
+    rig.w(0xFF21, 0x81); // volume 8, decrease, pace 1
+    rig.w(0xFF22, 0x00);
+    rig.w(0xFF23, 0x80);
+    rig.seq_ticks(7);
+    assert_eq!(rig.apu.ch4.env.volume, 8);
+    rig.seq_ticks(1); // step 7: first envelope clock
+    assert_eq!(rig.apu.ch4.env.volume, 7);
+}
+
+#[test]
+fn length_trigger_of_an_expired_counter_loses_one_before_a_length_step() {
+    // Next step odd (does not clock length): enabled counter reloads to max - 1.
+    let mut rig = Rig::new();
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF16, 0x3F); // counter 1
+    rig.w(0xFF19, 0xC0);
+    rig.seq_ticks(1); // step 0 expires it; next step is 1 (odd)
+    assert_eq!(rig.apu.ch2.length.counter, 0);
+    rig.w(0xFF19, 0xC0);
+    assert_eq!(rig.apu.ch2.length.counter, 63);
+
+    // Next step even: full reload.
+    let mut rig = Rig::new();
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF16, 0x3F);
+    rig.w(0xFF19, 0xC0);
+    rig.seq_ticks(2); // step 1 clocks nothing; next step is 2 (even)
+    assert_eq!(rig.apu.ch2.length.counter, 0);
+    rig.w(0xFF19, 0xC0);
+    assert_eq!(rig.apu.ch2.length.counter, 64);
+}
