@@ -120,3 +120,5 @@ fail mooneye 600 test/mooneye/emulator-only/mbc5/rom_8Mb.gb
 fail acid2 120 test/dmg-acid2/dmg-acid2.gb
 
 # --- Homebrew smoke tests (600 frames, framebuffer not blank) ---
+fail smoke 600 homebrew/snake.gb
+fail smoke 600 homebrew/breakout.gb
