@@ -665,9 +665,11 @@ fn stop_calls_bus_and_idles() {
 
 #[test]
 fn stop_wakes_on_joypad_line_with_ie_zero() {
-    // STOP; INC B. IE = 0, so no interrupt can wake it: only the joypad can.
+    // STOP; INC B. A pending, enabled interrupt must not wake it either.
     let (mut cpu, mut bus) = setup(&[0x10, 0x00, 0x04]);
     cpu.step(&mut bus);
+    bus.ie = 0x01;
+    bus.iflag = 0x01;
     for _ in 0..10 {
         cpu.step(&mut bus);
     }
@@ -702,5 +704,29 @@ fn rst_pushes_return_address() {
             Ev::Write(0xCFFF, 0x02),
             Ev::Write(0xCFFE, 0x01),
         ]
+    );
+}
+
+#[test]
+fn ei_halt_with_pending_interrupt_returns_to_halt() {
+    // EI; HALT with VBlank pending: serviced right after HALT, return address
+    // is the HALT itself, and the ISR's first fetch is a normal one.
+    let (mut cpu, mut bus) = setup(&[0xFB, 0x76, 0x04]);
+    bus.ie = 0x01;
+    bus.iflag = 0x01;
+    bus.mem[0x40] = 0x0C; // INC C
+    bus.mem[0x41] = 0x0C; // INC C
+    cpu.step(&mut bus); // EI
+    cpu.step(&mut bus); // HALT (bug condition: IME still 0)
+    cpu.step(&mut bus); // dispatch
+    assert_eq!(cpu.regs.pc, 0x0040);
+    let ret = u16::from(bus.mem[0xCFFE]) | (u16::from(bus.mem[0xCFFF]) << 8);
+    assert_eq!(ret, START + 1, "returns to the HALT");
+    let c = cpu.regs.c;
+    cpu.step(&mut bus);
+    assert_eq!(
+        (cpu.regs.c, cpu.regs.pc),
+        (c + 1, 0x0041),
+        "ISR fetch not doubled"
     );
 }

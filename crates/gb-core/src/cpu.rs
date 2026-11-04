@@ -22,9 +22,9 @@
 //!   so memory accesses land on the right M-cycle (mooneye `*_timing` tests).
 //! * `STOP` is simplified: it calls [`CpuBus::stop`], consumes its padding byte
 //!   without a bus access and idles until a selected joypad line is low
-//!   (Pan Docs "Joypad Input": wakes from STOP regardless of IE) or, as a
-//!   fallback for our still-running peripherals, any interrupt is pending.
-//!   The LCD/timer are not halted during STOP.
+//!   (Pan Docs "Joypad Input": wakes from STOP regardless of IE). Interrupts
+//!   do not wake it, as on hardware where the clocks stop. Unlike hardware,
+//!   the LCD/timer keep running during STOP.
 
 use crate::bus::CpuBus;
 use crate::interrupts::Interrupt;
@@ -80,8 +80,7 @@ pub struct Cpu {
     ei_pending: bool,
     /// HALTed: idle until an interrupt is pending.
     halted: bool,
-    /// STOPped (see module docs): idle until a joypad line is low or an
-    /// interrupt is pending.
+    /// STOPped (see module docs): idle until a selected joypad line is low.
     stopped: bool,
     /// HALT bug: the next opcode fetch does not increment PC.
     halt_bug: bool,
@@ -139,7 +138,7 @@ impl Cpu {
             return;
         }
         if self.stopped {
-            if !bus.joypad_line_low() && bus.pending_interrupts() == 0 {
+            if !bus.joypad_line_low() {
                 bus.tick();
                 return;
             }
@@ -179,7 +178,14 @@ impl Cpu {
         self.ei_pending = false;
         bus.tick();
         bus.tick();
-        let pc = self.regs.pc;
+        let mut pc = self.regs.pc;
+        if self.halt_bug {
+            // `EI; HALT` with an interrupt pending (Pan Docs "halt bug"): the
+            // interrupt is serviced and returns to the HALT, which then runs
+            // again. The skipped-increment fetch never happens.
+            self.halt_bug = false;
+            pc = pc.wrapping_sub(1);
+        }
         self.regs.sp = self.regs.sp.wrapping_sub(1);
         bus.write(self.regs.sp, (pc >> 8) as u8);
         let chosen = Interrupt::highest_priority(bus.pending_interrupts());
