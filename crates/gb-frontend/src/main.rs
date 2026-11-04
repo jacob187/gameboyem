@@ -63,7 +63,14 @@ fn main() -> ExitCode {
         match AudioOutput::start() {
             Ok(a) => {
                 gb.set_audio_sample_rate(a.sample_rate);
-                Some(a)
+                // The core clamps the rate; a mismatch would mean wrong pitch.
+                match audio::check_core_rate(a.sample_rate, gb.audio_sample_rate()) {
+                    Ok(()) => Some(a),
+                    Err(e) => {
+                        eprintln!("warning: audio disabled: {e}");
+                        None
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("warning: audio disabled: {e}");
