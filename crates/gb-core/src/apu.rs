@@ -3,12 +3,15 @@
 //! Channels live in submodules; this module owns the register file, the
 //! frame sequencer, NR50-NR52 handling and the mixer/resampler.
 //!
-//! Mixing model (decision): each channel's digital output (0..=15) is mapped
-//! unipolar to 0..1 and summed per NR51 panning, scaled by the NR50 master
-//! volume. The hardware DAC is bipolar with a high-pass filter; that is not
-//! modelled so that a silent APU produces exactly `0.0` samples. Output is in
-//! `0.0..=1.0`. Samples are the box average of the per-M-cycle mix over each
-//! output period (integer accumulation, one float division per sample).
+//! Mixing model: each channel's digital output (0..=15) goes through a
+//! bipolar DAC (digital 0 = analog +1, 15 = -1, a powered-down DAC = 0),
+//! channels are summed per NR51 panning and scaled by the NR50 master volume,
+//! then each side passes through the DMG high-pass filter (capacitor model,
+//! see [`HpfCap`]). Samples are the box average of the per-M-cycle mix over
+//! each output period (integer accumulation, one float division per sample),
+//! normalised so a full-scale mix is +-1: the stream is signed, in
+//! `-1.0..=1.0`. A powered-off APU, or one whose four DACs are all off,
+//! produces exactly `0.0`.
 
 mod common;
 mod noise;
@@ -27,14 +30,55 @@ const MCYCLES_PER_SECOND: u32 = crate::T_CYCLES_PER_SECOND / 4;
 const MAX_BUFFERED_SECS: usize = 1;
 /// Bit of the 16-bit system counter that is DIV bit 4 (Pan Docs: "Audio Details").
 const SEQUENCER_DIV_BIT: u16 = 1 << 12;
-/// Largest per-M-cycle mix: 4 channels x 15 x master volume 8.
+/// Largest per-M-cycle mix magnitude: 4 channels x 15 x master volume 8. A
+/// channel contributes `15 - 2 * digital` (the DAC's +-15 in 1/15 units).
 const MIX_MAX: f32 = 4.0 * 15.0 * 8.0;
+/// DMG high-pass charge factor per T-cycle (Pan Docs: "Audio Details").
+const HPF_CHARGE: f64 = 0.999_958;
+/// `1.0 - HPF_CHARGE`, written out so it is exact in decimal.
+const HPF_LOSS: f64 = 0.000_042;
 
 /// Bits that always read back as 1 for FF10..=FF2F (Pan Docs: "Audio Registers").
 const READ_MASK: [u8; 0x20] = [
     0x80, 0x3F, 0x00, 0xFF, 0xBF, 0xFF, 0x3F, 0x00, 0xFF, 0xBF, 0x7F, 0xFF, 0x9F, 0xFF, 0xBF, 0xFF,
     0xFF, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x70, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
+
+/// Per-sample DMG charge factor: `0.999958 ^ (4194304 / rate)`.
+///
+/// Computed with plain IEEE f64 multiplications (square-and-multiply for the
+/// integer part, a binomial series for the fraction, error < 1e-13) rather
+/// than `powf`, whose last bits differ between libm implementations.
+fn hpf_factor(rate: u32) -> f32 {
+    let exp = f64::from(crate::T_CYCLES_PER_SECOND) / f64::from(rate);
+    let whole = exp.floor();
+    let frac = exp - whole;
+    let (mut acc, mut base, mut n) = (1.0f64, HPF_CHARGE, whole as u32);
+    while n > 0 {
+        if n & 1 == 1 {
+            acc *= base;
+        }
+        base *= base;
+        n >>= 1;
+    }
+    acc *= 1.0 - frac * HPF_LOSS + frac * (frac - 1.0) * 0.5 * HPF_LOSS * HPF_LOSS;
+    acc as f32
+}
+
+/// High-pass filter capacitor for one output side (Pan Docs: "Audio Details").
+/// `out = in - cap`, then the capacitor charges towards `in` through the
+/// output: `cap = in - out * factor`. Both are IEEE f32 operations.
+#[derive(Clone, Copy, Debug, Default)]
+struct HpfCap(f32);
+
+impl HpfCap {
+    /// Filter one sample; returns the unclamped output.
+    fn step(&mut self, input: f32, factor: f32) -> f32 {
+        let out = input - self.0;
+        self.0 = input - out * factor;
+        out
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Apu {
@@ -51,12 +95,17 @@ pub struct Apu {
     sample_rate: u32,
     sample_acc: u32,
     /// Weighted mix of the current M-cycle; recomputed only when `dirty`.
-    cur_l: u32,
-    cur_r: u32,
+    cur_l: i32,
+    cur_r: i32,
+    /// At least one channel DAC is powered (the HPF capacitor is connected).
+    dac_any: bool,
     dirty: bool,
-    mix_l: u32,
-    mix_r: u32,
+    mix_l: i32,
+    mix_r: i32,
     mix_n: u32,
+    hpf_factor: f32,
+    cap_l: HpfCap,
+    cap_r: HpfCap,
     samples: Vec<f32>,
 }
 
@@ -81,10 +130,14 @@ impl Apu {
             sample_acc: 0,
             cur_l: 0,
             cur_r: 0,
+            dac_any: false,
             dirty: true,
             mix_l: 0,
             mix_r: 0,
             mix_n: 0,
+            hpf_factor: hpf_factor(DEFAULT_SAMPLE_RATE),
+            cap_l: HpfCap::default(),
+            cap_r: HpfCap::default(),
             samples: Vec::new(),
         };
         // Post-boot values (Pan Docs: "Power Up Sequence"). The NRx4 values are
@@ -112,11 +165,18 @@ impl Apu {
         }
         apu.ch1.enabled = true;
         apu.ch1.env.volume = 0;
+        // The boot ROM ran long enough for the capacitors to settle on the
+        // resulting DC level, so the first samples are silent, not a click.
+        apu.update_mix();
+        apu.dirty = false;
+        apu.cap_l = HpfCap(Self::level(apu.cur_l, 1));
+        apu.cap_r = HpfCap(Self::level(apu.cur_r, 1));
         apu
     }
 
     pub fn set_sample_rate(&mut self, rate: u32) {
         self.sample_rate = rate.clamp(8_000, 192_000);
+        self.hpf_factor = hpf_factor(self.sample_rate);
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -222,6 +282,13 @@ impl Apu {
             self.ch3.power_on();
         } else {
             self.regs = [0; 0x20];
+            // Every DAC is off now: the output is cut and the capacitors
+            // drain, so a later power-on starts from a clean slate.
+            self.dac_any = false;
+            self.cur_l = 0;
+            self.cur_r = 0;
+            self.cap_l = HpfCap::default();
+            self.cap_r = HpfCap::default();
             self.ch1.power_off();
             self.ch2.power_off();
             self.ch3.power_off();
@@ -283,35 +350,50 @@ impl Apu {
         }
     }
 
-    /// Recompute the weighted per-side mix (0..=60 x master volume 1..=8).
+    /// Recompute the weighted per-side mix: per channel the bipolar DAC value
+    /// `15 - 2 * digital` (0 if its DAC is off), summed per NR51 side and
+    /// multiplied by the NR50 master volume 1..=8. Range `-480..=480`.
     fn update_mix(&mut self) {
-        let outs = [
-            self.ch1.output(),
-            self.ch2.output(),
-            self.ch3.output(),
-            self.ch4.output(),
+        let chans = [
+            (self.ch1.dac_on(), self.ch1.output()),
+            (self.ch2.dac_on(), self.ch2.output()),
+            (self.ch3.dac_on(), self.ch3.output()),
+            (self.ch4.dac_on(), self.ch4.output()),
         ];
         let nr51 = self.regs[0x15];
         let nr50 = self.regs[0x14];
-        let (mut l, mut r) = (0u32, 0u32);
-        for (i, &o) in outs.iter().enumerate() {
+        let (mut l, mut r) = (0i32, 0i32);
+        for (i, &(dac, o)) in chans.iter().enumerate() {
+            let analog = if dac { 15 - 2 * i32::from(o) } else { 0 };
             if nr51 & (0x10 << i) != 0 {
-                l += u32::from(o);
+                l += analog;
             }
             if nr51 & (1 << i) != 0 {
-                r += u32::from(o);
+                r += analog;
             }
         }
-        self.cur_l = l * u32::from(((nr50 >> 4) & 7) + 1);
-        self.cur_r = r * u32::from((nr50 & 7) + 1);
+        self.dac_any = chans.iter().any(|&(dac, _)| dac);
+        self.cur_l = l * i32::from(((nr50 >> 4) & 7) + 1);
+        self.cur_r = r * i32::from((nr50 & 7) + 1);
+    }
+
+    /// Normalised level of a mix sum accumulated over `n` M-cycles.
+    fn level(sum: i32, n: u32) -> f32 {
+        sum as f32 / (n as f32 * MIX_MAX)
     }
 
     fn emit_sample(&mut self) {
-        let (l, r) = if self.mix_n == 0 {
-            (0.0, 0.0)
+        let (l, r) = if self.powered && self.dac_any && self.mix_n != 0 {
+            let n = self.mix_n;
+            let f = self.hpf_factor;
+            let l = self.cap_l.step(Self::level(self.mix_l, n), f);
+            let r = self.cap_r.step(Self::level(self.mix_r, n), f);
+            // The filter can overshoot full scale when a channel flips from
+            // one extreme to the other, so clamp the emitted value.
+            (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0))
         } else {
-            let d = self.mix_n as f32 * MIX_MAX;
-            (self.mix_l as f32 / d, self.mix_r as f32 / d)
+            // Powered off or every DAC off: the mixer is disconnected.
+            (0.0, 0.0)
         };
         self.mix_l = 0;
         self.mix_r = 0;
@@ -321,7 +403,11 @@ impl Apu {
         }
     }
 
-    /// Move all buffered interleaved stereo samples (L, R, L, R, ...) into `out`.
+    /// Move all buffered interleaved stereo samples (L, R, L, R, ...) into
+    /// `out`. The stream is signed: every value is in `-1.0..=1.0`, centred on
+    /// 0 by the DMG high-pass filter, and exactly `0.0` while the APU is off or
+    /// all DACs are off. (Before the bipolar DAC model the range was
+    /// `0.0..=1.0`; hosts that assumed unipolar data must not offset it.)
     pub fn drain_samples(&mut self, out: &mut Vec<f32>) {
         out.append(&mut self.samples);
     }

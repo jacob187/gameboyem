@@ -745,20 +745,166 @@ fn powered_off_apu_stays_silent_even_with_stale_pan_state() {
 const M_CYCLES_PER_FRAME_TEST: u32 = crate::M_CYCLES_PER_FRAME;
 
 #[test]
-fn triggered_channel_produces_bounded_non_silent_samples() {
+fn triggered_channel_produces_signed_bounded_samples() {
     let mut rig = Rig::new();
     rig.w(0xFF24, 0x77);
     rig.w(0xFF25, 0xFF);
     start_ch2(&mut rig);
     rig.run(M_CYCLES_PER_FRAME_TEST);
     let s = drain(&mut rig.apu);
-    assert!(s.iter().any(|&x| x > 0.0));
-    assert!(s.iter().all(|&x| (0.0..=1.0).contains(&x)));
-    // One channel at full volume out of four, master volume 8/8.
-    let max = s.iter().cloned().fold(0.0, f32::max);
-    assert!((max - 0.25).abs() < 1e-6, "{max}");
+    assert!(s.iter().all(|x| x.is_finite() && (-1.0..=1.0).contains(x)));
+    assert!(s.iter().any(|&x| x > 0.1), "positive half");
+    assert!(s.iter().any(|&x| x < -0.1), "negative half");
+    // One channel out of four at master volume 8/8 swings +-0.25; the filter
+    // can at most double a step.
+    let peak = s.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!(peak <= 0.5 + 1e-6, "{peak}");
     // Interleaved L/R are identical with symmetric panning.
     assert!(s.chunks(2).all(|p| p[0] == p[1]));
+}
+
+#[test]
+fn dac_is_bipolar_and_a_powered_down_dac_is_zero() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0x22); // CH2 on both sides
+    rig.w(0xFF16, 0x80); // duty 50%: first step is high
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF19, 0x80);
+    rig.apu.update_mix();
+    assert_eq!(rig.apu.cur_l, -15 * 8, "digital 15 -> analog -1, master 8");
+    rig.w(0xFF17, 0x08); // volume 0 with the DAC on: digital 0 -> analog +1
+    rig.w(0xFF19, 0x80);
+    rig.apu.update_mix();
+    assert_eq!(rig.apu.cur_l, 15 * 8);
+    rig.w(0xFF17, 0x00); // DAC off: contributes nothing at all
+    rig.apu.update_mix();
+    assert_eq!((rig.apu.cur_l, rig.apu.cur_r), (0, 0));
+    assert!(!rig.apu.dac_any);
+}
+
+#[test]
+fn hpf_decays_dc_from_an_enabled_but_silent_dac() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF17, 0x08); // DAC on, volume 0: constant analog +1 on CH2
+    rig.w(0xFF19, 0x80);
+    rig.run(M_CYCLES_PER_FRAME_TEST * 60); // ~1 s
+    let s = drain(&mut rig.apu);
+    assert!((s[0] - 0.25).abs() < 1e-6, "step passes through: {}", s[0]);
+    assert!(s[2] < s[0] && s[2] > 0.0, "decays monotonically");
+    let n = s.len();
+    assert!(s[n - 2000..].iter().all(|x| x.abs() < 1e-3), "{}", s[n - 1]);
+}
+
+#[test]
+fn hpf_centres_an_off_centre_waveform() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF16, 0x00); // 12.5% duty: raw mean is far from 0
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF18, 0x00);
+    rig.w(0xFF19, 0x87);
+    rig.run(M_CYCLES_PER_FRAME_TEST * 60);
+    let s = drain(&mut rig.apu);
+    let tail = &s[s.len() / 2..];
+    let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+    assert!(mean.abs() < 0.01, "{mean}");
+    assert!(tail.iter().any(|x| x.abs() > 0.1), "signal survives");
+}
+
+#[test]
+fn channel_start_and_stop_do_not_click() {
+    // A running tone is silenced by zeroing the volume (DAC stays on): the DC
+    // step this leaves behind fades instead of persisting.
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    start_ch2(&mut rig);
+    rig.run(M_CYCLES_PER_FRAME_TEST * 30);
+    drain(&mut rig.apu);
+    rig.w(0xFF17, 0x08);
+    rig.w(0xFF19, 0x80);
+    rig.run(M_CYCLES_PER_FRAME_TEST * 60);
+    let s = drain(&mut rig.apu);
+    assert!(s[s.len() - 2000..].iter().all(|x| x.abs() < 1e-3));
+}
+
+#[test]
+fn all_dacs_off_is_exactly_zero_and_resumes_when_one_returns() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    start_ch2(&mut rig);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    drain(&mut rig.apu);
+    rig.w(0xFF17, 0x00);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    let s = drain(&mut rig.apu);
+    assert!(!s.is_empty() && s.iter().all(|&x| x == 0.0));
+    start_ch2(&mut rig);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    assert!(drain(&mut rig.apu).iter().any(|&x| x != 0.0));
+}
+
+#[test]
+fn power_off_after_activity_is_exactly_zero() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    start_ch2(&mut rig);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    drain(&mut rig.apu);
+    rig.w(0xFF26, 0x00);
+    rig.run(M_CYCLES_PER_FRAME_TEST);
+    let s = drain(&mut rig.apu);
+    assert!(!s.is_empty() && s.iter().all(|&x| x == 0.0));
+}
+
+#[test]
+fn full_scale_mix_stays_finite_and_within_range() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    // All four channels at full volume, fast, with wave RAM alternating 0/F.
+    for i in 0..16u16 {
+        rig.w(0xFF30 + i, 0x0F);
+    }
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF19, 0x87);
+    rig.w(0xFF12, 0xF0);
+    rig.w(0xFF14, 0x87);
+    rig.w(0xFF1A, 0x80);
+    rig.w(0xFF1C, 0x20);
+    rig.w(0xFF1E, 0x87);
+    rig.w(0xFF21, 0xF0);
+    rig.w(0xFF22, 0x00);
+    rig.w(0xFF23, 0x80);
+    for round in 0..40 {
+        rig.run(M_CYCLES_PER_FRAME_TEST / 4);
+        // Toggle the pan and master volume to force big DC steps.
+        rig.w(0xFF25, if round % 2 == 0 { 0x0F } else { 0xF0 });
+        rig.w(0xFF24, if round % 3 == 0 { 0x00 } else { 0x77 });
+    }
+    let s = drain(&mut rig.apu);
+    assert!(s.iter().all(|x| x.is_finite() && (-1.0..=1.0).contains(x)));
+    assert!(s.iter().any(|&x| x != 0.0));
+}
+
+#[test]
+fn hpf_factor_matches_the_documented_formula() {
+    for rate in [8_000u32, 22_050, 44_100, 48_000, 96_000, 192_000] {
+        let expect = 0.999_958f64.powf(4_194_304.0 / f64::from(rate));
+        assert!(
+            (f64::from(hpf_factor(rate)) - expect).abs() < 1e-7,
+            "rate {rate}"
+        );
+    }
+    let mut apu = Apu::new();
+    apu.set_sample_rate(44_100);
+    assert_eq!(apu.hpf_factor, hpf_factor(44_100));
 }
 
 #[test]
