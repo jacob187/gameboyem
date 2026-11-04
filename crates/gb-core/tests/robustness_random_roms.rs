@@ -38,7 +38,7 @@ fn check_frame(gb: &mut GameBoy, label: &str, before: u64) {
 #[test]
 fn random_roms_never_panic() {
     let (mut loaded, mut rejected) = (0, 0);
-    for seed in 0..ROMS {
+    for seed in 0..ROMS * fuzz_scale() {
         let mut rng = Rng::new(0xA11CE ^ seed);
         let rom = random_rom(&mut rng);
         let label = format!(

@@ -304,3 +304,11 @@ pub fn random_rom(rng: &mut Rng) -> Vec<u8> {
     }
     rom
 }
+
+/// Iteration multiplier for soak runs: `GB_FUZZ_SCALE=50 cargo test ...`.
+pub fn fuzz_scale() -> u64 {
+    std::env::var("GB_FUZZ_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}

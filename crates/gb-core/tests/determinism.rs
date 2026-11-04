@@ -66,7 +66,7 @@ fn assert_lockstep(label: &str, rom: &[u8], script: &InputScript) -> Option<()> 
 #[test]
 fn random_roms_are_deterministic() {
     let mut ran = 0;
-    for seed in 0..60u64 {
+    for seed in 0..60 * fuzz_scale() {
         let mut rng = Rng::new(0xDE7E ^ seed);
         let rom = random_rom(&mut rng);
         let script = random_input_script(&mut rng, 12);

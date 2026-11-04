@@ -145,7 +145,7 @@ fn run_fuzz(seed: u64, cart_type: u8, ram_code: u8, ops: usize) {
 
 #[test]
 fn register_write_stream_never_panics() {
-    for seed in 0..48 {
+    for seed in 0..48 * fuzz_scale() {
         run_fuzz(seed, 0x00, 0, 400);
     }
 }
@@ -154,7 +154,7 @@ fn register_write_stream_never_panics() {
 fn register_write_stream_with_mbc_ram() {
     // Cartridge-RAM window writes hit real RAM here; also covers disabled RAM.
     for (i, cart_type) in [0x03u8, 0x13, 0x1B, 0x10, 0x09].into_iter().enumerate() {
-        for seed in 0..5 {
+        for seed in 0..5 * fuzz_scale() {
             run_fuzz(1000 + 100 * i as u64 + seed, cart_type, 0x03, 300);
         }
     }
