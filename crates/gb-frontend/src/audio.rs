@@ -120,6 +120,20 @@ fn write_frame<T: Sample + FromSample<f32>>(frame: &mut [T], l: f32, r: f32) {
     }
 }
 
+/// Check the core accepted the device's sample rate. The core clamps the rate
+/// it is given, so a device outside that range would play at the wrong pitch
+/// and underrun the ring; `Err` carries the reason audio must be disabled.
+pub fn check_core_rate(device_rate: u32, core_rate: u32) -> Result<(), String> {
+    if device_rate == core_rate {
+        Ok(())
+    } else {
+        Err(format!(
+            "device sample rate {device_rate} Hz is outside the emulator's supported range \
+             (it would run at {core_rate} Hz)"
+        ))
+    }
+}
+
 /// A running output stream plus the ring that feeds it.
 pub struct AudioOutput {
     pub ring: Arc<AudioRing>,
@@ -342,6 +356,14 @@ mod tests {
         let mut out = [9.0f32; 2];
         r.fill(&mut out, 2);
         assert_eq!(out, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn core_rate_must_match_the_device_rate() {
+        assert_eq!(check_core_rate(48_000, 48_000), Ok(()));
+        let e = check_core_rate(384_000, 192_000).unwrap_err();
+        assert!(e.contains("384000") && e.contains("192000"), "{e}");
+        assert!(check_core_rate(4_000, 8_000).is_err());
     }
 
     #[test]

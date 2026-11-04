@@ -46,6 +46,50 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Highest numbered backup tried before giving up (`.bak`, `.bak1`, ...).
+const MAX_BACKUPS: u32 = 1000;
+
+/// Copy `src` to `<src>.bak`, or the first free `<src>.bak1`, `.bak2`, ... so an
+/// existing backup is never overwritten (two ROMs can share a save stem). If an
+/// existing backup already holds identical bytes it is reused, so relaunching
+/// with the same odd file does not pile up copies. Returns the backup's path.
+fn backup_without_overwrite(src: &Path) -> io::Result<PathBuf> {
+    let data = fs::read(src)?;
+    for n in 0..=MAX_BACKUPS {
+        let candidate = if n == 0 {
+            append_ext(src, "bak")
+        } else {
+            append_ext(src, &format!("bak{n}"))
+        };
+        // `create_new` makes "does not exist yet" and "claim it" one atomic step.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut f) => {
+                let written = f.write_all(&data).and_then(|()| f.sync_all());
+                drop(f);
+                if let Err(e) = written {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(e);
+                }
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::read(&candidate).is_ok_and(|existing| existing == data) {
+                    return Ok(candidate);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{MAX_BACKUPS} backups of {} already exist", src.display()),
+    ))
+}
+
 /// Minimum time between "cannot write save" warnings while writes keep failing.
 pub const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -147,9 +191,8 @@ impl SaveManager {
                 Ok(()) => eprintln!("loaded save {}", self.path.display()),
                 Err(e) => {
                     // Keep the odd file around: the next write would replace it.
-                    let backup = append_ext(&self.path, "bak");
-                    match fs::copy(&self.path, &backup) {
-                        Ok(_) => eprintln!(
+                    match backup_without_overwrite(&self.path) {
+                        Ok(backup) => eprintln!(
                             "warning: ignoring {}: {e} (copied to {})",
                             self.path.display(),
                             backup.display()
@@ -233,6 +276,72 @@ mod tests {
     #[test]
     fn save_never_aliases_the_rom() {
         assert_eq!(save_path(Path::new("x.sav")), PathBuf::from("x.sav.sav"));
+    }
+
+    #[test]
+    fn backup_uses_bak_then_next_free_name_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let sav = dir.path().join("g.sav");
+        fs::write(&sav, b"first").unwrap();
+        let b0 = backup_without_overwrite(&sav).unwrap();
+        assert_eq!(b0, dir.path().join("g.sav.bak"));
+
+        fs::write(&sav, b"second").unwrap();
+        let b1 = backup_without_overwrite(&sav).unwrap();
+        assert_eq!(b1, dir.path().join("g.sav.bak1"));
+
+        fs::write(&sav, b"third").unwrap();
+        let b2 = backup_without_overwrite(&sav).unwrap();
+        assert_eq!(b2, dir.path().join("g.sav.bak2"));
+
+        assert_eq!(fs::read(&b0).unwrap(), b"first");
+        assert_eq!(fs::read(&b1).unwrap(), b"second");
+        assert_eq!(fs::read(&b2).unwrap(), b"third");
+    }
+
+    #[test]
+    fn backup_reuses_an_identical_existing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let sav = dir.path().join("g.sav");
+        fs::write(&sav, b"odd").unwrap();
+        let first = backup_without_overwrite(&sav).unwrap();
+        assert_eq!(backup_without_overwrite(&sav).unwrap(), first);
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "sav + one bak"
+        );
+    }
+
+    #[test]
+    fn backup_of_missing_file_fails_without_creating_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(backup_without_overwrite(&dir.path().join("none.sav")).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn load_with_wrong_size_save_keeps_prior_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom_path = dir.path().join("g.gb");
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x147] = 0x03; // MBC1+RAM+BATTERY
+        rom[0x149] = 0x02; // 8 KiB
+        let mut gb = GameBoy::new(rom).unwrap();
+        let sav = save_path(&rom_path);
+        fs::write(sav.with_extension("sav.bak"), b"other game's save").unwrap();
+        fs::write(&sav, b"wrong size").unwrap();
+
+        SaveManager::new(&rom_path, Instant::now()).load(&mut gb);
+
+        assert_eq!(
+            fs::read(dir.path().join("g.sav.bak")).unwrap(),
+            b"other game's save"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("g.sav.bak1")).unwrap(),
+            b"wrong size"
+        );
     }
 
     #[test]
