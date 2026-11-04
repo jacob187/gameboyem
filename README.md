@@ -28,7 +28,7 @@ cargo build --release
 ./target/release/gb path/to/game.gb
 ```
 
-**Windows.** `cargo build --release` works with the MSVC toolchain. CI runs it as a non-blocking job.
+**Windows.** Not yet built or run on Windows. CI has a non-blocking `windows-latest` job, but it hasn't been pushed and run yet. Locally, `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc` type-checks clean.
 
 **Command-line options:**
 
@@ -59,7 +59,8 @@ Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomica
 
 ```sh
 ./scripts/fetch-test-roms.sh                 # Blargg, mooneye, dmg-acid2 -> roms/test (gitignored)
-make -C homebrew                             # optional: homebrew smoke/playability cases
+make -C homebrew                             # needed for the homebrew cases (they fail when CI=true and the ROMs are missing)
+./scripts/fetch-homebrew-corpus.sh           # open-source homebrew corpus -> roms/corpus
 cargo test --workspace                       # unit tests + one test per ROM
 cargo run -p gb-test --release               # pass/fail table
 scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job, locally in Docker
@@ -69,7 +70,7 @@ scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job, locally in Dock
 
 ### Test-ROM results
 
-These are the results on `integration` for macOS arm64 and Linux x86_64 (Docker).
+These are the results on `integration`, run on macOS arm64. Linux x86_64 was checked with `scripts/docker-linux-test.sh amd64` (fmt, clippy, tests, ROM table) at `59db0b6` (109/109). GitHub Actions has not run yet, because this build had no push access.
 
 | Suite | Pass / total |
 |-------|--------------|
@@ -79,8 +80,9 @@ These are the results on `integration` for macOS arm64 and Linux x86_64 (Docker)
 | dmg-acid2 | 1 / 1 |
 | Mooneye (DMG acceptance subset + MBC1/MBC5) | 87 / 87 |
 | Blargg `dmg_sound` (12 + combined) | 13 / 13 |
-| Homebrew smoke, scripted playability, battery save round-trip | 6 / 6 |
-| **Total** | **124 / 124** |
+| Our homebrew: smoke, scripted playability, battery save round-trip, sound effects | 8 / 8 |
+| Open-source homebrew corpus (7 games, MBC1/MBC3+RTC/MBC5): smoke + 3 scripted play | 10 / 10 |
+| **Total** | **136 / 136** |
 
 Every case in the harness passes. Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
@@ -105,15 +107,28 @@ make -C homebrew          # -> roms/homebrew/snake.gb, roms/homebrew/breakout.gb
 - **Snake:** the D-pad steers and Start begins.
 - **Breakout:** left/right move the paddle, A or B launches the ball, and Start begins.
 
-Both have title, score and game-over screens. Each keeps a high score in battery RAM (MBC1+RAM+BATTERY), so it persists in `<rom>.sav`.
+Both have title, score and game-over screens. Each keeps a high score in battery RAM (MBC1+RAM+BATTERY), so it persists in `<rom>.sav`, and has sound effects.
+
+### Open-source homebrew corpus
+
+`scripts/fetch-homebrew-corpus.sh` downloads 7 redistributable DMG games, each pinned and sha256-checked. The licences are in the script header:
+- Tobu Tobu Girl
+- Squishy the Turtle
+- Sushi Nights
+- Breksta's Cat (MBC3+RTC)
+- Adjustris
+- AIRPLANZ
+- Renegade Rush
+
+They stand in for commercial games in the harness. All 7 boot, and 3 have PyBoy-validated scripted play cases.
 
 ## Known gaps
 
 - **PPU.** It renders a whole scanline at the start of mode 3, so mid-scanline register writes take effect on the next line. Mode-3 sprite penalties are fitted for SCX=0 with no window.
-- **APU.** It passes all of Blargg `dmg_sound`. Still missing:
-  - DMG zombie mode
-  - the envelope trigger quirk
-  - the high-pass filter. The output is unipolar, so channel starts and stops can click.
+- **APU.** It passes all of Blargg `dmg_sound`. Output is a signed [-1, 1] stream: a bipolar DAC plus the DMG high-pass filter, and exactly 0 when the APU or every DAC is off. Zombie mode follows the Pan Docs rules. Still missing:
+  - the sub-M-cycle low bits of the square frequency timer on trigger
+  - the duty-step-0 quirk after power-on
+  - model-specific zombie variants
 - **STOP.** Like hardware, it wakes only on a selected joypad line. Unlike hardware, the LCD and timer keep running during STOP.
 - **Not supported:** Game Boy Color, link cable, debugger, rewind and shaders.
 - **No boot ROM.** The emulator starts in the documented post-boot state.
