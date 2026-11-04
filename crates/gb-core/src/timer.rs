@@ -24,8 +24,10 @@
 
 use crate::interrupts::{Interrupt, Interrupts};
 
-/// Initial system counter after the DMG boot ROM (DIV = 0xAB).
-const POST_BOOT_COUNTER: u16 = 0xABCC;
+/// System counter when the first cartridge instruction executes after the DMG
+/// boot ROM (DIV = 0xAB). The low byte is the value that makes mooneye
+/// `boot_div-dmgABCmgb` pass (found by scanning every M-cycle phase).
+const POST_BOOT_COUNTER: u16 = 0xABC8;
 
 #[derive(Clone, Debug)]
 pub struct Timer {
