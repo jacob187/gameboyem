@@ -4,12 +4,16 @@ use crate::bus::Bus;
 use crate::cartridge::{self, CartridgeError, CartridgeHeader};
 use crate::cpu::{Cpu, Registers};
 use crate::joypad::Button;
-use crate::model::Model;
-use crate::state::{self, StateError, StateReader, StateWriter, tag};
+use crate::model::{Hw, Model};
+use crate::state::{self, StateError, StateReader, StateWriter, check, tag};
 use crate::{Framebuffer, M_CYCLES_PER_FRAME};
 
-/// Magic + version + ROM hash + model.
-const STATE_HEADER_LEN: usize = 4 + 2 + 8 + 1;
+/// Magic + version + ROM hash + model + hardware mode.
+const STATE_HEADER_LEN: usize = 4 + 2 + 8 + 1 + 1;
+
+/// The first state-format version, before there was a model: always a DMG, with
+/// no model or hardware-mode byte (the sections that follow are identical).
+const STATE_VERSION_DMG_ONLY: u16 = 1;
 
 /// A complete Game Boy (DMG or CGB): CPU + bus (which owns every other component).
 pub struct GameBoy {
@@ -152,6 +156,7 @@ impl GameBoy {
             Model::Dmg => 0,
             Model::Cgb => 1,
         });
+        w.u8(self.bus.hw.id());
         w.u8(tag::CPU);
         self.cpu.save_state(&mut w);
         self.bus.save_state(&mut w);
@@ -175,19 +180,30 @@ impl GameBoy {
             return Err(StateError::BadMagic);
         }
         let version = r.u16()?;
-        if version != state::VERSION {
+        if version != state::VERSION && version != STATE_VERSION_DMG_ONLY {
             return Err(StateError::UnsupportedVersion(version));
         }
         if r.u64()? != self.rom_hash {
             return Err(StateError::RomMismatch);
         }
-        let model = match r.u8()? {
-            0 => Model::Dmg,
-            1 => Model::Cgb,
-            _ => return Err(StateError::Invalid("model")),
+        let model = if version == STATE_VERSION_DMG_ONLY {
+            Model::Dmg
+        } else {
+            match r.u8()? {
+                0 => Model::Dmg,
+                1 => Model::Cgb,
+                _ => return Err(StateError::Invalid("model")),
+            }
         };
         if model != self.model {
             return Err(StateError::ModelMismatch);
+        }
+        if version != STATE_VERSION_DMG_ONLY {
+            // A function of the model and the ROM, so a mismatch with a matching
+            // hash and model means the byte is corrupt.
+            let hw = r.u8()?;
+            check(hw <= Hw::MAX_ID, "hardware mode")?;
+            check(hw == self.bus.hw.id(), "hardware mode")?;
         }
         let backup = self.save_state();
         if let Err(e) = self.load_sections(r) {
@@ -449,6 +465,7 @@ mod tests {
             (0xD123, 0x22),
             (0xFF4D, 1),
             (0xFF72, 0x99),
+            (0xFF74, 0x6B),
             (0xFF75, 0x30),
             (0xFF40, 0x91),
         ] {
@@ -468,6 +485,7 @@ mod tests {
         assert_eq!(b.peek(0xD123), 0x22);
         assert_eq!(b.peek(0xFF4D), 0x7F);
         assert_eq!(b.peek(0xFF72), 0x99);
+        assert_eq!(b.peek(0xFF74), 0x6B);
         assert_eq!(b.peek(0xFF75), 0xBF);
         assert_eq!(run(&mut b, 10), expected);
         assert_eq!(a.save_state(), b.save_state());
@@ -488,7 +506,7 @@ mod tests {
         assert_eq!(cgb.save_state(), cgb_state, "nothing changed");
         // An unknown model byte is corruption, not a mismatch.
         let mut bad = cgb_state.clone();
-        bad[STATE_HEADER_LEN - 1] = 7;
+        bad[STATE_HEADER_LEN - 2] = 7;
         assert_eq!(cgb.load_state(&bad), Err(StateError::Invalid("model")));
     }
 
@@ -543,6 +561,123 @@ mod tests {
                     Ok(()) => gb.step_frame(),
                     Err(_) => assert_eq!(gb.save_state(), before, "pos {pos}"),
                 }
+            }
+        }
+    }
+
+    /// The ROM `tests/fixtures/state_v1_dmg.bin` was taken with: fills WRAM,
+    /// starts CH1, then counts in HRAM forever.
+    fn v1_fixture_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]);
+        let prog: &[u8] = &[
+            0x21, 0x00, 0xC0, 0x06, 0x40, 0x78, 0x22, 0x05, 0x20, 0xFB, 0x3E, 0x77, 0xE0, 0x24,
+            0x3E, 0xF0, 0xE0, 0x12, 0x3E, 0x87, 0xE0, 0x14, 0x3C, 0xE0, 0x80, 0x18, 0xFB,
+        ];
+        rom[0x150..0x150 + prog.len()].copy_from_slice(prog);
+        rom
+    }
+
+    /// A real version-1 state: written by the `feat/save-states` writer
+    /// (`ae936d7`) after `GameBoy::new(v1_fixture_rom())` ran 3 frames.
+    const STATE_V1: &[u8] = include_bytes!("../tests/fixtures/state_v1_dmg.bin");
+    const V1_HEADER_LEN: usize = 4 + 2 + 8;
+
+    #[test]
+    fn version_1_states_load_as_a_dmg() {
+        assert_eq!(&STATE_V1[4..6], &[1, 0], "the fixture is a version-1 state");
+        let mut gb = GameBoy::new(v1_fixture_rom()).unwrap();
+        gb.load_state(STATE_V1).unwrap();
+        assert_eq!(gb.model(), Model::Dmg);
+        let r = gb.cpu_registers();
+        assert_eq!((r.a, r.pc, r.sp), (0x09, 0x0169, 0xFFFE));
+        assert_eq!(gb.mcycles(), 51554);
+        assert_eq!((gb.peek(0xC000), gb.peek(0xC03F)), (0x40, 0x01));
+        // It carries on exactly as the machine that wrote it did.
+        gb.step_frame();
+        gb.step_frame();
+        let r = gb.cpu_registers();
+        assert_eq!((gb.mcycles(), r.a, gb.peek(0xFF80)), (86666, 0xA1, 0xA1));
+        assert_eq!(state::fnv1a(gb.framebuffer()), 0xECA4_7F65_4990_2B25);
+    }
+
+    #[test]
+    fn version_1_layout_is_the_dmg_layout_of_today() {
+        // Same machine, same point in time: the current writer's sections are
+        // byte-identical to the v1 ones; only the header grew.
+        let mut gb = GameBoy::new(v1_fixture_rom()).unwrap();
+        for _ in 0..3 {
+            gb.step_frame();
+        }
+        let now = gb.save_state();
+        assert_eq!(&now[4..6], &state::VERSION.to_le_bytes());
+        assert_eq!(
+            &now[6..V1_HEADER_LEN],
+            &STATE_V1[6..V1_HEADER_LEN],
+            "ROM hash"
+        );
+        assert_eq!(&now[V1_HEADER_LEN..STATE_HEADER_LEN], &[0, 0], "DMG, DMG");
+        assert!(now[STATE_HEADER_LEN..] == STATE_V1[V1_HEADER_LEN..]);
+        // And a v1 state re-saves as the v2 state of the same machine.
+        let mut other = GameBoy::new(v1_fixture_rom()).unwrap();
+        other.load_state(STATE_V1).unwrap();
+        assert!(other.save_state() == now);
+    }
+
+    #[test]
+    fn version_1_states_do_not_load_into_a_cgb() {
+        let mut gb = GameBoy::with_model(v1_fixture_rom(), Model::Cgb).unwrap();
+        let before = gb.save_state();
+        assert_eq!(gb.load_state(STATE_V1), Err(StateError::ModelMismatch));
+        assert_eq!(gb.save_state(), before, "nothing changed");
+        // A truncated or corrupt v1 state is still an error, and rolls back.
+        let mut dmg = GameBoy::new(v1_fixture_rom()).unwrap();
+        let before = dmg.save_state();
+        assert_eq!(
+            dmg.load_state(&STATE_V1[..STATE_V1.len() - 1]),
+            Err(StateError::Truncated)
+        );
+        assert_eq!(dmg.save_state(), before);
+        let mut extra = STATE_V1.to_vec();
+        extra.push(0);
+        assert_eq!(dmg.load_state(&extra), Err(StateError::TrailingBytes));
+        assert_eq!(dmg.save_state(), before);
+    }
+
+    #[test]
+    fn unknown_versions_are_still_rejected() {
+        let mut gb = GameBoy::new(v1_fixture_rom()).unwrap();
+        for v in [0u16, 3, 0xFFFF] {
+            let mut s = STATE_V1.to_vec();
+            s[4..6].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(gb.load_state(&s), Err(StateError::UnsupportedVersion(v)));
+        }
+    }
+
+    #[test]
+    fn the_hardware_mode_is_saved_range_checked_and_matched() {
+        // (model, header flag, expected byte): DMG, CGB compat, CGB mode.
+        for (model, flag, hw) in [
+            (Model::Dmg, 0x80, 0),
+            (Model::Cgb, 0x00, 1),
+            (Model::Cgb, 0x80, 2),
+        ] {
+            let mut rom = nop_rom();
+            rom[0x143] = flag;
+            let mut gb = GameBoy::with_model(rom, model).unwrap();
+            let snap = gb.save_state();
+            assert_eq!(snap[STATE_HEADER_LEN - 1], hw);
+            gb.load_state(&snap).unwrap();
+            // Another valid mode (same ROM, same model) is refused, and so is an
+            // out-of-range byte; neither touches the machine.
+            for bad_hw in (0..=3).filter(|&b| b != hw) {
+                let mut bad = snap.clone();
+                bad[STATE_HEADER_LEN - 1] = bad_hw;
+                assert_eq!(
+                    gb.load_state(&bad),
+                    Err(StateError::Invalid("hardware mode"))
+                );
+                assert_eq!(gb.save_state(), snap);
             }
         }
     }

@@ -46,6 +46,18 @@ impl Hw {
         }
     }
 
+    /// Highest value of [`Hw::id`].
+    pub(crate) const MAX_ID: u8 = 2;
+
+    /// The byte a save state stores for this variant.
+    pub(crate) fn id(self) -> u8 {
+        match self {
+            Self::Dmg => 0,
+            Self::CgbCompat => 1,
+            Self::Cgb => 2,
+        }
+    }
+
     pub(crate) fn is_cgb(self) -> bool {
         self != Self::Dmg
     }

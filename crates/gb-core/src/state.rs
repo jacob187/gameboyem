@@ -1,9 +1,12 @@
 //! Save states: a versioned binary snapshot of the whole machine.
 //!
 //! Layout: magic `GBST`, a `u16` format version, the FNV-1a hash of the ROM
-//! the state was taken with, the model (`u8`: 0 DMG, 1 CGB), then one tagged section per component in a fixed
-//! order (see [`crate::GameBoy::save_state`]). All integers are little-endian;
-//! `f32`s are stored as their bit patterns so a round trip is bit-exact.
+//! the state was taken with, the model (`u8`: 0 DMG, 1 CGB), the hardware mode
+//! (`u8`: 0 DMG, 1 CGB in compatibility mode, 2 CGB), then one tagged section
+//! per component in a fixed order (see [`crate::GameBoy::save_state`]). All
+//! integers are little-endian; `f32`s are stored as their bit patterns so a
+//! round trip is bit-exact. Version 1 has neither the model nor the hardware
+//! byte (it predates the CGB; its sections are the DMG ones) and loads as a DMG.
 //!
 //! State bytes are untrusted input: every read is bounds-checked and every
 //! field that a component later uses as an index, a loop bound or a counter
