@@ -46,11 +46,80 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Minimum time between "cannot write save" warnings while writes keep failing.
+pub const WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What to tell the user about a failed write.
+#[derive(Debug, PartialEq, Eq)]
+struct Warning {
+    /// First failure since the last success (or since startup).
+    first: bool,
+    /// Failed attempts that were not reported since the previous warning.
+    suppressed: u32,
+}
+
+/// Rate limiter for save-failure warnings: report the first failure at once,
+/// then at most one warning per [`WARN_INTERVAL`] while failures continue.
+/// A success resets it so the next failure is reported immediately again.
+#[derive(Debug, Default)]
+struct WarnLimiter {
+    /// When the last warning was printed; `None` while writes are healthy.
+    last_warned: Option<Instant>,
+    suppressed: u32,
+}
+
+impl WarnLimiter {
+    /// Record a failed write. `urgent` (the final flush on exit) always warns.
+    fn failure(&mut self, now: Instant, urgent: bool) -> Option<Warning> {
+        let due = match self.last_warned {
+            None => true,
+            Some(t) => now.saturating_duration_since(t) >= WARN_INTERVAL,
+        };
+        if !(due || urgent) {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        let warning = Warning {
+            first: self.last_warned.is_none(),
+            suppressed: std::mem::take(&mut self.suppressed),
+        };
+        self.last_warned = Some(now);
+        Some(warning)
+    }
+
+    /// Record a successful write; true if writes had been failing.
+    fn success(&mut self) -> bool {
+        let was_failing = self.last_warned.is_some() || self.suppressed > 0;
+        *self = Self::default();
+        was_failing
+    }
+}
+
+fn failure_message(path: &Path, err: &io::Error, w: &Warning) -> String {
+    if w.first {
+        format!(
+            "warning: cannot write save {}: {err}\n  \
+             SAVING IS FAILING: progress since the last successful save will be lost if the \
+             emulator exits now. Retrying every {} s; this warning repeats at most every {} s.",
+            path.display(),
+            SAVE_INTERVAL.as_secs(),
+            WARN_INTERVAL.as_secs()
+        )
+    } else {
+        format!(
+            "warning: still cannot write save {}: {err} ({} failed attempts since the last warning)",
+            path.display(),
+            w.suppressed
+        )
+    }
+}
+
 pub struct SaveManager {
     path: PathBuf,
     /// Battery RAM as of the last load/write; `None` until known.
     last: Option<Vec<u8>>,
     next_check: Instant,
+    warn: WarnLimiter,
 }
 
 impl SaveManager {
@@ -59,6 +128,7 @@ impl SaveManager {
             path: save_path(rom),
             last: None,
             next_check: now + SAVE_INTERVAL,
+            warn: WarnLimiter::default(),
         }
     }
 
@@ -102,17 +172,23 @@ impl SaveManager {
     pub fn tick(&mut self, gb: &GameBoy, now: Instant) {
         if now >= self.next_check {
             self.next_check = now + SAVE_INTERVAL;
-            self.flush(gb);
+            self.sync(gb.battery_ram(), now, false);
         }
     }
 
-    /// Write now if battery RAM changed.
+    /// Write now if battery RAM changed (e.g. on pause). Failures are rate-limited.
     pub fn flush(&mut self, gb: &GameBoy) {
-        self.sync(gb.battery_ram());
+        self.sync(gb.battery_ram(), Instant::now(), false);
+    }
+
+    /// Last write before exiting: a failure is always reported, never throttled,
+    /// because it means data is being lost.
+    pub fn flush_final(&mut self, gb: &GameBoy) {
+        self.sync(gb.battery_ram(), Instant::now(), true);
     }
 
     /// Returns true if a file was written.
-    fn sync(&mut self, ram: Option<Vec<u8>>) -> bool {
+    fn sync(&mut self, ram: Option<Vec<u8>>, now: Instant, urgent: bool) -> bool {
         let Some(ram) = ram else { return false };
         if self.last.as_ref() == Some(&ram) {
             return false;
@@ -120,10 +196,15 @@ impl SaveManager {
         match write_atomic(&self.path, &ram) {
             Ok(()) => {
                 self.last = Some(ram);
+                if self.warn.success() {
+                    eprintln!("save writing recovered: {}", self.path.display());
+                }
                 true
             }
             Err(e) => {
-                eprintln!("warning: cannot write {}: {e}", self.path.display());
+                if let Some(w) = self.warn.failure(now, urgent) {
+                    eprintln!("{}", failure_message(&self.path, &e, &w));
+                }
                 false
             }
         }
@@ -133,6 +214,10 @@ impl SaveManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sync(m: &mut SaveManager, ram: Option<Vec<u8>>) -> bool {
+        m.sync(ram, Instant::now(), false)
+    }
 
     #[test]
     fn save_path_swaps_extension() {
@@ -176,12 +261,12 @@ mod tests {
         let rom = dir.path().join("g.gb");
         let mut m = SaveManager::new(&rom, Instant::now());
         m.last = Some(vec![0; 4]);
-        assert!(!m.sync(Some(vec![0; 4])), "unchanged");
-        assert!(!m.sync(None), "no battery");
+        assert!(!sync(&mut m, Some(vec![0; 4])), "unchanged");
+        assert!(!sync(&mut m, None), "no battery");
         assert!(!m.path().exists());
-        assert!(m.sync(Some(vec![1, 2, 3, 4])), "changed");
+        assert!(sync(&mut m, Some(vec![1, 2, 3, 4])), "changed");
         assert_eq!(fs::read(m.path()).unwrap(), [1, 2, 3, 4]);
-        assert!(!m.sync(Some(vec![1, 2, 3, 4])), "already written");
+        assert!(!sync(&mut m, Some(vec![1, 2, 3, 4])), "already written");
     }
 
     #[test]
@@ -189,9 +274,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rom = dir.path().join("missing").join("g.gb");
         let mut m = SaveManager::new(&rom, Instant::now());
-        assert!(!m.sync(Some(vec![9])));
+        assert!(!sync(&mut m, Some(vec![9])));
         fs::create_dir(dir.path().join("missing")).unwrap();
-        assert!(m.sync(Some(vec![9])));
+        assert!(sync(&mut m, Some(vec![9])));
     }
 
     /// 32 KiB MBC1+RAM+BATTERY ROM with 8 KiB RAM.
@@ -217,7 +302,7 @@ mod tests {
         m.load(&mut gb);
         assert_eq!(gb.battery_ram().unwrap()[0], 0xAB);
         assert!(
-            !m.sync(gb.battery_ram()),
+            !sync(&mut m, gb.battery_ram()),
             "freshly loaded save is not rewritten"
         );
 
@@ -239,5 +324,162 @@ mod tests {
         m.load(&mut gb);
         m.flush(&gb);
         assert!(!m.path().exists());
+    }
+
+    fn secs(base: Instant, s: u64) -> Instant {
+        base + Duration::from_secs(s)
+    }
+
+    #[test]
+    fn limiter_warns_first_then_at_most_once_a_minute() {
+        let t0 = Instant::now();
+        let mut l = WarnLimiter::default();
+        assert_eq!(
+            l.failure(t0, false),
+            Some(Warning {
+                first: true,
+                suppressed: 0
+            })
+        );
+        // Retries every 5 s are silent for the next minute.
+        for s in (5..60).step_by(5) {
+            assert_eq!(l.failure(secs(t0, s), false), None, "t+{s}s");
+        }
+        // 11 suppressed (5..=55); the warning at +60 s reports them.
+        assert_eq!(
+            l.failure(secs(t0, 60), false),
+            Some(Warning {
+                first: false,
+                suppressed: 11
+            })
+        );
+        // The interval is measured from the last *warning*, not the last failure.
+        assert_eq!(l.failure(secs(t0, 119), false), None);
+        assert_eq!(
+            l.failure(secs(t0, 120), false),
+            Some(Warning {
+                first: false,
+                suppressed: 1
+            })
+        );
+    }
+
+    #[test]
+    fn limiter_resets_after_success() {
+        let t0 = Instant::now();
+        let mut l = WarnLimiter::default();
+        assert!(!l.success(), "healthy writes are not news");
+        l.failure(t0, false);
+        l.failure(secs(t0, 5), false);
+        assert!(l.success(), "recovery after failures is reported");
+        assert!(!l.success(), "only once");
+        // A new failure right after recovery warns immediately and as a first.
+        assert_eq!(
+            l.failure(secs(t0, 6), false),
+            Some(Warning {
+                first: true,
+                suppressed: 0
+            })
+        );
+    }
+
+    #[test]
+    fn limiter_urgent_always_warns() {
+        let t0 = Instant::now();
+        let mut l = WarnLimiter::default();
+        l.failure(t0, false);
+        assert_eq!(l.failure(secs(t0, 1), false), None);
+        assert_eq!(
+            l.failure(secs(t0, 2), true),
+            Some(Warning {
+                first: false,
+                suppressed: 1
+            })
+        );
+        // The urgent warning restarts the interval.
+        assert_eq!(l.failure(secs(t0, 3), false), None);
+        assert!(l.failure(secs(t0, 62), false).is_some());
+    }
+
+    #[test]
+    fn limiter_tolerates_clock_going_backwards() {
+        let t0 = Instant::now();
+        let mut l = WarnLimiter::default();
+        l.failure(secs(t0, 10), false);
+        assert_eq!(l.failure(t0, false), None);
+    }
+
+    #[test]
+    fn failure_messages_state_that_saving_is_failing() {
+        let e = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let path = Path::new("/ro/g.sav");
+        let first = failure_message(
+            path,
+            &e,
+            &Warning {
+                first: true,
+                suppressed: 0,
+            },
+        );
+        assert!(first.contains("SAVING IS FAILING") && first.contains("/ro/g.sav"));
+        assert!(first.contains("5 s") && first.contains("60 s"));
+        let repeat = failure_message(
+            path,
+            &e,
+            &Warning {
+                first: false,
+                suppressed: 11,
+            },
+        );
+        assert!(repeat.contains("still cannot write") && repeat.contains("11 failed"));
+    }
+
+    #[test]
+    fn manager_rate_limits_through_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = dir.path().join("missing").join("g.gb");
+        let t0 = Instant::now();
+        let mut m = SaveManager::new(&rom, t0);
+        assert!(!m.sync(Some(vec![1]), t0, false));
+        assert!(m.warn.last_warned.is_some());
+        assert!(!m.sync(Some(vec![1]), secs(t0, 5), false));
+        assert_eq!(m.warn.suppressed, 1);
+        fs::create_dir(dir.path().join("missing")).unwrap();
+        assert!(m.sync(Some(vec![1]), secs(t0, 10), false));
+        assert_eq!(m.warn.last_warned, None, "success resets the limiter");
+    }
+
+    /// A `.sav` that cannot be created (read-only directory) must warn, not crash.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_directory_does_not_crash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom()).unwrap();
+        fs::write(dir.path().join("g.sav"), b"short").unwrap(); // bad save: backup attempt too
+        let rom = dir.path().join("g.gb");
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = fs::File::create(dir.path().join("probe")).is_ok();
+        if !writable {
+            let t0 = Instant::now();
+            let mut m = SaveManager::new(&rom, t0);
+            m.load(&mut gb); // wrong size -> .bak copy fails -> logged
+            let mut ram = gb.battery_ram().unwrap();
+            ram[0] = 1;
+            assert!(!m.sync(Some(ram), t0, false));
+            m.flush_final(&gb);
+            let names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, vec![OsString::from("g.sav")], "no stray temp file");
+        }
+        // Restore so the temp dir can be removed.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            eprintln!("skipped: directory permissions are not enforced (running as root?)");
+        }
     }
 }

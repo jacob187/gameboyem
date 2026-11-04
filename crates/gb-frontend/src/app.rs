@@ -308,6 +308,6 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.saves.flush(&self.gb);
+        self.saves.flush_final(&self.gb);
     }
 }
