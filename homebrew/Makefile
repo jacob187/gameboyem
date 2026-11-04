@@ -21,7 +21,7 @@ LDFLAGS := -Wl-m -Wl-j -Wm-yt0x03 -Wm-ya1
 GAMES   := snake breakout
 HEADERS := $(wildcard common/*.h snake/src/*.h breakout/src/*.h)
 
-COMMON_OBJ   := $(BUILD)/common/common.o
+COMMON_OBJ   := $(patsubst common/%.c,$(BUILD)/common/%.o,$(wildcard common/*.c))
 SNAKE_OBJ    := $(patsubst snake/src/%.c,$(BUILD)/snake/%.o,$(wildcard snake/src/*.c)) $(COMMON_OBJ)
 BREAKOUT_OBJ := $(patsubst breakout/src/%.c,$(BUILD)/breakout/%.o,$(wildcard breakout/src/*.c)) $(COMMON_OBJ)
 

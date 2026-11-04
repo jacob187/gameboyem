@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include "common.h"
+#include "sfx.h"
 
 /* ---- tiles ---------------------------------------------------------- */
 
@@ -220,6 +221,7 @@ static void play(void)
             length++;
             foods++;
             score += 10u;
+            sfx_eat();
             draw_score();
             delay = step_delay();
             if (length >= MAX_LEN) {
@@ -230,6 +232,7 @@ static void play(void)
         }
     }
 
+    sfx_game_over();
     hiscore_update(&best, score);
     /* Hold the final frame briefly so the collision is visible. */
     for (frames = 0; frames < 45; frames++) {
@@ -274,6 +277,7 @@ static void game_over_screen(void)
 void main(void)
 {
     hb_init();
+    sfx_init();
     best = hiscore_load();
     HIDE_SPRITES;
     SHOW_BKG;

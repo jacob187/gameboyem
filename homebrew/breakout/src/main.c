@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "common.h"
+#include "sfx.h"
 
 /* ---- tiles ---------------------------------------------------------- */
 
@@ -175,6 +176,7 @@ static uint8_t hit_bricks(int16_t px, int16_t py)
             bricks[row][col] = 0;
             bricks_left--;
             set_bkg_tile_xy(col, row + BR_ROW0, TILE_EMPTY);
+            sfx_brick(row);
             score += (uint16_t)(BR_ROWS - row); /* upper rows are worth more */
             hit = 1;
         }
@@ -225,6 +227,7 @@ static uint8_t step_ball(void)
         vx = zone_vx[zone];
         vy = -(int8_t)(zone_vy[zone] + speed_bonus());
         by = (int16_t)(PAD_Y - BALL_SIZE) << FP_SHIFT;
+        sfx_paddle();
     }
 
     return (by >> FP_SHIFT) >= SCREEN_H;
@@ -282,14 +285,17 @@ static void play(void)
             draw_lives();
             if (lives == 0u) {
                 draw_hud();
+                sfx_game_over();
                 break;
             }
+            sfx_life_lost();
             reset_ball();
         }
 
         if (bricks_left == 0u) {
             /* Board cleared: rebuild it, slightly faster, ball back on paddle. */
             level++;
+            sfx_level_clear();
             DISPLAY_OFF;
             build_bricks();
             draw_hud();
@@ -301,6 +307,7 @@ static void play(void)
             print_uint(6, 0, score, 5);
         }
         draw_sprites();
+        sfx_update();
     }
 
     HIDE_SPRITES;
@@ -349,6 +356,7 @@ static void game_over_screen(void)
 void main(void)
 {
     hb_init();
+    sfx_init();
     best = hiscore_load();
     HIDE_SPRITES;
     SHOW_BKG;

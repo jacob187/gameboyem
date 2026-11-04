@@ -41,6 +41,11 @@ pub enum Kind {
     PlayAdjustris,
     /// Corpus: Renegade Rush (MBC5). Title, menu, A starts a race, steer the car.
     PlayRenegade,
+    /// Homebrew sound: the title screen is silent, and Start and the first eat
+    /// (then game over) of snake produce audio that is absent without the input.
+    SfxSnake,
+    /// Same for breakout: Start, paddle hit, brick break, life lost, game over.
+    SfxBreakout,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +70,7 @@ impl Case {
             | Kind::PlayAdjustris
             | Kind::PlayRenegade => format!("{p}-play"),
             Kind::SaveSnake | Kind::SaveBreakout => format!("{p}-save"),
+            Kind::SfxSnake | Kind::SfxBreakout => format!("{p}-sfx"),
             _ => p.to_string(),
         }
     }
@@ -168,6 +174,8 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "play-tobu" => Kind::PlayTobu,
                 "play-adjustris" => Kind::PlayAdjustris,
                 "play-renegade" => Kind::PlayRenegade,
+                "sfx-snake" => Kind::SfxSnake,
+                "sfx-breakout" => Kind::SfxBreakout,
                 o => panic!("expected.txt:{}: bad kind {o:?}", n + 1),
             };
             let max_frames = next("max_frames")
@@ -198,6 +206,8 @@ pub fn run_case(case: &Case) -> Outcome {
         Kind::PlayTobu => return run_play(&rom, PLAY_TOBU, case.max_frames),
         Kind::PlayAdjustris => return run_play(&rom, PLAY_ADJUSTRIS, case.max_frames),
         Kind::PlayRenegade => return run_play(&rom, PLAY_RENEGADE, case.max_frames),
+        Kind::SfxSnake => return run_sfx(&rom, sfx_snake, case.max_frames),
+        Kind::SfxBreakout => return run_sfx(&rom, sfx_breakout, case.max_frames),
         _ => {}
     }
     let mut gb = match GameBoy::new(rom) {
@@ -216,7 +226,9 @@ pub fn run_case(case: &Case) -> Outcome {
         | Kind::PlayAdjustris
         | Kind::PlayRenegade
         | Kind::SaveSnake
-        | Kind::SaveBreakout => unreachable!("handled above"),
+        | Kind::SaveBreakout
+        | Kind::SfxSnake
+        | Kind::SfxBreakout => unreachable!("handled above"),
     }
 }
 
@@ -918,6 +930,318 @@ fn save_round_trip(rom: &[u8], bot: Bot, max_frames: u32) -> Result<(), Outcome>
             "title screen with a save equals the fresh one (no HI shown)",
         ));
     }
+    Ok(())
+}
+
+// ---- Homebrew sound effects -------------------------------------------------
+
+/// Peak-to-peak amplitude of a sample buffer. Insensitive to a DC offset, so it
+/// keeps working if the APU output becomes bipolar / high-pass filtered.
+fn peak_to_peak(samples: &[f32]) -> f32 {
+    let (lo, hi) = samples
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+    if samples.is_empty() { 0.0 } else { hi - lo }
+}
+
+/// A window with at least this peak-to-peak level counts as sound ...
+const SFX_LOUD: f32 = 0.02;
+/// ... and one below this as silence.
+const SFX_QUIET: f32 = 0.005;
+
+/// A [`Session`] that keeps the audio of every frame.
+struct Listener {
+    s: Session,
+    frames: Vec<Vec<f32>>,
+}
+
+impl Listener {
+    fn new(rom: &[u8], max_frames: u32) -> Result<Self, Outcome> {
+        Ok(Self {
+            s: Session::new(rom, max_frames)?,
+            frames: Vec::new(),
+        })
+    }
+
+    fn step(&mut self) -> Result<(), Outcome> {
+        self.s.step()?;
+        self.frames.push(self.s.gb.audio_samples());
+        Ok(())
+    }
+
+    fn run(&mut self, n: u32) -> Result<(), Outcome> {
+        (0..n).try_for_each(|_| self.step())
+    }
+
+    fn hold(&mut self, button: Button, n: u32) -> Result<(), Outcome> {
+        self.s.gb.set_button(button, true);
+        let r = self.run(n);
+        self.s.gb.set_button(button, false);
+        r
+    }
+
+    /// Frames run so far (the index of the next one).
+    fn now(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Peak-to-peak level over frames `[from, to)`, clamped to what was run.
+    fn level(&self, from: usize, to: usize) -> f32 {
+        let to = to.min(self.frames.len());
+        let from = from.min(to);
+        peak_to_peak(&self.frames[from..to].concat())
+    }
+}
+
+/// Frames a one-shot effect gets: Start blip 78 ms and eat 50 ms fit in 5.
+const SFX_WINDOW: usize = 8;
+
+/// Checks one named window of a run against its control (or against silence).
+struct SfxReport {
+    lines: Vec<String>,
+    failure: Option<String>,
+}
+
+impl SfxReport {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            failure: None,
+        }
+    }
+
+    fn note(&mut self, what: &str, level: f32, want_loud: bool) {
+        let ok = if want_loud {
+            level >= SFX_LOUD
+        } else {
+            level <= SFX_QUIET
+        };
+        self.lines.push(format!(
+            "{what}: {level:.4} ({})",
+            if want_loud { "loud" } else { "quiet" }
+        ));
+        if !ok && self.failure.is_none() {
+            self.failure = Some(format!(
+                "{what}: peak-to-peak {level:.4}, expected {} {}",
+                if want_loud { ">=" } else { "<=" },
+                if want_loud { SFX_LOUD } else { SFX_QUIET }
+            ));
+        }
+    }
+
+    fn loud(&mut self, what: &str, level: f32) {
+        self.note(what, level, true);
+    }
+
+    fn quiet(&mut self, what: &str, level: f32) {
+        self.note(what, level, false);
+    }
+
+    fn finish(self) -> Outcome {
+        if std::env::var_os("GB_SFX_LOG").is_some() {
+            eprintln!("{}", self.lines.join("\n"));
+        }
+        match self.failure {
+            None => Outcome::Pass,
+            Some(f) => Outcome::Fail(f),
+        }
+    }
+}
+
+type SfxScript = fn(&[u8], u32, &mut SfxReport) -> Result<(), Outcome>;
+
+fn run_sfx(rom: &[u8], script: SfxScript, max_frames: u32) -> Outcome {
+    let mut report = SfxReport::new();
+    match script(rom, max_frames, &mut report) {
+        Ok(()) => report.finish(),
+        Err(o) => o,
+    }
+}
+
+/// The title screen is silent (skipping the first frames while the machine
+/// settles), then Start gives a blip that a run without the press does not.
+/// Leaves `l` on the first frame after the blip window, with the game running
+/// (snake: field up, breakout: serving).
+fn sfx_title_and_start(
+    rom: &[u8],
+    l: &mut Listener,
+    max_frames: u32,
+    r: &mut SfxReport,
+) -> Result<(), Outcome> {
+    l.run(PLAY_BOOT_FRAMES)?;
+    r.quiet("title", l.level(30, PLAY_BOOT_FRAMES as usize));
+    l.hold(Button::Start, 5)?;
+    l.run(SFX_WINDOW as u32 - 5)?;
+    let end = PLAY_BOOT_FRAMES as usize + SFX_WINDOW;
+    r.loud("Start blip", l.level(PLAY_BOOT_FRAMES as usize, end));
+
+    let mut ctl = Listener::new(rom, max_frames)?;
+    ctl.run(end as u32)?;
+    r.quiet("Start omitted", ctl.level(PLAY_BOOT_FRAMES as usize, end));
+
+    l.run(55 - (SFX_WINDOW as u32 - 5))?;
+    Ok(())
+}
+
+/// Snake: Start blip, silent movement, the first eat, then game over.
+///
+/// Controls: no Start press; and Start but no steering, over the eat window.
+fn sfx_snake(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
+    const HEAD: u8 = 130;
+    const FOOD: u8 = 131;
+    let pads = [Button::Up, Button::Right, Button::Down, Button::Left];
+    let mut l = Listener::new(rom, max_frames)?;
+    sfx_title_and_start(rom, &mut l, max_frames, r)?;
+    let moving_from = l.now();
+
+    let food0 =
+        l.s.find_tile(FOOD)
+            .ok_or_else(|| Outcome::Fail("no food on the board".into()))?;
+    let mut dir = 1; // the snake starts heading right
+    let eat = loop {
+        let chunk = l.now();
+        match (l.s.find_tile(HEAD), l.s.find_tile(FOOD)) {
+            (Some(_), Some(f)) if f == food0 => {}
+            _ => break chunk - 2, // eaten during the previous 2-frame chunk
+        }
+        let head = l.s.find_tile(HEAD).unwrap_or(food0);
+        let want = match (head.0.cmp(&food0.0), head.1.cmp(&food0.1)) {
+            (std::cmp::Ordering::Less, _) => 1,
+            (std::cmp::Ordering::Greater, _) => 3,
+            (_, std::cmp::Ordering::Less) => 2,
+            _ => 0,
+        };
+        let next = if want % 2 == dir % 2 && want != dir {
+            if head.1 > 0 { 0 } else { 2 }
+        } else {
+            want
+        };
+        if next != dir {
+            l.s.gb.set_button(pads[dir], false);
+            dir = next;
+        }
+        l.s.gb.set_button(pads[dir], true);
+        l.run(2)?;
+    };
+    // Steering and moving make no sound of their own.
+    r.quiet("snake moving", l.level(moving_from, eat.saturating_sub(1)));
+    l.run(SFX_WINDOW as u32)?;
+    let win = (eat.saturating_sub(1), eat + SFX_WINDOW);
+    r.loud("eat", l.level(win.0, win.1));
+
+    // Same timeline as the main run, but no steering: nothing is eaten.
+    let mut pre = Listener::new(rom, max_frames)?;
+    pre.run(PLAY_BOOT_FRAMES)?;
+    pre.hold(Button::Start, 5)?;
+    pre.run(win.1 as u32 - PLAY_BOOT_FRAMES - 5)?;
+    r.quiet("eat, steering omitted", pre.level(win.0, win.1));
+
+    // Run into a wall: the first loud frame after the eat is the game over.
+    let wall = if dir % 2 == 1 { 0 } else { dir };
+    l.s.gb.set_button(pads[dir], false);
+    l.s.gb.set_button(pads[wall], true);
+    while !l.s.has_text(5, 4, "GAME OVER") {
+        l.step()?;
+    }
+    l.s.gb.set_button(pads[wall], false);
+    let after = win.1;
+    let onset = (after..l.now()).find(|&f| l.level(f, f + 1) >= SFX_LOUD);
+    match onset {
+        Some(f) => r.loud("game over", l.level(f, f + SFX_WINDOW)),
+        None => r.loud("game over", 0.0),
+    }
+    Ok(())
+}
+
+/// Breakout: Start blip, silent serve, then a bot that tracks the ball (paddle
+/// hits, brick breaks) and finally lets it drop (life lost, game over).
+///
+/// Controls: no Start press; and Start with Left held but A never pressed, so
+/// the ball is never launched, over the whole play span.
+fn sfx_breakout(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
+    const LIFE: u8 = 132;
+    let mut l = Listener::new(rom, max_frames)?;
+    sfx_title_and_start(rom, &mut l, max_frames, r)?;
+    let serving = (l.now() - 20, l.now());
+    r.quiet("serving", l.level(serving.0, serving.1));
+
+    let score = |l: &Listener| -> Vec<u8> { (6..11).map(|x| l.s.bg_tile(x, 0)).collect() };
+    let lives = |l: &Listener| (17..20).filter(|&x| l.s.bg_tile(x, 0) == LIFE).count();
+    let ball_y = |l: &Listener| l.s.gb.peek(0xFE0C);
+
+    let launch = l.now();
+    let (mut bricks, mut paddles, mut lost) = (Vec::new(), Vec::new(), Vec::new());
+    let mut over = None;
+    let (mut last_score, mut last_lives) = (score(&l), lives(&l));
+    let (mut old_y, mut last_y) = (ball_y(&l), ball_y(&l)); // ball OAM y, 2 and 1 frames ago
+    l.s.gb.set_button(Button::A, true);
+    while !l.s.has_text(5, 4, "GAME OVER") {
+        // Phase 1 tracks the ball until a brick and the paddle were both hit;
+        // phase 2 parks the paddle in the corner and lets the lives run out.
+        let tracking = bricks.is_empty() || paddles.is_empty();
+        let (pad, ball) = (l.s.gb.peek(0xFE01), l.s.gb.peek(0xFE0D));
+        let diff = i16::from(ball) - i16::from(pad) - 8;
+        for (b, on) in [
+            (Button::Left, !tracking || diff < -2),
+            (Button::Right, tracking && diff > 2),
+        ] {
+            l.s.gb.set_button(b, on);
+        }
+        if l.now() > launch + 1500 {
+            return Err(Outcome::Fail("breakout did not reach game over".into()));
+        }
+        l.step()?;
+        let at = l.now() - 1;
+        let (sc, lv, y) = (score(&l), lives(&l), ball_y(&l));
+        if over.is_none() {
+            if sc != last_score {
+                bricks.push(at);
+            }
+            // A paddle hit puts the ball at exactly y = 146 and sends it back up;
+            // a miss, a serve and a launch do not come down onto 146 and rise.
+            if old_y < 146 && last_y == 146 && y < 146 {
+                paddles.push(at - 1);
+            }
+            if lv < last_lives {
+                if lv == 0 {
+                    over = Some(at);
+                } else {
+                    lost.push(at);
+                }
+            }
+        }
+        (last_score, last_lives, old_y, last_y) = (sc, lv, last_y, y);
+    }
+    for b in [Button::A, Button::Left, Button::Right] {
+        l.s.gb.set_button(b, false);
+    }
+    let worst = |l: &Listener, ev: &[usize]| {
+        ev.iter()
+            .map(|&f| l.level(f.saturating_sub(1), f + SFX_WINDOW))
+            .fold(f32::MAX, f32::min)
+    };
+    for (name, ev) in [
+        ("brick", &bricks),
+        ("paddle", &paddles),
+        ("life lost", &lost),
+    ] {
+        if ev.is_empty() {
+            return Err(Outcome::Fail(format!("no {name} event happened")));
+        }
+        r.loud(&format!("{name} (worst of {})", ev.len()), worst(&l, ev));
+    }
+    let Some(over) = over else {
+        return Err(Outcome::Fail("lives never reached zero".into()));
+    };
+    r.loud("game over", worst(&l, &[over]));
+
+    let span = (launch, over + SFX_WINDOW);
+    let mut ctl = Listener::new(rom, max_frames)?;
+    ctl.run(PLAY_BOOT_FRAMES)?;
+    ctl.hold(Button::Start, 5)?;
+    ctl.s.gb.set_button(Button::Left, true);
+    ctl.run((span.1 - ctl.now()) as u32)?;
+    r.quiet("play span, A omitted", ctl.level(span.0, span.1));
     Ok(())
 }
 
