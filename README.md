@@ -80,7 +80,7 @@ cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5   # speed
 scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job in Docker; builds homebrew with Linux GBDK (tools/gbdk-linux/), needs roms/test + roms/corpus
 ```
 
-The benchmark compares each ROM's video, serial and audio hashes against `crates/gb-test/bench-pins.txt`. That catches any behaviour change, including from a "pure" optimisation. If a homebrew ROM is rebuilt from changed source, re-pin with `--print-pins`. CI also fails if the emulator drops below 5× real time.
+The benchmark compares each ROM's video, serial and audio hashes against `crates/gb-test/bench-pins.txt`. That catches any behaviour change, including from a "pure" optimisation. If a homebrew ROM is rebuilt from changed source, re-pin with `--print-pins`. CI also fails if the emulator drops below 5× real time. cgb-acid2 runs on a CGB in colour mode (its video hash covers the RGB555 frame), so the "overall" speed that `--min-speed` checks includes the colour renderer.
 
 `crates/gb-test/expected.txt` is a ratchet. A case fails if its outcome changes in either direction, so a regression or an unrecorded fix both break the build.
 

@@ -11,7 +11,9 @@
 1200 9bc9250d7f185f9d 94d57173ba276d05 e3db61b1d8a1a7c5 test/blargg/cpu_instrs/cpu_instrs.gb
 1200 712444458c1dd6ba 9029ec196d701ee5 af5f058ad29285e5 homebrew/snake.gb
 1200 d8d2320126d0f27b 1d9d921fb76ee6b8 e03676113bc72925 homebrew/breakout.gb
+1200 e00f807ed1acf443 9b5cd94e8707cd23 0e0eba9cdb8e2125 test/cgb-acid2/cgb-acid2.gbc
 3600 135a93076059053c ee8c236a0d5738fe 0ffcd0c624c53065 test/dmg-acid2/dmg-acid2.gb
 3600 9bc9250d7f185f9d 4267ecfa524e945b 7eafea56014c75f1 test/blargg/cpu_instrs/cpu_instrs.gb
 3600 712444458c1dd6ba 2feeede17431f240 908e67430b97c8e5 homebrew/snake.gb
 3600 d8d2320126d0f27b 6a762d8a8fea1178 4743036af4432c25 homebrew/breakout.gb
+3600 e00f807ed1acf443 c2a47483116515e3 4bdbd267a4d22425 test/cgb-acid2/cgb-acid2.gbc
