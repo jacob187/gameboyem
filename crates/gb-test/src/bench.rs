@@ -124,7 +124,7 @@ pub fn run(args: &[&String]) -> std::process::ExitCode {
     let all = f64::from(frames) * ROMS.len() as f64 / total.as_secs_f64();
     println!(
         "{:<38} {all:>10.0} {:>9.1}x",
-        "overall (harmonic)",
+        "overall",
         all / FRAMES_PER_SECOND
     );
     if ok {
