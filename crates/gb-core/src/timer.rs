@@ -6,11 +6,28 @@
 //! `counter[bit(TAC)] & TAC.enable`, which naturally reproduces the DIV-write
 //! and TAC-write glitches. On overflow TIMA reads 0 for one M-cycle, then is
 //! reloaded from TMA and the timer interrupt is requested.
+//!
+//! # M-cycle ordering (see `bus.rs`)
+//!
+//! Every CPU access is `tick_mcycle` first, then the register access. Using
+//! `T` for the tick in which the falling edge overflows TIMA (verified against
+//! mooneye `tima_reload`, `tima_write_reloading`, `tma_write_reloading`):
+//!
+//! | access in tick | TIMA reads | TIMA write         | TMA write                |
+//! |----------------|------------|--------------------|--------------------------|
+//! | `T`            | `0x00`     | cancels reload+IRQ | picked up by the reload  |
+//! | `T + 1`        | `TMA`      | ignored            | copied into TIMA too     |
+//! | `T + 2`        | normal     | normal             | too late for TIMA        |
+//!
+//! The `T + 1` row is Pan Docs' reload cycle where "TMA writes propagate";
+//! mooneye `tma_write_reloading` requires it (a write there reads back in TIMA).
 
 use crate::interrupts::{Interrupt, Interrupts};
 
-/// Initial system counter after the DMG boot ROM (DIV = 0xAB).
-const POST_BOOT_COUNTER: u16 = 0xABCC;
+/// System counter when the first cartridge instruction executes after the DMG
+/// boot ROM (DIV = 0xAB). The low byte is the value that makes mooneye
+/// `boot_div-dmgABCmgb` pass (found by scanning every M-cycle phase).
+const POST_BOOT_COUNTER: u16 = 0xABC8;
 
 #[derive(Clone, Debug)]
 pub struct Timer {
@@ -23,6 +40,9 @@ pub struct Timer {
     /// TIMA was reloaded from TMA during the current M-cycle; CPU writes to TIMA
     /// in this cycle are ignored and TMA writes are copied into TIMA.
     reloaded_this_cycle: bool,
+    /// A write-triggered (DIV/TAC glitch) overflow already reloaded TIMA and
+    /// requested the interrupt; the *next* cycle is its "reload cycle".
+    reloaded_by_write: bool,
 }
 
 impl Default for Timer {
@@ -40,6 +60,7 @@ impl Timer {
             tac: 0xF8,
             overflow_pending: false,
             reloaded_this_cycle: false,
+            reloaded_by_write: false,
         }
     }
 
@@ -70,9 +91,25 @@ impl Timer {
         }
     }
 
+    /// Falling edge caused by a CPU write (DIV reset, TAC change). The write
+    /// happens at the end of its M-cycle, so the one-cycle "TIMA = 0" window and
+    /// the reload are already over for the CPU: TIMA takes TMA and the interrupt
+    /// is requested at once, and the next M-cycle is the reload cycle (TIMA
+    /// writes ignored, TMA writes copied). mooneye `timer/rapid_toggle` observes
+    /// this as the timer interrupt being taken before the following instruction.
+    fn increment_tima_from_write(&mut self, interrupts: &mut Interrupts) {
+        self.increment_tima();
+        if self.overflow_pending {
+            self.overflow_pending = false;
+            self.tima = self.tma;
+            self.reloaded_by_write = true;
+            interrupts.request(Interrupt::Timer);
+        }
+    }
+
     /// Advance one M-cycle (4 T-cycles).
     pub fn tick_mcycle(&mut self, interrupts: &mut Interrupts) {
-        self.reloaded_this_cycle = false;
+        self.reloaded_this_cycle = std::mem::take(&mut self.reloaded_by_write);
         if self.overflow_pending {
             self.overflow_pending = false;
             self.tima = self.tma;
@@ -87,11 +124,11 @@ impl Timer {
     }
 
     /// Reset the system counter (DIV write or STOP). May clock TIMA.
-    pub fn reset_div(&mut self, _interrupts: &mut Interrupts) {
+    pub fn reset_div(&mut self, interrupts: &mut Interrupts) {
         let before = self.timer_signal();
         self.counter = 0;
         if before {
-            self.increment_tima();
+            self.increment_tima_from_write(interrupts);
         }
     }
 
@@ -125,7 +162,7 @@ impl Timer {
                 let before = self.timer_signal();
                 self.tac = value | 0xF8;
                 if before && !self.timer_signal() {
-                    self.increment_tima();
+                    self.increment_tima_from_write(interrupts);
                 }
             }
             _ => {}

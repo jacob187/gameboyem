@@ -99,6 +99,7 @@ impl Bus {
     fn step_dma(&mut self) {
         if let Some((src, index)) = self.dma.tick_mcycle() {
             let byte = self.read_dma_source(src);
+            self.dma.latch_data(byte);
             self.ppu.oam_dma_write(index, byte);
         }
     }
@@ -131,3 +132,7 @@ impl CpuBus for Bus {
         self.timer.reset_div(&mut self.interrupts);
     }
 }
+
+#[cfg(test)]
+#[path = "bus_tests.rs"]
+mod tests;

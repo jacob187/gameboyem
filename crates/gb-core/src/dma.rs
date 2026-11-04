@@ -1,17 +1,55 @@
 //! OAM DMA (Pan Docs: "OAM DMA Transfer"): writing `XX` to 0xFF46 copies
-//! `XX00..=XX9F` into OAM, one byte per M-cycle, starting one M-cycle after
-//! the write. 160 + 1 M-cycles total.
+//! `XX00..=XX9F` into OAM, one byte per M-cycle.
+//!
+//! Timing, in M-cycles relative to the CPU's write of 0xFF46 (verified against
+//! mooneye `oam_dma_start`, `oam_dma_timing`, `oam_dma_restart`):
+//!
+//! * `+0` write.
+//! * `+1` nothing yet: OAM and the buses are still accessible. If an earlier
+//!   transfer is running it keeps copying and keeps the buses locked.
+//! * `+2 ..= +161` the new transfer copies byte `0 ..= 159`; during these
+//!   cycles OAM reads `0xFF` and the source bus is in conflict with the CPU.
+//! * `+162` everything is accessible again.
+//!
+//! "During a cycle" means: the component tick runs first, then the CPU access
+//! (see `bus.rs`), so [`Dma::is_blocking`] describes the cycle whose tick just ran.
+
+/// Number of bytes in OAM.
+const OAM_LEN: u8 = 160;
+/// M-cycles between the register write and the first copy.
+const START_DELAY: u8 = 2;
+
+/// Which physical bus the transfer source sits on (DMG has two: the external
+/// bus for ROM / cartridge RAM / WRAM, and the video bus for VRAM).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaBus {
+    External,
+    Video,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Transfer {
+    source: u16,
+    index: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    source: u16,
+    delay: u8,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Dma {
     reg: u8,
-    /// Source base of the active transfer.
-    source: u16,
-    /// Next byte index to copy (0..160) while active.
-    index: u8,
-    active: bool,
-    /// M-cycles of start-up delay remaining before copying begins.
-    delay: u8,
+    active: Option<Transfer>,
+    pending: Option<Pending>,
+    /// A byte was copied during the most recent tick (bus locked this cycle).
+    busy: bool,
+    /// Source bus of the most recent copy.
+    bus: Option<DmaBus>,
+    /// Last byte the DMA engine moved; what a conflicting CPU read observes.
+    data_byte: u8,
 }
 
 impl Dma {
@@ -26,35 +64,78 @@ impl Dma {
         self.reg
     }
 
+    /// CPU write to 0xFF46. A running transfer is *not* stopped immediately; it
+    /// is replaced when the new one starts two M-cycles later.
     pub fn start(&mut self, value: u8) {
         self.reg = value;
-        self.source = (value as u16) << 8;
-        self.index = 0;
-        self.delay = 1;
-        self.active = true;
+        self.pending = Some(Pending {
+            source: (value as u16) << 8,
+            delay: START_DELAY,
+        });
     }
 
-    /// True while the CPU's access to non-HRAM memory is blocked.
+    /// True during a cycle in which the DMA engine is using the bus: OAM is
+    /// inaccessible and the source bus conflicts with the CPU.
     pub fn is_blocking(&self) -> bool {
-        self.active && self.delay == 0
+        self.busy
+    }
+
+    /// True if a transfer is running or about to start.
+    pub fn is_active(&self) -> bool {
+        self.active.is_some() || self.pending.is_some()
+    }
+
+    /// Whether a CPU access to `addr` (below 0xFE00) collides with the DMA
+    /// engine this cycle. HRAM, I/O and OAM (handled separately) are not covered.
+    pub fn conflicts_with(&self, addr: u16) -> bool {
+        if !self.busy || addr >= 0xFE00 {
+            return false;
+        }
+        let video = (0x8000..=0x9FFF).contains(&addr);
+        match self.bus {
+            Some(DmaBus::Video) => video,
+            Some(DmaBus::External) => !video,
+            None => false,
+        }
+    }
+
+    /// The byte the DMA engine last moved (what a conflicting read returns).
+    pub fn data_byte(&self) -> u8 {
+        self.data_byte
+    }
+
+    /// Record the byte read from the source for the copy just requested.
+    pub fn latch_data(&mut self, byte: u8) {
+        self.data_byte = byte;
     }
 
     /// Advance one M-cycle. Returns `(source_addr, oam_index)` when a byte
     /// should be copied this cycle.
     pub fn tick_mcycle(&mut self) -> Option<(u16, u8)> {
-        if !self.active {
-            return None;
+        if let Some(p) = &mut self.pending {
+            p.delay -= 1;
+            if p.delay == 0 {
+                self.active = Some(Transfer {
+                    source: p.source,
+                    index: 0,
+                });
+                self.pending = None;
+            }
         }
-        if self.delay > 0 {
-            self.delay -= 1;
-            return None;
+        self.busy = false;
+        let t = self.active.as_mut()?;
+        let copy = (t.source.wrapping_add(t.index as u16), t.index);
+        t.index += 1;
+        self.bus = Some(if (0x80..=0x9F).contains(&(t.source >> 8)) {
+            DmaBus::Video
+        } else {
+            DmaBus::External
+        });
+        if t.index == OAM_LEN {
+            self.active = None;
         }
-        let i = self.index;
-        self.index += 1;
-        if self.index == 160 {
-            self.active = false;
-        }
-        Some((self.source + i as u16, i))
+        self.busy = true;
+        Some(copy)
     }
 }
 
@@ -62,17 +143,134 @@ impl Dma {
 mod tests {
     use super::*;
 
+    /// Run `n` ticks, returning the copies made.
+    fn run(d: &mut Dma, n: usize) -> Vec<Option<(u16, u8)>> {
+        (0..n).map(|_| d.tick_mcycle()).collect()
+    }
+
     #[test]
-    fn copies_160_bytes_after_one_cycle_delay() {
+    fn idle_does_nothing() {
+        let mut d = Dma::new();
+        assert!(run(&mut d, 10).iter().all(Option::is_none));
+        assert!(!d.is_blocking());
+        assert!(!d.is_active());
+        assert_eq!(d.read_reg(), 0xFF);
+    }
+
+    #[test]
+    fn first_copy_two_cycles_after_write_and_160_total() {
         let mut d = Dma::new();
         d.start(0xC1);
-        assert_eq!(d.tick_mcycle(), None);
-        let mut n = 0;
+        assert_eq!(d.read_reg(), 0xC1);
+        assert_eq!(d.tick_mcycle(), None, "+1: nothing yet");
+        assert!(!d.is_blocking(), "+1: bus still free");
+        assert_eq!(d.tick_mcycle(), Some((0xC100, 0)), "+2: first byte");
+        assert!(d.is_blocking());
+        let mut n = 1;
+        let mut last = 0;
         while let Some((src, i)) = d.tick_mcycle() {
             assert_eq!(src, 0xC100 + i as u16);
+            assert!(d.is_blocking());
             n += 1;
+            last = i;
         }
-        assert_eq!(n, 160);
+        assert_eq!((n, last), (160, 159));
         assert!(!d.is_blocking());
+        assert!(!d.is_active());
+    }
+
+    #[test]
+    fn blocking_window_is_cycles_2_to_161() {
+        let mut d = Dma::new();
+        d.start(0x80);
+        let window: Vec<bool> = (1..=163)
+            .map(|_| {
+                d.tick_mcycle();
+                d.is_blocking()
+            })
+            .collect();
+        for (i, b) in window.iter().enumerate() {
+            let cycle = i + 1;
+            assert_eq!(*b, (2..=161).contains(&cycle), "cycle +{cycle}");
+        }
+    }
+
+    #[test]
+    fn restart_keeps_old_transfer_running_then_replaces_it() {
+        let mut d = Dma::new();
+        d.start(0xC0);
+        run(&mut d, 11); // +1 .. +11: bytes 0..=9 copied
+        assert!(d.is_blocking());
+        d.start(0xD0); // restart at +11
+        // +1 after restart: old transfer still copies (byte 10), bus locked.
+        assert_eq!(d.tick_mcycle(), Some((0xC000 + 10, 10)));
+        assert!(d.is_blocking());
+        // +2: new transfer begins at byte 0 from the new source.
+        assert_eq!(d.tick_mcycle(), Some((0xD000, 0)));
+        let rest = run(&mut d, 200);
+        assert_eq!(rest.iter().flatten().count(), 159);
+        assert!(!d.is_blocking());
+    }
+
+    #[test]
+    fn restart_end_is_161_cycles_after_second_write() {
+        let mut d = Dma::new();
+        d.start(0x80);
+        run(&mut d, 30);
+        d.start(0x80);
+        let window: Vec<bool> = (1..=165)
+            .map(|_| {
+                d.tick_mcycle();
+                d.is_blocking()
+            })
+            .collect();
+        assert!(window[0], "+1: old transfer keeps the bus locked");
+        assert!(window[160], "+161 still blocked");
+        assert!(!window[161], "+162 free");
+    }
+
+    #[test]
+    fn restart_after_completion_behaves_like_fresh_start() {
+        let mut d = Dma::new();
+        d.start(0x80);
+        run(&mut d, 170);
+        d.start(0x90);
+        assert_eq!(d.tick_mcycle(), None);
+        assert!(!d.is_blocking());
+        assert_eq!(d.tick_mcycle(), Some((0x9000, 0)));
+    }
+
+    #[test]
+    fn source_bus_selects_conflict_region() {
+        let mut d = Dma::new();
+        d.start(0x80); // VRAM source: video bus
+        run(&mut d, 2);
+        assert!(d.conflicts_with(0x8000));
+        assert!(d.conflicts_with(0x9FFF));
+        assert!(!d.conflicts_with(0x0000));
+        assert!(!d.conflicts_with(0xC000));
+        assert!(!d.conflicts_with(0xFE00), "OAM is handled by the mmu");
+        assert!(!d.conflicts_with(0xFF80));
+
+        let mut d = Dma::new();
+        d.start(0xC0); // WRAM source: external bus
+        run(&mut d, 2);
+        assert!(d.conflicts_with(0x0000));
+        assert!(d.conflicts_with(0x7FFF));
+        assert!(d.conflicts_with(0xA000));
+        assert!(d.conflicts_with(0xDFFF));
+        assert!(d.conflicts_with(0xFDFF));
+        assert!(!d.conflicts_with(0x8000), "VRAM is on its own bus");
+        assert!(!d.conflicts_with(0xFF00));
+    }
+
+    #[test]
+    fn no_conflict_before_first_copy_or_after_end() {
+        let mut d = Dma::new();
+        d.start(0xC0);
+        d.tick_mcycle();
+        assert!(!d.conflicts_with(0xC000));
+        run(&mut d, 161);
+        assert!(!d.conflicts_with(0xC000));
     }
 }
