@@ -71,8 +71,8 @@ fail mooneye 600 test/mooneye/acceptance/ppu/intr_2_oam_ok_timing.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/lcdon_timing-GS.gb
 fail mooneye 600 test/mooneye/acceptance/ppu/lcdon_write_timing-GS.gb
 pass mooneye 600 test/mooneye/acceptance/ppu/stat_irq_blocking.gb
-fail mooneye 600 test/mooneye/acceptance/ppu/stat_lyc_onoff.gb
-fail mooneye 600 test/mooneye/acceptance/ppu/vblank_stat_intr-GS.gb
+pass mooneye 600 test/mooneye/acceptance/ppu/stat_lyc_onoff.gb
+pass mooneye 600 test/mooneye/acceptance/ppu/vblank_stat_intr-GS.gb
 pass mooneye 600 test/mooneye/acceptance/push_timing.gb
 pass mooneye 600 test/mooneye/acceptance/rapid_di_ei.gb
 pass mooneye 600 test/mooneye/acceptance/ret_cc_timing.gb

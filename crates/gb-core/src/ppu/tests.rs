@@ -283,7 +283,8 @@ fn stat_mode_sources_fire_on_their_mode_entries() {
     // counted for mode 2: lines 1..=143 plus the immediate one.
     assert_eq!(count_stat_interrupts_over_frame(0x08), 144); // HBlank: 144 lines
     assert_eq!(count_stat_interrupts_over_frame(0x10), 1); // VBlank: once
-    assert_eq!(count_stat_interrupts_over_frame(0x20), 144); // OAM: lines 0..=143
+    // OAM: lines 0..=143, plus the pulse as line 144 (VBlank) begins.
+    assert_eq!(count_stat_interrupts_over_frame(0x20), 145);
 }
 
 #[test]
@@ -869,4 +870,58 @@ fn blocked_oam_does_not_stop_sprites_from_the_scan() {
     }
     let fb = rig.frame();
     assert_eq!(pixel(&fb, 0, 0), 3);
+}
+
+// ------------------------------------------------ LCD on/off and VBlank STAT
+
+#[test]
+fn lyc_flag_is_retained_while_lcd_is_off() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF45, 0x90);
+    rig.run_to(0x90, 0);
+    assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0x04);
+    rig.write(0xFF40, 0x11);
+    assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0x04);
+    // The comparison clock is stopped: LYC writes do not touch the flag.
+    rig.write(0xFF45, 0x01);
+    assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0x04);
+    // Turning the LCD on compares LY = 0 with the new LYC straight away.
+    rig.write(0xFF40, 0x91);
+    assert_eq!(rig.ppu.read_reg(0xFF41) & 0x04, 0);
+}
+
+#[test]
+fn lyc_irq_is_not_retriggered_by_lcd_on_when_flag_stays_set() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF41, 0x40);
+    rig.write(0xFF45, 0x90);
+    rig.run_to(0x90, 0);
+    rig.write(0xFF40, 0x11);
+    rig.write(0xFF45, 0x00);
+    rig.clear_if();
+    rig.write(0xFF40, 0x91);
+    assert_eq!(rig.ints.flags & STAT_BIT, 0, "flag 1 -> 1 is not an edge");
+}
+
+#[test]
+fn lyc_irq_fires_when_lcd_on_sets_the_flag() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF41, 0x40);
+    rig.write(0xFF45, 0x00);
+    rig.run_to(0x90, 0);
+    rig.write(0xFF40, 0x11);
+    rig.clear_if();
+    rig.write(0xFF40, 0x91);
+    assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT);
+}
+
+#[test]
+fn oam_source_pulses_with_vblank_on_line_144() {
+    let mut rig = Rig::at_line0();
+    rig.write(0xFF41, STAT_OAM_IRQ);
+    rig.run_to(143, 452);
+    rig.clear_if();
+    rig.tick();
+    assert_eq!(rig.ints.flags & VBLANK_BIT, VBLANK_BIT);
+    assert_eq!(rig.ints.flags & STAT_BIT, STAT_BIT);
 }

@@ -92,6 +92,10 @@ pub struct Ppu {
     /// sorted by drawing priority (lowest X first, ties by OAM index).
     line_sprites: [u8; 10],
     line_sprite_count: u8,
+    /// STAT bit 2: the LY == LYC comparison result. Only re-evaluated while the
+    /// LCD is on (the comparison clock stops with it), so it is retained
+    /// across LCD off and LYC writes made while the LCD is off.
+    lyc_flag: bool,
     /// Previous level of the STAT interrupt line (for rising-edge detection).
     stat_line: bool,
     back: Box<Framebuffer>,
@@ -134,6 +138,7 @@ impl Ppu {
             win_line: 0,
             line_sprites: [0; 10],
             line_sprite_count: 0,
+            lyc_flag: true,
             stat_line: false,
             back: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
@@ -171,8 +176,11 @@ impl Ppu {
         }
     }
 
-    fn lyc_match(&self) -> bool {
-        self.lcd_on() && self.lyc == self.visible_ly()
+    /// Re-run the LY == LYC comparison. A no-op while the LCD is off.
+    fn refresh_lyc_flag(&mut self) {
+        if self.lcd_on() {
+            self.lyc_flag = self.lyc == self.visible_ly();
+        }
     }
 
     /// Advance the PPU by one M-cycle (4 dots).
@@ -188,6 +196,7 @@ impl Ppu {
         for _ in 0..4 {
             self.step_dot(interrupts);
         }
+        self.refresh_lyc_flag();
         self.update_stat_line(interrupts);
     }
 
@@ -227,15 +236,21 @@ impl Ppu {
     /// Recompute the STAT interrupt line and request STAT on a rising edge
     /// (Pan Docs: "STAT interrupt" - all sources are ORed onto one line, so a
     /// source asserting while another already holds the line high is blocked).
+    ///
+    /// The LYC source follows the latched comparison flag, which survives the
+    /// LCD being off (mooneye `stat_lyc_onoff`). The mode sources need the LCD
+    /// on. Line 144 also pulses the mode 2 (OAM) source as VBlank begins
+    /// (mooneye `vblank_stat_intr-GS`).
     fn update_stat_line(&mut self, interrupts: &mut Interrupts) {
-        let line = self.lcd_on() && {
+        let sel = self.stat_select;
+        let mode_line = self.lcd_on() && {
             let mode = self.mode();
-            let sel = self.stat_select;
-            (sel & STAT_LYC_IRQ != 0 && self.lyc_match())
-                || (sel & STAT_HBLANK_IRQ != 0 && mode == 0)
+            let vblank_oam = self.ly == VBLANK_LINE && self.line_dot < 4;
+            (sel & STAT_HBLANK_IRQ != 0 && mode == 0)
                 || (sel & STAT_VBLANK_IRQ != 0 && mode == 1)
-                || (sel & STAT_OAM_IRQ != 0 && mode == 2)
+                || (sel & STAT_OAM_IRQ != 0 && (mode == 2 || vblank_oam))
         };
+        let line = mode_line || (sel & STAT_LYC_IRQ != 0 && self.lyc_flag);
         if line && !self.stat_line {
             interrupts.request(Interrupt::Stat);
         }
@@ -291,7 +306,7 @@ impl Ppu {
         match addr {
             0xFF40 => self.lcdc,
             0xFF41 => {
-                let coincidence = if self.lyc_match() { 0x04 } else { 0 };
+                let coincidence = if self.lyc_flag { 0x04 } else { 0 };
                 0x80 | self.stat_select | coincidence | self.mode()
             }
             0xFF42 => self.scy,
@@ -313,7 +328,7 @@ impl Ppu {
                 let was_on = self.lcd_on();
                 self.lcdc = value;
                 match (was_on, self.lcd_on()) {
-                    (true, false) => self.lcd_turned_off(),
+                    (true, false) => self.lcd_turned_off(interrupts),
                     (false, true) => self.lcd_turned_on(interrupts),
                     _ => {}
                 }
@@ -326,6 +341,7 @@ impl Ppu {
             0xFF43 => self.scx = value,
             0xFF45 => {
                 self.lyc = value;
+                self.refresh_lyc_flag();
                 self.update_stat_line(interrupts);
             }
             0xFF47 => self.bgp = value,
@@ -339,15 +355,15 @@ impl Ppu {
 
     /// Pan Docs "LCDC.7": turning the LCD off resets LY and the mode, and the
     /// screen goes blank.
-    fn lcd_turned_off(&mut self) {
+    fn lcd_turned_off(&mut self, interrupts: &mut Interrupts) {
         self.ly = 0;
         self.line_dot = 0;
         self.off_dots = 0;
-        self.stat_line = false;
         self.wy_triggered = false;
         self.win_line = 0;
         self.back.fill(0);
         self.front.fill(0);
+        self.update_stat_line(interrupts);
     }
 
     /// Turning the LCD on restarts line 0. The first line has no OAM scan and
@@ -360,7 +376,7 @@ impl Ppu {
         self.wy_triggered = false;
         self.win_line = 0;
         self.mode3_len = MODE3_BASE_DOTS;
-        self.stat_line = false;
+        self.refresh_lyc_flag();
         self.update_stat_line(interrupts);
     }
 }
