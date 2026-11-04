@@ -33,10 +33,11 @@ cargo build --release
 **Command-line options:**
 
 ```
-usage: gb [options] [--] <rom.gb>
+usage: gb [options] [--] <rom.gb|rom.gbc>
   --scale N        integer window scale, 1..=8 (default 4; HiDPI-aware)
   --mute           disable audio output
-  --palette NAME   green (default) or grey
+  --palette NAME   green (default) or grey (DMG only)
+  --model NAME     auto (default: CGB for CGB-flagged ROMs, else DMG), dmg or cgb
   --test-pattern   synthetic pattern + tone instead of running the core
   --               end of options; the next argument is the ROM path
 ```
@@ -70,7 +71,7 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 ## Tests
 
 ```sh
-./scripts/fetch-test-roms.sh                 # Blargg, mooneye, dmg-acid2 -> roms/test (gitignored)
+./scripts/fetch-test-roms.sh                 # Blargg, mooneye, dmg-acid2, cgb-acid2 -> roms/test (gitignored)
 make -C homebrew                             # needed for the homebrew cases (they fail when CI=true and the ROMs are missing)
 ./scripts/fetch-homebrew-corpus.sh           # open-source homebrew corpus -> roms/corpus
 cargo test --workspace                       # unit tests + one test per ROM
@@ -82,6 +83,8 @@ scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job in Docker; build
 The benchmark compares each ROM's video, serial and audio hashes against `crates/gb-test/bench-pins.txt`. That catches any behaviour change, including from a "pure" optimisation. If a homebrew ROM is rebuilt from changed source, re-pin with `--print-pins`. CI also fails if the emulator drops below 5× real time.
 
 `crates/gb-test/expected.txt` is a ratchet. A case fails if its outcome changes in either direction, so a regression or an unrecorded fix both break the build.
+
+cgb-acid2 (`acid2-cgb` in the manifest) runs on a Game Boy Color and compares the RGB555 frame, widened to 8 bits per channel with no colour correction, to its reference image. It is recorded as an expected failure until the CGB PPU lands, so it is not counted in the table below.
 
 ### Test-ROM results
 
