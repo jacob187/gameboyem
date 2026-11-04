@@ -204,6 +204,17 @@ impl Apu {
             | u8::from(self.ch4.enabled) << 3
     }
 
+    /// CGB PCM12 (0xFF76) / PCM34 (0xFF77): the channels' current digital
+    /// outputs, CH1 / CH3 in the low nibble and CH2 / CH4 in the high one. A
+    /// channel that is off outputs 0.
+    pub(crate) fn read_pcm(&self, addr: u16) -> u8 {
+        if addr == 0xFF76 {
+            self.ch1.output() | self.ch2.output() << 4
+        } else {
+            self.ch3.output() | self.ch4.output() << 4
+        }
+    }
+
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xFF26 => 0x70 | u8::from(self.powered) << 7 | self.status_bits(),

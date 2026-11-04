@@ -19,9 +19,10 @@ use crate::cartridge::{Cartridge, MbcKind};
 use crate::dma::Dma;
 use crate::interrupts::Interrupts;
 use crate::joypad::Joypad;
+use crate::model::{Hw, Model, compat_b};
 use crate::ppu::Ppu;
 use crate::serial::Serial;
-use crate::state::{StateError, StateReader, StateWriter, tag};
+use crate::state::{StateError, StateReader, StateWriter, check, tag};
 use crate::timer::Timer;
 
 /// The CPU's view of the machine. Implemented by [`Bus`] and by flat-memory
@@ -46,13 +47,21 @@ pub trait CpuBus {
     }
 }
 
+/// Bytes of WRAM a DMG has (two 4 KiB banks' worth).
 pub(crate) const WRAM_SIZE: usize = 0x2000;
+/// Bytes of WRAM a CGB has: 8 banks of 4 KiB.
+pub(crate) const CGB_WRAM_SIZE: usize = 0x8000;
+/// Offset of the switchable window (D000-DFFF) in `wram` while bank 1 is selected,
+/// which is where a DMG's second 4 KiB lives: the DMG layout is the CGB one with
+/// bank 1 selected.
+const WRAM_BANK1: usize = 0x1000;
 pub(crate) const HRAM_SIZE: usize = 0x7F;
 
 /// Owns all non-CPU components and routes memory accesses (see `mmu.rs`).
 pub struct Bus {
     pub(crate) cart: Box<dyn Cartridge>,
-    pub(crate) wram: Box<[u8; WRAM_SIZE]>,
+    /// All 8 CGB banks of 4 KiB (bank 0 first); a DMG uses the first 8 KiB.
+    pub(crate) wram: Box<[u8; CGB_WRAM_SIZE]>,
     pub(crate) hram: [u8; HRAM_SIZE],
     pub(crate) interrupts: Interrupts,
     pub(crate) timer: Timer,
@@ -65,15 +74,35 @@ pub struct Bus {
     pub(crate) mcycles: u64,
     /// Whether the cartridge needs a per-M-cycle tick (only an MBC3 RTC does).
     cart_ticks: bool,
+    // ---- CGB additions (DECISIONS #31, #33); VBK lives in the PPU ----
+    /// The machine variant; only the IO paths in `mmu.rs` look at it.
+    pub(crate) hw: Hw,
+    /// SVBK (FF70) bits 0-2 as written (0 selects bank 1).
+    pub(crate) svbk: u8,
+    /// Offset in `wram` of the D000-DFFF window; precomputed from `svbk` so
+    /// WRAM accesses don't branch on the model.
+    pub(crate) wram_hi: usize,
+    /// KEY1 (FF4D) bit 0: a speed switch is armed for the next STOP. The speed
+    /// itself (bit 7) is not implemented yet and always reads 0.
+    pub(crate) key1_prepare: bool,
+    /// Undocumented read/write registers FF72, FF73 and FF75 (bits 4-6 only).
+    pub(crate) cgb_scratch: [u8; 3],
 }
 
 impl Bus {
     pub fn new(cart: Box<dyn Cartridge>) -> Self {
+        Self::with_model(cart, Model::Dmg)
+    }
+
+    /// Power on as `model`. On a CGB the boot ROM's choice between CGB mode and
+    /// DMG-compatibility mode follows the cartridge header (see [`Hw`]).
+    pub fn with_model(cart: Box<dyn Cartridge>, model: Model) -> Self {
         let header = cart.header();
         let cart_ticks = header.mbc == MbcKind::Mbc3 && header.has_rtc;
-        Self {
+        let hw = Hw::new(model, header);
+        let mut bus = Self {
             cart,
-            wram: Box::new([0; WRAM_SIZE]),
+            wram: Box::new([0; CGB_WRAM_SIZE]),
             hram: [0; HRAM_SIZE],
             interrupts: Interrupts::new(),
             timer: Timer::new(),
@@ -84,6 +113,46 @@ impl Bus {
             serial: Serial::new(),
             mcycles: 0,
             cart_ticks,
+            hw,
+            svbk: 0,
+            wram_hi: WRAM_BANK1,
+            key1_prepare: false,
+            cgb_scratch: [0; 3],
+        };
+        if hw.is_cgb() {
+            bus.timer = Timer::new_cgb();
+            bus.ppu = Ppu::new_cgb();
+            bus.dma = Dma::new_cgb();
+            bus.joypad = Joypad::new_cgb(hw == Hw::CgbCompat);
+            if hw == Hw::Cgb {
+                bus.serial = Serial::new_cgb_mode();
+            }
+        }
+        bus
+    }
+
+    /// The registers the CPU starts with: the model's post-boot hand-off state.
+    pub(crate) fn post_boot_registers(&self) -> crate::cpu::Registers {
+        use crate::cpu::Registers;
+        match self.hw {
+            Hw::Dmg => Registers::dmg_post_boot(),
+            Hw::CgbCompat => Registers::cgb_compat_post_boot(compat_b(&*self.cart)),
+            Hw::Cgb => Registers::cgb_post_boot(),
+        }
+    }
+
+    /// Select the D000-DFFF WRAM bank from an SVBK write (bank 0 maps to 1).
+    pub(crate) fn set_svbk(&mut self, value: u8) {
+        self.svbk = value & 7;
+        self.wram_hi = usize::from(self.svbk.max(1)) * WRAM_BANK1;
+    }
+
+    /// Bytes of `wram` this machine has.
+    fn wram_len(&self) -> usize {
+        if self.hw.is_cgb() {
+            CGB_WRAM_SIZE
+        } else {
+            WRAM_SIZE
         }
     }
 
@@ -144,6 +213,9 @@ impl CpuBus for Bus {
     }
 
     fn stop(&mut self) {
+        // TODO(CGB speed switch): when `hw == Hw::Cgb && key1_prepare`, STOP
+        // toggles double speed instead of just resetting DIV (KEY1 bit 7, a
+        // ~2050 M-cycle pause, the clock ratio of every component).
         self.timer.reset_div(&mut self.interrupts);
     }
 
@@ -159,9 +231,15 @@ impl Bus {
     /// Every non-CPU component, each in its own tagged section.
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
         w.u8(tag::BUS);
-        w.bytes(&self.wram[..]);
+        w.bytes(&self.wram[..self.wram_len()]);
         w.bytes(&self.hram);
         w.u64(self.mcycles);
+        // CGB additions.
+        if self.hw.is_cgb() {
+            w.u8(self.svbk);
+            w.bool(self.key1_prepare);
+            w.bytes(&self.cgb_scratch);
+        }
         w.u8(tag::INTERRUPTS);
         self.interrupts.save_state(w);
         w.u8(tag::TIMER);
@@ -184,9 +262,17 @@ impl Bus {
     /// overwritten on error; [`crate::GameBoy::load_state`] rolls it back.
     pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
         r.tag(tag::BUS)?;
-        r.bytes_into(&mut self.wram[..])?;
+        let len = self.wram_len();
+        r.bytes_into(&mut self.wram[..len])?;
         r.bytes_into(&mut self.hram)?;
         self.mcycles = r.u64()?;
+        if self.hw.is_cgb() {
+            let svbk = r.u8()?;
+            check(svbk < 8, "SVBK")?;
+            self.set_svbk(svbk);
+            self.key1_prepare = r.bool()?;
+            r.bytes_into(&mut self.cgb_scratch)?;
+        }
         r.tag(tag::INTERRUPTS)?;
         self.interrupts.load_state(r)?;
         r.tag(tag::TIMER)?;

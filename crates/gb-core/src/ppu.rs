@@ -3,7 +3,8 @@
 //!
 //! # Contract (frozen; propose changes to the orchestrator)
 //!
-//! * [`Ppu::new`] creates the PPU in the DMG post-boot state.
+//! * [`Ppu::new`] creates the PPU in the DMG post-boot state ([`Ppu::new_cgb`]:
+//!   the CGB one).
 //! * [`Ppu::tick_mcycle`] advances 4 dots and requests VBlank / STAT interrupts.
 //! * [`Ppu::take_frame_ready`] returns true once per frame: when LY reaches 144
 //!   with the LCD on, and every 70224 dots while the LCD is off (so
@@ -56,6 +57,13 @@ const MODE3_BASE_DOTS: u16 = 172;
 const LCD_ON_LINE_DOT: u16 = 4;
 /// Dot of line 153 at the first cartridge instruction (see [`Ppu::new`]).
 const POST_BOOT_LINE_DOT: u16 = 356;
+/// CGB hand-off: line 144 (LY = 0x90, the only value on record, from whichboot.gb
+/// on a mainline CGB boot ROM), at an arbitrary dot (DECISIONS #34).
+const CGB_POST_BOOT_LINE: u8 = VBLANK_LINE;
+const CGB_POST_BOOT_LINE_DOT: u16 = 100;
+
+/// Bytes per VRAM bank.
+const VRAM_BANK_SIZE: usize = 0x2000;
 
 const LCDC_BG_ENABLE: u8 = 0x01;
 const LCDC_OBJ_ENABLE: u8 = 0x02;
@@ -73,7 +81,10 @@ const STAT_LYC_IRQ: u8 = 0x40;
 const STAT_WRITABLE: u8 = 0x78;
 
 pub struct Ppu {
-    vram: Box<[u8; 0x2000]>,
+    /// Both VRAM banks: bank 0 at `0..0x2000`, bank 1 at `0x2000..0x4000`. A DMG
+    /// only ever uses bank 0, so the renderer indexes `vram[..0x2000]` directly;
+    /// bank 1 is for CGB attributes and tiles (see [`Ppu::vram_bank`]).
+    vram: Box<[u8; 2 * VRAM_BANK_SIZE]>,
     oam: [u8; 0xA0],
     lcdc: u8,
     /// STAT bits 3..=6 (interrupt select). Mode / coincidence are derived.
@@ -120,6 +131,12 @@ pub struct Ppu {
     back: Box<Framebuffer>,
     front: Box<Framebuffer>,
     frame_ready: bool,
+    // ---- CGB additions (DECISIONS #31) ----
+    /// CGB hardware (bank 1 exists and is saved).
+    cgb: bool,
+    /// VBK (FF4F) bit 0: the VRAM bank the CPU and OAM DMA see. Always 0 on a DMG
+    /// and in DMG-compatibility mode.
+    vbk: u8,
 }
 
 impl Default for Ppu {
@@ -139,7 +156,7 @@ impl Ppu {
     /// middle of that range is used.
     pub fn new() -> Self {
         Self {
-            vram: Box::new([0; 0x2000]),
+            vram: Box::new([0; 2 * VRAM_BANK_SIZE]),
             oam: [0; 0xA0],
             lcdc: 0x91,
             stat_select: 0x00,
@@ -167,7 +184,45 @@ impl Ppu {
             back: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             frame_ready: false,
+            cgb: false,
+            vbk: 0,
         }
+    }
+
+    /// CGB post-boot state: the DMG one, but VBlank (line 144) instead of the
+    /// line-153 quirk window, and two VRAM banks.
+    pub(crate) fn new_cgb() -> Self {
+        Self {
+            ly: CGB_POST_BOOT_LINE,
+            line_dot: CGB_POST_BOOT_LINE_DOT,
+            // LYC (0) != 144, and the STAT select bits are clear.
+            lyc_flag: false,
+            cgb: true,
+            ..Self::new()
+        }
+    }
+
+    /// One whole VRAM bank (0 or 1), unaffected by VBK and by PPU mode. This is
+    /// how the renderer reads bank 1 (BG attributes, CGB tiles).
+    pub fn vram_bank(&self, bank: usize) -> &[u8; VRAM_BANK_SIZE] {
+        let start = (bank & 1) * VRAM_BANK_SIZE;
+        self.vram[start..start + VRAM_BANK_SIZE]
+            .try_into()
+            .expect("a bank is VRAM_BANK_SIZE bytes")
+    }
+
+    /// Offset of the CPU-selected bank in `vram`.
+    fn vram_base(&self) -> usize {
+        usize::from(self.vbk) * VRAM_BANK_SIZE
+    }
+
+    /// VBK (FF4F) as read: bit 0 is the bank, the rest read 1.
+    pub(crate) fn read_vbk(&self) -> u8 {
+        0xFE | self.vbk
+    }
+
+    pub(crate) fn write_vbk(&mut self, value: u8) {
+        self.vbk = value & 1;
     }
 
     fn lcd_on(&self) -> bool {
@@ -379,14 +434,15 @@ impl Ppu {
         if self.vram_read_blocked() {
             0xFF
         } else {
-            self.vram[(addr & 0x1FFF) as usize]
+            self.vram[self.vram_base() + (addr & 0x1FFF) as usize]
         }
     }
 
     /// CPU VRAM write: ignored while the PPU is drawing (mode 3).
     pub fn write_vram(&mut self, addr: u16, value: u8) {
         if !self.vram_write_blocked() {
-            self.vram[(addr & 0x1FFF) as usize] = value;
+            let base = self.vram_base();
+            self.vram[base + (addr & 0x1FFF) as usize] = value;
         }
     }
 
@@ -502,7 +558,7 @@ impl Ppu {
 impl Ppu {
     /// VRAM read for the OAM DMA engine, which is not gated by PPU mode (Pan Docs "OAM DMA Transfer").
     pub(crate) fn dma_read_vram(&self, addr: u16) -> u8 {
-        self.vram[(addr & 0x1FFF) as usize]
+        self.vram[self.vram_base() + (addr & 0x1FFF) as usize]
     }
 
     /// True while the CPU cannot read OAM (modes 2 and 3; Pan Docs "FEA0-FEFF range").
@@ -513,7 +569,7 @@ impl Ppu {
 
 impl Ppu {
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
-        w.bytes(&self.vram[..]);
+        w.bytes(&self.vram[..self.vram_len()]);
         w.bytes(&self.oam);
         for v in [
             self.lcdc,
@@ -545,10 +601,24 @@ impl Ppu {
         w.bytes(&self.back[..]);
         w.bytes(&self.front[..]);
         w.bool(self.frame_ready);
+        // CGB additions.
+        if self.cgb {
+            w.u8(self.vbk);
+        }
+    }
+
+    /// Bytes of `vram` in use: both banks on a CGB, bank 0 on a DMG.
+    fn vram_len(&self) -> usize {
+        if self.cgb {
+            2 * VRAM_BANK_SIZE
+        } else {
+            VRAM_BANK_SIZE
+        }
     }
 
     pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
-        r.bytes_into(&mut self.vram[..])?;
+        let len = self.vram_len();
+        r.bytes_into(&mut self.vram[..len])?;
         r.bytes_into(&mut self.oam)?;
         self.lcdc = r.u8()?;
         self.stat_select = r.u8()?;
@@ -599,6 +669,10 @@ impl Ppu {
             "framebuffer shade",
         )?;
         self.frame_ready = r.bool()?;
+        if self.cgb {
+            self.vbk = r.u8()?;
+            check(self.vbk <= 1, "VBK")?;
+        }
         Ok(())
     }
 }

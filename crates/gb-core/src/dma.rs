@@ -56,6 +56,11 @@ impl Dma {
         }
     }
 
+    /// CGB post-boot DMA register: 0x00 (Pan Docs "Power Up Sequence").
+    pub fn new_cgb() -> Self {
+        Self::default()
+    }
+
     pub fn read_reg(&self) -> u8 {
         self.reg
     }

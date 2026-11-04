@@ -1,4 +1,5 @@
-//! `gb-core`: a deterministic, platform-independent Game Boy (DMG) emulator core.
+//! `gb-core`: a deterministic, platform-independent Game Boy (DMG, and a growing
+//! CGB mode) emulator core.
 //!
 //! The core performs no I/O, reads no clocks and uses no randomness, so the same
 //! ROM + input sequence always produces the same frames, audio and serial output.
@@ -20,6 +21,7 @@ pub mod gameboy;
 pub mod interrupts;
 pub mod joypad;
 mod mmu;
+pub mod model;
 pub mod ppu;
 pub mod serial;
 pub mod state;
@@ -29,6 +31,7 @@ pub use cartridge::{Cartridge, CartridgeError, CartridgeHeader};
 pub use cpu::Registers;
 pub use gameboy::GameBoy;
 pub use joypad::Button;
+pub use model::Model;
 pub use state::StateError;
 
 /// LCD width in pixels.

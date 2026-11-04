@@ -70,6 +70,46 @@ impl Registers {
             pc: 0x0100,
         }
     }
+
+    /// CGB register state at hand-off in CGB mode (Pan Docs "Power Up
+    /// Sequence"; mooneye `misc/boot_regs-cgb` covers the compat variant).
+    pub const fn cgb_post_boot() -> Self {
+        Self {
+            a: 0x11,
+            f: 0x80,
+            b: 0x00,
+            c: 0x00,
+            d: 0xFF,
+            e: 0x56,
+            h: 0x00,
+            l: 0x0D,
+            sp: 0xFFFE,
+            pc: 0x0100,
+        }
+    }
+
+    /// CGB register state at hand-off in DMG-compatibility mode. `b` is the
+    /// title checksum the boot ROM leaves there (`model::compat_b`); HL depends
+    /// on it.
+    pub const fn cgb_compat_post_boot(b: u8) -> Self {
+        let hl = if b == 0x43 || b == 0x58 {
+            0x991A
+        } else {
+            0x007C
+        };
+        Self {
+            a: 0x11,
+            f: 0x80,
+            b,
+            c: 0x00,
+            d: 0x00,
+            e: 0x08,
+            h: (hl >> 8) as u8,
+            l: hl as u8,
+            sp: 0xFFFE,
+            pc: 0x0100,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,8 +137,13 @@ impl Default for Cpu {
 
 impl Cpu {
     pub fn new() -> Self {
+        Self::with_registers(Registers::dmg_post_boot())
+    }
+
+    /// A CPU at power-on with the given post-boot registers.
+    pub fn with_registers(regs: Registers) -> Self {
         Self {
-            regs: Registers::dmg_post_boot(),
+            regs,
             ime: false,
             ei_pending: false,
             halted: false,

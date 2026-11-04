@@ -56,9 +56,20 @@ impl Default for Serial {
 
 impl Serial {
     pub fn new() -> Self {
+        Self::with_sc(0x7E)
+    }
+
+    /// Post-boot serial port of a CGB in CGB mode: SC = 0x7F (Pan Docs "Power
+    /// Up Sequence"). In DMG-compatibility mode it is [`Serial::new`]'s 0x7E,
+    /// which mooneye `boot_hwio-C` pins.
+    pub fn new_cgb_mode() -> Self {
+        Self::with_sc(0x7F)
+    }
+
+    fn with_sc(sc: u8) -> Self {
         Self {
             sb: 0x00,
-            sc: 0x7E,
+            sc,
             bits_left: 0,
             tx: 0,
             output: Vec::new(),

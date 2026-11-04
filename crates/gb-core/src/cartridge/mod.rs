@@ -154,12 +154,19 @@ pub struct CartridgeHeader {
     /// Header checksum (0x014D) matches the computed one.
     pub header_checksum_ok: bool,
     /// Raw CGB flag byte (0x0143): 0x80 = CGB-enhanced, 0xC0 = CGB-only. On old
-    /// carts this byte may be a title character. Kept for future CGB support;
-    /// DMG ignores it.
+    /// carts this byte may be a title character. The DMG ignores it; see
+    /// [`CartridgeHeader::supports_cgb`].
     pub cgb_flag: u8,
 }
 
 impl CartridgeHeader {
+    /// True if the cartridge declares CGB support (flag 0x80 or 0xC0). The one
+    /// predicate behind [`crate::Model::from_header`] and the CGB boot ROM's
+    /// choice between CGB mode and DMG-compatibility mode.
+    pub fn supports_cgb(&self) -> bool {
+        matches!(self.cgb_flag, 0x80 | 0xC0)
+    }
+
     pub fn parse(rom: &[u8]) -> Result<Self, CartridgeError> {
         if rom.len() < 0x150 {
             return Err(CartridgeError::TooSmall(rom.len()));
