@@ -1,6 +1,7 @@
 //! No MBC ("MBC0"): 32 KiB ROM, optional 8 KiB RAM (types 0x00, 0x08, 0x09).
 
 use super::{Cartridge, CartridgeError, CartridgeHeader, ram_window_offset};
+use crate::state::{StateError, StateReader, StateWriter};
 
 pub struct RomOnly {
     rom: Vec<u8>,
@@ -61,5 +62,15 @@ impl Cartridge for RomOnly {
 
     fn battery_generation(&self) -> u64 {
         self.battery_gen
+    }
+
+    fn save_state(&self, w: &mut StateWriter) {
+        w.blob(&self.ram);
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.blob_into(&mut self.ram, "cart RAM size")?;
+        self.battery_gen += 1;
+        Ok(())
     }
 }

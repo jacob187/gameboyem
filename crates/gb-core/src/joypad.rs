@@ -1,6 +1,7 @@
 //! Joypad register P1/JOYP (Pan Docs: "Joypad Input").
 
 use crate::interrupts::{Interrupt, Interrupts};
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 /// A DMG button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -109,6 +110,26 @@ impl Joypad {
         if before & !self.low_nibble() != 0 {
             interrupts.request(Interrupt::Joypad);
         }
+    }
+}
+
+impl Joypad {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.select);
+        w.u8(self.dpad);
+        w.u8(self.action);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let j = Self {
+            select: r.u8()?,
+            dpad: r.u8()?,
+            action: r.u8()?,
+        };
+        check(j.select & !0x30 == 0, "joypad select")?;
+        check(j.dpad <= 0x0F && j.action <= 0x0F, "joypad buttons")?;
+        *self = j;
+        Ok(())
     }
 }
 

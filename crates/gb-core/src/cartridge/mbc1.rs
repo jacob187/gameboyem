@@ -15,6 +15,7 @@
 use super::{
     Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
 };
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 /// Offset of the Nintendo logo in a header.
 const LOGO: std::ops::Range<usize> = 0x104..0x134;
@@ -145,6 +146,26 @@ impl Cartridge for Mbc1 {
 
     fn battery_generation(&self) -> u64 {
         self.battery_gen
+    }
+
+    fn save_state(&self, w: &mut StateWriter) {
+        w.blob(&self.ram);
+        w.bool(self.ram_enabled);
+        w.u8(self.bank1);
+        w.u8(self.bank2);
+        w.bool(self.mode);
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.blob_into(&mut self.ram, "cart RAM size")?;
+        self.ram_enabled = r.bool()?;
+        self.bank1 = r.u8()?;
+        check((1..=0x1F).contains(&self.bank1), "MBC1 BANK1")?;
+        self.bank2 = r.u8()?;
+        check(self.bank2 <= 3, "MBC1 BANK2")?;
+        self.mode = r.bool()?;
+        self.battery_gen += 1;
+        Ok(())
     }
 }
 

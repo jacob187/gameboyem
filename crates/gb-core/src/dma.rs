@@ -14,6 +14,8 @@
 //! "During a cycle" means: the component tick runs first, then the CPU access
 //! (see `bus.rs`), so [`Dma::is_blocking`] describes the cycle whose tick just ran.
 
+use crate::state::{StateError, StateReader, StateWriter, check};
+
 /// Number of bytes in OAM.
 const OAM_LEN: u8 = 160;
 /// M-cycles between the register write and the first copy.
@@ -123,6 +125,58 @@ impl Dma {
         }
         self.busy = true;
         Some(copy)
+    }
+}
+
+impl Dma {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.reg);
+        w.bool(self.active.is_some());
+        if let Some(t) = self.active {
+            w.u16(t.source);
+            w.u8(t.index);
+        }
+        w.bool(self.pending.is_some());
+        if let Some(p) = self.pending {
+            w.u16(p.source);
+            w.u8(p.delay);
+        }
+        w.bool(self.busy);
+        w.bool(self.video_bus);
+        w.u8(self.data_byte);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let reg = r.u8()?;
+        let active = if r.bool()? {
+            let t = Transfer {
+                source: r.u16()?,
+                index: r.u8()?,
+            };
+            check(t.index < OAM_LEN, "dma index")?;
+            Some(t)
+        } else {
+            None
+        };
+        let pending = if r.bool()? {
+            let p = Pending {
+                source: r.u16()?,
+                delay: r.u8()?,
+            };
+            check((1..=START_DELAY).contains(&p.delay), "dma delay")?;
+            Some(p)
+        } else {
+            None
+        };
+        *self = Self {
+            reg,
+            active,
+            pending,
+            busy: r.bool()?,
+            video_bus: r.bool()?,
+            data_byte: r.u8()?,
+        };
+        Ok(())
     }
 }
 

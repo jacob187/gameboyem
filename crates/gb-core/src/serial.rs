@@ -28,6 +28,7 @@
 //! never captured, because it never finished.
 
 use crate::interrupts::{Interrupt, Interrupts};
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 /// Counter bit whose falling edge clocks the serial shifter (period 512 T).
 const CLOCK_BIT: u16 = 1 << 8;
@@ -118,6 +119,30 @@ impl Serial {
 
     pub fn take_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.output)
+    }
+}
+
+impl Serial {
+    /// Captured output is host-side and not part of the state.
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.sb);
+        w.u8(self.sc);
+        w.u8(self.bits_left);
+        w.u8(self.tx);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let sb = r.u8()?;
+        let sc = r.u8()?;
+        let bits_left = r.u8()?;
+        let tx = r.u8()?;
+        check(sc & 0x7E == 0x7E, "SC")?;
+        check(bits_left <= BITS_PER_BYTE, "serial bits")?;
+        self.sb = sb;
+        self.sc = sc;
+        self.bits_left = bits_left;
+        self.tx = tx;
+        Ok(())
     }
 }
 

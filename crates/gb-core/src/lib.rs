@@ -22,12 +22,14 @@ pub mod joypad;
 mod mmu;
 pub mod ppu;
 pub mod serial;
+pub mod state;
 pub mod timer;
 
 pub use cartridge::{Cartridge, CartridgeError, CartridgeHeader};
 pub use cpu::Registers;
 pub use gameboy::GameBoy;
 pub use joypad::Button;
+pub use state::StateError;
 
 /// LCD width in pixels.
 pub const SCREEN_WIDTH: usize = 160;
