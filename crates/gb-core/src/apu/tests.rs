@@ -672,6 +672,16 @@ fn post_boot_registers_read_back_like_the_phase1_stub() {
 }
 
 #[test]
+fn post_boot_period_registers_start_at_ff_for_all_three_channels() {
+    // Pan Docs "Power Up Sequence": NR13, NR23 and NR33 are $FF (write-only,
+    // so only the internal period shows) and NR14/NR24/NR34 carry 0x3F.
+    let apu = Apu::new();
+    assert_eq!(apu.ch1.freq, 0x7FF);
+    assert_eq!(apu.ch2.freq, 0x7FF);
+    assert_eq!(apu.ch3.freq, 0x7FF);
+}
+
+#[test]
 fn register_read_masks_hide_write_only_bits() {
     let mut apu = fresh();
     let write_only_bits = |i: usize| READ_MASK[i];
@@ -1055,4 +1065,224 @@ fn wave_retrigger_before_fetch_corrupts_wave_ram() {
     rig.run(7);
     rig.w(0xFF1E, 0x80);
     assert_eq!(rig.apu.ch3.ram[..4], [0x22, 0x11, 0x22, 0x33]);
+}
+
+/// Digital output of every channel with the DAC gating applied, summed per
+/// NR51 side and scaled by NR50, written out independently of `update_mix`
+/// (explicit per-bit tables instead of the shift loop).
+fn expected_mix(apu: &Apu) -> (i32, i32) {
+    if !apu.powered {
+        return (0, 0);
+    }
+    let outs = [
+        (apu.ch1.dac_on(), apu.ch1.output()),
+        (apu.ch2.dac_on(), apu.ch2.output()),
+        (apu.ch3.dac_on(), apu.ch3.output()),
+        (apu.ch4.dac_on(), apu.ch4.output()),
+    ];
+    // NR51: bits 7..4 = CH4..CH1 left, bits 3..0 = CH4..CH1 right.
+    let left_bit = [0x10u8, 0x20, 0x40, 0x80];
+    let right_bit = [0x01u8, 0x02, 0x04, 0x08];
+    let (mut l, mut r) = (0, 0);
+    for (c, &(dac, o)) in outs.iter().enumerate() {
+        let analog = if dac { 15 - 2 * i32::from(o) } else { 0 };
+        if apu.regs[0x15] & left_bit[c] != 0 {
+            l += analog;
+        }
+        if apu.regs[0x15] & right_bit[c] != 0 {
+            r += analog;
+        }
+    }
+    (
+        l * (i32::from(apu.regs[0x14] >> 4 & 7) + 1),
+        r * (i32::from(apu.regs[0x14] & 7) + 1),
+    )
+}
+
+#[test]
+fn mix_is_refreshed_at_a_sequencer_step_that_changes_a_channel() {
+    // Length expiry at step 0 silences CH2 with no register write and no
+    // channel-reported change: only the sequencer's `dirty` refreshes the mix.
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x77);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF16, 0x80 | 0x3F); // 50% duty (step 0 high), length counter 1
+    rig.w(0xFF18, 0x00);
+    rig.w(0xFF19, 0xC0); // trigger, length on, freq 0: no duty step for 2048 M-cycles
+    rig.run(1);
+    let playing = rig.apu.cur_l;
+    assert_eq!(rig.status() & 2, 2);
+    assert_ne!(playing, 15 * 8, "CH2 output must be non-zero here");
+    rig.run(SEQ_PERIOD - 2); // right before the step-0 DIV-APU event
+    assert_eq!(rig.apu.cur_l, playing);
+    rig.run(1); // sequencer step 0 clocks length: CH2 off
+    assert_eq!(rig.status() & 2, 0);
+    assert_eq!(rig.apu.cur_l, 15 * 8, "stale mix after the sequencer step");
+    assert_eq!((rig.apu.cur_l, rig.apu.cur_r), expected_mix(&rig.apu));
+}
+
+#[test]
+fn ch4_volume_decays_through_the_envelope_clock() {
+    let mut rig = Rig::new();
+    rig.w(0xFF21, 0x81); // volume 8, decrease, pace 1
+    rig.w(0xFF22, 0x00);
+    rig.w(0xFF23, 0x80);
+    rig.seq_ticks(7);
+    assert_eq!(rig.apu.ch4.env.volume, 8);
+    rig.seq_ticks(1); // step 7: first envelope clock
+    assert_eq!(rig.apu.ch4.env.volume, 7);
+}
+
+#[test]
+fn length_trigger_of_an_expired_counter_loses_one_before_a_length_step() {
+    // Next step odd (does not clock length): enabled counter reloads to max - 1.
+    let mut rig = Rig::new();
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF16, 0x3F); // counter 1
+    rig.w(0xFF19, 0xC0);
+    rig.seq_ticks(1); // step 0 expires it; next step is 1 (odd)
+    assert_eq!(rig.apu.ch2.length.counter, 0);
+    rig.w(0xFF19, 0xC0);
+    assert_eq!(rig.apu.ch2.length.counter, 63);
+
+    // Next step even: full reload.
+    let mut rig = Rig::new();
+    rig.w(0xFF17, 0xF0);
+    rig.w(0xFF16, 0x3F);
+    rig.w(0xFF19, 0xC0);
+    rig.seq_ticks(2); // step 1 clocks nothing; next step is 2 (even)
+    assert_eq!(rig.apu.ch2.length.counter, 0);
+    rig.w(0xFF19, 0xC0);
+    assert_eq!(rig.apu.ch2.length.counter, 64);
+}
+
+#[test]
+fn nr51_maps_each_bit_to_one_channel_and_side() {
+    // Only the DAC of `ch` is on, so a DAC-on silent channel contributes
+    // +15 (bipolar DAC) exactly when its own left/right bit is set.
+    let dac_on = |rig: &mut Rig, ch: usize| match ch {
+        0 => rig.w(0xFF12, 0x08),
+        1 => rig.w(0xFF17, 0x08),
+        2 => rig.w(0xFF1A, 0x80),
+        _ => rig.w(0xFF21, 0x08),
+    };
+    for ch in 0..4 {
+        for bit in 0..8 {
+            let mut rig = Rig::new();
+            rig.w(0xFF24, 0x25); // left volume 3, right volume 6
+            rig.w(0xFF25, 1 << bit);
+            dac_on(&mut rig, ch);
+            rig.run(1);
+            let mine = bit % 4 == ch;
+            let left = bit >= 4;
+            let want = (
+                if mine && left { 15 * 3 } else { 0 },
+                if mine && !left { 15 * 6 } else { 0 },
+            );
+            assert_eq!(
+                (rig.apu.cur_l, rig.apu.cur_r),
+                want,
+                "CH{} with NR51 bit {bit}",
+                ch + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn nr51_all_bits_set_sums_all_four_channels_per_side() {
+    let mut rig = Rig::new();
+    rig.w(0xFF24, 0x07);
+    rig.w(0xFF25, 0xFF);
+    rig.w(0xFF12, 0x08);
+    rig.w(0xFF17, 0x08);
+    rig.w(0xFF1A, 0x80);
+    rig.w(0xFF21, 0x08);
+    rig.run(1);
+    assert_eq!((rig.apu.cur_l, rig.apu.cur_r), (60, 480));
+}
+
+#[test]
+fn set_sample_rate_clamps_to_supported_range() {
+    let mut apu = Apu::new();
+    apu.set_sample_rate(1);
+    assert_eq!(apu.sample_rate(), 8_000);
+    assert_eq!(apu.hpf_factor, hpf_factor(8_000));
+    apu.set_sample_rate(10_000_000);
+    assert_eq!(apu.sample_rate(), 192_000);
+    assert_eq!(apu.hpf_factor, hpf_factor(192_000));
+}
+
+/// xorshift32, deterministic.
+struct Rng(u32);
+
+impl Rng {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0
+    }
+}
+
+#[test]
+fn cached_mix_matches_a_per_mcycle_recompute_under_random_writes() {
+    // `fast` is the real thing (mix cached behind `dirty`); `slow` is forced to
+    // recompute the mix every M-cycle. Random writes to every register (and
+    // wave RAM) drive all four channels through the mixer; the cached levels
+    // must equal both the reference and `expected_mix` on every M-cycle, and
+    // the emitted samples must be bit-identical.
+    let mut rng = Rng(0x1234_5678);
+    let mut fast = Rig::new();
+    let mut slow = Rig::new();
+    let mut status_seen = 0u8;
+    let mut levels = std::collections::BTreeSet::new();
+    let mut remaining = 0u32;
+    let mut div_resets = 0;
+    for _ in 0..250_000 {
+        if remaining == 0 {
+            remaining = rng.next() % 24;
+            let r = rng.next();
+            let (addr, mut v) = match (r >> 8) % 40 {
+                0 => (0xFF26, if r >> 20 & 7 == 0 { 0x00 } else { 0x80 }),
+                n @ 1..=30 => (0xFF10 + (n as u16 - 1) % 22, (r >> 16) as u8),
+                n => (0xFF30 + (n as u16 - 31), (r >> 16) as u8),
+            };
+            if r & 3 == 0 {
+                match addr {
+                    // Fast frequencies so squares, wave and noise toggle often.
+                    0xFF13 | 0xFF18 | 0xFF1D => v |= 0xF0,
+                    0xFF14 | 0xFF19 | 0xFF1E => v |= 0x87,
+                    0xFF22 => v &= 0x0F,
+                    _ => {}
+                }
+            }
+            if matches!(addr, 0xFF25 | 0xFF24) && r >> 24 & 3 != 0 {
+                v |= 0x77; // keep panning/volume mostly audible
+            }
+            fast.w(addr, v);
+            slow.w(addr, v);
+        } else {
+            remaining -= 1;
+        }
+        if rng.next() % 4096 == 0 {
+            fast.div = 0; // a DIV write: extra falling edge
+            slow.div = 0;
+            div_resets += 1;
+        }
+        slow.apu.dirty = true;
+        fast.run(1);
+        slow.run(1);
+        let got = (fast.apu.cur_l, fast.apu.cur_r);
+        assert_eq!(got, (slow.apu.cur_l, slow.apu.cur_r));
+        assert_eq!(got, expected_mix(&fast.apu));
+        status_seen |= fast.status();
+        levels.insert(got.0);
+    }
+    assert_eq!(drain(&mut fast.apu), drain(&mut slow.apu));
+    // The run must actually exercise the mixer with every channel.
+    assert_eq!(status_seen, 0x0F, "not every channel was active");
+    assert!(levels.len() > 40, "only {} distinct levels", levels.len());
+    assert!(div_resets > 10);
 }

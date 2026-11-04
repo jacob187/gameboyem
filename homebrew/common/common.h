@@ -8,11 +8,21 @@
  * built-in font (loaded by font_init()); game art starts at TILE_BASE. */
 #define TILE_BASE 128u
 
+/* Slot 0 of every game's tile set is the blank tile. */
+#define TILE_EMPTY (TILE_BASE + 0u)
+
 /* Standard DMG palette: 0 white, 1 light grey, 2 dark grey, 3 black. */
 #define PALETTE_DEFAULT 0xE4u
 
 /* Set up the font/console and the default palettes. Call once at boot. */
 void hb_init(void);
+
+/* Blank the whole 20x18 screen with TILE_EMPTY. Turns the display off (the
+ * caller turns it back on once the next screen is drawn). */
+void screen_clear(void);
+
+/* Wait ~0.75 s (45 frames) so a final frame, e.g. a collision, stays visible. */
+void hold_final_frame(void);
 
 /* Print a NUL-terminated string at tile position (x, y). */
 void print_at(uint8_t x, uint8_t y, const char *s);

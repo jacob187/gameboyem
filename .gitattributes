@@ -1,0 +1,7 @@
+# CI runs these under bash on Windows runners: keep LF so `#!/usr/bin/env bash`
+# and the make recipes are not broken by CRLF checkouts (core.autocrlf).
+*.sh text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+Makefile text eol=lf
+*.yml text eol=lf

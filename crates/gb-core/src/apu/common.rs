@@ -1,6 +1,15 @@
 //! Building blocks shared by the sound channels: length counter and volume
 //! envelope (Pan Docs: "Audio Details").
 
+/// A 3-bit period field (envelope pace, sweep pace) as a timer reload value:
+/// 0 counts as 8.
+pub(super) fn period_or_8(bits: u8) -> u8 {
+    match bits & 7 {
+        0 => 8,
+        p => p,
+    }
+}
+
 /// Length counter. Clocked at 256 Hz by the frame sequencer; when it reaches
 /// zero with length enabled, the owning channel is switched off.
 #[derive(Clone, Debug)]
@@ -96,10 +105,7 @@ impl Envelope {
     }
 
     fn pace_or_8(&self) -> u8 {
-        match self.nr2 & 7 {
-            0 => 8,
-            p => p,
-        }
+        period_or_8(self.nr2)
     }
 
     /// NRx2 write. While the channel is on (`channel_on`) the volume changes as

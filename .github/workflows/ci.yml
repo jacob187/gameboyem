@@ -58,14 +58,12 @@ jobs:
         run: ./scripts/fetch-homebrew-corpus.sh
 
       - name: Cache GBDK
-        if: hashFiles('homebrew/Makefile') != ''
         uses: actions/cache@v4
         with:
           path: tools/gbdk
           key: gbdk-${{ env.GBDK_VERSION }}-${{ matrix.gbdk }}
 
       - name: Build homebrew ROMs (GBDK-2020)
-        if: hashFiles('homebrew/Makefile') != ''
         run: |
           if [ ! -x tools/gbdk/bin/lcc ]; then
             mkdir -p tools
@@ -74,7 +72,7 @@ jobs:
           make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"
 
       - name: Upload homebrew ROMs (consumed by the Windows job)
-        if: matrix.name == 'linux-x86_64' && hashFiles('homebrew/Makefile') != ''
+        if: matrix.name == 'linux-x86_64'
         uses: actions/upload-artifact@v4
         with:
           name: homebrew-roms
@@ -108,6 +106,18 @@ jobs:
         run: |
           cargo build -p gb-core --target wasm32-unknown-unknown
           cargo clippy -p gb-core --target wasm32-unknown-unknown -- -D warnings
+
+  # gb-core and gb-test promise the workspace MSRV (gb-frontend needs newer:
+  # pixels 0.17 / wgpu 29 want 1.88, so it is not checked here).
+  msrv:
+    name: msrv-1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Check gb-core and gb-test on the MSRV
+        run: cargo check -p gb-core -p gb-test --all-targets
 
   # Phase 8. Non-blocking: a Windows failure never fails the workflow.
   # Homebrew ROMs come from the Linux leg (GBDK + make on Windows runners

@@ -147,6 +147,9 @@ impl Apu {
         // given without the trigger bit (reads are unaffected: bit 7 is masked
         // to 1) so no channel starts; CH1 is then marked active (NR52 = $F1)
         // with its envelope already decayed to silence by the boot sequence.
+        // NR13/NR23/NR33 are write-only (they read back $FF whatever is
+        // stored) but the table lists $FF for all three, so the internal
+        // period low byte of CH1-CH3 starts at $FF (Pan Docs: "Power Up Sequence").
         for (addr, v) in [
             (0xFF10, 0x80),
             (0xFF11, 0xBF),
@@ -154,10 +157,12 @@ impl Apu {
             (0xFF13, 0xFF),
             (0xFF14, 0x3F),
             (0xFF16, 0x3F),
+            (0xFF18, 0xFF),
             (0xFF19, 0x3F),
             (0xFF1A, 0x7F),
             (0xFF1B, 0xFF),
             (0xFF1C, 0x9F),
+            (0xFF1D, 0xFF),
             (0xFF1E, 0x3F),
             (0xFF20, 0xFF),
             (0xFF23, 0x3F),

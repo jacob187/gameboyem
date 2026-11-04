@@ -14,7 +14,6 @@
 
 /* ---- tiles ---------------------------------------------------------- */
 
-#define TILE_EMPTY  (TILE_BASE + 0u)
 #define TILE_BRICK0 (TILE_BASE + 1u) /* 3 brick styles: +0, +1, +2 */
 #define TILE_LIFE   (TILE_BASE + 4u)
 #define BKG_COUNT   5u
@@ -235,9 +234,7 @@ static uint8_t step_ball(void)
 
 static void draw_playfield(void)
 {
-    DISPLAY_OFF;
-    cls();
-    fill_bkg_rect(0, 0, 20, 18, TILE_EMPTY);
+    screen_clear();
     print_at(0, 0, "SCORE");
     print_at(12, 0, "LV");
     build_bricks();
@@ -313,18 +310,14 @@ static void play(void)
     HIDE_SPRITES;
     hiscore_update(&best, score);
     /* Hold the final frame briefly. */
-    for (keys = 0; keys < 45u; keys++) {
-        wait_vbl_done();
-    }
+    hold_final_frame();
 }
 
 static void title_screen(void)
 {
     uint8_t r;
 
-    DISPLAY_OFF;
-    cls();
-    fill_bkg_rect(0, 0, 20, 18, TILE_EMPTY);
+    screen_clear();
     print_at(6, 3, "BREAKOUT");
     for (r = 0; r < 3u; r++) {
         fill_bkg_rect(0, 6u + r, 20, 1, TILE_BRICK0 + r);
@@ -339,9 +332,7 @@ static void title_screen(void)
 
 static void game_over_screen(void)
 {
-    DISPLAY_OFF;
-    cls();
-    fill_bkg_rect(0, 0, 20, 18, TILE_EMPTY);
+    screen_clear();
     print_at(5, 4, "GAME OVER");
     print_at(4, 8, "SCORE");
     print_uint(10, 8, score, 5);

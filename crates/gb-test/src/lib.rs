@@ -193,42 +193,34 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
 }
 
 /// Run one case to completion (or its frame limit).
+///
+/// Kinds that script their own machines (play, save, sfx, blargg-mem with its
+/// reset protocol) take the ROM bytes; the rest run on one booted `GameBoy`.
 pub fn run_case(case: &Case) -> Outcome {
     let path = case.rom_path();
     let Ok(rom) = std::fs::read(&path) else {
         return Outcome::Missing;
     };
-    match case.kind {
-        Kind::PlaySnake => return run_play(&rom, PLAY_SNAKE, case.max_frames),
-        Kind::PlayBreakout => return run_play(&rom, PLAY_BREAKOUT, case.max_frames),
-        Kind::SaveSnake => return run_save(&rom, drive_snake, case.max_frames),
-        Kind::SaveBreakout => return run_save(&rom, drive_breakout, case.max_frames),
-        Kind::PlayTobu => return run_play(&rom, PLAY_TOBU, case.max_frames),
-        Kind::PlayAdjustris => return run_play(&rom, PLAY_ADJUSTRIS, case.max_frames),
-        Kind::PlayRenegade => return run_play(&rom, PLAY_RENEGADE, case.max_frames),
-        Kind::SfxSnake => return run_sfx(&rom, sfx_snake, case.max_frames),
-        Kind::SfxBreakout => return run_sfx(&rom, sfx_breakout, case.max_frames),
-        _ => {}
-    }
-    let mut gb = match GameBoy::new(rom) {
-        Ok(gb) => gb,
-        Err(e) => return Outcome::Fail(format!("load error: {e}")),
+    let frames = case.max_frames;
+    let on_machine = |run: &dyn Fn(&mut GameBoy) -> Outcome| match GameBoy::new(rom.clone()) {
+        Ok(mut gb) => run(&mut gb),
+        Err(e) => Outcome::Fail(format!("load error: {e}")),
     };
     match case.kind {
-        Kind::Blargg => run_blargg(&mut gb, case.max_frames),
-        Kind::BlarggMem => run_blargg_mem(&mut gb, case.max_frames),
-        Kind::Mooneye => run_mooneye(&mut gb, case.max_frames),
-        Kind::Acid2 => run_acid2(&mut gb, case),
-        Kind::Smoke => run_smoke(&mut gb, case.max_frames),
-        Kind::PlaySnake
-        | Kind::PlayBreakout
-        | Kind::PlayTobu
-        | Kind::PlayAdjustris
-        | Kind::PlayRenegade
-        | Kind::SaveSnake
-        | Kind::SaveBreakout
-        | Kind::SfxSnake
-        | Kind::SfxBreakout => unreachable!("handled above"),
+        Kind::Blargg => on_machine(&|gb| run_blargg(gb, frames)),
+        Kind::Mooneye => on_machine(&|gb| run_mooneye(gb, frames)),
+        Kind::Acid2 => on_machine(&|gb| run_acid2(gb, case)),
+        Kind::Smoke => on_machine(&|gb| run_smoke(gb, frames)),
+        Kind::BlarggMem => run_blargg_mem(&rom, frames),
+        Kind::PlaySnake => run_play(&rom, PLAY_SNAKE, frames),
+        Kind::PlayBreakout => run_play(&rom, PLAY_BREAKOUT, frames),
+        Kind::PlayTobu => run_play(&rom, PLAY_TOBU, frames),
+        Kind::PlayAdjustris => run_play(&rom, PLAY_ADJUSTRIS, frames),
+        Kind::PlayRenegade => run_play(&rom, PLAY_RENEGADE, frames),
+        Kind::SaveSnake => run_save(&rom, drive_snake, frames),
+        Kind::SaveBreakout => run_save(&rom, drive_breakout, frames),
+        Kind::SfxSnake => run_sfx(&rom, sfx_snake, frames),
+        Kind::SfxBreakout => run_sfx(&rom, sfx_breakout, frames),
     }
 }
 
@@ -279,15 +271,54 @@ fn run_blargg(gb: &mut GameBoy, max_frames: u32) -> Outcome {
     Outcome::Timeout(format!("serial: {:?}", serial_tail(gb)))
 }
 
+/// Cartridge RAM as the ROM left it, read around the MBC's RAM-enable gate.
+///
+/// `GameBoy::peek` goes through the gate and returns 0xFF once a ROM has
+/// disabled SRAM again, so a ROM that does so after writing its result would
+/// time out. `battery_ram()` hands back the raw contents (RAM bank 0 starts at
+/// offset 0 on every mapper, which is the bank Blargg's ROMs use). It only
+/// exists for battery-backed carts; for any other cart this falls back to the
+/// gated `peek`, which is a known limitation (gb-core has no ungated read).
+struct Sram(Option<Vec<u8>>);
+
+impl Sram {
+    fn of(gb: &GameBoy) -> Self {
+        Sram(gb.battery_ram())
+    }
+
+    fn read(&self, gb: &GameBoy, addr: u16) -> u8 {
+        match &self.0 {
+            Some(ram) => ram
+                .get(usize::from(addr.wrapping_sub(0xA000)))
+                .copied()
+                .unwrap_or(0xFF),
+            None => gb.peek(addr),
+        }
+    }
+}
+
 /// Blargg's memory protocol: `DE B0 61` at A001-A003 marks the block valid,
-/// A000 holds 0x80 while running and then the result code (0 = pass), and a
-/// NUL-terminated report starts at A004.
-fn run_blargg_mem(gb: &mut GameBoy, max_frames: u32) -> Outcome {
+/// A000 holds 0x80 while running and then the result code (0 = pass, 0x81 =
+/// "needs reset"), and a NUL-terminated report starts at A004.
+///
+/// On 0x81 the ROM wants a reset after >= 0.1 s with its SRAM kept (it is
+/// battery-backed on real carts): the machine is re-created from the ROM, the
+/// RAM carried over, and the run continues, at most `MAX_RESETS` times.
+fn run_blargg_mem(rom: &[u8], max_frames: u32) -> Outcome {
     const STATUS: u16 = 0xA000;
     const TEXT: u16 = 0xA004;
-    let report = |gb: &GameBoy| {
+    const RUNNING: u8 = 0x80;
+    const NEEDS_RESET: u8 = 0x81;
+    const MAX_RESETS: u32 = 5;
+    /// Frames to wait before resetting (>= 0.1 s).
+    const RESET_DELAY: u32 = 7;
+    /// Frames after a reset during which a leftover 0x81 is not a new request:
+    /// the ROM has not rewritten the status byte yet.
+    const BOOT_GRACE: u32 = 30;
+    let boot = || GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")));
+    let report = |gb: &GameBoy, sram: &Sram| {
         let text: Vec<u8> = (0..0x1000u16)
-            .map(|i| gb.peek(TEXT + i))
+            .map(|i| sram.read(gb, TEXT + i))
             .take_while(|&b| b != 0)
             .collect();
         let text = String::from_utf8_lossy(&text);
@@ -300,25 +331,62 @@ fn run_blargg_mem(gb: &mut GameBoy, max_frames: u32) -> Outcome {
         lines.drain(..lines.len().saturating_sub(6));
         lines.join(" | ")
     };
-    for _ in 0..max_frames {
+    let mut gb = match boot() {
+        Ok(gb) => gb,
+        Err(o) => return o,
+    };
+    let mut resets = 0;
+    let mut grace_until = 0;
+    for frame in 0..max_frames {
         gb.step_frame();
+        let sram = Sram::of(&gb);
         if gb.cpu_locked() {
-            return Outcome::Fail(format!("{}; report: {}", locked_message(gb), report(gb)));
+            return Outcome::Fail(format!(
+                "{}; report: {}",
+                locked_message(&gb),
+                report(&gb, &sram)
+            ));
         }
         let signed = [0xDE, 0xB0, 0x61]
             .iter()
             .enumerate()
-            .all(|(i, &b)| gb.peek(STATUS + 1 + i as u16) == b);
+            .all(|(i, &b)| sram.read(&gb, STATUS + 1 + i as u16) == b);
         if !signed {
             continue;
         }
-        match gb.peek(STATUS) {
-            0x80 => {}
+        match sram.read(&gb, STATUS) {
+            RUNNING => {}
+            NEEDS_RESET if frame < grace_until => {}
+            NEEDS_RESET => {
+                if resets == MAX_RESETS {
+                    return Outcome::Fail(format!("needs reset more than {MAX_RESETS} times"));
+                }
+                resets += 1;
+                for _ in 0..RESET_DELAY {
+                    gb.step_frame();
+                }
+                let saved = Sram::of(&gb).0;
+                gb = match boot() {
+                    Ok(gb) => gb,
+                    Err(o) => return o,
+                };
+                if let Some(ram) = saved {
+                    if let Err(e) = gb.load_battery_ram(&ram) {
+                        return Outcome::Fail(format!("carrying SRAM across reset: {e}"));
+                    }
+                }
+                grace_until = frame + BOOT_GRACE;
+            }
             0 => return Outcome::Pass,
-            code => return Outcome::Fail(format!("code {code:#04X}: {}", report(gb))),
+            code => return Outcome::Fail(format!("code {code:#04X}: {}", report(&gb, &sram))),
         }
     }
-    Outcome::Timeout(format!("status {:#04X}: {}", gb.peek(STATUS), report(gb)))
+    let sram = Sram::of(&gb);
+    Outcome::Timeout(format!(
+        "status {:#04X}: {}",
+        sram.read(&gb, STATUS),
+        report(&gb, &sram)
+    ))
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -687,7 +755,8 @@ fn play(
 /// * `Shot { moving: true }` must differ from the previous snapshot.
 /// * Every `Hold` must matter: a control run with that press left out (the
 ///   emulator is deterministic, so everything else is identical) must produce a
-///   different picture at the next `Shot`. Without this, a game that animates
+///   different picture at the next `Shot` (the control run stops there; the
+///   machine is not `Clone`, so each one replays from power-on). Without this, a game that animates
 ///   on its own would pass even with joypad input broken.
 fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
     let shots = match play(rom, script, None, max_frames) {
@@ -707,23 +776,24 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
                 shot_idx += 1;
             }
             Step::Hold(..) => {
-                let Some((next, label)) = script[i..]
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Shot { label, .. } => Some(*label),
-                        _ => None,
-                    })
-                    .enumerate()
-                    .map(|(k, l)| (shot_idx + k, l))
-                    .next()
+                // The control run only has to reach the next snapshot.
+                let Some((end, label)) =
+                    script
+                        .iter()
+                        .enumerate()
+                        .skip(i)
+                        .find_map(|(j, s)| match s {
+                            Step::Shot { label, .. } => Some((j, *label)),
+                            _ => None,
+                        })
                 else {
                     continue;
                 };
-                let control = match play(rom, script, Some(i), max_frames) {
+                let control = match play(rom, &script[..=end], Some(i), max_frames) {
                     Ok(s) => s,
                     Err(o) => return o,
                 };
-                if control[next] == shots[next] {
+                if control[shot_idx] == shots[shot_idx] {
                     return Outcome::Fail(format!(
                         "{label}: input had no effect (same picture without it)"
                     ));
@@ -1254,6 +1324,105 @@ mod tests {
         let cases = load_manifest();
         assert!(cases.len() > 50);
         assert!(cases.iter().any(|c| c.path.ends_with("03-op sp,hl.gb")));
+    }
+
+    /// A 32 KiB ROM with `code` at 0x150 (entry jumps there).
+    fn synth_rom(cart_type: u8, ram_code: u8, code: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x104].copy_from_slice(&[0x00, 0xC3, 0x50, 0x01]); // nop; jp $0150
+        rom[0x147] = cart_type;
+        rom[0x149] = ram_code;
+        rom[0x150..0x150 + code.len()].copy_from_slice(code);
+        rom
+    }
+
+    /// Shows one BG tile with a stripe and latches every D-pad press it sees
+    /// into BGP (the latch survives the release, so a snapshot taken after the
+    /// `Hold` still shows it). Buttons (A, B, ...) are never selected, so they
+    /// change nothing.
+    const JOYPAD_TO_PALETTE: &[u8] = &[
+        0xF3, // di
+        0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA, // wait for LY == 144
+        0xAF, 0xE0, 0x40, // LCD off
+        0x21, 0x00, 0x80, 0x01, 0x00, 0x20, // hl = $8000, bc = $2000
+        0xAF, 0x22, 0x0B, 0x78, 0xB1, 0x20, 0xF9, // clear VRAM
+        0x21, 0x00, 0x80, 0x36, 0xFF, // tile 0, first row = colour 1
+        0x3E, 0x91, 0xE0, 0x40, // LCD on, BG on
+        0x06, 0x00, // b = latch = 0
+        // loop:
+        0x3E, 0x20, 0xE0, 0x00, // select the D-pad
+        0xF0, 0x00, 0xE6, 0x0C, 0xEE, 0x0C, // a = pressed D-pad bits 3:2
+        0xB0, 0x47, // a |= b; b = a
+        0xF6, 0x03, 0xE0, 0x47, // BGP = a | 3
+        0x18, 0xEE, // jr loop
+    ];
+
+    fn play_script(button: Button) -> [Step; 5] {
+        [
+            Step::Run(20), // the boot code clears VRAM first (~1.2 frames)
+            Step::Shot {
+                label: "title",
+                moving: false,
+            },
+            Step::Hold(button, 3),
+            Step::Run(2),
+            Step::Shot {
+                label: "after the press",
+                moving: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn play_control_run_passes_when_input_changes_the_picture() {
+        let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
+        let out = run_play(&rom, &play_script(Button::Down), 100);
+        assert_eq!(out, Outcome::Pass, "{out}");
+    }
+
+    #[test]
+    fn play_control_run_fails_when_input_is_ignored() {
+        let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
+        let out = run_play(&rom, &play_script(Button::A), 100);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("input had no effect")),
+            "{out}"
+        );
+    }
+
+    /// Cart type MBC1+RAM+BATTERY, 8 KiB RAM. Enables SRAM, signs the block,
+    /// then: first run sets A010 and reports 0x81 (needs reset); the second
+    /// run (A010 survived the reset) reports 0 and disables SRAM again.
+    const BLARGG_RESET_THEN_PASS: &[u8] = &[
+        0x3E, 0x0A, 0xEA, 0x00, 0x00, // enable SRAM
+        0x3E, 0xDE, 0xEA, 0x01, 0xA0, //
+        0x3E, 0xB0, 0xEA, 0x02, 0xA0, //
+        0x3E, 0x61, 0xEA, 0x03, 0xA0, // signature
+        0xFA, 0x10, 0xA0, 0xB7, 0x20, 0x0C, // A010 != 0 -> second run
+        0x3E, 0x01, 0xEA, 0x10, 0xA0, // A010 = 1
+        0x3E, 0x81, 0xEA, 0x00, 0xA0, // status = needs reset
+        0x18, 0xFE, //
+        0xAF, 0xEA, 0x00, 0xA0, // status = 0 (pass)
+        0xEA, 0x00, 0x00, // disable SRAM
+        0x18, 0xFE,
+    ];
+
+    #[test]
+    fn blargg_mem_resets_on_0x81_and_reads_sram_ungated() {
+        let rom = synth_rom(0x03, 0x02, BLARGG_RESET_THEN_PASS);
+        assert_eq!(run_blargg_mem(&rom, 600), Outcome::Pass);
+    }
+
+    #[test]
+    fn blargg_mem_gives_up_after_too_many_resets() {
+        let mut code = BLARGG_RESET_THEN_PASS.to_vec();
+        code[23..26].fill(0x00); // NOP out `or a; jr nz`: every run reports "needs reset"
+        let rom = synth_rom(0x03, 0x02, &code);
+        let out = run_blargg_mem(&rom, 3000);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("needs reset")),
+            "{out}"
+        );
     }
 
     #[test]
