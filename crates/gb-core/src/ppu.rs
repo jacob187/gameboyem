@@ -455,7 +455,14 @@ impl Ppu {
             // (dots 0..4), the mode 2 -> 3 edge (excluded above) and the mode
             // 3 -> 0 edge, so with none of those crossed they cannot change.
             let mode3_end = OAM_SCAN_DOTS + self.mode3_len;
-            if dot >= 4 && !(dot < mode3_end && next >= mode3_end) {
+            // A CGB also re-evaluates when entering the line-144 STAT pulse
+            // window, the last M-cycle of line 143 (see `stat_line_level_for`).
+            let pulse_start = DOTS_PER_LINE - DOTS;
+            let enters_pulse = self.cgb && self.ly == VBLANK_LINE - 1 && dot < pulse_start;
+            if dot >= 4
+                && !(dot < mode3_end && next >= mode3_end)
+                && !(enters_pulse && next >= pulse_start)
+            {
                 debug_assert_eq!(self.lyc_flag, self.lyc == self.visible_ly());
                 debug_assert_eq!(self.stat_line, self.stat_line_level());
                 return;
@@ -545,7 +552,15 @@ impl Ppu {
     fn stat_line_level_for(&self, sel: u8) -> bool {
         let mode_line = self.lcd_on() && !(self.first_line && self.line_dot < OAM_SCAN_DOTS) && {
             let mode = self.mode();
-            let vblank_oam = self.ly == VBLANK_LINE && self.line_dot < 4;
+            // DMG: the M-cycle VBlank starts in. CGB: the one before it (mooneye
+            // `vblank_stat_intr-C`: the STAT interrupt precedes VBlank by a
+            // cycle), which is 4 dots at normal speed and 2 in double speed.
+            let vblank_oam = if self.cgb {
+                let m_cycle = if self.double_speed { 2 } else { 4 };
+                self.ly == VBLANK_LINE - 1 && self.line_dot >= DOTS_PER_LINE - m_cycle
+            } else {
+                self.ly == VBLANK_LINE && self.line_dot < 4
+            };
             (sel & STAT_HBLANK_IRQ != 0 && mode == 0)
                 || (sel & STAT_VBLANK_IRQ != 0 && mode == 1)
                 || (sel & STAT_OAM_IRQ != 0 && (mode == 2 || vblank_oam))

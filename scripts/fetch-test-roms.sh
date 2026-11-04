@@ -61,4 +61,34 @@ fetch "$ACID2_REF_URL" dmg-acid2/reference-dmg.png
 # cgb-acid2
 fetch "$CGB_ACID2_URL" cgb-acid2/cgb-acid2.gbc
 fetch "$CGB_ACID2_REF_URL" cgb-acid2/reference.png
+
+# --- CGB: speed switch, double speed, HDMA (phase P2) ---
+# Blargg cgb_sound (same retrio mirror commit as above; memory protocol like dmg_sound).
+# These go in their own directory: roms/test/blargg may be a symlink to another checkout.
+fetch "$B/cgb_sound/cgb_sound.gb" cgb_sound/cgb_sound.gb
+for f in 01-registers 02-len\ ctr 03-trigger 04-sweep 05-sweep\ details 06-overflow\ on\ trigger \
+         07-len\ sweep\ period\ sync 08-len\ ctr\ during\ power 09-wave\ read\ while\ on \
+         10-wave\ trigger\ while\ on 11-regs\ after\ power 12-wave; do
+  fetch "$B/cgb_sound/rom_singles/${f// /%20}.gb" "cgb_sound/rom_singles/$f.gb"
+done
+
+# SameSuite (LIJI32) DMA tests and the AGE speed-switch tests, taken from the c-sp/game-boy-test-roms
+# v7.0 release (prebuilt with RGBDS; both report with the Fibonacci register protocol, like mooneye).
+# The zip is verified against its sha256 before anything is extracted.
+GBTR_URL="https://github.com/c-sp/game-boy-test-roms/releases/download/v7.0/game-boy-test-roms-v7.0.zip"
+GBTR_SHA256="b9a9d7a1075aa35a3d07c07c34974048672d8520dca9e07a50178f5860c3832c"
+if [ ! -s same-suite/dma/hdma_mode0.gb ] || [ ! -s age-test-roms/speed-switch/spsw-div-cgbBCE.gb ]; then
+  tmp="$(mktemp -d)"
+  curl -fsSL --retry 3 -o "$tmp/gbtr.zip" "$GBTR_URL"
+  if command -v sha256sum >/dev/null 2>&1; then got="$(sha256sum "$tmp/gbtr.zip" | cut -d' ' -f1)"
+  else got="$(shasum -a 256 "$tmp/gbtr.zip" | cut -d' ' -f1)"; fi
+  if [ "$got" != "$GBTR_SHA256" ]; then
+    echo "game-boy-test-roms-v7.0.zip sha256 mismatch: $got" >&2; rm -rf "$tmp"; exit 1
+  fi
+  mkdir -p same-suite age-test-roms
+  unzip -q -o "$tmp/gbtr.zip" 'same-suite/dma/*.gb' 'age-test-roms/speed-switch/*.gb' -d "$tmp/x"
+  cp -R "$tmp/x/same-suite/dma" same-suite/
+  cp -R "$tmp/x/age-test-roms/speed-switch" age-test-roms/
+  rm -rf "$tmp"
+fi
 echo "test ROMs ready in $DEST"

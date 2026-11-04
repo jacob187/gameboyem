@@ -122,32 +122,43 @@ fn compat_mode_and_dmg_never_switch() {
 }
 
 #[test]
-fn speed_switch_pauses_for_2050_mcycles_with_div_frozen() {
+fn speed_switch_pauses_for_32768_mcycles_with_the_timer_running() {
     let mut b = cgb();
     for _ in 0..300 {
         b.tick();
     }
+    // A 4 kHz TIMA (256 M-cycles per step) counts 128 steps in the pause.
+    b.write(0xFF07, 0x04);
+    b.write(0xFF05, 0);
     b.write(KEY1, 1);
     let start = b.mcycles();
     assert!(b.stop());
-    assert_eq!(b.mcycles() - start, u64::from(SPEED_SWITCH_MCYCLES));
+    // The padding byte's cycle, then the pause.
+    assert_eq!(b.mcycles() - start, 1 + u64::from(SPEED_SWITCH_MCYCLES));
+    assert_eq!(b.timer.div_counter(), 0, "2^17 counter steps: DIV reads 0");
+    let tima = b.read(0xFF05);
+    assert!((0x80..=0x81).contains(&tima), "TIMA = 128 steps: {tima:#X}");
+    b.tick();
     assert_eq!(
         b.timer.div_counter(),
-        0,
-        "DIV reset and frozen in the pause"
+        8,
+        "and it counts on (the read above ticked once)"
     );
-    b.tick();
-    assert_eq!(b.timer.div_counter(), 4, "and it runs again afterwards");
 }
 
 #[test]
-fn a_pending_interrupt_skips_the_pause() {
+fn a_pending_interrupt_ends_the_pause() {
     let mut b = cgb();
     b.write(0xFFFF, 0x04);
     b.interrupts.write_if(0x04);
-    let took = switch(&mut b);
-    assert_eq!(took, 0);
+    assert_eq!(switch(&mut b), 1, "only the padding cycle");
     assert!(b.double_speed());
+    // One that arrives mid-pause ends it too.
+    b.interrupts.write_if(0);
+    b.write(0xFF07, 0x05); // 262 kHz: TIMA overflows after 1024 M-cycles
+    b.write(0xFF05, 0);
+    let took = switch(&mut b);
+    assert!((1000..=1100).contains(&took), "{took}");
 }
 
 #[test]
@@ -485,20 +496,25 @@ fn hdma_runs_one_block_per_hblank_in_double_speed_too() {
 }
 
 #[test]
-fn writing_bit7_clear_cancels_and_keeps_the_remaining_length() {
+fn writing_bit7_clear_cancels_and_loads_the_written_length() {
     let mut b = cgb_lcd_on();
     setup_dma(&mut b, 0xC000, 0x8000);
+    run_to_line(&mut b, 10);
     b.write(HDMA5, 0x85); // 6 blocks
-    run_to_line(&mut b, 3);
-    let remaining = b.read(HDMA5);
+    run_to_line(&mut b, 13);
+    let remaining = b.hdma.read5();
     assert!(remaining < 0x05 && remaining & 0x80 == 0);
-    b.write(HDMA5, 0x00);
+    b.write(HDMA5, 0x03);
     assert!(!b.hdma.hblank_active() && !b.slow);
-    assert_eq!(b.read(HDMA5), 0x80 | remaining, "bit 7 set, length kept");
+    // SameSuite hdma_lcd_off / hdma_mode0: cancelling with 0 reads back $80.
+    assert_eq!(b.read(HDMA5), 0x80 | 0x03);
     let copied = vram(&b, 0x20);
-    run_to_line(&mut b, 8);
-    assert_eq!(b.read(HDMA5), 0x80 | remaining, "nothing more copied");
+    run_to_line(&mut b, 20);
+    assert_eq!(b.read(HDMA5), 0x83, "nothing more copied");
     assert_eq!(vram(&b, 0x20), copied);
+    b.write(HDMA5, 0x80);
+    b.write(HDMA5, 0x00);
+    assert_eq!(b.read(HDMA5), 0x80);
 }
 
 #[test]

@@ -13,7 +13,8 @@
 //!   bit 7 = 1 starts an HBlank DMA (0x10 bytes per HBlank on lines 0-143).
 //!   Writing bit 7 = 0 while an HBlank DMA is active cancels it instead.
 //! * FF55 reads `remaining blocks - 1` in bits 0-6, with bit 7 clear while an
-//!   HBlank DMA is active and set otherwise, so `0xFF` means "complete".
+//!   HBlank DMA is active and set otherwise, so `0xFF` means "complete". A
+//!   cancelling write loads its own length bits (see [`Hdma::write5`]).
 //! * A block advances both address registers and the destination wraps inside
 //!   VRAM's 13 bits; a transfer whose destination wraps stops early
 //!   (Pan Docs: "if the destination overflows, the transfer stops early").
@@ -94,8 +95,12 @@ impl Hdma {
     /// CPU write to FF55. The caller does the copying.
     pub(crate) fn write5(&mut self, v: u8) -> Start {
         if v & 0x80 == 0 && self.hblank {
-            // Pan Docs: the remaining length stays readable (SameBoy overwrites
-            // it with the written value instead; DECISIONS #39).
+            // The cancelling write also loads the length bits: FF55 then reads
+            // `0x80 | (v & 0x7F)`, not the blocks that were left (SameBoy; the
+            // hardware-verified SameSuite `hdma_lcd_off` / `hdma_mode0` expect
+            // $80 after cancelling with 0; Pan Docs says the remaining length
+            // stays, DECISIONS #39).
+            self.blocks_left = (v & 0x7F) + 1;
             self.hblank = false;
             return Start::Cancelled;
         }

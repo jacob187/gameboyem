@@ -19,16 +19,21 @@
 //!
 //! # Speed switch
 //!
-//! STOP with KEY1.0 set (and no selected joypad line low) resets DIV (as every
-//! STOP does), flips the speed, clears KEY1.0 and then pauses the CPU for
-//! [`SPEED_SWITCH_MCYCLES`] M-cycles of the *new* speed (Pan Docs: 2050
-//! M-cycles). The pause is spent inside `stop()`, so the CPU never sees a state
-//! in the middle of it and there is no counter to save. DIV (and with it the
-//! timer, serial and the APU frame sequencer) is frozen during the pause, as
-//! Pan Docs says; the PPU, APU, OAM DMA and cartridge keep running. If an
-//! interrupt is already pending (IE & IF) the pause is skipped, after SameBoy
-//! (Pan Docs advises clearing IE before switching and leaves the interrupt
-//! behaviour open).
+//! STOP with KEY1.0 set (and no selected joypad line low) spends the padding
+//! byte's M-cycle, resets DIV, flips the speed, clears KEY1.0 and then pauses the
+//! CPU for [`SPEED_SWITCH_MCYCLES`] M-cycles (of the new speed), all inside
+//! `stop()`; the CPU then carries on after the STOP. The timer (DIV, TIMA), serial,
+//! the PPU, the APU, OAM DMA and the cartridge keep running through the pause,
+//! as on hardware (AGE `spsw-tima`: a 4 kHz TIMA counts 128 steps during it).
+//! 32768 M-cycles is 2^17 system-counter steps, so DIV reads 0 again right after
+//! the pause and counts on from there (AGE `spsw-div`, which no other length
+//! passes, as `boot_div` did for the post-boot counter). A pending interrupt ends
+//! the pause early, like a HALT (SameBoy). There is nothing to save: the pause
+//! never spans a `step_instruction` boundary.
+//!
+//! The pause is a lot longer than Pan Docs' "2050 M-cycles"; the hardware
+//! evidence above and SameBoy (0x20008 T-cycles) agree with each other
+//! (DECISIONS #38).
 //!
 //! # HDMA
 //!
@@ -57,10 +62,11 @@
 use crate::bus::Bus;
 use crate::hdma::{BLOCK_BYTES, Start};
 
-/// CPU M-cycles (of the new speed) a speed switch pauses the CPU for (Pan Docs).
-/// SameBoy waits 0x20008 T-cycles (32770 M-cycles) instead; the two disagree and
-/// nothing here pins either (DECISIONS #38).
-pub(crate) const SPEED_SWITCH_MCYCLES: u32 = 2050;
+/// CPU M-cycles (of the new speed) a speed switch pauses the CPU for, after the
+/// DIV reset: 2^17 system-counter steps. Pan Docs says 2050 M-cycles; the AGE
+/// `spsw-div` and `spsw-tima` ROMs (hardware-verified) and SameBoy's 0x20008
+/// T-cycles say this (DECISIONS #38).
+pub(crate) const SPEED_SWITCH_MCYCLES: u32 = 32768;
 
 impl Bus {
     /// Recompute [`Bus::slow`] after the speed or the HDMA state changed.
@@ -89,18 +95,15 @@ impl Bus {
         {
             self.hdma_burst(false);
         }
-        self.tick_core(false);
+        self.tick_core();
     }
 
-    /// One CPU M-cycle of the CGB clocking (see the module docs). `div_frozen`
-    /// holds the timer and serial still, for the speed-switch pause.
-    pub(crate) fn tick_core(&mut self, div_frozen: bool) {
+    /// One CPU M-cycle of the CGB clocking (see the module docs).
+    pub(crate) fn tick_core(&mut self) {
         self.mcycles += 1;
-        if !div_frozen {
-            self.timer.tick_mcycle(&mut self.interrupts);
-            self.serial
-                .tick_mcycle(&mut self.interrupts, self.timer.div_counter());
-        }
+        self.timer.tick_mcycle(&mut self.interrupts);
+        self.serial
+            .tick_mcycle(&mut self.interrupts, self.timer.div_counter());
         self.step_dma();
         if self.double_speed {
             self.ppu.tick_mcycle_double(&mut self.interrupts);
@@ -121,6 +124,9 @@ impl Bus {
 
     /// STOP with a speed switch armed (see the module docs).
     pub(crate) fn speed_switch(&mut self) {
+        // The padding byte after STOP: the CPU model skips it without a bus
+        // cycle, but on hardware the DIV reset lands after it (AGE `spsw-tima`).
+        self.tick_components();
         self.timer.reset_div(&mut self.interrupts);
         self.key1_prepare = false;
         self.double_speed = !self.double_speed;
@@ -132,10 +138,12 @@ impl Bus {
             counter
         });
         self.refresh_slow();
-        if self.interrupts.pending() == 0 {
-            for _ in 0..SPEED_SWITCH_MCYCLES {
-                self.tick_core(true);
+        // An interrupt that is (or becomes) pending ends the pause, like a HALT.
+        for _ in 0..SPEED_SWITCH_MCYCLES {
+            if self.interrupts.pending() != 0 {
+                break;
             }
+            self.tick_core();
         }
     }
 
@@ -157,7 +165,7 @@ impl Bus {
     /// One burst: the start-up M-cycle, then the whole length (`general`) or a
     /// single block. Ticks every component while the CPU waits.
     fn hdma_burst(&mut self, general: bool) {
-        self.tick_core(false);
+        self.tick_core();
         loop {
             let (src, dst) = self.hdma.next_block();
             self.hdma_copy_block(src, dst);
@@ -176,7 +184,7 @@ impl Bus {
             let byte = self.hdma_source_byte(src.wrapping_add(i));
             self.ppu.hdma_write_vram(dst + i, byte);
             if (i + 1) % per_tick == 0 {
-                self.tick_core(false);
+                self.tick_core();
             }
         }
     }

@@ -177,6 +177,41 @@ pass mooneye-cgb 600 test/mooneye/misc/boot_regs-cgb.gb
 pass mooneye-cgb 600 test/mooneye/misc/boot_hwio-C.gb
 pass mooneye-cgb 600 test/mooneye/misc/bits/unused_hwio-C.gb
 pass mooneye-cgb 600 test/mooneye/misc/boot_div-cgbABCDE.gb
-# Cause not diagnosed (likely CGB PPU timing: the colour PPU keeps the DMG line timing, and removing
-# the DMG STAT-write quirk for a CGB did not change the result).
-fail mooneye-cgb 600 test/mooneye/misc/ppu/vblank_stat_intr-C.gb
+# On a CGB the line-144 STAT mode-2 pulse comes one M-cycle before VBlank (DECISIONS #38).
+pass mooneye-cgb 600 test/mooneye/misc/ppu/vblank_stat_intr-C.gb
+
+# --- CGB speed switch, double speed and HDMA (P2; DECISIONS #38, #39) ---
+# SameSuite dma/ (LIJI32) and the AGE speed-switch tests, both CGB-flagged and reporting with the
+# Fibonacci register protocol. Fetched from the pinned c-sp/game-boy-test-roms v7.0 zip.
+pass mooneye-cgb 600 test/same-suite/dma/gbc_dma_cont.gb
+pass mooneye-cgb 600 test/same-suite/dma/gdma_addr_mask.gb
+pass mooneye-cgb 600 test/same-suite/dma/hdma_lcd_off.gb
+pass mooneye-cgb 600 test/same-suite/dma/hdma_mode0.gb
+# spsw-div and spsw-stop-prefetch pass: they pin the 32768 M-cycle pause and the DIV phase after it.
+# spsw-tima: the 4 kHz rows match, but TIMA is one step short right after the switch and the 262 / 65 /
+# 16 kHz "immediate increment by the STOP's DIV reset" edges are one M-cycle off (the 4 kHz timer and the
+# faster ones disagree on where the reset lands, so no single STOP offset fixes both). spsw-mode0 and
+# spsw-ch2-lc-delay need the LCD / APU phase across the switch, which is not modelled.
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-ch2-lc-delay-cgbBCE.gb
+pass mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-div-cgbBCE.gb
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-mode0-cgbBCE.gb
+pass mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-stop-prefetch-cgbBCE.gb
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-tima-cgbBC.gb
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-tima-cgbE.gb
+# Blargg cgb_sound (memory protocol), the CGB twin of dmg_sound. It does not exercise the speed
+# switch or HDMA; it only checks the APU on a CGB (ROMs 08-12 fail on CGB-specific APU behaviour the
+# DMG-calibrated APU does not model: length counters on power-off, wave RAM access and the wave
+# timer reset). 03-trigger passes but needs more than 600 frames.
+fail blargg-mem-cgb 3000 test/cgb_sound/cgb_sound.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/01-registers.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/02-len ctr.gb
+pass blargg-mem-cgb 3000 test/cgb_sound/rom_singles/03-trigger.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/04-sweep.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/05-sweep details.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/06-overflow on trigger.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/07-len sweep period sync.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/08-len ctr during power.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/09-wave read while on.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/10-wave trigger while on.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/11-regs after power.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/12-wave.gb
