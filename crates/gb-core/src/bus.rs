@@ -108,7 +108,11 @@ impl Bus {
             hram: [0; HRAM_SIZE],
             interrupts: Interrupts::new(),
             timer: if cgb { Timer::new_cgb() } else { Timer::new() },
-            ppu: if cgb { Ppu::new_cgb() } else { Ppu::new() },
+            ppu: if cgb {
+                Ppu::new_cgb(hw == Hw::Cgb)
+            } else {
+                Ppu::new()
+            },
             dma: if cgb { Dma::new_cgb() } else { Dma::new() },
             apu: Apu::new(),
             joypad: if cgb {

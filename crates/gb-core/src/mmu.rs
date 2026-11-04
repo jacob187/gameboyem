@@ -136,13 +136,20 @@ impl Bus {
     }
 
     /// Reads in the range a DMG leaves unmapped. In DMG-compatibility mode a CGB
-    /// maps only VBK (locked to bank 0), the palette index registers' unused
-    /// bit and FF72, FF73, FF75-FF77 (mooneye `unused_hwio-C`, `boot_hwio-C`); the
+    /// maps only VBK (locked to bank 0), the palette index registers BCPS / OCPS
+    /// and FF72, FF73, FF75-FF77 (mooneye `unused_hwio-C`, `boot_hwio-C`); the
     /// rest (KEY1, SVBK, FF74, HDMA, RP, ...) stays unmapped. CGB mode adds those.
     fn read_cgb_io(&self, addr: u16) -> u8 {
         match (self.hw, addr) {
             (Hw::Dmg, _) => 0xFF,
             (_, 0xFF4F) => self.ppu.read_vbk(),
+            // The index registers are plain in compat mode too; the data ports
+            // and OPRI are CGB mode only (mooneye `boot_hwio-C`, `unused_hwio-C`).
+            (_, 0xFF68) => self.ppu.read_bcps(),
+            (_, 0xFF6A) => self.ppu.read_ocps(),
+            (Hw::Cgb, 0xFF69) => self.ppu.read_pal_data(false),
+            (Hw::Cgb, 0xFF6B) => self.ppu.read_pal_data(true),
+            (Hw::Cgb, 0xFF6C) => self.ppu.read_opri(),
             (Hw::Cgb, 0xFF4D) => 0x7E | u8::from(self.key1_prepare),
             (Hw::Cgb, 0xFF70) => 0xF8 | self.svbk,
             (_, 0xFF72) => self.cgb_scratch[0],
@@ -177,6 +184,11 @@ impl Bus {
             // bit 0 of VBK.
             (Hw::CgbCompat, 0xFF4F) => {}
             (Hw::Cgb, 0xFF4F) => self.ppu.write_vbk(value),
+            (_, 0xFF68) => self.ppu.write_bcps(value),
+            (_, 0xFF6A) => self.ppu.write_ocps(value),
+            (Hw::Cgb, 0xFF69) => self.ppu.write_pal_data(false, value),
+            (Hw::Cgb, 0xFF6B) => self.ppu.write_pal_data(true, value),
+            (Hw::Cgb, 0xFF6C) => self.ppu.write_opri(value),
             (Hw::Cgb, 0xFF4D) => self.key1_prepare = value & 1 != 0,
             (Hw::Cgb, 0xFF70) => self.set_svbk(value),
             (_, 0xFF72) => self.cgb_scratch[0] = value,

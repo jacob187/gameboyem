@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use gb_core::{Button, GameBoy};
+use gb_core::{Button, GameBoy, Model};
 use gb_test::{in_ci, roms_dir};
 
 const BEFORE: u32 = 240;
@@ -19,7 +19,10 @@ const AFTER: u32 = 240;
 /// and line 140 falls inside the bottom status bars games draw with the window.
 const SAVE_OFFSETS: [u64; 2] = [(10 + 50) * 114, (10 + 140) * 114];
 
-fn roms() -> Vec<PathBuf> {
+/// A ROM and the console to run it on.
+type Case = (PathBuf, Model);
+
+fn roms() -> Vec<Case> {
     let root = roms_dir();
     let mut out: Vec<PathBuf> = ["corpus", "homebrew"]
         .iter()
@@ -40,7 +43,19 @@ fn roms() -> Vec<PathBuf> {
         .filter(|p| p.is_file()),
     );
     out.sort();
-    out
+    let mut cases: Vec<Case> = out.into_iter().map(|p| (p, Model::Dmg)).collect();
+    // CGB colour mode (cgb-acid2: RGB555 frames, palette RAM, attributes) and a
+    // flag-less ROM on a CGB (DMG-compatibility mode).
+    cases.extend(
+        [
+            ("test/cgb-acid2/cgb-acid2.gbc", Model::Cgb),
+            ("test/dmg-acid2/dmg-acid2.gb", Model::Cgb),
+        ]
+        .map(|(p, m)| (root.join(p), m))
+        .into_iter()
+        .filter(|(p, _)| p.is_file()),
+    );
+    cases
 }
 
 /// Deterministic input so menus advance and games react.
@@ -66,6 +81,11 @@ fn run(gb: &mut GameBoy, start: u32, frames: u32) -> (u64, u64, Vec<u8>) {
         apply_input(gb, f);
         gb.step_frame();
         video = fnv(video, gb.framebuffer());
+        if let Some(fb) = gb.cgb_framebuffer() {
+            for px in fb {
+                video = fnv(video, &px.to_le_bytes());
+            }
+        }
         samples.clear();
         gb.drain_audio_into(&mut samples);
         for s in &samples {
@@ -75,9 +95,9 @@ fn run(gb: &mut GameBoy, start: u32, frames: u32) -> (u64, u64, Vec<u8>) {
     (video, audio, gb.take_serial_output())
 }
 
-fn check(path: &PathBuf, offset: u64) -> Result<(), String> {
+fn check((path, model): &Case, offset: u64) -> Result<(), String> {
     let rom = std::fs::read(path).map_err(|e| e.to_string())?;
-    let mut a = GameBoy::new(rom.clone()).map_err(|e| format!("{e:?}"))?;
+    let mut a = GameBoy::with_model(rom.clone(), *model).map_err(|e| format!("{e:?}"))?;
     run(&mut a, 0, BEFORE);
     let target = a.mcycles() + offset;
     while a.mcycles() < target {
@@ -89,7 +109,7 @@ fn check(path: &PathBuf, offset: u64) -> Result<(), String> {
     let snap = a.save_state();
     let expected = run(&mut a, BEFORE, AFTER);
 
-    let mut b = GameBoy::new(rom).map_err(|e| format!("{e:?}"))?;
+    let mut b = GameBoy::with_model(rom, *model).map_err(|e| format!("{e:?}"))?;
     b.load_state(&snap).map_err(|e| e.to_string())?;
     if b.save_state() != snap {
         return Err("load then save is not byte-identical".into());
@@ -122,11 +142,11 @@ fn save_state_replays_identically() {
         let handles: Vec<_> = roms
             .iter()
             .flat_map(|p| SAVE_OFFSETS.map(|o| (p, o)))
-            .map(|(p, o)| {
+            .map(|(c, o)| {
                 s.spawn(move || {
-                    check(p, o)
+                    check(c, o)
                         .err()
-                        .map(|e| format!("{} (offset {o}): {e}", p.display()))
+                        .map(|e| format!("{} ({:?}, offset {o}): {e}", c.0.display(), c.1))
                 })
             })
             .collect();

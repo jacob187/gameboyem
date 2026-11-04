@@ -9,12 +9,12 @@ use super::{
 use crate::SCREEN_WIDTH;
 
 /// OAM sprite attribute bits (Pan Docs: "OAM" attributes/flags).
-const ATTR_BG_PRIORITY: u8 = 0x80;
-const ATTR_Y_FLIP: u8 = 0x40;
-const ATTR_X_FLIP: u8 = 0x20;
+pub(super) const ATTR_BG_PRIORITY: u8 = 0x80;
+pub(super) const ATTR_Y_FLIP: u8 = 0x40;
+pub(super) const ATTR_X_FLIP: u8 = 0x20;
 const ATTR_PALETTE: u8 = 0x10;
 
-const MAX_SPRITES_PER_LINE: usize = 10;
+pub(super) const MAX_SPRITES_PER_LINE: usize = 10;
 /// OAM X values from here on place a sprite fully off the right edge.
 const SPRITE_X_OFFSCREEN: u16 = 168;
 /// See [`Ppu::compute_mode3_len`].
@@ -31,7 +31,7 @@ struct SpriteRow {
 }
 
 /// Colour id (0..=3) of the pixel at `bit` of a tile row's bitplanes.
-fn color_id(lo: u8, hi: u8, bit: u8) -> u8 {
+pub(super) fn color_id(lo: u8, hi: u8, bit: u8) -> u8 {
     ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1)
 }
 
@@ -41,7 +41,7 @@ fn shade(palette: u8, id: u8) -> u8 {
 }
 
 impl Ppu {
-    fn sprite_height(&self) -> u8 {
+    pub(super) fn sprite_height(&self) -> u8 {
         if self.lcdc & LCDC_OBJ_TALL != 0 {
             16
         } else {
@@ -67,7 +67,9 @@ impl Ppu {
             }
         }
         // DMG priority: lower X wins, ties go to the lower OAM index. The
-        // stable sort keeps OAM order within equal X.
+        // stable sort keeps OAM order within equal X. It is also the fetch order
+        // `compute_mode3_len` needs, so CGB colour mode sorts too and picks its
+        // own drawing order (`OPRI`) in `render_line_cgb`.
         let oam = &self.oam;
         self.line_sprites[..count].sort_by_key(|&i| oam[usize::from(i) * 4 + 1]);
         self.line_sprite_count = count as u8;
@@ -75,7 +77,9 @@ impl Ppu {
 
     /// True if the window is drawn on the current line (Pan Docs: "Window").
     pub(super) fn window_on_line(&self) -> bool {
-        self.lcdc & LCDC_BG_ENABLE != 0
+        // On a CGB in colour mode LCDC.0 only strips the BG's priority; the
+        // window is still drawn.
+        (self.colour || self.lcdc & LCDC_BG_ENABLE != 0)
             && self.lcdc & LCDC_WIN_ENABLE != 0
             && self.wy_triggered
             && self.wx <= 166
@@ -134,6 +138,9 @@ impl Ppu {
 
     /// Draw the current line into the back buffer.
     pub(super) fn render_line(&mut self) {
+        if self.colour {
+            return self.render_line_cgb();
+        }
         let ly = self.ly;
         // With LCDC.0 clear the BG and window are colour 0, which BGP still
         // maps (SameBoy fills the line with BGP[1:0]); Pan Docs' "blank

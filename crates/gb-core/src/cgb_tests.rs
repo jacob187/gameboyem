@@ -311,9 +311,7 @@ fn compat_b_is_the_title_sum_for_licensee_01() {
 
 /// mooneye `misc/boot_hwio-C` data (rows of a mask byte, then 8 values):
 /// registers a CGB in DMG-compatibility mode shows at hand-off. Skipped
-/// (mask 0) are DIV, wave RAM, LCDC, STAT, LY, DMA and OBP0/1; the palette
-/// registers FF68-FF6B (BCPS/OCPS read 0xC8/0xD0 there) are not implemented yet,
-/// so that row's first four values are masked out here.
+/// (mask 0) are DIV, wave RAM, LCDC, STAT, LY, DMA and OBP0/1.
 const BOOT_HWIO_C: [[u8; 9]; 16] = [
     [0b1111_0111, 0xFF, 0x00, 0x7E, 0xFF, 0xFF, 0x00, 0x00, 0xF8],
     [0b1111_1111, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xE1],
@@ -328,7 +326,7 @@ const BOOT_HWIO_C: [[u8; 9]; 16] = [
     [0b1111_1111, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
     [0b1111_1111, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
     [0b1111_1111, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-    [0b0000_1111, 0xC8, 0xFF, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+    [0b1111_1111, 0xC8, 0xFF, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
     [0b1111_1111, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0x8F, 0x00, 0x00],
     [0b1111_1111, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
 ];
@@ -379,4 +377,42 @@ fn dmg_post_boot_state_is_untouched() {
     assert_eq!(gb.cpu_registers(), Registers::dmg_post_boot());
     assert_eq!(gb.peek(0xFF44), 0, "LY=153 quirk window reads 0");
     assert_eq!(gb.peek(0xFF41), 0x85);
+}
+
+#[test]
+fn cgb_mode_maps_the_palette_ports_and_opri() {
+    let mut b = cgb();
+    assert_eq!((b.read(0xFF68), b.read(0xFF6A)), (0xC8, 0xD0));
+    assert_eq!(b.read(0xFF6C), 0xFE);
+    // The LCD is in VBlank at hand-off, so the ports are open.
+    b.write(0xFF68, 0x80 | 2);
+    b.write(0xFF69, 0x34);
+    b.write(0xFF69, 0x12);
+    assert_eq!(b.read(0xFF68), 0xC4);
+    b.write(0xFF68, 2);
+    assert_eq!((b.read(0xFF69), b.read(0xFF68)), (0x34, 0x42));
+    b.write(0xFF6A, 0x80);
+    b.write(0xFF6B, 0xAA);
+    b.write(0xFF6A, 0);
+    assert_eq!(b.read(0xFF6B), 0xAA);
+    b.write(0xFF6C, 0xFF);
+    assert_eq!(b.read(0xFF6C), 0xFF);
+    // A colour-mode machine has RGB555 frames; the others do not.
+    assert!(b.ppu.cgb_framebuffer().is_some());
+    assert!(compat().ppu.cgb_framebuffer().is_none());
+    assert!(bus(Model::Dmg, 0x80).ppu.cgb_framebuffer().is_none());
+}
+
+#[test]
+fn compat_mode_has_plain_palette_index_registers_and_no_data_ports() {
+    let mut b = compat();
+    assert_eq!((b.read(0xFF68), b.read(0xFF6A)), (0xC8, 0xD0));
+    b.write(0xFF68, 0x00);
+    b.write(0xFF6A, 0x05);
+    assert_eq!((b.read(0xFF68), b.read(0xFF6A)), (0x40, 0x45));
+    // The data ports read 0xFF and drop writes, with no auto-increment.
+    b.write(0xFF68, 0x80);
+    b.write(0xFF69, 0x12);
+    assert_eq!((b.read(0xFF69), b.read(0xFF68)), (0xFF, 0xC0));
+    assert_eq!(b.read(0xFF6C), 0xFF);
 }
