@@ -1,0 +1,15 @@
+/target/
+**/target/
+/tools/
+/roms/
+*.sav
+.DS_Store
+homebrew/**/build/
+homebrew/**/*.o
+homebrew/**/*.lst
+homebrew/**/*.sym
+homebrew/**/*.map
+homebrew/**/*.noi
+homebrew/**/*.ihx
+homebrew/**/*.asm
+!homebrew/**/src/*.asm

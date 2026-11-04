@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/gb-core", "crates/gb-frontend", "crates/gb-test"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+gb-core = { path = "crates/gb-core" }
+
+# The emulator core is hot; keep it optimized even in debug/test builds so the
+# test-ROM harness runs at a useful speed.
+[profile.dev.package.gb-core]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
