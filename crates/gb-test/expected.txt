@@ -33,7 +33,7 @@ pass mooneye 600 test/mooneye/acceptance/bits/mem_oam.gb
 pass mooneye 600 test/mooneye/acceptance/bits/reg_f.gb
 pass mooneye 600 test/mooneye/acceptance/bits/unused_hwio-GS.gb
 pass mooneye 600 test/mooneye/acceptance/boot_div-dmgABCmgb.gb
-fail mooneye 600 test/mooneye/acceptance/boot_hwio-dmgABCmgb.gb
+pass mooneye 600 test/mooneye/acceptance/boot_hwio-dmgABCmgb.gb
 pass mooneye 600 test/mooneye/acceptance/boot_regs-dmgABC.gb
 pass mooneye 600 test/mooneye/acceptance/call_cc_timing.gb
 pass mooneye 600 test/mooneye/acceptance/call_cc_timing2.gb

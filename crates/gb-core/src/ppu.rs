@@ -53,6 +53,8 @@ const MODE3_BASE_DOTS: u16 = 172;
 /// own M-cycle has already been ticked, so the line begins one M-cycle in
 /// (mooneye `lcdon_timing-GS`: LY, STAT and VRAM/OAM access after LCD on).
 const LCD_ON_LINE_DOT: u16 = 4;
+/// Dot of line 153 at the first cartridge instruction (see [`Ppu::new`]).
+const POST_BOOT_LINE_DOT: u16 = 356;
 
 const LCDC_BG_ENABLE: u8 = 0x01;
 const LCDC_OBJ_ENABLE: u8 = 0x02;
@@ -130,6 +132,10 @@ impl Ppu {
     ///
     /// That STAT value is only reachable in the LY=153 quirk window (LY already
     /// reads 0 while the PPU is still in VBlank), so power-on starts there.
+    /// The dot within line 153 is pinned by mooneye `boot_hwio-dmgABCmgb`,
+    /// which reads STAT 1139 M-cycles after the first instruction and expects
+    /// HBlank (mode 0) and then LY = 10: dots 260..=452 all satisfy it, so the
+    /// middle of that range is used.
     pub fn new() -> Self {
         Self {
             vram: Box::new([0; 0x2000]),
@@ -145,7 +151,7 @@ impl Ppu {
             obp1: 0xFF,
             wy: 0,
             wx: 0,
-            line_dot: 8,
+            line_dot: POST_BOOT_LINE_DOT,
             off_dots: 0,
             mode3_len: MODE3_BASE_DOTS,
             first_line: false,
