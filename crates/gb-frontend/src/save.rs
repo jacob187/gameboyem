@@ -204,6 +204,9 @@ pub struct SaveManager {
     path: PathBuf,
     /// Battery RAM as of the last load/write; `None` until known.
     last: Option<Vec<u8>>,
+    /// The cartridge's battery generation as of the last load/write (or last
+    /// time the image was found current); `None` until known.
+    last_gen: Option<u64>,
     next_check: Instant,
     warn: WarnLimiter,
     /// Set when an existing file at `path` could not be read or backed up. Writing
@@ -216,6 +219,7 @@ impl SaveManager {
         Self {
             path: save_path(rom),
             last: None,
+            last_gen: None,
             next_check: now + SAVE_INTERVAL,
             warn: WarnLimiter::default(),
             write_blocked: false,
@@ -266,38 +270,60 @@ impl SaveManager {
         }
         // Whatever the cartridge holds now is the baseline; only changes get written.
         self.last = gb.battery_ram();
+        self.last_gen = Some(gb.battery_generation());
     }
 
-    /// Periodic check; writes if battery RAM changed since the last write.
+    /// Periodic check; writes if the cartridge reports a battery change.
     pub fn tick(&mut self, gb: &GameBoy, now: Instant) {
         if now >= self.next_check {
             self.next_check = now + SAVE_INTERVAL;
-            self.sync(gb.battery_ram(), now, false);
+            self.sync_gb(gb, now, false, false);
         }
     }
 
-    /// Write now if battery RAM changed (e.g. on pause). Failures are rate-limited.
+    /// Write now if the cartridge reports a battery change (e.g. on pause).
+    /// Failures are rate-limited.
     pub fn flush(&mut self, gb: &GameBoy) {
-        self.sync(gb.battery_ram(), Instant::now(), false);
+        self.sync_gb(gb, Instant::now(), false, false);
     }
 
     /// Last write before exiting: a failure is always reported, never throttled,
-    /// because it means data is being lost.
+    /// because it means data is being lost. Ignores the generation counter and
+    /// always looks at the RAM image, so a free-running RTC is saved on quit.
     pub fn flush_final(&mut self, gb: &GameBoy) {
-        self.sync(gb.battery_ram(), Instant::now(), true);
+        self.sync_gb(gb, Instant::now(), true, true);
     }
 
-    /// Does `ram` differ from what is on disk (or was loaded)? The one place that
-    /// decides "changed"; a core-provided generation counter could replace it.
+    /// Cheap pre-check on the cartridge's battery generation (no RAM clone, no
+    /// write while it is unchanged), then [`Self::sync`]. `force` skips the
+    /// pre-check.
+    fn sync_gb(&mut self, gb: &GameBoy, now: Instant, urgent: bool, force: bool) {
+        let generation = gb.battery_generation();
+        if !force && self.last_gen == Some(generation) {
+            return;
+        }
+        match self.sync_ram(gb.battery_ram(), now, urgent) {
+            // Nothing left to write for this generation. A failed write keeps the
+            // old one so the next tick retries.
+            Outcome::Current | Outcome::Blocked | Outcome::Wrote => {
+                self.last_gen = Some(generation);
+            }
+            Outcome::NoBattery | Outcome::Failed => {}
+        }
+    }
+
+    /// Does `ram` differ from what is on disk (or was loaded)? Second guard behind
+    /// the generation counter: a change that was undone writes nothing.
     fn needs_write(&self, ram: &[u8]) -> bool {
         self.last.as_deref() != Some(ram)
     }
 
-    /// Returns true if a file was written.
-    fn sync(&mut self, ram: Option<Vec<u8>>, now: Instant, urgent: bool) -> bool {
-        let Some(ram) = ram else { return false };
+    fn sync_ram(&mut self, ram: Option<Vec<u8>>, now: Instant, urgent: bool) -> Outcome {
+        let Some(ram) = ram else {
+            return Outcome::NoBattery;
+        };
         if !self.needs_write(&ram) {
-            return false;
+            return Outcome::Current;
         }
         if self.write_blocked {
             // Said once at load; on exit say what that means for this session.
@@ -307,7 +333,7 @@ impl SaveManager {
                     self.path.display()
                 );
             }
-            return false;
+            return Outcome::Blocked;
         }
         match write_atomic(&self.path, &ram) {
             Ok(()) => {
@@ -315,16 +341,35 @@ impl SaveManager {
                 if self.warn.success() {
                     eprintln!("save writing recovered: {}", self.path.display());
                 }
-                true
+                Outcome::Wrote
             }
             Err(e) => {
                 if let Some(w) = self.warn.failure(now, urgent) {
                     eprintln!("{}", failure_message(&self.path, &e, &w));
                 }
-                false
+                Outcome::Failed
             }
         }
     }
+
+    /// Returns true if a file was written.
+    #[cfg(test)]
+    fn sync(&mut self, ram: Option<Vec<u8>>, now: Instant, urgent: bool) -> bool {
+        self.sync_ram(ram, now, urgent) == Outcome::Wrote
+    }
+}
+
+/// What [`SaveManager::sync_ram`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The cartridge has no battery.
+    NoBattery,
+    /// The image equals what is on disk.
+    Current,
+    /// Changed, but writing is disabled (see `write_blocked`).
+    Blocked,
+    Wrote,
+    Failed,
 }
 
 #[cfg(test)]
@@ -632,6 +677,77 @@ mod tests {
         let mut ram = gb.battery_ram().unwrap();
         ram[0] = 1;
         assert!(m.sync(Some(ram), t0, false));
+    }
+
+    /// MBC3+TIMER+RAM+BATTERY, loaded through a manager (no `.sav` yet), then run
+    /// for `frames` so the free-running RTC makes the image differ from the load.
+    fn rtc_cart_after(dir: &Path, frames: u32) -> (GameBoy, SaveManager) {
+        let mut gb = cart(0x10, 0x02);
+        let mut m = SaveManager::new(&dir.join("g.gb"), Instant::now());
+        m.load(&mut gb);
+        let before = gb.battery_ram().unwrap();
+        for _ in 0..frames {
+            gb.step_frame();
+        }
+        assert_ne!(gb.battery_ram().unwrap(), before, "the live RTC moved");
+        (gb, m)
+    }
+
+    #[test]
+    fn unchanged_generation_skips_periodic_and_pause_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gb, mut m) = rtc_cart_after(dir.path(), 130); // > 1 s emulated
+        assert_eq!(Some(gb.battery_generation()), m.last_gen);
+
+        m.flush(&gb); // the pause flush
+        m.tick(&gb, Instant::now() + SAVE_INTERVAL * 2); // the periodic check
+        assert!(!m.path().exists(), "RTC ticks alone are not a save event");
+    }
+
+    #[test]
+    fn exit_flush_writes_the_live_rtc_even_if_generation_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gb, mut m) = rtc_cart_after(dir.path(), 130);
+        m.flush_final(&gb);
+        assert_eq!(fs::read(m.path()).unwrap(), gb.battery_ram().unwrap());
+    }
+
+    #[test]
+    fn changed_generation_writes_once_then_goes_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = cart(0x03, 0x02);
+        let mut m = SaveManager::new(&dir.path().join("g.gb"), Instant::now());
+        m.load(&mut gb);
+        let g0 = gb.battery_generation();
+
+        let mut ram = gb.battery_ram().unwrap();
+        ram[0] = 9;
+        gb.load_battery_ram(&ram).unwrap();
+        assert_ne!(gb.battery_generation(), g0);
+        m.flush(&gb);
+        assert_eq!(fs::read(m.path()).unwrap()[0], 9);
+        assert_eq!(Some(gb.battery_generation()), m.last_gen);
+
+        fs::remove_file(m.path()).unwrap();
+        m.flush(&gb);
+        assert!(!m.path().exists(), "same generation: not rewritten");
+    }
+
+    #[test]
+    fn failed_write_keeps_the_old_generation_so_it_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = cart(0x03, 0x02);
+        let mut m = SaveManager::new(&dir.path().join("missing").join("g.gb"), Instant::now());
+        m.load(&mut gb);
+        let mut ram = gb.battery_ram().unwrap();
+        ram[0] = 3;
+        gb.load_battery_ram(&ram).unwrap();
+
+        m.flush(&gb); // directory missing: fails
+        assert_ne!(m.last_gen, Some(gb.battery_generation()));
+        fs::create_dir(dir.path().join("missing")).unwrap();
+        m.flush(&gb);
+        assert_eq!(fs::read(m.path()).unwrap()[0], 3);
     }
 
     #[test]
