@@ -170,9 +170,9 @@ pass smoke 600 corpus/renegade-rush.gb
 # frozen; scripts/fetch-homebrew-corpus.sh, DECISIONS #39) ---
 pass smoke-cgb 600 corpus/tobutobugirl-dx.gb
 pass smoke-cgb 600 corpus/escape-obliterizer-dx.gb
-# Gets past the speed switch since P2 (#38) and draws 7 colours, but the picture does not change when idle
-# or after Start / A, so the smoke check calls it frozen (DECISIONS #39).
-fail smoke-cgb 600 corpus/rebound.gb
+# Three 240-frame splash screens (static for most of each) come before the animated title screen at ~frame 850,
+# so it gets 900 boot frames instead of 600 (DECISIONS #39).
+pass smoke-cgb 900 corpus/rebound.gb
 pass smoke-cgb 600 corpus/aevilia.gb
 pass smoke-cgb 600 corpus/ucity.gb
 pass smoke-cgb 600 corpus/geometrix.gb
