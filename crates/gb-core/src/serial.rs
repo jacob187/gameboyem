@@ -2,20 +2,30 @@
 //!
 //! No link partner is emulated: an internally clocked transfer shifts in 1 bits
 //! (line pulled high) and completes after 8 shifts. Every byte the game sends
-//! is captured; the test harness reads Blargg results from it.
+//! is captured when its transfer completes; the test harness reads Blargg
+//! results from it.
 //!
 //! The 8192 Hz serial clock is the system counter divided down (bit 8 of the
 //! 16-bit counter that also drives DIV), so a transfer's bit edges align with
 //! the counter's phase at *reset*, not with the moment SC is written (mooneye
-//! `boot_sclk_align`). The bus does not hand the timer's counter to this unit,
-//! so it keeps its own copy, started at the post-boot value and advanced every
-//! M-cycle. It therefore ignores DIV resets (a DIV write or STOP).
+//! `boot_sclk_align`). The bus hands this unit the timer's counter every
+//! M-cycle (`Timer::div_counter()`, ticked before serial), so DIV writes and
+//! STOP re-phase the serial clock exactly as they re-phase DIV.
 //!
-//! To make it exact, `Bus::tick_components` would pass the timer's counter
-//! (`timer.div_counter()`, ticked before serial) and the edge would be detected
-//! on `counter.wrapping_add(4)`: the mirror below runs 4 T-cycles ahead of the
-//! timer's counter, a calibration against `boot_sclk_align` with no hardware
-//! explanation yet. Passing the raw counter would be one M-cycle late.
+//! The falling edge is detected on `counter + 4`: the clock edge reaches the
+//! shifter one M-cycle before the raw counter shows it. This offset is a
+//! calibration against `boot_sclk_align` with no hardware explanation yet;
+//! passing the raw counter would be one M-cycle late.
+//!
+//! Edge detection is stateless (the counter advances by 4 per M-cycle, so the
+//! edge is the step `counter -> counter + 4`), which lets an idle port return
+//! immediately. A DIV reset in the middle of a transfer therefore never
+//! produces an extra shift; it only moves the following edges.
+//!
+//! Restarting (writing SC with start and internal clock) in the middle of a
+//! transfer reloads the 8-shift count; SB keeps its partially shifted contents,
+//! which become the byte the new transfer sends. The aborted transfer's byte is
+//! never captured, because it never finished.
 
 use crate::interrupts::{Interrupt, Interrupts};
 
@@ -23,11 +33,6 @@ use crate::interrupts::{Interrupt, Interrupts};
 const CLOCK_BIT: u16 = 1 << 8;
 /// Shifts per transferred byte.
 const BITS_PER_BYTE: u8 = 8;
-/// Phase of this unit's counter copy at power-on. The timer's own post-boot
-/// counter is 0xABC8; this one runs a further M-cycle ahead, which is what
-/// mooneye `boot_sclk_align` needs (IRQ one M-cycle before the 8th edge of the
-/// timer's counter). A calibration, not a derived hardware value.
-const POST_BOOT_COUNTER: u16 = 0xABCC;
 /// Cap captured output so a ROM spamming the port can't grow memory unboundedly.
 const MAX_CAPTURE: usize = 64 * 1024;
 
@@ -35,10 +40,10 @@ const MAX_CAPTURE: usize = 64 * 1024;
 pub struct Serial {
     sb: u8,
     sc: u8,
-    /// Copy of the system counter (see the module docs).
-    counter: u16,
     /// Shifts still to do; 0 when no transfer is running.
     bits_left: u8,
+    /// The byte the running transfer is sending (SB at the moment it started).
+    tx: u8,
     output: Vec<u8>,
 }
 
@@ -53,8 +58,8 @@ impl Serial {
         Self {
             sb: 0x00,
             sc: 0x7E,
-            counter: POST_BOOT_COUNTER,
             bits_left: 0,
+            tx: 0,
             output: Vec::new(),
         }
     }
@@ -72,9 +77,7 @@ impl Serial {
             _ => {
                 self.sc = value | 0x7E;
                 if value & 0x81 == 0x81 {
-                    if self.output.len() < MAX_CAPTURE {
-                        self.output.push(self.sb);
-                    }
+                    self.tx = self.sb;
                     self.bits_left = BITS_PER_BYTE;
                 } else {
                     self.bits_left = 0;
@@ -83,17 +86,28 @@ impl Serial {
         }
     }
 
-    pub fn tick_mcycle(&mut self, interrupts: &mut Interrupts) {
-        let before = self.counter;
-        self.counter = self.counter.wrapping_add(4);
-        let falling_edge = before & CLOCK_BIT != 0 && self.counter & CLOCK_BIT == 0;
-        if self.bits_left > 0 && falling_edge {
-            self.sb = self.sb << 1 | 1;
-            self.bits_left -= 1;
-            if self.bits_left == 0 {
-                self.sc &= 0x7F;
-                interrupts.request(Interrupt::Serial);
+    /// Advance one M-cycle. `counter` is the system counter after this
+    /// M-cycle's timer tick (see the module docs).
+    #[inline]
+    pub fn tick_mcycle(&mut self, interrupts: &mut Interrupts, counter: u16) {
+        if self.bits_left == 0 {
+            return;
+        }
+        let falling_edge = counter & CLOCK_BIT != 0 && counter.wrapping_add(4) & CLOCK_BIT == 0;
+        if falling_edge {
+            self.shift(interrupts);
+        }
+    }
+
+    fn shift(&mut self, interrupts: &mut Interrupts) {
+        self.sb = self.sb << 1 | 1;
+        self.bits_left -= 1;
+        if self.bits_left == 0 {
+            self.sc &= 0x7F;
+            if self.output.len() < MAX_CAPTURE {
+                self.output.push(self.tx);
             }
+            interrupts.request(Interrupt::Serial);
         }
     }
 
@@ -111,26 +125,68 @@ impl Serial {
 mod tests {
     use super::*;
 
+    /// A stand-in for the timer: the system counter, post-boot, advancing 4
+    /// per M-cycle and ticked before the serial port, as in `Bus`.
+    struct Rig {
+        s: Serial,
+        i: Interrupts,
+        counter: u16,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let mut i = Interrupts::new();
+            i.write_if(0);
+            Self {
+                s: Serial::new(),
+                i,
+                counter: 0xABC8,
+            }
+        }
+
+        fn tick(&mut self) {
+            self.counter = self.counter.wrapping_add(4);
+            self.s.tick_mcycle(&mut self.i, self.counter);
+        }
+
+        fn ticks(&mut self, n: u32) {
+            for _ in 0..n {
+                self.tick();
+            }
+        }
+
+        fn start(&mut self, byte: u8) {
+            self.s.write(0xFF01, byte);
+            self.s.write(0xFF02, 0x81);
+        }
+
+        fn irq(&self) -> bool {
+            self.i.read_if() & 0x08 != 0
+        }
+
+        /// M-cycles until the serial interrupt.
+        fn run_to_interrupt(&mut self) -> u32 {
+            let mut n = 0;
+            while !self.irq() {
+                self.tick();
+                n += 1;
+                assert!(n <= 2 * 1024, "transfer never completed");
+            }
+            n
+        }
+    }
+
     /// M-cycles from the start of a transfer until the interrupt, ticking from
     /// `ticks_before` M-cycles after power-on.
     fn mcycles_to_interrupt(ticks_before: u32) -> u32 {
-        let mut s = Serial::new();
-        let mut i = Interrupts::new();
-        i.write_if(0);
-        for _ in 0..ticks_before {
-            s.tick_mcycle(&mut i);
-        }
-        s.write(0xFF01, b'P');
-        s.write(0xFF02, 0x81);
-        assert_eq!(s.output(), b"P");
-        let mut n = 0;
-        while i.read_if() & 0x08 == 0 {
-            s.tick_mcycle(&mut i);
-            n += 1;
-            assert!(n <= 2 * 1024, "transfer never completed");
-        }
-        assert_eq!(s.read(0xFF02) & 0x80, 0);
-        assert_eq!(s.read(0xFF01), 0xFF);
+        let mut r = Rig::new();
+        r.ticks(ticks_before);
+        r.start(b'P');
+        assert!(r.s.output().is_empty(), "captured only on completion");
+        let n = r.run_to_interrupt();
+        assert_eq!(r.s.output(), b"P");
+        assert_eq!(r.s.read(0xFF02) & 0x80, 0);
+        assert_eq!(r.s.read(0xFF01), 0xFF);
         n
     }
 
@@ -153,14 +209,74 @@ mod tests {
     }
 
     #[test]
-    fn external_clock_never_completes() {
-        let mut s = Serial::new();
-        let mut i = Interrupts::new();
-        i.write_if(0);
-        s.write(0xFF02, 0x80);
-        for _ in 0..4096 {
-            s.tick_mcycle(&mut i);
+    fn delay_after_a_div_reset_does_not_depend_on_the_earlier_phase() {
+        // A DIV write (or STOP) zeroes the system counter, which re-phases the
+        // serial clock. Whatever the phase was before the reset, a transfer
+        // started a fixed time after it takes the same time.
+        let after_reset = |ticks_before_reset: u32, ticks_after_reset: u32| {
+            let mut r = Rig::new();
+            r.ticks(ticks_before_reset);
+            r.counter = 0;
+            r.ticks(ticks_after_reset);
+            r.start(0x42);
+            r.run_to_interrupt()
+        };
+        let reference = after_reset(0, 5);
+        for before in [1, 2, 3, 7, 31, 64, 127, 128, 129, 200, 255, 256, 511, 1000] {
+            assert_eq!(after_reset(before, 5), reference, "reset after {before}");
         }
-        assert_eq!(i.read_if() & 0x08, 0);
+        // And it is the counter's phase, not the start, that sets the delay.
+        assert_eq!(after_reset(9, 6), reference - 1);
+    }
+
+    #[test]
+    fn external_clock_never_completes() {
+        let mut r = Rig::new();
+        r.s.write(0xFF02, 0x80);
+        r.ticks(4096);
+        assert!(!r.irq());
+        assert!(r.s.output().is_empty());
+    }
+
+    #[test]
+    fn restart_mid_transfer_reloads_the_count_and_sends_the_partial_byte() {
+        let mut r = Rig::new();
+        r.start(b'P'); // 0x50
+        // Run until exactly 3 bits have shifted.
+        while r.s.bits_left > BITS_PER_BYTE - 3 {
+            r.tick();
+        }
+        assert_eq!(r.s.read(0xFF01), 0x87);
+        r.s.write(0xFF02, 0x81);
+        assert!(
+            r.s.output().is_empty(),
+            "the aborted byte is never captured"
+        );
+        assert_eq!(r.s.read(0xFF02) & 0x80, 0x80);
+        // A full 8 shifts are needed again, and the byte sent is what SB held.
+        assert_eq!(r.s.bits_left, BITS_PER_BYTE);
+        let mut shifts = 0;
+        let mut left = r.s.bits_left;
+        while !r.irq() {
+            r.tick();
+            if r.s.bits_left != left {
+                shifts += 1;
+                left = r.s.bits_left;
+            }
+        }
+        assert_eq!(shifts, 8);
+        assert_eq!(r.s.output(), [0x87]);
+        assert_eq!(r.s.read(0xFF01), 0xFF);
+    }
+
+    #[test]
+    fn clearing_start_mid_transfer_aborts_without_capture() {
+        let mut r = Rig::new();
+        r.start(b'P');
+        r.ticks(300);
+        r.s.write(0xFF02, 0x01);
+        r.ticks(2048);
+        assert!(!r.irq());
+        assert!(r.s.output().is_empty());
     }
 }
