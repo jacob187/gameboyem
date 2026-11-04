@@ -558,7 +558,7 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
     for (i, step) in script.iter().enumerate() {
         match *step {
             Step::Shot { label, moving } => {
-                if moving && shots[shot_idx] == shots[shot_idx - 1] {
+                if moving && shot_idx > 0 && shots[shot_idx] == shots[shot_idx - 1] {
                     return Outcome::Fail(format!("{label}: framebuffer did not change"));
                 }
                 shot_idx += 1;
