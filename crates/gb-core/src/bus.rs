@@ -15,7 +15,7 @@
 //!   free (no cycle) and are how the CPU observes and services IE/IF.
 
 use crate::apu::Apu;
-use crate::cartridge::Cartridge;
+use crate::cartridge::{Cartridge, MbcKind};
 use crate::dma::Dma;
 use crate::interrupts::Interrupts;
 use crate::joypad::Joypad;
@@ -62,10 +62,14 @@ pub struct Bus {
     pub(crate) serial: Serial,
     /// Total M-cycles elapsed since power-on.
     pub(crate) mcycles: u64,
+    /// Whether the cartridge needs a per-M-cycle tick (only an MBC3 RTC does).
+    cart_ticks: bool,
 }
 
 impl Bus {
     pub fn new(cart: Box<dyn Cartridge>) -> Self {
+        let header = cart.header();
+        let cart_ticks = header.mbc == MbcKind::Mbc3 && header.has_rtc;
         Self {
             cart,
             wram: Box::new([0; WRAM_SIZE]),
@@ -78,6 +82,7 @@ impl Bus {
             joypad: Joypad::new(),
             serial: Serial::new(),
             mcycles: 0,
+            cart_ticks,
         }
     }
 
@@ -98,7 +103,9 @@ impl Bus {
         self.step_dma();
         self.ppu.tick_mcycle(&mut self.interrupts);
         self.apu.tick_mcycle(self.timer.div_counter());
-        self.cart.tick_mcycle();
+        if self.cart_ticks {
+            self.cart.tick_mcycle();
+        }
     }
 
     /// Copy one OAM DMA byte if a transfer is active (Pan Docs: "OAM DMA Transfer").
