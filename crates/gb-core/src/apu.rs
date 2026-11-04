@@ -356,8 +356,18 @@ impl Apu {
         }
     }
 
-    /// Advance one M-cycle. `div_counter` is the timer's 16-bit system counter
-    /// (the frame sequencer is clocked by its bit 12 falling edge).
+    /// Re-latch the frame sequencer's input bit after a CPU speed switch, so the
+    /// change of which counter bit drives it cannot look like a falling edge.
+    /// `div_counter` is the value [`Apu::tick_mcycle`] gets next.
+    pub(crate) fn sync_sequencer(&mut self, div_counter: u16) {
+        self.last_div_bit = div_counter & SEQUENCER_DIV_BIT != 0;
+    }
+
+    /// Advance one M-cycle of real time. `div_counter` is the timer's 16-bit
+    /// system counter (the frame sequencer is clocked by its bit 12 falling edge).
+    /// In CPU double speed the bus calls this every other CPU M-cycle with the
+    /// counter shifted right once, so the sequencer sees counter bit 13 and
+    /// everything else keeps its real-time rate (DECISIONS #38).
     pub fn tick_mcycle(&mut self, div_counter: u16) {
         // The edge is tracked while powered off too, so powering on never sees
         // a spurious step. DIV writes / STOP clear the counter, which produces

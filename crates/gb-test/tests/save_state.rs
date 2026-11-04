@@ -103,18 +103,25 @@ fn check((path, model): &Case, offset: u64) -> Result<(), String> {
     while a.mcycles() < target {
         a.step_instruction();
     }
+    replay(a, rom, *model, BEFORE)
+}
+
+/// Save `a` here, replay `AFTER` frames from it and from a fresh machine that
+/// loaded the state, and compare everything. `frame` is the frame counter to
+/// continue the scripted input from.
+fn replay(mut a: GameBoy, rom: Vec<u8>, model: Model, frame: u32) -> Result<(), String> {
     // Host buffers aren't part of a state; start both runs with them empty.
     a.audio_samples();
     a.take_serial_output();
     let snap = a.save_state();
-    let expected = run(&mut a, BEFORE, AFTER);
+    let expected = run(&mut a, frame, AFTER);
 
-    let mut b = GameBoy::with_model(rom, *model).map_err(|e| format!("{e:?}"))?;
+    let mut b = GameBoy::with_model(rom, model).map_err(|e| format!("{e:?}"))?;
     b.load_state(&snap).map_err(|e| e.to_string())?;
     if b.save_state() != snap {
         return Err("load then save is not byte-identical".into());
     }
-    let actual = run(&mut b, BEFORE, AFTER);
+    let actual = run(&mut b, frame, AFTER);
     if actual.0 != expected.0 {
         return Err("video diverged after load".into());
     }
@@ -157,4 +164,49 @@ fn save_state_replays_identically() {
     });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     eprintln!("{} ROMs replayed identically", roms.len());
+}
+
+/// A CGB-flagged ROM that switches to double speed, then starts an HBlank DMA of
+/// 128 blocks from ROM into VRAM, then spins.
+fn hdma_double_speed_rom() -> Vec<u8> {
+    let mut rom = vec![0u8; 0x8000];
+    rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]); // JP 0150
+    rom[0x143] = 0xC0;
+    #[rustfmt::skip]
+    let code = [
+        0xF3,             // DI
+        0x3E, 0x01, 0xE0, 0x4D, // LD A,1 ; LDH (KEY1),A
+        0x10, 0x00,       // STOP: switch to double speed
+        0x3E, 0x01, 0xE0, 0x51, // HDMA1: source 0x0100
+        0x3E, 0x00, 0xE0, 0x52, // HDMA2
+        0x3E, 0x80, 0xE0, 0x53, // HDMA3: destination 0x8000
+        0x3E, 0x00, 0xE0, 0x54, // HDMA4
+        0x3E, 0xFF, 0xE0, 0x55, // HDMA5: HBlank mode, 128 blocks
+        0x04,             // loop: INC B
+        0x18, 0xFD,       // JR loop
+    ];
+    rom[0x150..0x150 + code.len()].copy_from_slice(&code);
+    rom
+}
+
+#[test]
+fn save_state_replays_identically_mid_hdma_in_double_speed() {
+    let rom = hdma_double_speed_rom();
+    let mut gb = GameBoy::with_model(rom.clone(), Model::Cgb).expect("synthetic ROM loads");
+    // FF4D bit 7 = current speed; FF55 bit 7 clear = an HBlank DMA is running.
+    let mut guard = 0;
+    while gb.peek(0xFF55) & 0x80 != 0 {
+        gb.step_instruction();
+        guard += 1;
+        assert!(guard < 1_000_000, "the HDMA never started");
+    }
+    // Let it copy a few blocks, then save in the middle of it.
+    let target = gb.mcycles() + 20 * 228;
+    while gb.mcycles() < target {
+        gb.step_instruction();
+    }
+    assert_eq!(gb.peek(0xFF4D) & 0x80, 0x80, "in double speed");
+    assert_eq!(gb.peek(0xFF55) & 0x80, 0, "HDMA still running");
+    assert!(gb.double_speed());
+    replay(gb, rom, Model::Cgb, 0).expect("replay");
 }

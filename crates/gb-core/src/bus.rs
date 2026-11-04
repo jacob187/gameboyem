@@ -17,6 +17,7 @@
 use crate::apu::Apu;
 use crate::cartridge::{Cartridge, MbcKind};
 use crate::dma::Dma;
+use crate::hdma::Hdma;
 use crate::interrupts::Interrupts;
 use crate::joypad::Joypad;
 use crate::model::{Hw, Model, compat_b};
@@ -38,8 +39,19 @@ pub trait CpuBus {
     fn pending_interrupts(&self) -> u8;
     /// Clear the given IF bit(s), without spending a cycle.
     fn acknowledge_interrupt(&mut self, mask: u8);
-    /// Called when the CPU executes `STOP` (DMG: resets DIV). No cycle cost.
-    fn stop(&mut self) {}
+    /// Called when the CPU executes `STOP` (DMG: resets DIV). No cycle cost,
+    /// except that a CGB speed switch spends its whole pause inside this call.
+    /// Returns true if STOP performed a speed switch, in which case the CPU
+    /// carries on instead of entering STOP.
+    fn stop(&mut self) -> bool {
+        false
+    }
+    /// Spend one M-cycle while the CPU is halted or stopped (or locked up). The
+    /// default is an ordinary [`CpuBus::tick`]; the real bus uses it to tell an
+    /// idle CPU from a busy one, because HBlank DMA only runs for a busy CPU.
+    fn idle_tick(&mut self) {
+        self.tick();
+    }
     /// True while any *selected* P1 input line is low (button held). This is
     /// the STOP wake-up condition and is independent of IE. No cycle cost.
     fn joypad_line_low(&self) -> bool {
@@ -73,7 +85,7 @@ pub struct Bus {
     /// Total M-cycles elapsed since power-on.
     pub(crate) mcycles: u64,
     /// Whether the cartridge needs a per-M-cycle tick (only an MBC3 RTC does).
-    cart_ticks: bool,
+    pub(crate) cart_ticks: bool,
     // ---- CGB additions (DECISIONS #31, #33); VBK lives in the PPU ----
     /// The machine variant; only the IO paths in `mmu.rs` look at it.
     pub(crate) hw: Hw,
@@ -82,9 +94,18 @@ pub struct Bus {
     /// Offset in `wram` of the D000-DFFF window; precomputed from `svbk` so
     /// WRAM accesses don't branch on the model.
     pub(crate) wram_hi: usize,
-    /// KEY1 (FF4D) bit 0: a speed switch is armed for the next STOP. The speed
-    /// itself (bit 7) is not implemented yet and always reads 0.
+    /// KEY1 (FF4D) bit 0: a speed switch is armed for the next STOP.
     pub(crate) key1_prepare: bool,
+    /// KEY1 bit 7: the CPU runs at double speed (`Hw::Cgb` only; see
+    /// `bus_cgb.rs`). Timer, serial and OAM DMA follow the CPU; the PPU, APU and
+    /// cartridge clock keep their real-time rate.
+    pub(crate) double_speed: bool,
+    /// HDMA1-HDMA5 (FF51-FF55), `Hw::Cgb` only.
+    pub(crate) hdma: Hdma,
+    /// Derived (never saved): `double_speed || hdma.hblank_active()`. When false
+    /// `tick_components` takes its plain path, the only one a DMG or a machine in
+    /// compatibility mode ever runs. Set again by [`Bus::refresh_slow`].
+    pub(crate) slow: bool,
     /// The undocumented read/write registers FF72-FF75 (CGB hardware only).
     pub(crate) cgb_scratch: CgbScratch,
 }
@@ -170,6 +191,9 @@ impl Bus {
             svbk: 0,
             wram_hi: WRAM_BANK1,
             key1_prepare: false,
+            double_speed: false,
+            hdma: Hdma::new(),
+            slow: false,
             cgb_scratch: CgbScratch::default(),
         }
     }
@@ -209,7 +233,11 @@ impl Bus {
     /// The order is load-bearing: timer, serial, DMA, PPU, APU, cartridge,
     /// then the CPU's access (in `CpuBus` read/write). The mooneye timer and
     /// OAM DMA tests and `bus_tests.rs` pin it down, so don't reorder casually.
+    #[inline]
     pub(crate) fn tick_components(&mut self) {
+        if self.slow {
+            return self.tick_slow(false);
+        }
         self.mcycles += 1;
         self.timer.tick_mcycle(&mut self.interrupts);
         self.serial
@@ -223,7 +251,7 @@ impl Bus {
     }
 
     /// Copy one OAM DMA byte if a transfer is active (Pan Docs: "OAM DMA Transfer").
-    fn step_dma(&mut self) {
+    pub(crate) fn step_dma(&mut self) {
         if let Some((src, index)) = self.dma.tick_mcycle() {
             let byte = self.read_dma_source(src);
             self.dma.latch_data(byte);
@@ -255,11 +283,21 @@ impl CpuBus for Bus {
         self.interrupts.acknowledge(mask);
     }
 
-    fn stop(&mut self) {
-        // TODO(CGB speed switch): when `hw == Hw::Cgb && key1_prepare`, STOP
-        // toggles double speed instead of just resetting DIV (KEY1 bit 7, a
-        // ~2050 M-cycle pause, the clock ratio of every component).
+    fn stop(&mut self) -> bool {
+        if self.hw == Hw::Cgb && self.key1_prepare && !self.joypad.any_selected_low() {
+            self.speed_switch();
+            return true;
+        }
         self.timer.reset_div(&mut self.interrupts);
+        false
+    }
+
+    fn idle_tick(&mut self) {
+        if self.slow {
+            self.tick_slow(true);
+        } else {
+            self.tick_components();
+        }
     }
 
     fn joypad_line_low(&self) -> bool {
@@ -282,6 +320,10 @@ impl Bus {
             w.u8(self.svbk);
             w.bool(self.key1_prepare);
             self.cgb_scratch.save_state(w);
+        }
+        if self.hw == Hw::Cgb {
+            w.bool(self.double_speed);
+            self.hdma.save_state(w);
         }
         w.u8(tag::INTERRUPTS);
         self.interrupts.save_state(w);
@@ -316,6 +358,10 @@ impl Bus {
             self.key1_prepare = r.bool()?;
             self.cgb_scratch = CgbScratch::load_state(r, self.hw == Hw::Cgb)?;
         }
+        if self.hw == Hw::Cgb {
+            self.double_speed = r.bool()?;
+            self.hdma = Hdma::load_state(r)?;
+        }
         r.tag(tag::INTERRUPTS)?;
         self.interrupts.load_state(r)?;
         r.tag(tag::TIMER)?;
@@ -331,6 +377,10 @@ impl Bus {
         r.tag(tag::SERIAL)?;
         self.serial.load_state(r)?;
         r.tag(tag::CART)?;
-        self.cart.load_state(r)
+        self.cart.load_state(r)?;
+        // Derived from what was just loaded (neither is part of a state).
+        self.ppu.set_double_speed(self.double_speed);
+        self.refresh_slow();
+        Ok(())
     }
 }
