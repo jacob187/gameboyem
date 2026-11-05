@@ -28,7 +28,9 @@
 //! 32768 M-cycles is 2^17 system-counter steps, so DIV reads 0 again right after
 //! the pause and counts on from there (AGE `spsw-div`, which no other length
 //! passes, as `boot_div` did for the post-boot counter). A pending interrupt ends
-//! the pause early, like a HALT (SameBoy). There is nothing to save: the pause
+//! the pause early, like a HALT (SameBoy: any enabled and pending interrupt, IME
+//! or not, and one already pending at the STOP skips the pause). No HDMA block runs
+//! during the pause (a STOP / HALT, below). There is nothing to save: the pause
 //! never spans a `step_instruction` boundary.
 //!
 //! The pause is a lot longer than Pan Docs' "2050 M-cycles"; the hardware
@@ -86,7 +88,6 @@ impl Bus {
 
     /// The slow path of [`Bus::tick_components`]: double speed and / or an HBlank
     /// DMA is running. `idle` is true for a halted or stopped CPU.
-    #[cold]
     #[inline(never)]
     pub(crate) fn tick_slow(&mut self, idle: bool) {
         if !idle
@@ -140,6 +141,11 @@ impl Bus {
             }
             self.tick_core();
         }
+        // The pause is a STOP / HALT as far as HDMA goes: `tick_core` skips the
+        // block hook, so no block ran in it, and an HBlank signal raised on a
+        // line inside it is stale. Keep it only if the PPU is in HBlank now.
+        let signalled = self.ppu.take_hblank_entered() && self.ppu.in_hdma_window();
+        self.ppu.set_hblank_entered(signalled);
     }
 
     /// CPU write to FF55.

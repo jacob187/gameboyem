@@ -553,6 +553,44 @@ fn a_halted_cpu_does_not_run_hdma_but_the_block_follows_on_waking_in_hblank() {
 }
 
 #[test]
+fn the_speed_switch_pause_runs_no_hdma_block_and_drops_a_stale_signal() {
+    let (mut inside, mut outside) = (0, 0);
+    // Start the STOP at every few M-cycles of a line, so the pause (about 144
+    // lines) ends all over the line, in and out of HBlank.
+    for k in (0..114).step_by(3) {
+        let mut b = cgb_lcd_on();
+        setup_dma(&mut b, 0xC000, 0x8000);
+        run_to_line(&mut b, 20);
+        b.write(HDMA5, 0x8F); // 16 blocks, more than the pause could drain
+        for _ in 0..k {
+            b.idle_tick();
+        }
+        let before = b.hdma.read5();
+        b.write(KEY1, 1);
+        assert!(b.stop());
+        let after = b.hdma.read5();
+        // At most the padding cycle's busy tick (before the pause) ran a block.
+        assert!(before - after <= 1, "k={k}: blocks ran in the pause");
+        let in_hblank = b.ppu.in_hdma_window();
+        let signalled = b.ppu.take_hblank_entered();
+        assert!(
+            !signalled || in_hblank,
+            "k={k}: a signal from an earlier line survived the pause"
+        );
+        b.ppu.set_hblank_entered(signalled);
+        b.tick();
+        let fired = after - b.hdma.read5();
+        assert_eq!(fired, u8::from(in_hblank), "k={k}");
+        if in_hblank {
+            inside += 1;
+        } else {
+            outside += 1;
+        }
+    }
+    assert!(inside > 0 && outside > 0, "{inside} in, {outside} out");
+}
+
+#[test]
 fn lcd_off_runs_one_block_on_start_and_then_none() {
     let mut b = cgb();
     setup_dma(&mut b, 0xC000, 0x8000);
