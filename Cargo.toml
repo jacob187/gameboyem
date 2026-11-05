@@ -11,6 +11,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 emu-common = { path = "crates/emu-common" }
 gb-core = { path = "crates/gb-core" }
+gba-core = { path = "crates/gba-core" }
 winit = "0.30.13"
 pixels = "0.17.2"
 cpal = "0.18.2"
