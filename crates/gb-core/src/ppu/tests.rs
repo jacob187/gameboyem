@@ -1811,3 +1811,84 @@ fn colour_ppu_state_round_trips_and_is_range_checked() {
             .is_err()
     );
 }
+
+// ---------------------------------------------------- CGB double speed
+
+impl Rig {
+    /// One CPU M-cycle in double speed: 2 dots.
+    fn tick_double(&mut self) {
+        self.ppu.tick_mcycle_double(&mut self.ints);
+    }
+}
+
+/// The (STAT, VBlank) flags raised by each of the next `n` M-cycles.
+fn flags_per_tick(rig: &mut Rig, double: bool, n: usize) -> Vec<(bool, bool)> {
+    rig.clear_if();
+    (0..n)
+        .map(|_| {
+            if double {
+                rig.tick_double();
+            } else {
+                rig.tick();
+            }
+            let flags = std::mem::take(&mut rig.ints.flags);
+            (flags & STAT_BIT != 0, flags & VBLANK_BIT != 0)
+        })
+        .collect()
+}
+
+#[test]
+fn cgb_line_143_stat_pulse_leads_vblank_by_one_cpu_cycle_at_each_speed() {
+    // With only the OAM select set, a CGB raises STAT on the last CPU M-cycle
+    // of line 143 (mooneye vblank_stat_intr-C) and VBlank follows on the next.
+    // That M-cycle is the last 4 dots at normal speed, the last 2 in double
+    // speed.
+    let mut rig = Rig::cgb();
+    rig.write(0xFF41, STAT_OAM_IRQ);
+    rig.run_to(143, 448);
+    let seen = flags_per_tick(&mut rig, false, 2); // dots 452, then line 144
+    assert_eq!(seen, [(true, false), (false, true)], "normal speed");
+    assert_eq!((rig.ppu.ly, rig.ppu.line_dot), (144, 0));
+
+    let mut rig = Rig::cgb();
+    rig.write(0xFF41, STAT_OAM_IRQ);
+    rig.run_to(143, 448);
+    rig.ppu.set_double_speed(true);
+    // Dots 450, 452, 454, then line 144: not before the last 2 dots.
+    let seen = flags_per_tick(&mut rig, true, 4);
+    assert_eq!(
+        seen,
+        [(false, false), (false, false), (true, false), (false, true)],
+        "double speed"
+    );
+    assert_eq!((rig.ppu.ly, rig.ppu.line_dot), (144, 0));
+}
+
+#[test]
+fn cgb_lcd_on_starts_the_first_line_at_the_dot_after_its_own_cpu_cycle() {
+    // The LCDC write's own M-cycle is already spent: 4 dots at normal speed,
+    // 2 in double speed. The mode 0 -> 3 switch still lands on dot 80.
+    for (double, start, ticks_to_dot_80) in [(false, 4, 19), (true, 2, 39)] {
+        let mut rig = Rig::cgb();
+        rig.ppu.set_double_speed(double);
+        rig.write(0xFF40, 0x00);
+        rig.write(0xFF40, 0x91);
+        assert_eq!(rig.ppu.line_dot, start, "double speed {double}");
+        assert_eq!(rig.ppu.ly, 0);
+        for _ in 0..ticks_to_dot_80 - 1 {
+            if double {
+                rig.tick_double();
+            } else {
+                rig.tick();
+            }
+        }
+        assert_eq!(rig.ppu.mode(), 0, "double speed {double}");
+        if double {
+            rig.tick_double();
+        } else {
+            rig.tick();
+        }
+        assert_eq!(rig.ppu.line_dot, 80, "double speed {double}");
+        assert_eq!(rig.ppu.mode(), 3, "double speed {double}");
+    }
+}

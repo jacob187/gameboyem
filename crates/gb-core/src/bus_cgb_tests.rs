@@ -472,6 +472,8 @@ fn hdma_does_not_run_in_vblank() {
 #[test]
 fn hdma_runs_one_block_per_hblank_in_double_speed_too() {
     let mut b = cgb();
+    // Before the switch: 256 writes take more than a double-speed line.
+    filled_wram(&mut b);
     switch(&mut b);
     let mut b = {
         b.write(0xFF40, 0x91);
@@ -479,20 +481,20 @@ fn hdma_runs_one_block_per_hblank_in_double_speed_too() {
         b
     };
     setup_dma(&mut b, 0xC000, 0x8000);
-    b.write(HDMA5, 0x87);
-    let mut lines = 0;
-    let mut prev = b.read(HDMA5);
+    b.write(HDMA5, 0x87); // 8 blocks
+    // Exactly one block per HBlank: FF55 (peeked, so the read adds no tick)
+    // drops by one per line, from 8 blocks left down to 5.
+    let mut seen = Vec::new();
     for line in 2..=4 {
         run_to_line(&mut b, line);
-        let now = b.read(HDMA5);
-        assert!(
-            now < prev || now == 0xFF,
-            "line {line}: {prev:02X} -> {now:02X}"
-        );
-        prev = now;
-        lines += 1;
+        seen.push(b.hdma.read5());
     }
-    assert_eq!(lines, 3);
+    assert_eq!(seen, [0x06, 0x05, 0x04]);
+    for k in 0..3usize {
+        let want: Vec<u8> = (0..16).map(|i| ((k * 16 + i) as u8) ^ 0x5C).collect();
+        assert_eq!(vram_range(&b, k * 16), &want[..], "block {k}");
+    }
+    assert_eq!(vram(&b, 3 * 16), 0, "no fourth block");
 }
 
 #[test]
@@ -618,6 +620,57 @@ fn switching_the_lcd_off_outside_hblank_gives_the_armed_hdma_one_block() {
     b.write(0xFF40, 0x11); // LCD off in mode 2/3
     b.tick();
     assert_eq!(b.read(HDMA5), left - 1);
+}
+
+/// A colour-mode bus whose LCD was just switched on (LY 0, dot 4 of the first
+/// line, whose first 80 dots read STAT mode 0), with a one-block source ready.
+fn cgb_first_line() -> Bus {
+    let mut b = cgb();
+    filled_wram(&mut b);
+    setup_dma(&mut b, 0xC000, 0x8000);
+    b.write(0xFF40, 0x91);
+    assert!(b.ppu.in_hdma_window(), "STAT mode 0 on the first line");
+    b
+}
+
+#[test]
+fn an_hblank_transfer_started_in_the_first_line_prelude_copies_a_block_at_once() {
+    // Dots 4..80 of the first line after LCD on read STAT mode 0, so SameBoy
+    // starts the block at the FF55 write instead of waiting for the real HBlank
+    // (dot 252).
+    let mut b = cgb_first_line();
+    for _ in 0..3 {
+        b.tick();
+    }
+    assert!(b.ppu.in_hdma_window());
+    let start = b.mcycles();
+    b.write(HDMA5, 0x80);
+    b.tick();
+    assert_eq!(b.hdma.read5(), 0xFF, "the block ran");
+    assert_eq!(vram(&b, 0), 0x5C);
+    assert!(b.mcycles() - start < 12, "at once, not at dot 252");
+    assert_eq!(b.ppu.read_reg(LY), 0);
+}
+
+#[test]
+fn switching_the_lcd_off_in_the_first_line_prelude_gives_the_armed_hdma_no_block() {
+    // STAT mode reads 0 there, so SameBoy's `GB_lcd_off` arms nothing.
+    let mut b = cgb();
+    filled_wram(&mut b);
+    setup_dma(&mut b, 0xC000, 0x8000);
+    b.write(HDMA5, 0x81); // LCD off: one block at once, one left
+    b.tick();
+    assert_eq!(b.hdma.read5(), 0x00);
+    b.write(0xFF40, 0x91);
+    for _ in 0..3 {
+        b.tick();
+    }
+    assert!(b.ppu.in_hdma_window());
+    b.write(0xFF40, 0x11);
+    for _ in 0..4 {
+        b.tick();
+    }
+    assert_eq!(b.hdma.read5(), 0x00, "still one block left");
 }
 
 #[test]

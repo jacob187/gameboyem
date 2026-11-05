@@ -159,12 +159,21 @@ pub struct CartridgeHeader {
     pub cgb_flag: u8,
 }
 
+/// The CGB flag values (0x0143) that declare CGB support. Free-standing so
+/// [`CartridgeHeader::parse`] can use it before a header exists.
+fn flag_supports_cgb(flag: u8) -> bool {
+    matches!(flag, 0x80 | 0xC0)
+}
+
 impl CartridgeHeader {
     /// True if the cartridge declares CGB support (flag 0x80 or 0xC0). The one
-    /// predicate behind [`crate::Model::from_header`] and the CGB boot ROM's
-    /// choice between CGB mode and DMG-compatibility mode.
+    /// predicate behind [`crate::Model::from_header`], the CGB boot ROM's choice
+    /// between CGB mode and DMG-compatibility mode, and where [`parse`] ends the
+    /// title.
+    ///
+    /// [`parse`]: CartridgeHeader::parse
     pub fn supports_cgb(&self) -> bool {
-        matches!(self.cgb_flag, 0x80 | 0xC0)
+        flag_supports_cgb(self.cgb_flag)
     }
 
     pub fn parse(rom: &[u8]) -> Result<Self, CartridgeError> {
@@ -212,7 +221,7 @@ impl CartridgeHeader {
             .iter()
             .fold(0u8, |acc, &b| acc.wrapping_sub(b).wrapping_sub(1));
         let cgb_flag = rom[0x143];
-        let title_end = if matches!(cgb_flag, 0x80 | 0xC0) {
+        let title_end = if flag_supports_cgb(cgb_flag) {
             0x13F // 0x13F..=0x142 is the manufacturer code, 0x143 the flag
         } else if cgb_flag.is_ascii_graphic() || cgb_flag == b' ' {
             0x144 // pre-CGB cart with a full 16-character title

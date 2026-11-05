@@ -1,5 +1,5 @@
-//! `gb-core`: a deterministic, platform-independent Game Boy (DMG, and a growing
-//! CGB mode) emulator core.
+//! `gb-core`: a deterministic, platform-independent Game Boy (DMG and CGB)
+//! emulator core.
 //!
 //! The core performs no I/O, reads no clocks and uses no randomness, so the same
 //! ROM + input sequence always produces the same frames, audio and serial output.

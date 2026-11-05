@@ -44,6 +44,28 @@ fn model_from_header() {
 }
 
 #[test]
+fn the_header_title_and_the_model_agree_on_which_flags_are_cgb() {
+    for flag in 0..=0xFFu8 {
+        let mut rom = rom_with_flag(flag);
+        rom[0x134..0x13F].fill(b'x');
+        rom[0x13F..0x143].copy_from_slice(b"ABCD");
+        let h = cartridge::CartridgeHeader::parse(&rom).unwrap();
+        let cgb = Model::from_header(&h) == Model::Cgb;
+        assert_eq!(cgb, matches!(flag, 0x80 | 0xC0), "{flag:02X}");
+        // A CGB cart's title stops before the manufacturer code (0x13F..).
+        assert_eq!(h.title.contains('A'), !cgb, "{flag:02X}");
+    }
+}
+
+#[test]
+fn model_ids_round_trip_and_unknown_ids_are_refused() {
+    for model in [Model::Dmg, Model::Cgb] {
+        assert_eq!(Model::from_id(model.id()), Some(model));
+    }
+    assert!((2..=u8::MAX).all(|id| Model::from_id(id).is_none()));
+}
+
+#[test]
 fn dmg_leaves_every_cgb_register_unmapped() {
     // Even a CGB-flagged ROM: the model is explicit, never inferred.
     for flag in [0x00, 0x80, 0xC0] {

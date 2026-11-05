@@ -5,7 +5,10 @@
 //!
 //! * [`Cpu::step`] executes exactly one of: an interrupt dispatch, one halted
 //!   M-cycle, or one instruction. All cycle cost is paid through the
-//!   [`CpuBus`] (`read`/`write`/`tick`, one M-cycle each).
+//!   [`CpuBus`] (`read`/`write`/`tick`, one M-cycle each), with one exception:
+//!   a CGB speed-switch `STOP` spends its pause (up to 32768 M-cycles, see
+//!   `bus_cgb.rs`) inside [`CpuBus::stop`], so that one step can advance the
+//!   clock by far more than an instruction.
 //! * Opcode `0x40` (`LD B,B`) sets a flag readable with
 //!   [`Cpu::take_ld_b_b_breakpoint`] (mooneye/acid2 test signal).
 //! * Illegal opcodes (0xD3, 0xDB, ...) lock the CPU: [`Cpu::is_locked`] becomes
@@ -24,7 +27,9 @@
 //!   without a bus access and idles until a selected joypad line is low
 //!   (Pan Docs "Joypad Input": wakes from STOP regardless of IE). Interrupts
 //!   do not wake it, as on hardware where the clocks stop. Unlike hardware,
-//!   the LCD/timer keep running during STOP.
+//!   the LCD/timer keep running during STOP. If `stop` returns true (a CGB
+//!   speed switch, which has already spent its pause) the CPU does not idle and
+//!   carries on after the STOP.
 
 use crate::bus::CpuBus;
 use crate::interrupts::Interrupt;

@@ -112,6 +112,8 @@ impl GameBoy {
     }
 
     /// Execute one CPU step (instruction, interrupt dispatch or halted cycle).
+    /// A CGB speed-switch `STOP` is one step too, and advances the clock by up to
+    /// `32768 + 2` M-cycles (see `Cpu`'s contract).
     pub fn step_instruction(&mut self) {
         self.cpu.step(&mut self.bus);
     }
@@ -192,10 +194,7 @@ impl GameBoy {
         w.bytes(&state::MAGIC);
         w.u16(state::VERSION);
         w.u64(self.rom_hash);
-        w.u8(match self.model {
-            Model::Dmg => 0,
-            Model::Cgb => 1,
-        });
+        w.u8(self.model.id());
         w.u8(self.bus.hw.id());
         w.u8(tag::CPU);
         self.cpu.save_state(&mut w);
@@ -206,7 +205,9 @@ impl GameBoy {
     /// Upper bound on the size of [`GameBoy::save_state`]'s output, so the
     /// writer allocates once: the machine's fixed state (measured: 63 025 bytes
     /// on a DMG, 95 802 in compatibility mode, 142 011 in colour mode, each
-    /// rounded up) plus the cartridge RAM.
+    /// rounded up) plus the cartridge RAM. The test
+    /// `the_state_size_hint_covers_every_mode_without_much_slack` fails when the
+    /// layout outgrows these numbers (or they go stale), so update both together.
     fn state_size_hint(&self) -> usize {
         let fixed = match self.bus.hw {
             Hw::Dmg => 64 * 1024,
@@ -242,11 +243,7 @@ impl GameBoy {
         let model = if version == STATE_VERSION_DMG_ONLY {
             Model::Dmg
         } else {
-            match r.u8()? {
-                0 => Model::Dmg,
-                1 => Model::Cgb,
-                _ => return Err(StateError::Invalid("model")),
-            }
+            Model::from_id(r.u8()?).ok_or(StateError::Invalid("model"))?
         };
         if model != self.model {
             return Err(StateError::ModelMismatch);
@@ -255,7 +252,6 @@ impl GameBoy {
             // A function of the model and the ROM, so a mismatch with a matching
             // hash and model means the byte is corrupt.
             let hw = r.u8()?;
-            check(hw <= Hw::MAX_ID, "hardware mode")?;
             check(hw == self.bus.hw.id(), "hardware mode")?;
         }
         let backup = self.save_state();
@@ -653,6 +649,32 @@ mod tests {
     }
 
     #[test]
+    fn compat_mode_rejects_bank_selectors_it_can_never_reach() {
+        // Compatibility mode has no SVBK and drops VBK writes, so a state with
+        // either set (written here by poking a twin machine) is forged.
+        let compat = || GameBoy::with_model(nop_rom(), Model::Cgb).unwrap();
+        assert_eq!(compat().bus.hw, Hw::CgbCompat);
+        for (svbk, vbk, field) in [(1, 0, "SVBK"), (5, 0, "SVBK"), (0, 1, "VBK")] {
+            let mut twin = compat();
+            twin.bus.set_svbk(svbk);
+            twin.bus.ppu.write_vbk(vbk);
+            let bad = twin.save_state();
+            let mut gb = compat();
+            let before = gb.save_state();
+            assert_eq!(gb.load_state(&bad), Err(StateError::Invalid(field)));
+            assert_eq!(gb.save_state(), before, "rolled back");
+        }
+        // The same values are fine in colour mode.
+        let mut twin = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        twin.bus.set_svbk(5);
+        twin.bus.ppu.write_vbk(1);
+        let ok = twin.save_state();
+        let mut gb = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        gb.load_state(&ok).unwrap();
+        assert_eq!(gb.save_state(), ok);
+    }
+
+    #[test]
     fn corrupt_undocumented_registers_are_rejected() {
         // CGB mode: FF75 holds bits 4-6 only; FF74 is a free register.
         let with = |rom: Vec<u8>, v| {
@@ -795,6 +817,33 @@ mod tests {
             let mut s = STATE_V1.to_vec();
             s[4..6].copy_from_slice(&v.to_le_bytes());
             assert_eq!(gb.load_state(&s), Err(StateError::UnsupportedVersion(v)));
+        }
+    }
+
+    #[test]
+    fn the_state_size_hint_covers_every_mode_without_much_slack() {
+        // (model, header flag, cart type, RAM size code): DMG, CGB compat, CGB
+        // mode, and a cart with 32 KiB of RAM on top of the colour machine.
+        for (model, flag, cart_type, ram_code) in [
+            (Model::Dmg, 0x00, 0x00, 0x00),
+            (Model::Cgb, 0x00, 0x00, 0x00),
+            (Model::Cgb, 0x80, 0x00, 0x00),
+            (Model::Cgb, 0x80, 0x03, 0x03),
+        ] {
+            let mut rom = nop_rom();
+            rom[0x143] = flag;
+            rom[0x147] = cart_type;
+            rom[0x149] = ram_code;
+            let mut gb = GameBoy::with_model(rom, model).unwrap();
+            for _ in 0..2 {
+                let (len, hint) = (gb.save_state().len(), gb.state_size_hint());
+                assert!(len <= hint, "{model:?} {flag:02X}: {len} > hint {hint}");
+                assert!(
+                    hint - len <= 4096,
+                    "{model:?} {flag:02X}: hint {hint} is far above {len}"
+                );
+                gb.step_frame();
+            }
         }
     }
 
