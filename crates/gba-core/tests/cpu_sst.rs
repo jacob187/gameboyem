@@ -33,7 +33,6 @@ struct Case {
     initial: CpuState,
     initial_access: u32,
     last: CpuState,
-    last_access: u32,
     txs: Vec<Tx>,
     opcode: u32,
     base_addr: u32,
@@ -71,7 +70,7 @@ fn parse_file(b: &[u8]) -> Vec<Case> {
         let test_size = u32_at(b, p) as usize;
         let start = p + 4;
         let (initial, initial_access, sz) = parse_state(b, start);
-        let (last, last_access, sz2) = parse_state(b, start + sz);
+        let (last, _, sz2) = parse_state(b, start + sz);
         let mut q = start + sz + sz2;
         let tx_size = u32_at(b, q) as usize;
         let count = u32_at(b, q + 8) as usize;
@@ -95,7 +94,6 @@ fn parse_file(b: &[u8]) -> Vec<Case> {
             initial,
             initial_access,
             last,
-            last_access,
             txs,
             opcode,
             base_addr,
@@ -326,9 +324,11 @@ fn run_case(c: &Case, verbose_budget: &mut usize, stats: &mut Stats) {
             eprintln!("    {p}");
         }
     }
-    let _ = c.last_access;
 }
 
+/// The exclusions and masks below are the deliberate deviations from the
+/// reference data listed in DECISIONS #50 and #51; everything else must match.
+///
 /// Encodings the ARM architecture marks UNPREDICTABLE, where the reference data
 /// shows implementation accidents rather than behaviour worth copying:
 /// * load/store or LDM/STM with writeback and Rn = R15,
@@ -385,13 +385,6 @@ fn flags_unspecified(opcode: u32, thumb: bool) -> bool {
     }
 }
 
-/// Cases that are knowingly not matched, with the reason (NanoBoyAdvance's
-/// output differs from the hardware/GBATEK behaviour we implement). Keyed by
-/// file name; the count is how many failing cases the file may have.
-fn known_failures(_name: &str) -> usize {
-    0
-}
-
 fn run_file(name: &str) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../roms/test/gba/sst");
     let path = dir.join(format!("{name}.json.bin"));
@@ -435,10 +428,7 @@ fn run_file(name: &str) {
         stats.no_write
     );
     let failed = stats.total - stats.passed;
-    assert!(
-        failed <= known_failures(name),
-        "{name}: {failed} failing cases"
-    );
+    assert!(failed == 0, "{name}: {failed} failing cases");
 }
 
 macro_rules! sst {
