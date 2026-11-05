@@ -76,9 +76,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(msg) = cli::check_system_flags(system, &opts) {
-        eprintln!("error: {msg}\n\n{}", cli::USAGE);
-        return ExitCode::from(2);
+    match cli::check_system_flags(system, &opts) {
+        Ok(Some(warning)) => eprintln!("warning: {warning}"),
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("error: {msg}\n\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
     }
     let rom = match rom::read_rom(&opts.rom, system) {
         Ok(r) => r,

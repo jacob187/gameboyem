@@ -72,7 +72,7 @@ pub struct Options {
     /// `--bios`: a GBA BIOS dump.
     pub bios: Option<PathBuf>,
     /// Game Boy-only flags the user passed (a flag equal to its default still
-    /// counts), so a GBA run can refuse them; see [`check_system_flags`].
+    /// counts), so a GBA run can say they are ignored; see [`check_system_flags`].
     pub gb_only: Vec<&'static str>,
 }
 
@@ -177,23 +177,21 @@ where
     }))
 }
 
-/// Refuse options that do not apply to `system`: `--model` and `--palette` are
-/// Game Boy-only, `--bios` is GBA-only. Run once the system is known, before
-/// the ROM is read.
-pub fn check_system_flags(system: System, o: &Options) -> Result<(), String> {
+/// Check the options that depend on the system, once it is known. `--bios` on a
+/// Game Boy game is an error (a user mistake with no safe meaning). `--model`
+/// and `--palette` on a GBA game are harmless, so a launcher that always passes
+/// them keeps working: the warning to print (`Ok(Some(..))`) says they are ignored.
+pub fn check_system_flags(system: System, o: &Options) -> Result<Option<String>, String> {
     match system {
-        System::Gba => match o.gb_only.first() {
-            Some(flag) => Err(format!(
-                "{flag} only applies to Game Boy games, but this is a GBA game \
-                 (use --system gb to run it as a Game Boy ROM)"
-            )),
-            None => Ok(()),
-        },
+        System::Gba if !o.gb_only.is_empty() => {
+            Ok(Some(format!("{} ignored for GBA", o.gb_only.join(" and "))))
+        }
+        System::Gba => Ok(None),
         System::Gb if o.bios.is_some() => Err(
             "--bios only applies to GBA games (use --system gba to run this as a GBA ROM)"
                 .to_owned(),
         ),
-        System::Gb => Ok(()),
+        System::Gb => Ok(None),
     }
 }
 
@@ -328,20 +326,27 @@ mod tests {
     }
 
     #[test]
-    fn game_boy_only_flags_are_refused_for_a_gba_even_at_their_defaults() {
-        for args in [
-            &["--model", "auto", "g.gba"][..],
-            &["--model=dmg", "g.gba"],
-            &["--palette", "green", "g.gba"],
-            &["--palette=grey", "g.gba"],
+    fn game_boy_only_flags_are_ignored_with_a_warning_for_a_gba() {
+        for (args, flags) in [
+            (&["--model", "auto", "g.gba"][..], "--model"),
+            (&["--model=dmg", "g.gba"], "--model"),
+            (&["--palette", "green", "g.gba"], "--palette"),
+            (&["--palette=grey", "g.gba"], "--palette"),
+            (
+                &["--model=cgb", "--palette=grey", "g.gba"],
+                "--model and --palette",
+            ),
         ] {
             let o = run(args);
-            let e = check_system_flags(System::Gba, &o).unwrap_err();
-            assert!(e.contains("only applies to Game Boy"), "{args:?}: {e}");
-            assert_eq!(check_system_flags(System::Gb, &o), Ok(()));
+            assert_eq!(
+                check_system_flags(System::Gba, &o),
+                Ok(Some(format!("{flags} ignored for GBA"))),
+                "{args:?}"
+            );
+            assert_eq!(check_system_flags(System::Gb, &o), Ok(None));
         }
         let o = run(&["--scale", "2", "--mute", "g.gba"]);
-        assert_eq!(check_system_flags(System::Gba, &o), Ok(()));
+        assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
     }
 
     #[test]
@@ -349,7 +354,7 @@ mod tests {
         let o = run(&["--bios", "b.bin", "g.gb"]);
         let e = check_system_flags(System::Gb, &o).unwrap_err();
         assert!(e.contains("--bios only applies to GBA"), "{e}");
-        assert_eq!(check_system_flags(System::Gba, &o), Ok(()));
+        assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
     }
 
     #[test]
