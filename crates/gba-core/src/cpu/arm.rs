@@ -320,7 +320,7 @@ fn bx<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 }
 
 fn swi<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, op: u32) {
-    cpu.software_interrupt(bus, (op >> 16) as u8);
+    cpu.software_interrupt(bus, op);
 }
 
 // ---- multiply ------------------------------------------------------------

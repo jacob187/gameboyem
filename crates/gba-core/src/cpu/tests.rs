@@ -13,6 +13,8 @@ struct Ram {
     accesses: Vec<(char, u32, Access)>,
     irq: bool,
     swi: SwiResult,
+    /// Results handed out first (front to back) before falling back to `swi`.
+    swi_script: Vec<SwiResult>,
 }
 
 impl Ram {
@@ -27,6 +29,7 @@ impl Ram {
             accesses: Vec::new(),
             irq: false,
             swi: SwiResult::Unhandled,
+            swi_script: Vec::new(),
         }
     }
 
@@ -75,7 +78,11 @@ impl CpuBus for Ram {
         self.irq
     }
     fn swi(&mut self, _number: u8, _r: &mut [u32; 4]) -> SwiResult {
-        self.swi
+        if self.swi_script.is_empty() {
+            self.swi
+        } else {
+            self.swi_script.remove(0)
+        }
     }
 }
 
@@ -519,4 +526,44 @@ fn teqp_returning_into_thumb_refills_in_the_new_state() {
     assert_eq!(r.r[15], 4, "resumes at the next instruction");
     run(&mut cpu, &mut ram, 1);
     assert_eq!(cpu.registers().r[0], 0x55, "ran as Thumb code");
+}
+
+#[test]
+fn wait_then_retry_costs_no_bus_accesses_while_waiting() {
+    // One SWI execution is a single opcode fetch; two retries and the final
+    // Done must add no fetch, no refill and no internal cycle of their own.
+    let (mut cpu, mut ram) = setup(&[0xEF00_0000, 0xE1A0_0000], |_| {});
+    ram.swi_script = vec![
+        SwiResult::WaitThenRetry,
+        SwiResult::WaitThenRetry,
+        SwiResult::Done,
+    ];
+    run(&mut cpu, &mut ram, 1);
+    assert_eq!(ram.accesses.len(), 1, "the SWI's own fetch");
+    assert_eq!(cpu.registers().r[15], 0, "PC stays on the SWI");
+    run(&mut cpu, &mut ram, 2);
+    assert_eq!(ram.accesses.len(), 1, "retries fetch nothing");
+    assert_eq!(ram.idle, 0);
+    assert_eq!(cpu.registers().r[15], 4, "Done continues after the SWI");
+    // The next instruction runs from the intact pipeline.
+    run(&mut cpu, &mut ram, 1);
+    assert_eq!(cpu.registers().r[15], 8);
+}
+
+#[test]
+fn wait_then_retry_in_thumb_and_irq_returns_to_the_swi() {
+    let (mut cpu, mut ram) = setup(&[0], |s| {
+        s.cpsr = 0x3F;
+        s.r[15] = 0x100 + 4;
+        s.pipeline = [0xDF05, 0x46C0];
+    });
+    ram.swi_script = vec![SwiResult::WaitThenRetry];
+    run(&mut cpu, &mut ram, 1);
+    assert_eq!(cpu.registers().r[15], 0x100);
+    // The wake-up IRQ is taken before the retry and returns to the SWI.
+    ram.irq = true;
+    run(&mut cpu, &mut ram, 1);
+    let r = cpu.registers();
+    assert_eq!(r.cpsr & 0x1F, 0x12);
+    assert_eq!(r.r[14] - 4, 0x100);
 }

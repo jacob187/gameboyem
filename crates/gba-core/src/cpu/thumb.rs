@@ -378,7 +378,7 @@ fn ldm_stm<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 /// Format 16/17: conditional branch, and SWI (condition 0xF). `F` = condition.
 fn bcc<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     if F == 0xF {
-        cpu.software_interrupt(bus, op as u8);
+        cpu.software_interrupt(bus, op);
     } else if F == 0xE || COND_PASS[F as usize] >> (cpu.cpsr >> 28) & 1 != 0 {
         let target = cpu.r[15].wrapping_add(((op as u8 as i8 as i32) << 1) as u32);
         cpu.refill(bus, target);

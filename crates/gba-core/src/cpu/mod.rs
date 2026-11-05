@@ -145,6 +145,9 @@ pub struct Cpu {
     /// After reset/post_bios there is no bus yet: `r[15]` holds the raw start
     /// address and `step` fills the pipeline before executing.
     needs_refill: bool,
+    /// A SWI that the HLE BIOS answered `WaitThenRetry`: its opcode, to run again
+    /// on the next `step` with the pipeline exactly as it was while it executed.
+    retry: Option<u32>,
 }
 
 type Handler<B> = fn(&mut Cpu, &mut B, u32);
@@ -171,6 +174,7 @@ impl Cpu {
             seq: false,
             flushed: false,
             needs_refill: true,
+            retry: None,
         }
     }
 
@@ -423,17 +427,30 @@ impl Cpu {
         self.enter_exception(bus, MODE_UND, 0x04, lr);
     }
 
-    /// Software interrupt `number`: the HLE BIOS gets the first go.
-    fn software_interrupt<B: CpuBus>(&mut self, bus: &mut B, number: u8) {
+    /// The SWI in `op` (ARM: comment in bits 16..=23; Thumb: bits 0..=7): the HLE
+    /// BIOS gets the first go.
+    ///
+    /// `Done` costs nothing beyond the SWI's own fetch (the HLE charges what its
+    /// work would have taken). `WaitThenRetry` leaves the CPU *on* the SWI
+    /// without fetching or refilling anything: the pipeline and r15 stay as they
+    /// were mid-instruction and the next `step` runs the same opcode again
+    /// (`registers().r[15]` reports the SWI's address meanwhile). Waiting
+    /// therefore costs no bus accesses at all, only what the HLE charges per
+    /// attempt. An IRQ taken instead of the retry returns to the SWI.
+    /// `Unhandled` takes the SVC exception (2S + 1N like a branch).
+    fn software_interrupt<B: CpuBus>(&mut self, bus: &mut B, op: u32) {
+        let number = if self.cpsr & PSR_T != 0 {
+            op as u8
+        } else {
+            (op >> 16) as u8
+        };
         let mut regs = [self.r[0], self.r[1], self.r[2], self.r[3]];
         match bus.swi(number, &mut regs) {
             SwiResult::Done => self.r[..4].copy_from_slice(&regs),
             SwiResult::WaitThenRetry => {
                 self.r[..4].copy_from_slice(&regs);
-                // Run the SWI again after the wake-up: refetch from its address.
-                let size = if self.cpsr & PSR_T != 0 { 4 } else { 8 };
-                self.r[15] = self.r[15].wrapping_sub(size);
-                self.needs_refill = true;
+                self.retry = Some(op);
+                // Keep r15: the retry runs in this same pipeline state.
                 self.flushed = true;
             }
             SwiResult::Unhandled => {
@@ -475,7 +492,16 @@ impl Cpu {
             self.flushed = false;
         }
         if bus.irq_line() && self.cpsr & PSR_I == 0 {
+            self.retry = None;
             self.irq(bus);
+        } else if let Some(op) = self.retry.take() {
+            self.software_interrupt(bus, op);
+            if self.flushed {
+                self.flushed = false;
+            } else {
+                let size = if self.cpsr & PSR_T != 0 { 2 } else { 4 };
+                self.r[15] = self.r[15].wrapping_add(size);
+            }
         } else if self.cpsr & PSR_T == 0 {
             self.step_arm(bus);
         } else {
