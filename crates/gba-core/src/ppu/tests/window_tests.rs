@@ -199,9 +199,12 @@ fn window_can_hide_sprites_and_the_obj_bit_is_per_window() {
     assert_eq!(px(&f, 50, 10), obj);
 }
 
+/// A screen coordinate and whether the window covers it.
+type Probe = (usize, bool);
+
 #[test]
 fn x_range_edge_cases() {
-    let cases: [(u16, u16, &[(usize, bool)]); 5] = [
+    let cases: [(u16, u16, &[Probe]); 5] = [
         // x1 > x2 wraps: [200, 240) and [0, 40).
         (
             200,
@@ -240,7 +243,7 @@ fn x_range_edge_cases() {
 
 #[test]
 fn y_range_edge_cases() {
-    let cases: [(u16, u16, &[(usize, bool)]); 5] = [
+    let cases: [(u16, u16, &[Probe]); 5] = [
         // y1 > y2 wraps: lines [120, 160) and [0, 30).
         (
             120,
