@@ -31,7 +31,7 @@ Sizes and sha256 with the pinned toolchain (the same on any machine and any `CAR
 | ROM | Bytes | sha256 |
 |-----|-------|--------|
 | `grains.gba` | 14168 | `bc68def9fc254f7e2bec8ae2f4c3ce005b6bf56d8a7f808857f9975356ab3e5e` |
-| `moth.gba` | 51104 | `94cf0ece051946e09911c857c5037d30544a8c52c71c64233f19b2832eabb178` |
+| `moth.gba` | 51112 | `2220d181fddb05ff4d133bd8b66f7e3ca897746e07f02d95a8d7dff3a1d905bf` |
 
 `agb` is built with `default-features = false, features = ["testing"]`: no backtrace/QR panic screen. A panic
 prints to the mGBA debug log (if present) and halts the CPU, which is also what a headless test wants.
