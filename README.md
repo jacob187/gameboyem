@@ -53,7 +53,7 @@ If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than a
 
 Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **S** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr.
 
-A state is tied to the exact ROM and the console model (DMG or Game Boy Color) it was taken with. A state from another ROM or model, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched. States from before CGB support (format version 1) still load on a DMG.
+A state is tied to the exact ROM and the console model (DMG or Game Boy Color) it was taken with. A state from another ROM or model, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched. States from before CGB support (format version 1) are DMG states and still load on a DMG. Because `--model auto` now starts CGB-flagged ROMs (header 0x143 = 0x80 or 0xC0) as a Game Boy Color, such a ROM refuses an old state with a message pointing to `--model dmg`; start it with that flag to load the state.
 
 Loading a state also rewinds battery RAM, and the next autosave writes that RAM over `<rom>.sav`. So before the first load in a session, the existing `<rom>.sav` is copied to `<rom>.sav.bak` (then `.bak1`, ...). If that copy fails, the load is refused.
 
@@ -91,7 +91,7 @@ cgb-acid2 (`acid2-cgb` in the manifest) runs on a Game Boy Color and compares th
 
 ### Test-ROM results
 
-These are the results on `feat/cgb` at `e93d0b6`, run on macOS arm64 on 2026-11-04. Linux x86_64 was last checked with `scripts/docker-linux-test.sh amd64` (fmt, clippy, tests, ROM table) at `0160611` (136/136), before the CGB work. GitHub Actions has not run yet, because this build had no push access.
+These are the results at the head of `feat/cgb`, run on macOS arm64 on 2026-11-04. Linux x86_64 was last checked with `scripts/docker-linux-test.sh amd64` (fmt, clippy, tests, ROM table) at `0160611` (136/136), before the CGB work. GitHub Actions has not run yet, because this build had no push access.
 
 | Suite | Pass / total |
 |-------|--------------|
@@ -142,7 +142,7 @@ Both have title, score and game-over screens. Each keeps a high score in battery
 
 ### Open-source homebrew corpus
 
-`scripts/fetch-homebrew-corpus.sh` downloads 7 redistributable DMG games, each pinned and sha256-checked. The licences are in the script header:
+`scripts/fetch-homebrew-corpus.sh` downloads 13 redistributable games (7 DMG, 6 CGB), each pinned and sha256-checked. The licences are in the script header. The DMG games:
 - Tobu Tobu Girl
 - Squishy the Turtle
 - Sushi Nights
@@ -151,7 +151,9 @@ Both have title, score and game-over screens. Each keeps a high score in battery
 - AIRPLANZ
 - Renegade Rush
 
-They stand in for commercial games in the harness. All 7 boot, and 3 have PyBoy-validated scripted play cases.
+The six CGB games are Tobu Tobu Girl Deluxe, Escape Obliterizer DX, Rebound, Aevilia, uCity and Geometrix. They run as a Game Boy Color in `smoke-cgb` cases that check the RGB555 frame (no MBC3 CGB game with a usable licence exists).
+
+They stand in for commercial games in the harness. All 13 boot, and 3 of the DMG games have PyBoy-validated scripted play cases.
 
 ## Known gaps
 
@@ -165,6 +167,7 @@ They stand in for commercial games in the harness. All 7 boot, and 3 have PyBoy-
   - Speed-switch edge cases: the LCD and APU phase across a switch and the DIV-reset edges of the fast timer rates are not exact (AGE `speed-switch` 2 / 6; DECISIONS #38). CGB APU differences fail 6 Blargg `cgb_sound` ROMs.
   - No colourisation of DMG games: a flag-less cartridge on a forced `--model cgb` runs in DMG-compatibility mode in the `--palette` shades, because the boot ROM's compatibility palettes aren't modelled.
   - No infrared port (RP, FF56).
+  - Serial fast clock: SC bit 1 (the 262144 Hz clock) is not modelled; in CGB mode it reads as 1 and transfers run at 8192 Hz.
   - CGB-mode post-boot timing is approximate. The DIV and serial phase and the PPU line and dot at hand-off are the compat-mode calibration or a guess, because no test ROM pins them (DECISIONS #33, #34). The CGB boot ROM's clearing of wave RAM isn't modelled either. The palette-port lock timing reuses the VRAM lock timing and is unverified (DECISIONS #36).
 - **Not supported:** link cable, debugger, rewind and shaders.
 - **No boot ROM.** The emulator starts in the documented post-boot state.
