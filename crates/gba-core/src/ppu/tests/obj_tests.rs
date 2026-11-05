@@ -400,11 +400,11 @@ fn sprites_draw_over_a_bitmap_background() {
     solid_obj_tiles(&mut rig);
     rig.hide_all_sprites();
     rig.vram16(0, rgb(31, 0, 0));
-    rig.oam(0, attr0(0, 0, false), attr1(1, 0, 0), attr2(600, 0, 0));
+    rig.oam(0, attr0(0, 0, false), attr1(1, 0, 0), attr2(601, 0, 0));
     rig.write(DISPCNT, 3 | 0x400 | OBJ_ON | ONE_D);
     let f = rig.frame();
     assert_eq!(px(&f, 0, 0), rgb(31, 0, 0));
-    assert_eq!(px(&f, 1, 0), obj_colour(1 + 600 % 15));
+    assert_eq!(px(&f, 1, 0), obj_colour(1 + 601 % 15));
 }
 
 #[test]
