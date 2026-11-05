@@ -7,7 +7,8 @@ set -eu
 status=0
 for f in "$@"; do
     byte() { od -An -tu1 -j "$1" -N 1 "$f" | tr -d ' \n'; }
-    err() { echo "$f: $1" >&2; status=1; }
+    bad=0
+    err() { echo "$f: $1" >&2; bad=1; status=1; }
 
     size=$(wc -c <"$f" | tr -d ' ')
     [ "$size" -ge 192 ] || { err "shorter than the 192 byte header"; continue; }
@@ -24,6 +25,6 @@ for f in "$@"; do
 
     title=$(dd if="$f" bs=1 skip=160 count=12 2>/dev/null | tr -d '\0')
     code=$(dd if="$f" bs=1 skip=172 count=4 2>/dev/null)
-    [ "$status" -eq 0 ] && echo "$f: header ok (title $title, code $code, $size bytes)"
+    [ "$bad" -eq 0 ] && echo "$f: header ok (title $title, code $code, $size bytes)"
 done
 exit "$status"
