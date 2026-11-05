@@ -1,6 +1,7 @@
 //! The public emulator facade.
 
 use crate::bus::Bus;
+use crate::bus_cgb::SPEED_SWITCH_MCYCLES;
 use crate::cartridge::{self, CartridgeError, CartridgeHeader};
 use crate::cpu::{Cpu, Registers};
 use crate::joypad::Button;
@@ -73,15 +74,35 @@ impl GameBoy {
 
     /// Run until the PPU completes a frame (≈70224 T-cycles).
     ///
-    /// A safety cap of two frames' worth of cycles guarantees termination even
-    /// if a component misbehaves.
+    /// A safety cap guarantees termination even if a component misbehaves.
     pub fn step_frame(&mut self) {
-        // Double speed has twice the M-cycles per frame (DECISIONS #38).
+        self.run_to_frame();
+    }
+
+    /// [`GameBoy::step_frame`]; false if the safety cap ended the run before a
+    /// frame was ready.
+    ///
+    /// The cap is two frames' worth of M-cycles (four in double speed, which has
+    /// twice as many per frame), plus one speed-switch pause on a CGB: the step
+    /// that switches spends [`SPEED_SWITCH_MCYCLES`] inside itself, and the cap is
+    /// only looked at between steps. A frame is never more than 70224 dots away and
+    /// an M-cycle is at least two dots, so 35112 M-cycles plus a pause always
+    /// reach one: the cap is out of reach for a healthy machine.
+    fn run_to_frame(&mut self) -> bool {
         let frames = if self.bus.double_speed { 4 } else { 2 };
-        let limit = self.bus.mcycles() + frames * M_CYCLES_PER_FRAME as u64;
-        while !self.bus.ppu.take_frame_ready() && self.bus.mcycles() < limit {
+        let pause = if self.model == Model::Cgb {
+            u64::from(SPEED_SWITCH_MCYCLES) + 1
+        } else {
+            0
+        };
+        let limit = self.bus.mcycles() + frames * M_CYCLES_PER_FRAME as u64 + pause;
+        while !self.bus.ppu.take_frame_ready() {
+            if self.bus.mcycles() >= limit {
+                return false;
+            }
             self.cpu.step(&mut self.bus);
         }
+        true
     }
 
     /// The CPU runs at CGB double speed (KEY1 bit 7). Always false on a DMG and
@@ -319,6 +340,59 @@ mod tests {
         let start = gb.mcycles();
         gb.step_frame();
         assert_eq!(gb.mcycles() - start, M_CYCLES_PER_FRAME as u64);
+    }
+
+    /// A CGB ROM that waits for the next start of VBlank, burns `d` loops of 7
+    /// M-cycles and switches speed, `switches` times over; then spins.
+    fn switching_rom(d: u16, switches: usize) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x143] = 0x80;
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]); // JP 0x150
+        let delay = [0x01, d as u8, (d >> 8) as u8, 0x0B, 0x78, 0xB1, 0x20, 0xFB];
+        let switch = [0x3E, 0x01, 0xE0, 0x4D, 0x10, 0x00]; // LD A,1; LDH (KEY1),A; STOP
+        // Leave LY = 144 (the boot state may sit on it), then wait for it.
+        let mut code = vec![
+            0xF0, 0x44, 0xFE, 0x90, 0x28, 0xFA, 0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA,
+        ];
+        for _ in 0..switches {
+            code.extend_from_slice(&delay);
+            code.extend_from_slice(&switch);
+        }
+        code.extend_from_slice(&[0x18, 0xFE]); // JR -2
+        rom[0x150..0x150 + code.len()].copy_from_slice(&code);
+        rom
+    }
+
+    #[test]
+    fn step_frame_returns_with_a_frame_whenever_the_speed_switches() {
+        // 2508 delay loops of 7 M-cycles are one frame (17556): the first STOP
+        // lands around the frame boundary, where a call that starts right on it
+        // spends nearly its whole cap on the pause. The second STOP (double to
+        // normal) lands a frame or so later.
+        for d in 2480..2540 {
+            let mut gb = GameBoy::with_model(switching_rom(d, 2), Model::Cgb).unwrap();
+            for n in 0..8 {
+                assert!(gb.run_to_frame(), "d={d}, call {n}: the cap ended it");
+            }
+            assert!(!gb.double_speed() && gb.mcycles() > 2 * 32768, "d={d}");
+        }
+    }
+
+    #[test]
+    fn step_frame_takes_a_frame_of_cycles_at_either_speed_after_a_switch() {
+        for (switches, frame) in [(1, 2), (2, 1)] {
+            let mut gb = GameBoy::with_model(switching_rom(1, switches), Model::Cgb).unwrap();
+            for _ in 0..6 {
+                gb.step_frame();
+            }
+            assert_eq!(gb.double_speed(), switches == 1);
+            let start = gb.mcycles();
+            gb.step_frame();
+            let took = gb.mcycles() - start;
+            let want = frame * M_CYCLES_PER_FRAME as u64;
+            // The frame is ready inside the spinning `JR`, which is 3 M-cycles.
+            assert!(took.abs_diff(want) <= 3, "{switches} switches: {took}");
+        }
     }
 
     #[test]
