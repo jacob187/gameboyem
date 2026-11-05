@@ -87,6 +87,20 @@ impl Gba {
     }
 
     /// The cartridge title from the header.
+    /// Append the audio produced since the last call (interleaved stereo f32,
+    /// see `Apu::drain_samples`).
+    pub fn drain_audio_into(&mut self, out: &mut Vec<f32>) {
+        self.bus.apu.drain_samples(out);
+    }
+
+    pub fn audio_sample_rate(&self) -> u32 {
+        self.bus.apu.sample_rate()
+    }
+
+    pub fn set_audio_sample_rate(&mut self, hz: u32) {
+        self.bus.apu.set_sample_rate(hz);
+    }
+
     pub fn title(&self) -> String {
         self.bus.cart.title()
     }
