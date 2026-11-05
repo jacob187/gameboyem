@@ -2,7 +2,10 @@
 //! hand-built VRAM / palette / OAM / register state, no CPU or cartridge.
 
 use super::*;
-use crate::{CYCLES_PER_FRAME, VISIBLE_LINES};
+use crate::{CYCLES_PER_FRAME, SCREEN_WIDTH, VISIBLE_LINES};
+
+mod bg_tests;
+mod obj_tests;
 
 pub(super) const DISPCNT: u32 = 0x000;
 pub(super) const DISPSTAT: u32 = 0x004;
@@ -66,6 +69,63 @@ impl Rig {
     pub fn stat(&self) -> u16 {
         self.ppu.read_io(DISPSTAT)
     }
+
+    /// Run until the next frame completes and return it.
+    pub fn frame(&mut self) -> Vec<u16> {
+        let target = self.frames + 1;
+        while self.frames < target {
+            let next = self.sched.next_at().expect("PPU events are always pending");
+            self.run_to(next);
+        }
+        self.ppu.framebuffer().to_vec()
+    }
+
+    pub fn vram16(&mut self, addr: usize, v: u16) {
+        self.ppu.vram[addr..addr + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Palette RAM entry `i` (0..256 BG, 256..512 OBJ).
+    pub fn pal(&mut self, i: usize, colour: u16) {
+        self.ppu.palette[i * 2..i * 2 + 2].copy_from_slice(&colour.to_le_bytes());
+    }
+
+    /// Give every palette entry the distinct colour `i * 7 + 1` (entry 0, the
+    /// backdrop, is 1), see [`pal_colour`].
+    pub fn distinct_palette(&mut self) {
+        for i in 0..512 {
+            self.pal(i, pal_colour(i));
+        }
+    }
+
+    pub fn oam(&mut self, index: usize, attr0: u16, attr1: u16, attr2: u16) {
+        let o = index * 8;
+        self.ppu.oam[o..o + 2].copy_from_slice(&attr0.to_le_bytes());
+        self.ppu.oam[o + 2..o + 4].copy_from_slice(&attr1.to_le_bytes());
+        self.ppu.oam[o + 4..o + 6].copy_from_slice(&attr2.to_le_bytes());
+    }
+
+    /// Park every sprite off screen and disabled (OAM resets to zero, which is a
+    /// visible 8x8 sprite at (0,0)).
+    pub fn hide_all_sprites(&mut self) {
+        for i in 0..128 {
+            self.oam(i, 0x0200, 0, 0);
+        }
+    }
+}
+
+/// The colour [`Rig::distinct_palette`] gives entry `i`.
+pub(super) fn pal_colour(i: usize) -> u16 {
+    (i as u16) * 7 + 1
+}
+
+/// Pixel (x, y) of a frame.
+pub(super) fn px(frame: &[u16], x: usize, y: usize) -> u16 {
+    frame[y * SCREEN_WIDTH + x]
+}
+
+/// 15-bit colour from 5-bit components.
+pub(super) fn rgb(r: u16, g: u16, b: u16) -> u16 {
+    r | g << 5 | b << 10
 }
 
 #[test]

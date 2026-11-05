@@ -13,6 +13,8 @@
 use crate::scheduler::{Event, Scheduler};
 use crate::{CYCLES_PER_LINE, Framebuffer, LINES_PER_FRAME, SCREEN_HEIGHT, SCREEN_WIDTH};
 
+mod bg;
+mod obj;
 mod render;
 #[cfg(test)]
 mod tests;
@@ -62,6 +64,8 @@ pub struct Ppu {
     vcount: u16,
     /// The HBlank flag: set by the HBlank event, cleared at line end.
     hblank: bool,
+    /// Per-layer line buffers (scratch; see `render.rs`).
+    layers: Box<render::Layers>,
     /// The frame being drawn, one line per HBlank.
     back: Box<Framebuffer>,
     /// The last complete frame (swapped in at VBlank start).
@@ -83,6 +87,7 @@ impl Ppu {
             io: [0; 0x30],
             vcount: 0,
             hblank: false,
+            layers: render::Layers::new(),
             back: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
         }
