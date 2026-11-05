@@ -503,3 +503,20 @@ fn thumb_hi_register_add_to_pc_branches() {
     run(&mut cpu, &mut ram, 1);
     assert_eq!(cpu.registers().r[15], 0x24);
 }
+
+#[test]
+fn teqp_returning_into_thumb_refills_in_the_new_state() {
+    // teqp pc, #0 in IRQ mode with SPSR_irq = system mode, Thumb; the next
+    // instruction (at 4) is `mov r0, #0x55` in Thumb encoding.
+    let (mut cpu, mut ram) = setup(&[0xE33F_F000, 0x0000_2055], |s| {
+        s.cpsr = 0x12;
+        s.spsr[3] = 0x3F;
+    });
+    run(&mut cpu, &mut ram, 1);
+    let r = cpu.registers();
+    assert_eq!(r.cpsr, 0x3F, "CPSR restored from SPSR");
+    assert!(cpu.is_thumb());
+    assert_eq!(r.r[15], 4, "resumes at the next instruction");
+    run(&mut cpu, &mut ram, 1);
+    assert_eq!(cpu.registers().r[0], 0x55, "ran as Thumb code");
+}

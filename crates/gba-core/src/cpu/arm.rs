@@ -180,9 +180,17 @@ fn dp_exec<B: CpuBus, const F: u32>(
     };
     let rd = ((op >> 12) & 0xF) as usize;
     if (0x8..=0xB).contains(&opc) {
-        // TSTP/TEQP/CMPP/CMNP (Rd=R15): CPSR = SPSR where there is one.
+        // TSTP/TEQP/CMPP/CMNP (Rd=R15): CPSR = SPSR where there is one. The
+        // result is not written to the PC, but if the restored CPSR changes the
+        // state the pipeline holds the wrong opcode width: refill the next
+        // instruction in the new state (as the Rd=R15 path below does).
         if rd == 15 && cpu.spsr_index().is_some() {
+            let thumb = cpu.cpsr & PSR_T;
             cpu.restore_spsr();
+            if cpu.cpsr & PSR_T != thumb {
+                let next = cpu.r[15].wrapping_sub(4);
+                cpu.refill(bus, next);
+            }
         } else {
             cpu.set_nz(res);
             cpu.set_c(carry);

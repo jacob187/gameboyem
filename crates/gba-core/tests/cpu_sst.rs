@@ -246,7 +246,7 @@ struct Stats {
 }
 
 fn run_case(c: &Case, verbose_budget: &mut usize, stats: &mut Stats) {
-    if unpredictable(c.opcode, thumb_state(&c.initial)) {
+    if unpredictable(c.opcode, thumb_state(&c.initial), &c.initial) {
         stats.excluded += 1;
         return;
     }
@@ -333,9 +333,24 @@ fn run_case(c: &Case, verbose_budget: &mut usize, stats: &mut Stats) {
 /// shows implementation accidents rather than behaviour worth copying:
 /// * load/store or LDM/STM with writeback and Rn = R15,
 /// * a long multiply whose RdHi and RdLo are the same register.
-fn unpredictable(op: u32, thumb: bool) -> bool {
+fn unpredictable(op: u32, thumb: bool, initial: &CpuState) -> bool {
     if thumb {
         return false;
+    }
+    // TSTP/TEQP/CMPP/CMNP with Rd=R15 restore CPSR from SPSR. If that flips the
+    // Thumb bit we refill in the new state; the reference does not.
+    if op & 0x0C00_0000 == 0 && op & (1 << 20) != 0 && (8..=11).contains(&((op >> 21) & 0xF)) {
+        let spsr = match initial.cpsr & 0x1F {
+            0x11 => Some(initial.spsr[0]),
+            0x13 => Some(initial.spsr[1]),
+            0x17 => Some(initial.spsr[2]),
+            0x12 => Some(initial.spsr[3]),
+            0x1B => Some(initial.spsr[4]),
+            _ => None,
+        };
+        if (op >> 12) & 0xF == 15 && spsr.is_some_and(|p| (p ^ initial.cpsr) & 0x20 != 0) {
+            return true;
+        }
     }
     let rn = (op >> 16) & 0xF;
     match (op >> 25) & 7 {
