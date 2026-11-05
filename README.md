@@ -46,7 +46,7 @@ usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
   --               end of options; the next argument is the ROM path, even if it starts with `-`
 ```
 
-`.gb` and `.gbc` ROMs are both accepted (the extension isn't checked; the header decides). With `--model auto`, a ROM whose header byte 0x143 is 0x80 or 0xC0 runs as a Game Boy Color, in colour. Any other ROM runs as a DMG. `--model cgb` forces a Game Boy Color, and a ROM without a CGB flag then runs in DMG-compatibility mode. It isn't colourised, because there's no boot ROM to pick a compatibility palette, so it uses `--palette`. `--model dmg` runs everything on a DMG, including CGB ROMs.
+A `.gba` file runs as a GBA game. Any other file is a GBA game if its header is a GBA one (0x96 at 0xB2 and a valid checksum at 0xBD), otherwise a Game Boy game; `--system gb|gba` overrides this. `--model` and `--palette` are ignored with a warning for a GBA game, and `--bios` is an error for a Game Boy game. For Game Boy, `.gb` and `.gbc` ROMs are both accepted (the header decides, not the extension). With `--model auto`, a ROM whose header byte 0x143 is 0x80 or 0xC0 runs as a Game Boy Color, in colour. Any other ROM runs as a DMG. `--model cgb` forces a Game Boy Color, and a ROM without a CGB flag then runs in DMG-compatibility mode. It isn't colourised, because there's no boot ROM to pick a compatibility palette, so it uses `--palette`. `--model dmg` runs everything on a DMG, including CGB ROMs.
 
 Battery RAM is saved to `<rom>.sav` next to the ROM. The save is written atomically every 5 s when RAM changes, on pause, on quit, and on SIGINT/SIGTERM/SIGHUP (Ctrl-C). If writing fails, a warning is printed at once and then at most once a minute, and the failure is always reported on exit.
 
