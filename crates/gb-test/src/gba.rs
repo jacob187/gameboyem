@@ -24,6 +24,8 @@ const ROM_BASE: u32 = 0x0800_0000;
 const EWRAM_BASE: u32 = 0x0200_0000;
 /// Size of FuzzARM's failure record (16 words).
 const FUZZ_DUMP_LEN: usize = 64;
+/// Instruction cap for `jsmolka-gba`, independent of the cycle budget (the ROMs finish in well under a million).
+const MAX_INSTRUCTIONS: u64 = 50_000_000;
 /// Frames FuzzARM is given, after the first nonzero EWRAM word, to finish writing its record.
 const FUZZ_SETTLE_FRAMES: u32 = 10;
 
@@ -79,7 +81,20 @@ pub fn jsmolka_result(reg: usize, value: u32) -> Outcome {
 }
 
 fn run_jsmolka(gba: &mut Gba, idle: u32, reg: usize, max_frames: u32) -> Outcome {
+    run_jsmolka_capped(gba, idle, reg, max_frames, MAX_INSTRUCTIONS)
+}
+
+/// [`run_jsmolka`] with an explicit instruction cap. The cycle budget alone is not enough: if the
+/// CPU halts and `step_instruction` stops advancing the clock, the budget would never run out.
+fn run_jsmolka_capped(
+    gba: &mut Gba,
+    idle: u32,
+    reg: usize,
+    max_frames: u32,
+    max_instructions: u64,
+) -> Outcome {
     let budget = u64::from(max_frames) * u64::from(CYCLES_PER_FRAME);
+    let mut executed = 0u64;
     loop {
         let r = gba.cpu_registers();
         if r.r[15] == idle {
@@ -91,7 +106,16 @@ fn run_jsmolka(gba: &mut Gba, idle: u32, reg: usize, max_frames: u32) -> Outcome
                 r.r[15]
             ));
         }
+        if executed >= max_instructions {
+            return Outcome::Timeout(format!(
+                "idle loop {idle:08X} not reached in {max_instructions} instructions \
+                 (clock stuck at {} cycles?); PC={:08X}",
+                gba.cycles(),
+                r.r[15]
+            ));
+        }
         gba.step_instruction();
+        executed += 1;
     }
 }
 
@@ -313,6 +337,18 @@ mod tests {
             Outcome::Fail("failed test 204 (r12)".into())
         );
         assert_eq!(jsmolka_result(7, 3).detail(), "failed test 3 (r7)");
+    }
+
+    #[test]
+    fn jsmolka_runner_stops_at_the_instruction_cap_whatever_the_clock_does() {
+        // The idle address is never reached (the ROM spins at its entry point), and the cycle
+        // budget is far away, so only the instruction cap can end the run.
+        let mut gba = Gba::new(rom_of(&[IDLE_WORD]), None).unwrap();
+        let out = run_jsmolka_capped(&mut gba, 0x0800_0100, 12, 1_000_000, 1000);
+        assert!(
+            matches!(&out, Outcome::Timeout(d) if d.contains("1000 instructions")),
+            "{out:?}"
+        );
     }
 
     #[test]
