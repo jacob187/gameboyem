@@ -199,6 +199,10 @@ impl Apu {
     }
 
     /// Set the host output rate (clamped to 8 kHz..=192 kHz). **Contract.**
+    /// Applies to the cycles run after this call: sync with [`Apu::advance_to`]
+    /// first (`Gba::set_audio_sample_rate` does). The sample phase carries over
+    /// as a fraction of a sample, so the total count across a change is
+    /// `floor((old * t1 + new * t2) / 2^24)`.
     pub fn set_sample_rate(&mut self, hz: u32) {
         self.sample_rate = hz.clamp(8_000, 192_000);
     }

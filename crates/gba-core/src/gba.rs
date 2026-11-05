@@ -101,6 +101,9 @@ impl Gba {
     }
 
     pub fn set_audio_sample_rate(&mut self, hz: u32) {
+        // P2-APU (code-review A2#2): cycles already elapsed are accounted at the
+        // old rate; the new one applies from now on.
+        self.bus.apu.advance_to(self.bus.sched.now());
         self.bus.apu.set_sample_rate(hz);
     }
 
