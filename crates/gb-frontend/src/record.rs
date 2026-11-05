@@ -3,6 +3,12 @@
 //! Records are written straight to the file as they happen (a few per second
 //! while playing), so a crash loses at most the final `End` record;
 //! `gb-test --replay` still plays such a file up to its last input.
+//!
+//! Recordings are system-aware (format v3): the header carries the system byte,
+//! so a GBA session records its L and R buttons and its battery image (at most
+//! 128 KiB of Flash, inside the codec's 256 KiB bound). `gb-test --replay` is
+//! Game Boy only: it rejects a GBA recording as the wrong system until the GBA
+//! replayer lands in P3 (DECISIONS #62).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
