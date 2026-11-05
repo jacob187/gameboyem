@@ -1,3 +1,5 @@
+cargo-features = ["trim-paths"]
+
 [package]
 name = "gba-homebrew"
 version = "0.1.0"
@@ -10,7 +12,7 @@ description = "Two original GBA homebrew games (agb) used as emulator smoke test
 [workspace]
 
 [dependencies]
-agb = "=0.25.0"
+agb = { version = "=0.25.0", default-features = false, features = ["testing"] }
 
 [[bin]]
 name = "grains"
@@ -28,6 +30,7 @@ debug = true
 opt-level = 3
 
 [profile.release]
+trim-paths = "all"
 opt-level = 3
 lto = "fat"
 debug = true
