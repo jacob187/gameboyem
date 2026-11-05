@@ -88,7 +88,6 @@ impl Bus {
 
     /// The slow path of [`Bus::tick_components`]: double speed and / or an HBlank
     /// DMA is running. `idle` is true for a halted or stopped CPU.
-    #[cold]
     #[inline(never)]
     pub(crate) fn tick_slow(&mut self, idle: bool) {
         if !idle
