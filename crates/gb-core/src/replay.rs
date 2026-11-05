@@ -423,8 +423,11 @@ mod tests {
         assert_eq!(dec(&good[..MODEL_AT]), Err(D::TruncatedHeader));
         assert_eq!(dec(&good[..MODEL_AT + 1]), Err(D::TruncatedHeader));
 
-        let mut v = good.clone();
-        v[17..21].copy_from_slice(&((MAX_BATTERY_LEN + 1) as u32).to_le_bytes());
+        let big = Header {
+            battery: Some(vec![0; MAX_BATTERY_LEN + 1]),
+            ..header.clone()
+        };
+        let v = encode_header(&big);
         assert_eq!(
             dec(&v),
             Err(D::BatteryTooLarge {

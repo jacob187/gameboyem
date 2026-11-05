@@ -465,10 +465,7 @@ mod tests {
             Err(DecodeError::UnsupportedVersion(VERSION + 1))
         );
         v[8] = 0;
-        assert_eq!(
-            decode_header(&v),
-            Err(DecodeError::UnsupportedVersion(0))
-        );
+        assert_eq!(decode_header(&v), Err(DecodeError::UnsupportedVersion(0)));
         // Cut at every length short of the full header: always TruncatedHeader.
         for cut in 9..good.len() {
             assert_eq!(
