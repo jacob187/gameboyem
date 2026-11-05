@@ -90,6 +90,9 @@ impl Gba {
     /// Append the audio produced since the last call (interleaved stereo f32,
     /// see `Apu::drain_samples`).
     pub fn drain_audio_into(&mut self, out: &mut Vec<f32>) {
+        // P2-APU: run the APU up to the clock first, so the audio covers exactly
+        // the emulated time elapsed (signature and contract unchanged).
+        self.bus.apu.advance_to(self.bus.sched.now());
         self.bus.apu.drain_samples(out);
     }
 
