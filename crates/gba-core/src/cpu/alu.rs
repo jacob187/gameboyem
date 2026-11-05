@@ -104,7 +104,7 @@ pub fn shift_reg(kind: u32, v: u32, amount: u32, c: bool) -> (u32, bool) {
 /// the multiplier `rs` are all zeros (or, for signed multiplies, all ones).
 #[inline(always)]
 pub fn mul_cycles(rs: u32, signed: bool) -> u32 {
-    let ones = if signed { !rs } else { 0 };
+    let ones = if signed { !rs } else { u32::MAX };
     if rs >> 8 == 0 || ones >> 8 == 0 {
         1
     } else if rs >> 16 == 0 || ones >> 16 == 0 {

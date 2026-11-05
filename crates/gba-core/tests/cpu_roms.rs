@@ -238,6 +238,7 @@ fn fuzzarm(name: &str) {
     };
     let mut bus = FlatBus::new(rom);
     let mut cpu = Cpu::post_bios();
+    let started = std::time::Instant::now();
     let mut steps = 0u64;
     let mut stuck = 0u32;
     let mut last = cpu.registers().r[15];
@@ -258,6 +259,13 @@ fn fuzzarm(name: &str) {
         if steps % 4096 == 0 && bus.rd32(0x0200_0000) != 0 {
             break;
         }
+    }
+    if std::env::var_os("ROM_TEST_SPEED").is_some() {
+        let secs = started.elapsed().as_secs_f64();
+        eprintln!(
+            "{name}: {steps} instructions in {secs:.3} s = {:.1} M/s",
+            steps as f64 / secs / 1e6
+        );
     }
     let word0 = bus.rd32(0x0200_0000);
     let dump: Vec<u32> = (0..16).map(|i| bus.rd32(0x0200_0000 + i * 4)).collect();
