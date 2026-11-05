@@ -3,6 +3,7 @@
 mod sys_common;
 use gba_core::bus::CpuBus;
 use gba_core::dma::DmaTrigger;
+use gba_core::ppu::HDRAW_CYCLES;
 use sys_common::*;
 
 const IF: u32 = 0x0400_0202;
@@ -178,8 +179,8 @@ fn hblank_dma_waits_for_the_trigger_and_repeats() {
         0x8000 | 2 << 12 | 1 << 9 | 3 << 5,
     );
     assert!(b.dma.active_channel().is_none());
-    // The PPU's HBlank signal (line 0, dot 240) starts it.
-    run_to(&mut b, 960);
+    // The PPU's HBlank signal (line 0, DECISIONS #55) starts it.
+    run_to(&mut b, u64::from(HDRAW_CYCLES));
     assert_eq!(b.dma.active_channel(), Some(0));
     settle(&mut b);
     assert_eq!(read_all16(&mut b, IWRAM + 0x100, 2), [0x1000, 0x1001]);
@@ -190,7 +191,7 @@ fn hblank_dma_waits_for_the_trigger_and_repeats() {
     );
     // Next line: the source continues, the destination restarts at its reload.
     b.write16(IWRAM + 0x100, 0xFFFF, N);
-    run_to(&mut b, 1232 + 960);
+    run_to(&mut b, 1232 + u64::from(HDRAW_CYCLES));
     settle(&mut b);
     assert_eq!(b.read16(IWRAM + 0x100, N), 0x1002);
     assert_eq!(b.read16(IWRAM + 0x102, N), 0x1003);
