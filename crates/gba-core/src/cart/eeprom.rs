@@ -54,7 +54,9 @@ impl Eeprom {
         self.data.fill(0xFF);
         self.data[..bytes.len()].copy_from_slice(bytes);
         self.size = Some(bytes.len());
-        self.size_confirmed = false;
+        // The file's size sticks: a later DMA length must not shrink or grow a
+        // loaded save (code-review S#1).
+        self.size_confirmed = true;
         self.reset_serial();
     }
 
@@ -221,10 +223,15 @@ mod tests {
     }
 
     #[test]
-    fn loaded_size_is_overridden_by_the_first_dma() {
+    fn a_loaded_size_sticks_against_a_conflicting_dma_length() {
         let mut e = Eeprom::default();
-        e.load(&vec![0; SIZE_8K]);
+        let mut img = vec![0xFF; SIZE_8K];
+        img[0x3FF * 8..0x3FF * 8 + 8].copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        e.load(&img);
         e.begin_write_dma(9);
-        assert_eq!(e.data().unwrap().len(), SIZE_512);
+        assert_eq!(e.data().unwrap().len(), SIZE_8K);
+        // Still 14-bit addressing: the last block is reachable.
+        send(&mut e, &read_req(0x3FF, 14));
+        assert_eq!(read_value(&mut e), 0x0001_0203_0405_0607);
     }
 }
