@@ -14,7 +14,7 @@ use winit::window::{Window, WindowId};
 
 use crate::audio::{AudioOutput, ToneGen};
 use crate::keymap::{Action, InputState, map};
-use crate::pacer::FramePacer;
+use crate::pacer::{FramePacer, MAX_STEPS_PER_ADVANCE, audio_seconds};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
@@ -265,31 +265,46 @@ impl App {
         }
     }
 
-    /// Run `n` emulated frames, feed audio, and upload the last picture.
-    fn run_frames(&mut self, n: u32) {
-        for _ in 0..n {
-            self.audio_buf.clear();
-            match self.test.as_mut() {
-                Some(t) => {
-                    test_pattern(t.frame, &mut t.fb);
-                    t.frame = t.frame.wrapping_add(1);
-                    self.audio_buf.extend_from_slice(&t.tone.next_frame());
-                }
-                None => {
-                    self.gb.step_frame();
-                    // Always drain so the core's buffer cannot grow unbounded.
-                    self.gb.drain_audio_into(&mut self.audio_buf);
-                }
+    /// Run one `step_frame`, feed audio, and return the emulated seconds it
+    /// covered (see [`audio_seconds`]): usually one frame, but a CGB speed
+    /// switch makes a step span 0.4-1.9 frames.
+    fn step_once(&mut self) -> f64 {
+        self.audio_buf.clear();
+        let emulated = match self.test.as_mut() {
+            Some(t) => {
+                test_pattern(t.frame, &mut t.fb);
+                t.frame = t.frame.wrapping_add(1);
+                self.audio_buf.extend_from_slice(&t.tone.next_frame());
+                self.pacer.period()
             }
-            if !self.fast_forward
-                && let Some(a) = &self.audio
-            {
-                a.ring.push(&self.audio_buf);
+            None => {
+                self.gb.step_frame();
+                // Always drain so the core's buffer cannot grow unbounded.
+                self.gb.drain_audio_into(&mut self.audio_buf);
+                audio_seconds(self.audio_buf.len(), self.gb.audio_sample_rate())
             }
+        };
+        if !self.fast_forward
+            && let Some(a) = &self.audio
+        {
+            a.ring.push(&self.audio_buf);
         }
-        if n > 0 {
+        emulated
+    }
+
+    /// Run steps while the pacer says a frame is owed, then upload the last
+    /// picture. Returns whether any step ran.
+    fn run_due(&mut self) -> bool {
+        let mut ran = 0;
+        while ran < MAX_STEPS_PER_ADVANCE && self.pacer.frame_due() {
+            let emulated = self.step_once();
+            self.pacer.consume(emulated);
+            ran += 1;
+        }
+        if ran > 0 {
             self.upload();
         }
+        ran > 0
     }
 
     fn upload(&mut self) {
@@ -410,14 +425,12 @@ impl ApplicationHandler for App {
                 .set_control_flow(status_until.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
             return;
         }
-        let n = self.pacer.advance(dt);
-        if n > 0 {
-            self.run_frames(n);
-            if self.surface_ok
-                && let Some(w) = &self.window
-            {
-                w.request_redraw();
-            }
+        self.pacer.advance(dt);
+        if self.run_due()
+            && self.surface_ok
+            && let Some(w) = &self.window
+        {
+            w.request_redraw();
         }
         self.saves.tick(&self.gb, now);
 
@@ -492,6 +505,18 @@ mod tests {
     }
 
     #[test]
+    fn a_normal_step_covers_one_frame_of_emulated_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let period = app.pacer.period();
+        app.step_once(); // the first frame starts mid-frame after the boot state
+        let total: f64 = (0..120).map(|_| app.step_once()).sum();
+        // Samples are whole, so the total is within a sample of 120 periods.
+        let rate = f64::from(app.gb.audio_sample_rate());
+        assert!((total - 120.0 * period).abs() < 2.0 / rate, "{total}");
+    }
+
+    #[test]
     fn save_and_load_state_keys_restore_the_machine() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
@@ -501,7 +526,9 @@ mod tests {
         assert!(dir.path().join("g.ss1").is_file());
         assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
 
-        app.run_frames(5);
+        for _ in 0..5 {
+            app.step_once();
+        }
         app.load_state();
         assert_eq!(app.gb.save_state(), snap);
         assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
