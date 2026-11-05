@@ -111,12 +111,15 @@ impl Flash {
                 false
             }
             State::Unlocked1 => {
-                self.state = if a == 0x2AAA && v == 0x55 {
-                    State::Unlocked2
+                if a == 0x2AAA && v == 0x55 {
+                    self.state = State::Unlocked2;
+                    false
                 } else {
-                    State::Idle
-                };
-                false
+                    // Not the second unlock byte: look at it as a fresh start, so
+                    // a repeated 0xAA@0x5555 keeps the unlock going (code-review S#4).
+                    self.state = State::Idle;
+                    self.write(addr, v)
+                }
             }
             State::Unlocked2 => {
                 self.state = State::Idle;
@@ -206,6 +209,24 @@ mod tests {
         cmd(&mut f, 0x80);
         cmd(&mut f, 0x10);
         assert_eq!(f.read(0x1000), 0xFF);
+    }
+
+    #[test]
+    fn a_retried_unlock_sequence_still_works() {
+        let mut f = Flash::new(SIZE_64K);
+        f.write(0x5555, 0xAA);
+        f.write(0x5555, 0xAA); // restart, not abort
+        f.write(0x2AAA, 0x55);
+        f.write(0x5555, 0xA0);
+        f.write(0x10, 0x42);
+        assert_eq!(f.read(0x10), 0x42);
+        // A junk byte in between aborts the sequence.
+        f.write(0x5555, 0xAA);
+        f.write(0x1234, 0x00);
+        f.write(0x2AAA, 0x55);
+        f.write(0x5555, 0xA0);
+        f.write(0x11, 0x42);
+        assert_eq!(f.read(0x11), 0xFF);
     }
 
     #[test]
