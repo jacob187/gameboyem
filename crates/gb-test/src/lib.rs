@@ -2078,6 +2078,87 @@ mod tests {
         );
     }
 
+    /// A CGB-flagged ROM that draws one BG tile with a stripe: BG palette 0 colour 0 is white
+    /// and colour 1 is `colour1` (RGB555, little-endian). It then latches every button in
+    /// `mask` (P1 bits 3:0 = Start, Select, B, A) it sees pressed into the low byte of colour 1
+    /// (the latch starts as that byte and survives the release), so the picture changes after such a press and
+    /// otherwise never does.
+    fn smoke_cgb_rom(colour1: [u8; 2], mask: u8) -> Vec<u8> {
+        #[rustfmt::skip]
+        let code = [
+            0xF3,                         // di
+            0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA, // wait for LY == 144
+            0xAF, 0xE0, 0x40,             // LCD off
+            0x21, 0x00, 0x80, 0x01, 0x00, 0x20, // hl = $8000, bc = $2000
+            0xAF, 0x22, 0x0B, 0x78, 0xB1, 0x20, 0xF9, // clear VRAM
+            0x21, 0x00, 0x80, 0x36, 0xFF, // tile 0, first row = colour 1
+            0x3E, 0x80, 0xE0, 0x68,       // BCPS: index 0, auto-increment
+            0x3E, 0xFF, 0xE0, 0x69, 0x3E, 0x7F, 0xE0, 0x69, // colour 0 = white
+            0x3E, colour1[0], 0xE0, 0x69, 0x3E, colour1[1], 0xE0, 0x69, // colour 1
+            0x3E, 0x91, 0xE0, 0x40,       // LCD on, BG on
+            0x06, colour1[0],             // b = latch = colour 1's low byte
+            // loop:
+            0x3E, 0x10, 0xE0, 0x00,       // select the buttons
+            0xF0, 0x00, 0x2F, 0xE6, mask, // a = pressed buttons in mask
+            0xB0, 0x47,                   // a |= b; b = a
+            0x3E, 0x82, 0xE0, 0x68,       // BCPS: colour 1, low byte
+            0x78, 0xE0, 0x69,             // BCPD = latch
+            0x18, 0xEC,                   // jr loop
+        ];
+        let mut rom = synth_rom(0x00, 0, &code);
+        rom[0x143] = 0xC0;
+        rom
+    }
+
+    /// Colour 1 starts black; the stripe is visible.
+    const BLACK: [u8; 2] = [0x00, 0x00];
+
+    fn smoke_cgb(rom: Vec<u8>, model: Model) -> Outcome {
+        let mut gb = GameBoy::with_model(rom, model).expect("synthetic ROM loads");
+        run_smoke_cgb(&mut gb, 20)
+    }
+
+    #[test]
+    fn smoke_cgb_passes_when_start_or_a_changes_the_picture() {
+        for mask in [0x08, 0x01] {
+            let out = smoke_cgb(smoke_cgb_rom(BLACK, mask), Model::Cgb);
+            assert_eq!(out, Outcome::Pass, "mask {mask:#04X}: {out}");
+        }
+    }
+
+    #[test]
+    fn smoke_cgb_fails_on_a_frozen_picture() {
+        // Nothing the script presses (Start, A) reaches the latch: B only, then nothing at all.
+        for mask in [0x02, 0x00] {
+            let out = smoke_cgb(smoke_cgb_rom(BLACK, mask), Model::Cgb);
+            assert!(
+                matches!(&out, Outcome::Fail(m) if m.contains("picture frozen (2 colours)")),
+                "mask {mask:#04X}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_cgb_fails_on_a_single_colour_picture() {
+        // Colour 1 is white too, so the stripe is invisible. Start would change it, but the
+        // colour check comes first.
+        let out = smoke_cgb(smoke_cgb_rom([0xFF, 0x7F], 0x08), Model::Cgb);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("colour framebuffer blank (1 colour)")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn smoke_cgb_fails_without_a_colour_frame() {
+        // The same ROM on a DMG never renders in colour.
+        let out = smoke_cgb(smoke_cgb_rom(BLACK, 0x08), Model::Dmg);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("cgb_framebuffer() is None")),
+            "{out}"
+        );
+    }
+
     /// Cart type MBC1+RAM+BATTERY, 8 KiB RAM. Enables SRAM, signs the block,
     /// then: first run sets A010 and reports 0x81 (needs reset); the second
     /// run (A010 survived the reset) reports 0 and disables SRAM again.
