@@ -354,11 +354,11 @@ fn main(mut gba: agb::Gba) -> ! {
     put_text(hud, 1, 0, b"SCORE", 2);
     put_text(hud, 22, 0, b"TIME", 2);
     let title = &mut new_bg(Priority::P0);
-    put_text(title, 13, 4, b"MOTH", 1);
+    put_text(title, 13, 4, b"MOTH", 2);
     put_text(title, 6, 8, b"COLLECT THE GLINTS", 2);
     put_text(title, 9, 12, b"PRESS START", 3);
     let over = &mut new_bg(Priority::P0);
-    put_text(over, 11, 6, b"TIME UP", 1);
+    put_text(over, 11, 6, b"TIME UP", 2);
     put_text(over, 9, 10, b"PRESS START", 3);
 
     let moth_frames = [
