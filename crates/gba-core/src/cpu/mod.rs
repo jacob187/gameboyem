@@ -197,10 +197,7 @@ impl Cpu {
             // Undo the pipelined PC: report the next instruction to execute.
             r[15] = r[15].wrapping_sub(if self.cpsr & PSR_T != 0 { 4 } else { 8 });
         }
-        Registers {
-            r,
-            cpsr: self.cpsr,
-        }
+        Registers { r, cpsr: self.cpsr }
     }
 
     /// CPSR (test and debug hook).

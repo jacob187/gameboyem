@@ -411,7 +411,11 @@ fn irq_return_address_is_next_instruction_plus_4_in_arm_and_thumb() {
     run(&mut cpu, &mut ram, 1);
     let r = cpu.registers();
     assert_eq!(r.cpsr & 0x1F, 0x12);
-    assert_eq!(r.r[14] - 4, 0, "`subs pc, lr, #4` resumes the interrupted instruction");
+    assert_eq!(
+        r.r[14] - 4,
+        0,
+        "`subs pc, lr, #4` resumes the interrupted instruction"
+    );
     assert_eq!(r.r[15], 0x18);
     assert_eq!(cpu.state().spsr[3], 0x1F);
 

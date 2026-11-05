@@ -193,7 +193,11 @@ fn jsmolka(rel: &str, idle_addr: u32, thumb_idle: bool, result_reg: usize) {
     let Some(rom) = load(rel) else { return };
     let off = (idle_addr & 0x01FF_FFFF) as usize;
     if thumb_idle {
-        assert_eq!(&rom[off..off + 2], &[0xFE, 0xE7], "no `b .` at {idle_addr:#X}");
+        assert_eq!(
+            &rom[off..off + 2],
+            &[0xFE, 0xE7],
+            "no `b .` at {idle_addr:#X}"
+        );
     } else {
         assert_eq!(
             &rom[off..off + 4],
@@ -202,7 +206,11 @@ fn jsmolka(rel: &str, idle_addr: u32, thumb_idle: bool, result_reg: usize) {
         );
     }
     let end = run(rom, 50_000_000, |pc| pc == idle_addr || pc < 0x4000);
-    assert_eq!(end.pc, idle_addr, "{rel} left the program (pc {:#X})", end.pc);
+    assert_eq!(
+        end.pc, idle_addr,
+        "{rel} left the program (pc {:#X})",
+        end.pc
+    );
     assert_eq!(
         end.r[result_reg], 0,
         "{rel}: failed test number {} (after {} instructions)",

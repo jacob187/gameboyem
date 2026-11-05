@@ -214,7 +214,11 @@ fn dp_exec<B: CpuBus, const F: u32>(
 fn dp_imm<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     let rot = ((op >> 8) & 0xF) * 2;
     let imm = (op & 0xFF).rotate_right(rot);
-    let sc = if rot == 0 { cpu.carry() } else { imm >> 31 != 0 };
+    let sc = if rot == 0 {
+        cpu.carry()
+    } else {
+        imm >> 31 != 0
+    };
     let rn = cpu.r[((op >> 16) & 0xF) as usize];
     dp_exec::<B, F>(cpu, bus, op, rn, imm, sc);
 }

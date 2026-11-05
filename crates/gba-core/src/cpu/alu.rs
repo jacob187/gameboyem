@@ -125,13 +125,13 @@ mod tests {
     #[test]
     fn add_sub_flags() {
         assert_eq!(add_with_carry(0xFFFF_FFFF, 1, 0), (0, true, false));
-        assert_eq!(add_with_carry(0x7FFF_FFFF, 1, 0), (0x8000_0000, false, true));
+        assert_eq!(
+            add_with_carry(0x7FFF_FFFF, 1, 0),
+            (0x8000_0000, false, true)
+        );
         assert_eq!(sub_with_carry(5, 5, 1), (0, true, false));
         assert_eq!(sub_with_carry(0, 1, 1), (0xFFFF_FFFF, false, false));
-        assert_eq!(
-            sub_with_carry(0x8000_0000, 1, 1),
-            (0x7FFF_FFFF, true, true)
-        );
+        assert_eq!(sub_with_carry(0x8000_0000, 1, 1), (0x7FFF_FFFF, true, true));
     }
 
     #[test]
