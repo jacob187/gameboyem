@@ -130,9 +130,7 @@ impl std::error::Error for ReplayError {}
 
 /// FNV-1a 64 of the ROM image; ties a recording to the ROM it was made with.
 pub fn rom_hash(rom: &[u8]) -> u64 {
-    rom.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+    emu_common::fnv1a(rom)
 }
 
 pub fn encode_header(header: &Header) -> Vec<u8> {

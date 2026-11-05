@@ -198,7 +198,7 @@ mod tests {
         let mut cgb = GameBoy::with_model(cgb_rom(0x02), Model::Cgb).unwrap();
         slots.save(&dmg).unwrap(); // a DMG state, as every pre-CGB state is
         let err = slots.load(&mut cgb).unwrap_err();
-        assert!(err.contains("different Game Boy model"), "{err}");
+        assert!(err.contains("different hardware model"), "{err}");
         assert!(err.contains("--model dmg"), "{err}");
 
         slots.save(&cgb).unwrap();

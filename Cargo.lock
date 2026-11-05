@@ -568,6 +568,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "emu-common"
+version = "0.1.0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -687,6 +691,9 @@ dependencies = [
 [[package]]
 name = "gb-core"
 version = "0.1.0"
+dependencies = [
+ "emu-common",
+]
 
 [[package]]
 name = "gb-frontend"
