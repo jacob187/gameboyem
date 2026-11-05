@@ -26,7 +26,7 @@ build output. Cargo must run inside this directory (that is where rustup and `.c
 for manual work: `cd homebrew/gba && cargo build --release --locked`, `cargo clippy --release`, `cargo fmt --check`.
 `check-header.sh` validates ROM headers and is run by the Makefile target.
 
-Sizes with the pinned toolchain: `grains.gba` 157548 bytes, `moth.gba` 193392 bytes (about half is `agb`'s default
+Sizes with the pinned toolchain: `grains.gba` 157548 bytes, `moth.gba` 193452 bytes (about half is `agb`'s default
 panic and backtrace screen). Repeated clean builds on one machine are byte-identical, but the ROMs contain
 absolute `~/.cargo` and `~/.rustup` source paths (panic locations), so hashes differ between machines.
 
