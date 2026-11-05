@@ -294,7 +294,7 @@ fn title(vblank: &VBlank, input: &mut ButtonController) {
     set_page(0);
     fill_rows(0, 0, H, C_BG);
     text(0, 48, 30, 6, b"GRAINS", C_TEXT);
-    text(0, 60, 120, 2, b"PRESS START", C_BLINK);
+    text(0, 76, 120, 2, b"PRESS START", C_BLINK);
     for i in 0..8 {
         fill_rect(0, 56 + i * 16, 80, 16, 8, C_RAINBOW + i as u8);
     }
