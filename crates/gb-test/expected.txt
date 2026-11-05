@@ -250,8 +250,8 @@ pass jsmolka-gba 150 test/gba/jsmolka/save/flash64.gba
 pass jsmolka-gba 150 test/gba/jsmolka/save/flash128.gba
 pass jsmolka-gba 60 test/gba/jsmolka/save/none.gba
 # FuzzARM: 10000 random instruction tests per ROM. Each draws its test number as 8 hex glyphs from
-# ROM (16-bit bus, so 6+ cycles per ARM instruction), and the ROMs reach their idle loop at frame
-# 826-828, so the budget is 2x that. The flash ROMs need 74 frames (64 K fills of the chip a byte at
+# ROM (16-bit bus, so 6+ cycles per ARM instruction), and the ROMs reach their idle loop at frames
+# 825.3-827.3, so the budget is 2x that. The flash ROMs need 73.9 frames (64 K fills of the chip a byte at
 # a time through 8-bit SRAM-bus accesses), hence 150.
 pass fuzzarm-gba 1650 test/gba/fuzzarm/ARM_Any.gba
 pass fuzzarm-gba 1650 test/gba/fuzzarm/ARM_DataProcessing.gba
