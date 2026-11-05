@@ -31,7 +31,6 @@ const FUZZ_SETTLE_FRAMES: u32 = 10;
 
 /// Dispatch a GBA case. `rom` is the file's bytes.
 pub fn run_case(case: &Case, rom: Vec<u8>) -> Outcome {
-    let file = case.path.rsplit('/').next().unwrap_or(&case.path);
     let idle = match case.kind {
         Kind::JsmolkaGba | Kind::FuzzarmGba => match find_idle(&rom) {
             Ok(a) => a,
@@ -44,7 +43,7 @@ pub fn run_case(case: &Case, rom: Vec<u8>) -> Outcome {
         Err(e) => return Outcome::Fail(format!("load error: {e}")),
     };
     match case.kind {
-        Kind::JsmolkaGba => run_jsmolka(&mut gba, idle, fail_register(file), case.max_frames),
+        Kind::JsmolkaGba => run_jsmolka(&mut gba, idle, fail_register(&case.path), case.max_frames),
         Kind::FuzzarmGba => run_fuzzarm(&mut gba, idle, case.max_frames),
         _ => run_smoke(&mut gba, case),
     }
@@ -67,9 +66,14 @@ pub fn find_idle(rom: &[u8]) -> Result<u32, String> {
 }
 
 /// The register jsmolka's `m_test_eval` leaves the failed-test number in: r7 for the Thumb
-/// ROM, r12 for the rest. Keyed on the file name, as there is exactly one Thumb ROM.
-pub fn fail_register(file_name: &str) -> usize {
-    if file_name == "thumb.gba" { 7 } else { 12 }
+/// ROM, r12 for the rest. Keyed on the case path's `jsmolka/thumb/` directory rather than a bare
+/// `thumb.gba`, so another suite's file of that name is not mistaken for it.
+pub fn fail_register(rom_path: &str) -> usize {
+    if rom_path.contains("jsmolka/thumb/") {
+        7
+    } else {
+        12
+    }
 }
 
 /// Turn the failed-test register into an outcome.
@@ -317,13 +321,15 @@ mod tests {
 
     #[test]
     fn thumb_rom_reports_in_r7_and_the_rest_in_r12() {
-        assert_eq!(fail_register("thumb.gba"), 7);
+        assert_eq!(fail_register("test/gba/jsmolka/thumb/thumb.gba"), 7);
         for f in [
-            "arm.gba",
-            "memory.gba",
-            "nes.gba",
-            "sram.gba",
-            "flash64.gba",
+            "test/gba/jsmolka/arm/arm.gba",
+            "test/gba/jsmolka/memory/memory.gba",
+            "test/gba/jsmolka/nes/nes.gba",
+            "test/gba/jsmolka/save/sram.gba",
+            "test/gba/jsmolka/save/flash64.gba",
+            // Only the jsmolka thumb directory is special.
+            "test/gba/other/thumb.gba",
         ] {
             assert_eq!(fail_register(f), 12, "{f}");
         }
