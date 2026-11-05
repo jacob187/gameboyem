@@ -703,6 +703,7 @@ dependencies = [
  "ctrlc",
  "emu-common",
  "gb-core",
+ "gba-core",
  "pixels",
  "png",
  "tempfile",

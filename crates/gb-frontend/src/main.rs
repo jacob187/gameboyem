@@ -1,5 +1,5 @@
-//! `gb`: desktop frontend (window, input, audio, saves) for the gb-core emulator.
-//! All platform-specific code lives in this crate; `gb-core` stays pure.
+//! `gb`: desktop frontend (window, input, audio, saves) for the gb-core and gba-core
+//! emulators. All platform-specific code lives in this crate; the cores stay pure.
 #![forbid(unsafe_code)]
 
 mod app;
@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use emu_common::{Core, System};
 use gb_core::GameBoy;
+use gba_core::Gba;
 use winit::event_loop::EventLoop;
 
 use crate::app::{App, Storage};
@@ -27,6 +28,31 @@ use crate::cli::Command;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
+
+/// A Game Boy core for `rom`, as `--model` asks.
+fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<Box<dyn Core>, String> {
+    let archive = rom::archive_kind(&rom);
+    let model = opts.model.resolve(&rom);
+    let gb = GameBoy::with_model(rom, model)
+        .map_err(|e| rom::cartridge_message(&opts.rom, &e, archive))?;
+    if !gb.cartridge_header().header_checksum_ok {
+        eprintln!("warning: ROM header checksum is wrong (running anyway)");
+    }
+    Ok(Box::new(gb))
+}
+
+/// A GBA core for `rom`, booted through `--bios` if given (else the built-in
+/// HLE BIOS, DECISIONS #47).
+fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<Box<dyn Core>, String> {
+    let archive = rom::archive_kind(&rom);
+    let bios = match &opts.bios {
+        Some(path) => Some(rom::read_bios(path)?),
+        None => None,
+    };
+    let gba =
+        Gba::new(rom, bios).map_err(|e| rom::gba_cartridge_message(&opts.rom, &e, archive))?;
+    Ok(Box::new(gba))
+}
 
 fn main() -> ExitCode {
     let opts = match cli::parse(std::env::args_os().skip(1)) {
@@ -41,9 +67,19 @@ fn main() -> ExitCode {
         }
     };
 
-    // The only system so far; a GBA core chooses here (by extension or header)
-    // and builds its own `Box<dyn Core>` below.
-    let system = System::Gb;
+    // The system comes first: the ROM size limit depends on it, and so do the
+    // flags that apply (DECISIONS #46).
+    let system = match rom::pick_system(&opts.rom, opts.system) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(msg) = cli::check_system_flags(system, &opts) {
+        eprintln!("error: {msg}\n\n{}", cli::USAGE);
+        return ExitCode::from(2);
+    }
     let rom = match rom::read_rom(&opts.rom, system) {
         Ok(r) => r,
         Err(msg) => {
@@ -51,20 +87,18 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let archive = rom::archive_kind(&rom);
-    let model = opts.model.resolve(&rom);
     let rom_hash = emu_common::replay::rom_hash(&rom);
-    let gb = match GameBoy::with_model(rom, model) {
-        Ok(gb) => gb,
-        Err(e) => {
-            eprintln!("error: {}", rom::cartridge_message(&opts.rom, &e, archive));
+    let built = match system {
+        System::Gb => build_gb(&opts, rom),
+        System::Gba => build_gba(&opts, rom),
+    };
+    let mut core = match built {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
-    if !gb.cartridge_header().header_checksum_ok {
-        eprintln!("warning: ROM header checksum is wrong (running anyway)");
-    }
-    let mut core: Box<dyn Core> = Box::new(gb);
 
     let audio = if opts.mute {
         None

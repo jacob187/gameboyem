@@ -8,13 +8,84 @@ use std::path::Path;
 use emu_common::System;
 use gb_core::CartridgeError;
 use gb_core::cartridge::MAX_ROM_SIZE;
+use gba_core::CartError;
 
 /// The largest ROM image `system`'s core accepts.
 pub fn max_rom_bytes(system: System) -> u64 {
     match system {
         System::Gb => MAX_ROM_SIZE as u64,
-        // The GBA cartridge address space (32 MiB).
-        System::Gba => 32 * 1024 * 1024,
+        System::Gba => gba_core::MAX_ROM_SIZE as u64,
+    }
+}
+
+/// Bytes of a GBA header that [`looks_like_gba`] needs (through the checksum at 0xBD).
+const GBA_HEADER_PEEK: usize = 0xC0;
+
+/// Whether `head` (the start of a file) has a GBA cartridge header: the fixed
+/// byte 0x96 at 0xB2 and a valid complement checksum at 0xBD (the sum of
+/// 0xA0..=0xBC, negated, minus 0x19). A Game Boy header never matches by chance
+/// in practice: both bytes must agree.
+pub fn looks_like_gba(head: &[u8]) -> bool {
+    if head.len() <= 0xBD || head[0xB2] != 0x96 {
+        return false;
+    }
+    let sum = head[0xA0..=0xBC]
+        .iter()
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    head[0xBD] == 0u8.wrapping_sub(sum).wrapping_sub(0x19)
+}
+
+/// Which system to run `path` as (DECISIONS #46): `forced` (`--system`) if
+/// given, else GBA for a `.gba` file name, else GBA if the file's header looks
+/// like one, else Game Boy. Only the first 0xC0 bytes are read, and only when
+/// the name and flag leave it open, so this runs before [`read_rom`] (whose
+/// size limit depends on the answer). Archives are not unpacked, so there is
+/// no inside-the-archive case: a zip is reported by its magic later.
+pub fn pick_system(path: &Path, forced: Option<System>) -> Result<System, String> {
+    if let Some(system) = forced {
+        return Ok(system);
+    }
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gba"))
+    {
+        return Ok(System::Gba);
+    }
+    let head = read_rom_io(path, GBA_HEADER_PEEK as u64).map_err(|e| io_message(path, &e))?;
+    Ok(if looks_like_gba(&head) {
+        System::Gba
+    } else {
+        System::Gb
+    })
+}
+
+/// Read and validate a GBA BIOS dump: exactly [`gba_core::BIOS_SIZE`] bytes.
+/// Reading stops one byte past that, so a huge file cannot exhaust memory.
+///
+/// The official image's hash is not checked: the frontend has no hash crate
+/// and the dump cannot be shipped to take an FNV from (DECISIONS #62), so a
+/// wrong-but-16 KiB file boots and misbehaves like any other bad BIOS.
+pub fn read_bios(path: &Path) -> Result<Box<[u8]>, String> {
+    let data =
+        read_rom_io(path, gba_core::BIOS_SIZE as u64 + 1).map_err(|e| io_message(path, &e))?;
+    check_bios_size(path, data.len())?;
+    Ok(data.into_boxed_slice())
+}
+
+fn check_bios_size(path: &Path, len: usize) -> Result<(), String> {
+    match len.cmp(&gba_core::BIOS_SIZE) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => Err(format!(
+            "{} is not a GBA BIOS: it is {len} bytes, the BIOS is exactly {} bytes",
+            path.display(),
+            gba_core::BIOS_SIZE
+        )),
+        // The reader stopped one byte past the limit, so the real size is unknown.
+        std::cmp::Ordering::Greater => Err(format!(
+            "{} is not a GBA BIOS: it is larger than {} bytes, the BIOS is exactly that size",
+            path.display(),
+            gba_core::BIOS_SIZE
+        )),
     }
 }
 
@@ -120,11 +191,162 @@ pub fn cartridge_message(path: &Path, e: &CartridgeError, archive: Option<&str>)
     format!("{} is not a usable ROM: {reason}{hint}", path.display())
 }
 
+/// Message for a GBA ROM the core refused. `archive` is [`archive_kind`] of the
+/// file contents.
+pub fn gba_cartridge_message(path: &Path, e: &CartError, archive: Option<&str>) -> String {
+    let reason = match e {
+        CartError::TooSmall(0) => "the file is empty".to_owned(),
+        CartError::TooSmall(n) => format!(
+            "the file is only {n} bytes; a GBA ROM is at least {} (0xC0) bytes",
+            gba_core::cart::HEADER_SIZE
+        ),
+        // The reader caps the size, so the real one is unknown.
+        CartError::TooLarge(_) => {
+            "the file is larger than 32 MiB, the biggest ROM a GBA can map".to_owned()
+        }
+        // Save-related errors cannot come from loading a ROM; keep the core's text.
+        CartError::SaveSize { .. } | CartError::NoSave => e.to_string(),
+    };
+    let hint = archive.map_or(String::new(), |kind| {
+        format!(" (this looks like a {kind} archive; extract the ROM first)")
+    });
+    format!("{} is not a usable ROM: {reason}{hint}", path.display())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const P: &str = "g.gb";
+
+    /// A 0xC0-byte GBA header with the fixed byte and a correct checksum.
+    fn gba_head() -> Vec<u8> {
+        let mut h = vec![0u8; 0xC0];
+        h[0xA0..0xA4].copy_from_slice(b"GAME");
+        h[0xB2] = 0x96;
+        let sum = h[0xA0..=0xBC].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        h[0xBD] = 0u8.wrapping_sub(sum).wrapping_sub(0x19);
+        h
+    }
+
+    #[test]
+    fn the_header_decides_when_the_name_does_not() {
+        let head = gba_head();
+        assert!(looks_like_gba(&head));
+        // A bad checksum, a missing fixed byte, or a short file is not a GBA.
+        let mut bad = head.clone();
+        bad[0xBD] ^= 1;
+        assert!(!looks_like_gba(&bad));
+        let mut no96 = head.clone();
+        no96[0xB2] = 0x97;
+        assert!(!looks_like_gba(&no96));
+        assert!(!looks_like_gba(&head[..0xBD]));
+        assert!(!looks_like_gba(&[]));
+        // A changed title byte breaks the checksum too.
+        let mut title = head;
+        title[0xA0] ^= 0x10;
+        assert!(!looks_like_gba(&title));
+        // A plain Game Boy header is not.
+        assert!(!looks_like_gba(&vec![0u8; 0x8000]));
+    }
+
+    #[test]
+    fn system_comes_from_the_flag_then_the_extension_then_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |name: &str, data: &[u8]| {
+            let p = dir.path().join(name);
+            fs::write(&p, data).unwrap();
+            p
+        };
+        let gb = vec![0u8; 0x8000];
+        // Extension, in any case, even with Game Boy contents.
+        assert_eq!(pick_system(&w("a.gba", &gb), None), Ok(System::Gba));
+        assert_eq!(pick_system(&w("b.GBA", &gb), None), Ok(System::Gba));
+        // Otherwise the header.
+        assert_eq!(pick_system(&w("c.bin", &gba_head()), None), Ok(System::Gba));
+        assert_eq!(pick_system(&w("d.gb", &gba_head()), None), Ok(System::Gba));
+        assert_eq!(pick_system(&w("e.gb", &gb), None), Ok(System::Gb));
+        let mut bad = gba_head();
+        bad[0xBD] ^= 0xFF;
+        assert_eq!(pick_system(&w("f.bin", &bad), None), Ok(System::Gb));
+        // --system overrides all of it.
+        assert_eq!(
+            pick_system(&w("g.gba", &gb), Some(System::Gb)),
+            Ok(System::Gb)
+        );
+        assert_eq!(
+            pick_system(&w("h.gb", &gb), Some(System::Gba)),
+            Ok(System::Gba)
+        );
+        // A forced system does not even need the file (read_rom reports it).
+        assert_eq!(
+            pick_system(&dir.path().join("nope.gb"), Some(System::Gb)),
+            Ok(System::Gb)
+        );
+        // Without a flag or a .gba name the file has to be readable.
+        let e = pick_system(&dir.path().join("nope.gb"), None).unwrap_err();
+        assert!(e.contains("file not found"), "{e}");
+        // A tiny file is a Game Boy ROM (the core reports it too small).
+        assert_eq!(pick_system(&w("i.gb", b"abc"), None), Ok(System::Gb));
+    }
+
+    #[test]
+    fn limits_come_from_the_cores() {
+        assert_eq!(max_rom_bytes(System::Gba), gba_core::MAX_ROM_SIZE as u64);
+        assert_eq!(max_rom_bytes(System::Gb), MAX_ROM_SIZE as u64);
+    }
+
+    #[test]
+    fn a_bios_must_be_exactly_16_kib() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |name: &str, len: usize| {
+            let p = dir.path().join(name);
+            fs::write(&p, vec![7u8; len]).unwrap();
+            p
+        };
+        let ok = read_bios(&w("ok.bin", gba_core::BIOS_SIZE)).unwrap();
+        assert_eq!(ok.len(), gba_core::BIOS_SIZE);
+        let short = read_bios(&w("short.bin", 100)).unwrap_err();
+        assert!(
+            short.contains("100 bytes") && short.contains("16384"),
+            "{short}"
+        );
+        assert!(
+            read_bios(&w("empty.bin", 0))
+                .unwrap_err()
+                .contains("0 bytes")
+        );
+        let big = read_bios(&w("big.bin", 1 << 20)).unwrap_err();
+        assert!(big.contains("larger than 16384"), "{big}");
+        assert!(read_bios(&w("one.bin", gba_core::BIOS_SIZE + 1)).is_err());
+        assert!(
+            read_bios(&dir.path().join("nope.bin"))
+                .unwrap_err()
+                .contains("file not found")
+        );
+    }
+
+    #[test]
+    fn gba_core_errors_map_to_messages() {
+        let p = Path::new("g.gba");
+        let m = |e: CartError| gba_cartridge_message(p, &e, None);
+        assert!(m(CartError::TooSmall(0)).contains("empty"));
+        let small = m(CartError::TooSmall(10));
+        assert!(
+            small.contains("10 bytes") && small.contains("192"),
+            "{small}"
+        );
+        let large = m(CartError::TooLarge(gba_core::MAX_ROM_SIZE + 1));
+        assert!(large.contains("larger than 32 MiB") && !large.contains("33554433"));
+        assert!(m(CartError::NoSave).contains("no battery"));
+        assert!(
+            gba_cartridge_message(Path::new("g.zip"), &CartError::TooSmall(4), Some("zip"))
+                .contains("zip archive")
+        );
+        // The real core's refusals, end to end.
+        let e = gba_core::Gba::new(vec![0; 10], None).err().unwrap();
+        assert!(m(e).contains("10 bytes"));
+    }
 
     fn msg(e: CartridgeError) -> String {
         cartridge_message(Path::new(P), &e, None)

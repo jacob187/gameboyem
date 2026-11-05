@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 emu-common.workspace = true
 gb-core.workspace = true
+gba-core.workspace = true
 winit.workspace = true
 pixels.workspace = true
 cpal.workspace = true

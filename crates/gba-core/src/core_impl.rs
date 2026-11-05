@@ -200,7 +200,11 @@ mod tests {
         assert!(Core::has_battery(&eeprom));
         assert_eq!(Core::battery_ram(&eeprom), None);
         assert!(Core::load_battery_ram(&mut eeprom, &[0; 100]).is_err());
-        assert_eq!(Core::battery_ram(&eeprom), None, "a bad size changes nothing");
+        assert_eq!(
+            Core::battery_ram(&eeprom),
+            None,
+            "a bad size changes nothing"
+        );
         assert!(Core::load_battery_ram(&mut eeprom, &[0xAB; 512]).is_ok());
         assert_eq!(Core::battery_ram(&eeprom), Some(vec![0xAB; 512]));
     }
