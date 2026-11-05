@@ -188,3 +188,21 @@ fn the_pump_keeps_the_apu_within_one_interval_of_the_clock() {
     let lag = b.sched.now() - b.apu.now();
     assert!(lag <= gba_core::apu::PUMP_CYCLES + 48, "lag {lag}");
 }
+
+/// code-review A2#1: reads see the APU at the current cycle, not the last pump.
+#[test]
+fn sound_register_reads_see_the_current_cycle() {
+    let mut b = new_bus();
+    wr(&mut b, 0x84, 0x80);
+    wr(&mut b, 0x62, 0xF000 | 63); // length 1
+    wr(&mut b, 0x64, 0xC000); // restart with the length flag
+    assert_eq!(rd(&mut b, 0x84) & 1, 1);
+    // The first length clock is 32768 cycles after sound was enabled. Move the
+    // clock past it without dispatching events, so no pump syncs the APU.
+    b.idle(32_768 + 100);
+    assert!(
+        b.apu.now() < b.sched.now() - 32_000,
+        "the APU lags the clock"
+    );
+    assert_eq!(rd(&mut b, 0x84) & 1, 0, "already expired");
+}
