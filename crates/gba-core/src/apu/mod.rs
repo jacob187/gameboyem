@@ -53,7 +53,9 @@ pub const PUMP_CYCLES: u64 = 512;
 /// the GBA PSG shares, GBATEK gives the three rates).
 const SEQUENCER_CYCLES: u32 = CYCLES_PER_SECOND / 512;
 
-/// Seconds of audio kept if the host never drains.
+/// Seconds of audio kept if the host never drains. When the buffer is full the
+/// newest samples are dropped, exactly as `gb-core`'s APU does, so a frontend
+/// sees the same overflow behaviour from both cores (code-review A2#3).
 const MAX_BUFFERED_SECS: usize = 1;
 
 /// Mix units: a quarter of one SOUNDBIAS output LSB, so the PSG's 25% ratio

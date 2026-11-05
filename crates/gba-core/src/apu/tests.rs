@@ -476,6 +476,27 @@ fn an_undrained_buffer_is_capped() {
     assert_eq!(drain(&mut a).len(), 2 * 48_000);
 }
 
+/// Same policy as gb-core: when full, the newest samples are dropped.
+#[test]
+fn a_full_buffer_keeps_the_oldest_samples() {
+    let mut a = Apu::default();
+    a.advance_to(CPS / 2); // silence at the bias centre
+    w(&mut a, SOUNDBIAS, 0x0300); // from now on the level is 0.5
+    a.advance_to(5 * CPS);
+    let s = drain(&mut a);
+    assert_eq!(s.len(), 2 * 48_000);
+    assert_eq!(s[0], 0.0);
+    assert_eq!(s[2 * 24_000 - 2], 0.0, "the first half second is kept");
+    assert_eq!(
+        *s.last().unwrap(),
+        0.5,
+        "the cap falls inside the later audio"
+    );
+    // Draining makes room again.
+    a.advance_to(6 * CPS);
+    assert!(!drain(&mut a).is_empty());
+}
+
 #[test]
 fn wave_ram_cpu_bank_is_the_one_not_playing() {
     let mut a = on();
