@@ -28,6 +28,7 @@
 
 use crate::bus::CpuBus;
 use crate::interrupts::Interrupt;
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 #[cfg(test)]
 mod tests;
@@ -766,5 +767,54 @@ impl Cpu {
             2 => self.set_r8(bus, z, v & !(1 << y)),
             _ => self.set_r8(bus, z, v | (1 << y)),
         }
+    }
+}
+
+impl Cpu {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        let r = &self.regs;
+        for v in [r.a, r.f, r.b, r.c, r.d, r.e, r.h, r.l] {
+            w.u8(v);
+        }
+        w.u16(r.sp);
+        w.u16(r.pc);
+        for v in [
+            self.ime,
+            self.ei_pending,
+            self.halted,
+            self.stopped,
+            self.halt_bug,
+            self.locked,
+            self.ld_b_b,
+        ] {
+            w.bool(v);
+        }
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let regs = Registers {
+            a: r.u8()?,
+            f: r.u8()?,
+            b: r.u8()?,
+            c: r.u8()?,
+            d: r.u8()?,
+            e: r.u8()?,
+            h: r.u8()?,
+            l: r.u8()?,
+            sp: r.u16()?,
+            pc: r.u16()?,
+        };
+        check(regs.f & 0x0F == 0, "cpu flags")?;
+        *self = Self {
+            regs,
+            ime: r.bool()?,
+            ei_pending: r.bool()?,
+            halted: r.bool()?,
+            stopped: r.bool()?,
+            halt_bug: r.bool()?,
+            locked: r.bool()?,
+            ld_b_b: r.bool()?,
+        };
+        Ok(())
     }
 }

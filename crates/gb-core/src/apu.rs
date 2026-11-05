@@ -18,6 +18,7 @@ mod noise;
 mod square;
 mod wave;
 
+use crate::state::{StateError, StateReader, StateWriter, check};
 use noise::Noise;
 use square::Square;
 use wave::Wave;
@@ -430,3 +431,66 @@ impl Apu {
 
 #[cfg(test)]
 mod tests;
+impl Apu {
+    /// The sample rate, its filter factor and buffered samples are host-side
+    /// and not part of the state.
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.bytes(&self.regs);
+        self.ch1.save_state(w);
+        self.ch2.save_state(w);
+        self.ch3.save_state(w);
+        self.ch4.save_state(w);
+        w.bool(self.powered);
+        w.u8(self.seq_step);
+        w.bool(self.last_div_bit);
+        w.bool(self.skip_div_event);
+        w.u32(self.sample_acc);
+        w.i32(self.cur_l);
+        w.i32(self.cur_r);
+        w.bool(self.dac_any);
+        w.bool(self.dirty);
+        w.i32(self.mix_l);
+        w.i32(self.mix_r);
+        w.u32(self.mix_n);
+        w.f32(self.cap_l.0);
+        w.f32(self.cap_r.0);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.bytes_into(&mut self.regs)?;
+        self.ch1.load_state(r)?;
+        self.ch2.load_state(r)?;
+        self.ch3.load_state(r)?;
+        self.ch4.load_state(r)?;
+        self.powered = r.bool()?;
+        self.seq_step = r.u8()?;
+        check(self.seq_step <= 7, "frame sequencer step")?;
+        self.last_div_bit = r.bool()?;
+        self.skip_div_event = r.bool()?;
+        self.sample_acc = r.u32()?;
+        check(self.sample_acc < MCYCLES_PER_SECOND, "sample accumulator")?;
+        // Per-M-cycle mix: 4 channels x level 15 x volume 8.
+        const MAX_CUR: i32 = 4 * 15 * 8;
+        self.cur_l = r.i32()?;
+        self.cur_r = r.i32()?;
+        check(
+            self.cur_l.abs() <= MAX_CUR && self.cur_r.abs() <= MAX_CUR,
+            "mix level",
+        )?;
+        self.dac_any = r.bool()?;
+        self.dirty = r.bool()?;
+        self.mix_l = r.i32()?;
+        self.mix_r = r.i32()?;
+        self.mix_n = r.u32()?;
+        // One output sample spans at most MCYCLES_PER_SECOND / 8000 M-cycles.
+        check(self.mix_n <= MCYCLES_PER_SECOND / 8_000 + 1, "mix count")?;
+        let max_mix = i64::from(self.mix_n) * i64::from(MAX_CUR);
+        check(
+            i64::from(self.mix_l).abs() <= max_mix && i64::from(self.mix_r).abs() <= max_mix,
+            "mix sum",
+        )?;
+        self.cap_l = HpfCap(r.f32()?);
+        self.cap_r = HpfCap(r.f32()?);
+        Ok(())
+    }
+}

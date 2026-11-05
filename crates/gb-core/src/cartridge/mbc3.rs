@@ -35,6 +35,7 @@
 use super::{
     Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
 };
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 /// M-cycles per emulated second (4 194 304 Hz / 4).
 const MCYCLES_PER_SECOND: u32 = 1 << 20;
@@ -122,6 +123,14 @@ impl Rtc {
             r.set(0x08 + i as u8, v as u8);
         }
         r
+    }
+
+    fn load_state(r: &mut StateReader) -> Result<Self, StateError> {
+        let mut regs = [0; 5];
+        r.bytes_into(&mut regs)?;
+        let rtc = Self::from_regs(regs.map(u32::from));
+        check(rtc.to_regs() == regs, "RTC register")?;
+        Ok(rtc)
     }
 }
 
@@ -326,6 +335,35 @@ impl Cartridge for Mbc3 {
 
     fn battery_generation(&self) -> u64 {
         self.battery_gen
+    }
+
+    fn save_state(&self, w: &mut StateWriter) {
+        w.blob(&self.ram);
+        w.bool(self.ram_enabled);
+        w.u8(self.rom_bank);
+        w.u8(self.ram_select);
+        w.bytes(&self.live.to_regs());
+        w.bytes(&self.latched.to_regs());
+        w.u32(self.subsecond);
+        w.bool(self.latch_armed);
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.blob_into(&mut self.ram, "cart RAM size")?;
+        self.ram_enabled = r.bool()?;
+        self.rom_bank = r.u8()?;
+        check(
+            self.rom_bank != 0 && self.rom_bank & !self.rom_bank_reg_mask == 0,
+            "MBC3 ROM bank",
+        )?;
+        self.ram_select = r.u8()?;
+        self.live = Rtc::load_state(r)?;
+        self.latched = Rtc::load_state(r)?;
+        self.subsecond = r.u32()?;
+        check(self.subsecond < MCYCLES_PER_SECOND, "RTC sub-second")?;
+        self.latch_armed = r.bool()?;
+        self.battery_gen += 1;
+        Ok(())
     }
 }
 

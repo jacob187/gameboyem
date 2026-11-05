@@ -23,6 +23,7 @@
 //! mooneye `tma_write_reloading` requires it (a write there reads back in TIMA).
 
 use crate::interrupts::{Interrupt, Interrupts};
+use crate::state::{StateError, StateReader, StateWriter};
 
 /// System counter when the first cartridge instruction executes after the DMG
 /// boot ROM (DIV = 0xAB). The low byte is the value that makes mooneye
@@ -167,6 +168,31 @@ impl Timer {
             }
             _ => {}
         }
+    }
+}
+
+impl Timer {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u16(self.counter);
+        w.u8(self.tima);
+        w.u8(self.tma);
+        w.u8(self.tac);
+        w.bool(self.overflow_pending);
+        w.bool(self.reloaded_this_cycle);
+        w.bool(self.reloaded_by_write);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        *self = Self {
+            counter: r.u16()?,
+            tima: r.u8()?,
+            tma: r.u8()?,
+            tac: r.u8()?,
+            overflow_pending: r.bool()?,
+            reloaded_this_cycle: r.bool()?,
+            reloaded_by_write: r.bool()?,
+        };
+        Ok(())
     }
 }
 

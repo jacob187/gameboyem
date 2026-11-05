@@ -1,6 +1,8 @@
 //! Building blocks shared by the sound channels: length counter and volume
 //! envelope (Pan Docs: "Audio Details").
 
+use crate::state::{StateError, StateReader, StateWriter, check};
+
 /// A 3-bit period field (envelope pace, sweep pace) as a timer reload value:
 /// 0 counts as 8.
 pub(super) fn period_or_8(bits: u8) -> u8 {
@@ -152,5 +154,42 @@ impl Envelope {
         } else {
             self.volume = v;
         }
+    }
+}
+
+impl Length {
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.u16(self.counter);
+        w.bool(self.enabled);
+    }
+
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let counter = r.u16()?;
+        check(counter <= self.max, "length counter")?;
+        self.counter = counter;
+        self.enabled = r.bool()?;
+        Ok(())
+    }
+}
+
+impl Envelope {
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.nr2);
+        w.u8(self.volume);
+        w.u8(self.timer);
+        w.bool(self.auto);
+    }
+
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let e = Self {
+            nr2: r.u8()?,
+            volume: r.u8()?,
+            timer: r.u8()?,
+            auto: r.bool()?,
+        };
+        check(e.volume <= 15, "envelope volume")?;
+        check(e.timer <= 9, "envelope timer")?;
+        *self = e;
+        Ok(())
     }
 }

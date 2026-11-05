@@ -1,6 +1,7 @@
 //! Noise channel CH4 (Pan Docs: "Audio Registers", NR41-NR44, "Audio Details").
 
 use super::common::{Envelope, Length};
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 #[derive(Clone, Debug)]
 pub(super) struct Noise {
@@ -125,5 +126,29 @@ impl Noise {
         } else {
             0
         }
+    }
+}
+
+impl Noise {
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.u8(self.nr43);
+        w.u16(self.lfsr);
+        w.i32(self.timer);
+        self.length.save_state(w);
+        self.env.save_state(w);
+    }
+
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        self.enabled = r.bool()?;
+        self.nr43 = r.u8()?;
+        self.lfsr = r.u16()?;
+        check(self.lfsr <= 0x7FFF, "noise LFSR")?;
+        self.timer = r.i32()?;
+        // Positive between clocks; at most the longest period (divisor 112, shift 15).
+        check((1..=112 << 15).contains(&self.timer), "noise timer")?;
+        self.length.load_state(r)?;
+        self.env.load_state(r)?;
+        Ok(())
     }
 }

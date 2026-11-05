@@ -1,6 +1,7 @@
 //! Wave channel CH3 (Pan Docs: "Audio Registers", NR30-NR34, "Wave Pattern RAM").
 
 use super::common::Length;
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 /// T-cycles between a trigger and the first sample fetch, on top of the
 /// period (three 2 MHz ticks). Empirical, not derived from a hardware trace:
@@ -178,5 +179,43 @@ impl Wave {
         } else {
             None
         }
+    }
+}
+
+impl Wave {
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.bool(self.dac);
+        w.u8(self.level);
+        w.u16(self.freq);
+        w.i32(self.timer);
+        w.u8(self.pos);
+        w.u8(self.sample);
+        w.bool(self.just_read);
+        self.length.save_state(w);
+        w.bytes(&self.ram);
+    }
+
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        self.enabled = r.bool()?;
+        self.dac = r.bool()?;
+        self.level = r.u8()?;
+        check(self.level <= 3, "wave level")?;
+        self.freq = r.u16()?;
+        check(self.freq <= 0x7FF, "wave frequency")?;
+        self.timer = r.i32()?;
+        // Positive between fetches; at most a full period plus the trigger delay.
+        check(
+            (1..=2 * 2048 + TRIGGER_DELAY).contains(&self.timer),
+            "wave timer",
+        )?;
+        self.pos = r.u8()?;
+        check(self.pos <= 31, "wave position")?;
+        self.sample = r.u8()?;
+        check(self.sample <= 15, "wave sample")?;
+        self.just_read = r.bool()?;
+        self.length.load_state(r)?;
+        r.bytes_into(&mut self.ram)?;
+        Ok(())
     }
 }

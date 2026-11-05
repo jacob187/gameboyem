@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gb_core::{FRAMES_PER_SECOND, Framebuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gb_core::{Button, FRAMES_PER_SECOND, Framebuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -17,10 +17,14 @@ use crate::keymap::{Action, InputState, map};
 use crate::pacer::FramePacer;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
+use crate::state::StateSlots;
 use crate::video::{Palette, blit, test_pattern};
 
 /// Speed multiplier while Tab is held.
 const FAST_FORWARD_SPEED: f64 = 4.0;
+
+/// How long a save-state message stays in the window title.
+const STATUS_DURATION: Duration = Duration::from_secs(2);
 
 /// The size to configure the surface with, or `None` while the window has no
 /// drawable area (minimised: a zero dimension makes wgpu panic or error).
@@ -35,15 +39,24 @@ struct TestMode {
     tone: ToneGen,
 }
 
+/// Where progress is persisted: battery RAM and save-state slots.
+pub struct Storage {
+    pub saves: SaveManager,
+    pub states: StateSlots,
+}
+
 pub struct App {
     gb: GameBoy,
     saves: SaveManager,
+    states: StateSlots,
     audio: Option<AudioOutput>,
     /// Reused every frame to carry samples from the core to the ring.
     audio_buf: Vec<f32>,
     palette: Palette,
     scale: u32,
     title: String,
+    /// Save-state feedback shown in the title until the given instant.
+    status: Option<(String, Instant)>,
     test: Option<TestMode>,
     shutdown: ShutdownFlag,
 
@@ -64,7 +77,7 @@ pub struct App {
 impl App {
     pub fn new(
         gb: GameBoy,
-        saves: SaveManager,
+        Storage { saves, states }: Storage,
         audio: Option<AudioOutput>,
         palette: Palette,
         scale: u32,
@@ -90,11 +103,13 @@ impl App {
         Self {
             gb,
             saves,
+            states,
             audio,
             audio_buf: Vec::new(),
             palette,
             scale,
             title,
+            status: None,
             test,
             shutdown,
             input: InputState::default(),
@@ -138,7 +153,57 @@ impl App {
     fn update_title(&self) {
         if let Some(w) = &self.window {
             let suffix = if self.paused { " [paused]" } else { "" };
-            w.set_title(&format!("{}{suffix}", self.title));
+            let status = self
+                .status
+                .as_ref()
+                .map_or(String::new(), |(msg, _)| format!(" - {msg}"));
+            w.set_title(&format!("{}{suffix}{status}", self.title));
+        }
+    }
+
+    /// Report a save-state result on stderr and, briefly, in the title.
+    fn show_status(&mut self, msg: String) {
+        eprintln!("{msg}");
+        self.status = Some((msg, Instant::now() + STATUS_DURATION));
+        self.update_title();
+    }
+
+    /// Drop an expired status message; returns when the current one expires.
+    fn expire_status(&mut self, now: Instant) -> Option<Instant> {
+        match &self.status {
+            Some((_, until)) if now >= *until => {
+                self.status = None;
+                self.update_title();
+                None
+            }
+            Some((_, until)) => Some(*until),
+            None => None,
+        }
+    }
+
+    fn save_state(&mut self) {
+        let msg = self.states.save(&self.gb).unwrap_or_else(|e| e);
+        self.show_status(msg);
+    }
+
+    fn load_state(&mut self) {
+        match self.states.load(&mut self.gb) {
+            Ok(msg) => {
+                // The state holds the buttons pressed when it was saved; apply
+                // the keys held now instead.
+                for button in Button::ALL {
+                    self.gb.set_button(button, self.input.is_down(button));
+                }
+                self.clear_audio();
+                self.reset_clock();
+                // Show the restored picture even while paused.
+                self.upload();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                self.show_status(msg);
+            }
+            Err(msg) => self.show_status(msg),
         }
     }
 
@@ -171,6 +236,14 @@ impl App {
             Some(Action::Quit) if down => event_loop.exit(),
             Some(Action::Pause) if down => self.toggle_pause(),
             Some(Action::FastForward) => self.set_fast_forward(down),
+            // States need the core, which `--test-pattern` bypasses.
+            _ if !down || self.test.is_some() => {}
+            Some(Action::SaveState) => self.save_state(),
+            Some(Action::LoadState) => self.load_state(),
+            Some(Action::SelectSlot(slot)) => {
+                self.states.select(slot);
+                self.show_status(format!("state slot {}", self.states.slot()));
+            }
             _ => {}
         }
     }
@@ -326,9 +399,12 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
+        let status_until = self.expire_status(now);
 
         if self.paused {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // Wake once more to clear a status message from the title.
+            event_loop
+                .set_control_flow(status_until.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
             return;
         }
         let n = self.pacer.advance(dt);
@@ -377,7 +453,10 @@ mod tests {
         saves.load(&mut gb); // no .sav yet: the blank RAM is the baseline
         App::new(
             gb,
-            saves,
+            Storage {
+                saves,
+                states: StateSlots::new(&dir.join("g.gb")),
+            },
             None,
             [[0; 4]; 4],
             1,
@@ -407,6 +486,59 @@ mod tests {
         app.toggle_pause();
         assert!(!app.paused);
         assert_eq!(fs::read(&sav).unwrap()[0], 0xAB, "not written on resume");
+    }
+
+    #[test]
+    fn save_and_load_state_keys_restore_the_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.gb.step_frame();
+        let snap = app.gb.save_state();
+        app.save_state();
+        assert!(dir.path().join("g.ss1").is_file());
+        assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
+
+        app.run_frames(5);
+        app.load_state();
+        assert_eq!(app.gb.save_state(), snap);
+        assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
+    }
+
+    #[test]
+    fn failed_state_load_keeps_the_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.gb.step_frame();
+        let before = app.gb.save_state();
+        app.load_state(); // slot 1 doesn't exist
+        assert_eq!(app.gb.save_state(), before);
+        assert!(app.status.as_ref().unwrap().0.contains("empty"));
+    }
+
+    #[test]
+    fn loading_a_state_rewinds_the_battery_save_after_backing_it_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let sav = dir.path().join("g.sav");
+        let mut app = headless_app(dir.path());
+        app.save_state(); // blank RAM
+        change_ram(&mut app, 0xAB);
+        app.toggle_pause(); // writes 0xAB to g.sav
+        app.load_state();
+        app.toggle_pause();
+        app.toggle_pause(); // pause flushes the restored RAM
+        assert_eq!(fs::read(&sav).unwrap()[0], 0x00, "rewound with the state");
+        assert_eq!(fs::read(dir.path().join("g.sav.bak")).unwrap()[0], 0xAB);
+    }
+
+    #[test]
+    fn status_message_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.show_status("hi".into());
+        let until = app.expire_status(Instant::now()).unwrap();
+        assert!(app.status.is_some());
+        assert_eq!(app.expire_status(until), None);
+        assert!(app.status.is_none());
     }
 
     #[test]

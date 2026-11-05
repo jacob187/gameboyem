@@ -22,7 +22,7 @@ pub fn save_path(rom: &Path) -> PathBuf {
     }
 }
 
-fn append_ext(path: &Path, ext: &str) -> PathBuf {
+pub(crate) fn append_ext(path: &Path, ext: &str) -> PathBuf {
     let mut s: OsString = path.as_os_str().to_owned();
     s.push(".");
     s.push(ext);
@@ -64,6 +64,11 @@ const MAX_SAVE_BYTES: u64 = 0x20000 + 48;
 /// reading the contents, anything that is not a regular file (a FIFO would block
 /// `open`, `/dev/zero` never ends), and stops at [`MAX_SAVE_BYTES`] + 1.
 fn read_save(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    read_capped(path, MAX_SAVE_BYTES, "save")
+}
+
+/// [`read_save`] with a caller-chosen cap; `what` names the file in the error.
+pub(crate) fn read_capped(path: &Path, max: u64, what: &str) -> io::Result<Option<Vec<u8>>> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -73,13 +78,11 @@ fn read_save(path: &Path) -> io::Result<Option<Vec<u8>>> {
         return Err(io::Error::other("not a regular file"));
     }
     let mut data = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_SAVE_BYTES + 1)
-        .read_to_end(&mut data)?;
-    if data.len() as u64 > MAX_SAVE_BYTES {
+    fs::File::open(path)?.take(max + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("larger than any valid save ({MAX_SAVE_BYTES} bytes)"),
+            format!("larger than any valid {what} ({max} bytes)"),
         ));
     }
     Ok(Some(data))
@@ -92,7 +95,7 @@ const MAX_BACKUPS: u32 = 1000;
 /// existing backup is never overwritten (two ROMs can share a save stem). If an
 /// existing backup already holds identical bytes it is reused, so relaunching
 /// with the same odd file does not pile up copies. Returns the backup's path.
-fn backup_without_overwrite(src: &Path) -> io::Result<PathBuf> {
+pub(crate) fn backup_without_overwrite(src: &Path) -> io::Result<PathBuf> {
     let data = fs::read(src)?;
     for n in 0..=MAX_BACKUPS {
         let candidate = if n == 0 {

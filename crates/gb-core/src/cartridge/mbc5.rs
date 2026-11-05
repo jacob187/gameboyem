@@ -15,6 +15,7 @@
 use super::{
     Cartridge, CartridgeError, CartridgeHeader, RAM_BANK_SIZE, ROM_BANK_SIZE, ram_window_offset,
 };
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 pub struct Mbc5 {
     rom: Vec<u8>,
@@ -110,6 +111,25 @@ impl Cartridge for Mbc5 {
 
     fn battery_generation(&self) -> u64 {
         self.battery_gen
+    }
+
+    fn save_state(&self, w: &mut StateWriter) {
+        w.blob(&self.ram);
+        w.bool(self.ram_enabled);
+        w.u16(self.rom_bank);
+        w.u8(self.ram_bank);
+    }
+
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.blob_into(&mut self.ram, "cart RAM size")?;
+        self.ram_enabled = r.bool()?;
+        self.rom_bank = r.u16()?;
+        check(self.rom_bank <= 0x1FF, "MBC5 ROM bank")?;
+        self.ram_bank = r.u8()?;
+        let max_bank = if self.header.has_rumble { 0x07 } else { 0x0F };
+        check(self.ram_bank <= max_bank, "MBC5 RAM bank")?;
+        self.battery_gen += 1;
+        Ok(())
     }
 }
 

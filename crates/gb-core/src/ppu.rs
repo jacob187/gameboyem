@@ -41,6 +41,7 @@ mod render;
 mod tests;
 
 use crate::interrupts::{Interrupt, Interrupts};
+use crate::state::{StateError, StateReader, StateWriter, check};
 use crate::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 const DOTS_PER_LINE: u16 = 456;
@@ -507,5 +508,97 @@ impl Ppu {
     /// True while the CPU cannot read OAM (modes 2 and 3; Pan Docs "FEA0-FEFF range").
     pub(crate) fn oam_blocked(&self) -> bool {
         self.oam_read_blocked()
+    }
+}
+
+impl Ppu {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.bytes(&self.vram[..]);
+        w.bytes(&self.oam);
+        for v in [
+            self.lcdc,
+            self.stat_select,
+            self.scy,
+            self.scx,
+            self.ly,
+            self.lyc,
+            self.bgp,
+            self.obp0,
+            self.obp1,
+            self.wy,
+            self.wx,
+        ] {
+            w.u8(v);
+        }
+        w.u16(self.line_dot);
+        w.u32(self.off_dots);
+        w.u16(self.mode3_len);
+        w.bool(self.first_line);
+        w.bool(self.skip_frame);
+        w.bool(self.wy_triggered);
+        w.u8(self.win_line);
+        w.bytes(&self.line_sprites);
+        w.u8(self.line_sprite_count);
+        w.bool(self.lyc_flag);
+        w.u8(self.vis_mode);
+        w.bool(self.stat_line);
+        w.bytes(&self.back[..]);
+        w.bytes(&self.front[..]);
+        w.bool(self.frame_ready);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.bytes_into(&mut self.vram[..])?;
+        r.bytes_into(&mut self.oam)?;
+        self.lcdc = r.u8()?;
+        self.stat_select = r.u8()?;
+        check(self.stat_select & !STAT_WRITABLE == 0, "STAT")?;
+        self.scy = r.u8()?;
+        self.scx = r.u8()?;
+        self.ly = r.u8()?;
+        check(self.ly < LINES_PER_FRAME, "LY")?;
+        self.lyc = r.u8()?;
+        self.bgp = r.u8()?;
+        self.obp0 = r.u8()?;
+        self.obp1 = r.u8()?;
+        self.wy = r.u8()?;
+        self.wx = r.u8()?;
+        self.line_dot = r.u16()?;
+        check(self.line_dot < DOTS_PER_LINE, "line dot")?;
+        self.off_dots = r.u32()?;
+        check(self.off_dots < DOTS_PER_FRAME, "LCD-off dots")?;
+        self.mode3_len = r.u16()?;
+        check(
+            self.mode3_len <= DOTS_PER_LINE - OAM_SCAN_DOTS,
+            "mode 3 length",
+        )?;
+        self.first_line = r.bool()?;
+        self.skip_frame = r.bool()?;
+        self.wy_triggered = r.bool()?;
+        self.win_line = r.u8()?;
+        r.bytes_into(&mut self.line_sprites)?;
+        self.line_sprite_count = r.u8()?;
+        check(
+            usize::from(self.line_sprite_count) <= self.line_sprites.len(),
+            "sprite count",
+        )?;
+        check(
+            self.line_sprites
+                .iter()
+                .all(|&i| usize::from(i) < self.oam.len() / 4),
+            "sprite index",
+        )?;
+        self.lyc_flag = r.bool()?;
+        self.vis_mode = r.u8()?;
+        check(self.vis_mode <= 3, "STAT mode")?;
+        self.stat_line = r.bool()?;
+        r.bytes_into(&mut self.back[..])?;
+        r.bytes_into(&mut self.front[..])?;
+        check(
+            self.back.iter().chain(self.front.iter()).all(|&s| s <= 3),
+            "framebuffer shade",
+        )?;
+        self.frame_ready = r.bool()?;
+        Ok(())
     }
 }

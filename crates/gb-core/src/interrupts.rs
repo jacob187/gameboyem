@@ -4,6 +4,8 @@
 //! setting its IF bit via [`Interrupts::request`]; the CPU checks
 //! [`Interrupts::pending`] and acknowledges (clears) the bit it services.
 
+use crate::state::{StateError, StateReader, StateWriter, check};
+
 /// One interrupt source. The discriminant is its bit mask in IE/IF; priority
 /// is lowest bit first (VBlank highest).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -95,6 +97,21 @@ impl Interrupts {
 
     pub fn write_ie(&mut self, value: u8) {
         self.enable = value;
+    }
+}
+
+impl Interrupts {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.enable);
+        w.u8(self.flags);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let enable = r.u8()?;
+        let flags = r.u8()?;
+        check(flags & !0x1F == 0, "IF")?;
+        *self = Self { enable, flags };
+        Ok(())
     }
 }
 

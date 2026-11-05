@@ -9,6 +9,8 @@ mod rom_only;
 
 use std::fmt;
 
+use crate::state::{StateError, StateReader, StateWriter};
+
 pub use mbc1::Mbc1;
 pub use mbc3::Mbc3;
 pub use mbc5::Mbc5;
@@ -70,6 +72,15 @@ pub trait Cartridge: Send {
 
     /// Restore persistent RAM from a `.sav` file.
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartridgeError>;
+
+    /// Write the mapper's full state (registers, RAM, RTC) for a save state.
+    /// The battery generation counter is host bookkeeping and is not included.
+    fn save_state(&self, w: &mut StateWriter);
+
+    /// Restore from [`Cartridge::save_state`] output. A successful load
+    /// advances [`Cartridge::battery_generation`], so the host persists the
+    /// restored RAM. May leave the cartridge partly overwritten on error.
+    fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError>;
 }
 
 /// Errors while loading a ROM or save file. All ROM content is untrusted input.
@@ -306,6 +317,84 @@ pub(crate) mod test_util {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(cart: &dyn Cartridge) -> Vec<u8> {
+        let mut w = StateWriter::new();
+        cart.save_state(&mut w);
+        w.into_bytes()
+    }
+
+    /// Every mapper: banking, RAM and (MBC3) the RTC survive a save-state
+    /// round trip, and loading advances the battery generation.
+    #[test]
+    fn mapper_state_round_trips() {
+        use test_util::banked_rom;
+        // ROM+RAM+BATTERY, MBC1+RAM+BATTERY, MBC3+TIMER+RAM+BATTERY, MBC5+RAM+BATTERY.
+        for (cart_type, ram_code) in [(0x09, 0x02), (0x03, 0x03), (0x10, 0x03), (0x1B, 0x03)] {
+            let banks = if cart_type == 0x09 { 2 } else { 8 };
+            let rom = banked_rom(banks, cart_type, if banks == 2 { 0 } else { 2 }, ram_code);
+            let mut a = from_rom(rom.clone()).unwrap();
+            a.write_rom(0x0000, 0x0A);
+            a.write_rom(0x2000, 0x05);
+            a.write_rom(0x6000, 0x01);
+            a.write_rom(0x4000, 0x02);
+            a.write_ram(0xA123, 0x5A);
+            if a.header().has_rtc {
+                a.write_rom(0x4000, 0x08);
+                a.write_ram(0xA000, 30);
+                for _ in 0..(1 << 20) + 5 {
+                    a.tick_mcycle();
+                }
+                a.write_rom(0x6000, 0x00);
+                a.write_rom(0x6000, 0x01);
+                a.write_rom(0x6000, 0x00);
+            }
+            let snap = snapshot(a.as_ref());
+
+            let mut b = from_rom(rom).unwrap();
+            let generation = b.battery_generation();
+            let mut r = StateReader::new(&snap);
+            b.load_state(&mut r).unwrap();
+            r.finish().unwrap();
+            assert!(b.battery_generation() > generation, "type {cart_type:#x}");
+            assert_eq!(snapshot(b.as_ref()), snap, "type {cart_type:#x}");
+            assert_eq!(a.battery_ram(), b.battery_ram(), "type {cart_type:#x}");
+            for addr in (0x0000..0x8000).step_by(0x0800) {
+                assert_eq!(
+                    a.read_rom(addr),
+                    b.read_rom(addr),
+                    "type {cart_type:#x} {addr:#x}"
+                );
+            }
+            for addr in (0xA000..0xC000).step_by(0x0101) {
+                assert_eq!(
+                    a.read_ram(addr),
+                    b.read_ram(addr),
+                    "type {cart_type:#x} {addr:#x}"
+                );
+            }
+            if a.header().has_rtc {
+                // The free-running clock and the latch keep going in step.
+                for _ in 0..(1 << 20) {
+                    a.tick_mcycle();
+                    b.tick_mcycle();
+                }
+                assert_eq!(snapshot(a.as_ref()), snapshot(b.as_ref()));
+            }
+        }
+    }
+
+    #[test]
+    fn mapper_state_rejects_other_ram_size() {
+        use test_util::banked_rom;
+        let small = from_rom(banked_rom(8, 0x1B, 2, 0x02)).unwrap();
+        let mut big = from_rom(banked_rom(8, 0x1B, 2, 0x03)).unwrap();
+        let snap = snapshot(small.as_ref());
+        assert_eq!(
+            big.load_state(&mut StateReader::new(&snap)),
+            Err(StateError::Invalid("cart RAM size"))
+        );
+    }
 
     #[test]
     fn rejects_tiny_rom() {

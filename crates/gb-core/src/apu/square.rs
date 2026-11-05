@@ -2,6 +2,7 @@
 //! NR10-NR14 / NR21-NR24).
 
 use super::common::{Envelope, Length, period_or_8};
+use crate::state::{StateError, StateReader, StateWriter, check};
 
 /// Duty waveforms, one bit per step, first step first (Pan Docs: NRx1).
 const DUTY: [[u8; 8]; 4] = [
@@ -211,5 +212,48 @@ impl Square {
         } else {
             0
         }
+    }
+}
+
+impl Square {
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.u8(self.duty);
+        w.u8(self.pos);
+        w.u16(self.freq);
+        w.u16(self.timer);
+        self.length.save_state(w);
+        self.env.save_state(w);
+        let s = &self.sweep;
+        w.u8(s.nr10);
+        w.u16(s.shadow);
+        w.u8(s.timer);
+        w.bool(s.enabled);
+        w.bool(s.negate_used);
+    }
+
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        self.enabled = r.bool()?;
+        self.duty = r.u8()?;
+        check(self.duty <= 3, "square duty")?;
+        self.pos = r.u8()?;
+        check(self.pos <= 7, "square position")?;
+        self.freq = r.u16()?;
+        check(self.freq <= 0x7FF, "square frequency")?;
+        self.timer = r.u16()?;
+        check((1..=2048).contains(&self.timer), "square timer")?;
+        self.length.load_state(r)?;
+        self.env.load_state(r)?;
+        let s = Sweep {
+            nr10: r.u8()?,
+            shadow: r.u16()?,
+            timer: r.u8()?,
+            enabled: r.bool()?,
+            negate_used: r.bool()?,
+        };
+        check(s.shadow <= 0x7FF, "sweep shadow")?;
+        check(s.timer <= 8, "sweep timer")?;
+        self.sweep = s;
+        Ok(())
     }
 }

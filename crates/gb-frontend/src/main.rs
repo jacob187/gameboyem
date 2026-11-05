@@ -10,6 +10,7 @@ mod pacer;
 mod rom;
 mod save;
 mod shutdown;
+mod state;
 mod video;
 
 use std::process::ExitCode;
@@ -18,11 +19,12 @@ use std::time::Instant;
 use gb_core::GameBoy;
 use winit::event_loop::EventLoop;
 
-use crate::app::App;
+use crate::app::{App, Storage};
 use crate::audio::AudioOutput;
 use crate::cli::Command;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
+use crate::state::StateSlots;
 
 fn main() -> ExitCode {
     let opts = match cli::parse(std::env::args_os().skip(1)) {
@@ -102,9 +104,13 @@ fn main() -> ExitCode {
             eprintln!("warning: cannot install the Ctrl-C/SIGTERM handler: {e}");
         }
     }
+    let storage = Storage {
+        saves,
+        states: StateSlots::new(&opts.rom),
+    };
     let mut app = App::new(
         gb,
-        saves,
+        storage,
         audio,
         opts.palette.colors(),
         opts.scale,

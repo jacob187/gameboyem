@@ -21,6 +21,7 @@ use crate::interrupts::Interrupts;
 use crate::joypad::Joypad;
 use crate::ppu::Ppu;
 use crate::serial::Serial;
+use crate::state::{StateError, StateReader, StateWriter, tag};
 use crate::timer::Timer;
 
 /// The CPU's view of the machine. Implemented by [`Bus`] and by flat-memory
@@ -154,3 +155,53 @@ impl CpuBus for Bus {
 #[cfg(test)]
 #[path = "bus_tests.rs"]
 mod tests;
+impl Bus {
+    /// Every non-CPU component, each in its own tagged section.
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u8(tag::BUS);
+        w.bytes(&self.wram[..]);
+        w.bytes(&self.hram);
+        w.u64(self.mcycles);
+        w.u8(tag::INTERRUPTS);
+        self.interrupts.save_state(w);
+        w.u8(tag::TIMER);
+        self.timer.save_state(w);
+        w.u8(tag::PPU);
+        self.ppu.save_state(w);
+        w.u8(tag::DMA);
+        self.dma.save_state(w);
+        w.u8(tag::APU);
+        self.apu.save_state(w);
+        w.u8(tag::JOYPAD);
+        self.joypad.save_state(w);
+        w.u8(tag::SERIAL);
+        self.serial.save_state(w);
+        w.u8(tag::CART);
+        self.cart.save_state(w);
+    }
+
+    /// Restore from [`Bus::save_state`] output. May leave the bus partly
+    /// overwritten on error; [`crate::GameBoy::load_state`] rolls it back.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.tag(tag::BUS)?;
+        r.bytes_into(&mut self.wram[..])?;
+        r.bytes_into(&mut self.hram)?;
+        self.mcycles = r.u64()?;
+        r.tag(tag::INTERRUPTS)?;
+        self.interrupts.load_state(r)?;
+        r.tag(tag::TIMER)?;
+        self.timer.load_state(r)?;
+        r.tag(tag::PPU)?;
+        self.ppu.load_state(r)?;
+        r.tag(tag::DMA)?;
+        self.dma.load_state(r)?;
+        r.tag(tag::APU)?;
+        self.apu.load_state(r)?;
+        r.tag(tag::JOYPAD)?;
+        self.joypad.load_state(r)?;
+        r.tag(tag::SERIAL)?;
+        self.serial.load_state(r)?;
+        r.tag(tag::CART)?;
+        self.cart.load_state(r)
+    }
+}
