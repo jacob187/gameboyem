@@ -2,7 +2,11 @@
 #
 # Format: <expect> <kind> <max_frames> <path relative to the roms dir>
 #   expect: pass | fail      kind: blargg | blargg-mem | mooneye | acid2 | smoke | play-snake | play-breakout |
-#         save-snake | save-breakout | sfx-snake | sfx-breakout | play-tobu | play-adjustris | play-renegade
+#         save-snake | save-breakout | sfx-snake | sfx-breakout | play-tobu | play-adjustris | play-renegade |
+#         play-cgbdemo
+#   A `-cgb` suffix on the kind (`mooneye-cgb`, `acid2-cgb`, `smoke-cgb`) runs the case on a Game Boy Color
+#   (`Model::Cgb`); without it the case runs on a DMG. Only the suffix is special
+#   (`blargg-mem` is its own kind). Comment lines start with `#`.
 #
 # Each line is one `cargo test -p gb-test --test roms` case. A case FAILS when
 # the actual outcome differs from `expect` in either direction, so flipping a
@@ -135,6 +139,9 @@ pass mooneye 600 test/mooneye/emulator-only/mbc5/rom_8Mb.gb
 # --- dmg-acid2 (framebuffer vs reference-dmg.png) ---
 pass acid2 120 test/dmg-acid2/dmg-acid2.gb
 
+# --- cgb-acid2 (RGB555 framebuffer -> RGB888 vs reference.png; DECISIONS #10, #35) ---
+pass acid2-cgb 120 test/cgb-acid2/cgb-acid2.gbc
+
 # --- Homebrew smoke tests (600 frames, framebuffer not blank) ---
 pass smoke 600 homebrew/snake.gb
 pass smoke 600 homebrew/breakout.gb
@@ -142,6 +149,9 @@ pass smoke 600 homebrew/breakout.gb
 # --- Homebrew playability (boot, press Start, scripted input, framebuffer must change) ---
 pass play-snake 400 homebrew/snake.gb
 pass play-breakout 400 homebrew/breakout.gb
+
+# --- Homebrew CGB demo (CGB-only ROM; RGB555 colour frame; DECISIONS #37) ---
+pass play-cgbdemo-cgb 200 homebrew/cgbdemo.gb
 
 # --- Homebrew saves (play to game over, carry battery RAM into a fresh machine, title HI differs) ---
 pass save-snake 700 homebrew/snake.gb
@@ -156,6 +166,17 @@ pass smoke 600 corpus/adjustris.gb
 pass smoke 600 corpus/airplanz.gb
 pass smoke 600 corpus/renegade-rush.gb
 
+# --- CGB homebrew corpus, run as a CGB (kind `smoke-cgb`: RGB555 frame has 2+ colours and is not
+# frozen; scripts/fetch-homebrew-corpus.sh, DECISIONS #39) ---
+pass smoke-cgb 600 corpus/tobutobugirl-dx.gb
+pass smoke-cgb 600 corpus/escape-obliterizer-dx.gb
+# Three 240-frame splash screens (static for most of each) come before the animated title screen at ~frame 850,
+# so it gets 900 boot frames instead of 600 (DECISIONS #39).
+pass smoke-cgb 900 corpus/rebound.gb
+pass smoke-cgb 600 corpus/aevilia.gb
+pass smoke-cgb 600 corpus/ucity.gb
+pass smoke-cgb 600 corpus/geometrix.gb
+
 # --- Homebrew corpus playability (scripts validated against headless PyBoy) ---
 pass play-tobu 1500 corpus/tobutobugirl.gb
 pass play-adjustris 400 corpus/adjustris.gb
@@ -164,3 +185,48 @@ pass play-renegade 700 corpus/renegade-rush.gb
 # --- Homebrew sound (audio_samples: silent title, loud on Start / eat / brick / paddle / life lost / game over, quiet without the input) ---
 pass sfx-snake 700 homebrew/snake.gb
 pass sfx-breakout 1500 homebrew/breakout.gb
+
+# --- Mooneye, CGB subset, run as a CGB (kind `mooneye-cgb`; DECISIONS #32) ---
+# These ROMs have no CGB flag, so the CGB boot ROM runs them in DMG-compatibility mode (#33).
+pass mooneye-cgb 600 test/mooneye/misc/boot_regs-cgb.gb
+pass mooneye-cgb 600 test/mooneye/misc/boot_hwio-C.gb
+pass mooneye-cgb 600 test/mooneye/misc/bits/unused_hwio-C.gb
+pass mooneye-cgb 600 test/mooneye/misc/boot_div-cgbABCDE.gb
+# On a CGB the line-144 STAT mode-2 pulse comes one M-cycle before VBlank (DECISIONS #38).
+pass mooneye-cgb 600 test/mooneye/misc/ppu/vblank_stat_intr-C.gb
+
+# --- CGB speed switch, double speed and HDMA (P2; DECISIONS #38, #40) ---
+# SameSuite dma/ (LIJI32) and the AGE speed-switch tests, both CGB-flagged and reporting with the
+# Fibonacci register protocol. Fetched from the pinned c-sp/game-boy-test-roms v7.0 zip.
+pass mooneye-cgb 600 test/same-suite/dma/gbc_dma_cont.gb
+pass mooneye-cgb 600 test/same-suite/dma/gdma_addr_mask.gb
+pass mooneye-cgb 600 test/same-suite/dma/hdma_lcd_off.gb
+pass mooneye-cgb 600 test/same-suite/dma/hdma_mode0.gb
+# spsw-div and spsw-stop-prefetch pass: they pin the 32768 M-cycle pause and the DIV phase after it.
+# spsw-tima: the 4 kHz rows match, but TIMA is one step short right after the switch and the 262 / 65 /
+# 16 kHz "immediate increment by the STOP's DIV reset" edges are one M-cycle off (the 4 kHz timer and the
+# faster ones disagree on where the reset lands, so no single STOP offset fixes both). spsw-mode0 and
+# spsw-ch2-lc-delay need the LCD / APU phase across the switch, which is not modelled.
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-ch2-lc-delay-cgbBCE.gb
+pass mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-div-cgbBCE.gb
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-mode0-cgbBCE.gb
+pass mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-stop-prefetch-cgbBCE.gb
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-tima-cgbBC.gb
+fail mooneye-cgb 600 test/age-test-roms/speed-switch/spsw-tima-cgbE.gb
+# Blargg cgb_sound (memory protocol), the CGB twin of dmg_sound. It does not exercise the speed
+# switch or HDMA; it only checks the APU on a CGB (ROMs 08-12 fail on CGB-specific APU behaviour the
+# DMG-calibrated APU does not model: length counters on power-off, wave RAM access and the wave
+# timer reset). 03-trigger passes but needs more than 600 frames.
+fail blargg-mem-cgb 3000 test/cgb_sound/cgb_sound.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/01-registers.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/02-len ctr.gb
+pass blargg-mem-cgb 3000 test/cgb_sound/rom_singles/03-trigger.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/04-sweep.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/05-sweep details.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/06-overflow on trigger.gb
+pass blargg-mem-cgb 600 test/cgb_sound/rom_singles/07-len sweep period sync.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/08-len ctr during power.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/09-wave read while on.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/10-wave trigger while on.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/11-regs after power.gb
+fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/12-wave.gb

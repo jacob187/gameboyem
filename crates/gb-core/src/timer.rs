@@ -29,6 +29,10 @@ use crate::state::{StateError, StateReader, StateWriter};
 /// boot ROM (DIV = 0xAB). The low byte is the value that makes mooneye
 /// `boot_div-dmgABCmgb` pass (found by scanning every M-cycle phase).
 const POST_BOOT_COUNTER: u16 = 0xABC8;
+/// The same for the CGB boot ROM (DIV = 0x26). Found like [`POST_BOOT_COUNTER`]:
+/// scanning every M-cycle phase for mooneye `boot_div-cgbABCDE`, which has
+/// exactly one solution (DECISIONS #34).
+const CGB_POST_BOOT_COUNTER: u16 = 0x2674;
 
 #[derive(Clone, Debug)]
 pub struct Timer {
@@ -54,8 +58,17 @@ impl Default for Timer {
 
 impl Timer {
     pub fn new() -> Self {
+        Self::with_counter(POST_BOOT_COUNTER)
+    }
+
+    /// Post-boot timer of a CGB.
+    pub fn new_cgb() -> Self {
+        Self::with_counter(CGB_POST_BOOT_COUNTER)
+    }
+
+    fn with_counter(counter: u16) -> Self {
         Self {
-            counter: POST_BOOT_COUNTER,
+            counter,
             tima: 0,
             tma: 0,
             tac: 0xF8,

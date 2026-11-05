@@ -204,6 +204,30 @@ impl Apu {
             | u8::from(self.ch4.enabled) << 3
     }
 
+    /// CGB PCM12 (0xFF76) / PCM34 (0xFF77): the channels' current digital
+    /// outputs, CH1 / CH3 in the low nibble and CH2 / CH4 in the high one. Both
+    /// read 0 while the APU is powered off (NR52.7 = 0), and a channel whose DAC
+    /// is off (NRx2 bits 7-3 clear, or NR30.7 clear) outputs 0. A channel with
+    /// its DAC on but disabled (length expiry) also outputs 0, via `output`.
+    pub(crate) fn read_pcm(&self, addr: u16) -> u8 {
+        if !self.powered {
+            return 0;
+        }
+        let nibble = |dac: bool, out: u8| if dac { out } else { 0 };
+        let (lo, hi) = if addr == 0xFF76 {
+            (
+                nibble(self.ch1.dac_on(), self.ch1.output()),
+                nibble(self.ch2.dac_on(), self.ch2.output()),
+            )
+        } else {
+            (
+                nibble(self.ch3.dac_on(), self.ch3.output()),
+                nibble(self.ch4.dac_on(), self.ch4.output()),
+            )
+        };
+        lo | hi << 4
+    }
+
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xFF26 => 0x70 | u8::from(self.powered) << 7 | self.status_bits(),
@@ -332,8 +356,11 @@ impl Apu {
         }
     }
 
-    /// Advance one M-cycle. `div_counter` is the timer's 16-bit system counter
-    /// (the frame sequencer is clocked by its bit 12 falling edge).
+    /// Advance one M-cycle of real time. `div_counter` is the timer's 16-bit
+    /// system counter (the frame sequencer is clocked by its bit 12 falling edge).
+    /// In CPU double speed the bus calls this every other CPU M-cycle with the
+    /// counter shifted right once, so the sequencer sees counter bit 13 and
+    /// everything else keeps its real-time rate (DECISIONS #38).
     pub fn tick_mcycle(&mut self, div_counter: u16) {
         // The edge is tracked while powered off too, so powering on never sees
         // a spurious step. DIV writes / STOP clear the counter, which produces

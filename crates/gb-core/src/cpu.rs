@@ -5,7 +5,10 @@
 //!
 //! * [`Cpu::step`] executes exactly one of: an interrupt dispatch, one halted
 //!   M-cycle, or one instruction. All cycle cost is paid through the
-//!   [`CpuBus`] (`read`/`write`/`tick`, one M-cycle each).
+//!   [`CpuBus`] (`read`/`write`/`tick`, one M-cycle each), with one exception:
+//!   a CGB speed-switch `STOP` spends its pause (up to 32768 M-cycles, see
+//!   `bus_cgb.rs`) inside [`CpuBus::stop`], so that one step can advance the
+//!   clock by far more than an instruction.
 //! * Opcode `0x40` (`LD B,B`) sets a flag readable with
 //!   [`Cpu::take_ld_b_b_breakpoint`] (mooneye/acid2 test signal).
 //! * Illegal opcodes (0xD3, 0xDB, ...) lock the CPU: [`Cpu::is_locked`] becomes
@@ -24,7 +27,9 @@
 //!   without a bus access and idles until a selected joypad line is low
 //!   (Pan Docs "Joypad Input": wakes from STOP regardless of IE). Interrupts
 //!   do not wake it, as on hardware where the clocks stop. Unlike hardware,
-//!   the LCD/timer keep running during STOP.
+//!   the LCD/timer keep running during STOP. If `stop` returns true (a CGB
+//!   speed switch, which has already spent its pause) the CPU does not idle and
+//!   carries on after the STOP.
 
 use crate::bus::CpuBus;
 use crate::interrupts::Interrupt;
@@ -70,6 +75,46 @@ impl Registers {
             pc: 0x0100,
         }
     }
+
+    /// CGB register state at hand-off in CGB mode (Pan Docs "Power Up
+    /// Sequence"; mooneye `misc/boot_regs-cgb` covers the compat variant).
+    pub const fn cgb_post_boot() -> Self {
+        Self {
+            a: 0x11,
+            f: 0x80,
+            b: 0x00,
+            c: 0x00,
+            d: 0xFF,
+            e: 0x56,
+            h: 0x00,
+            l: 0x0D,
+            sp: 0xFFFE,
+            pc: 0x0100,
+        }
+    }
+
+    /// CGB register state at hand-off in DMG-compatibility mode. `b` is the
+    /// title checksum the boot ROM leaves there (`model::compat_b`); HL depends
+    /// on it.
+    pub const fn cgb_compat_post_boot(b: u8) -> Self {
+        let hl = if b == 0x43 || b == 0x58 {
+            0x991A
+        } else {
+            0x007C
+        };
+        Self {
+            a: 0x11,
+            f: 0x80,
+            b,
+            c: 0x00,
+            d: 0x00,
+            e: 0x08,
+            h: (hl >> 8) as u8,
+            l: hl as u8,
+            sp: 0xFFFE,
+            pc: 0x0100,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,8 +142,13 @@ impl Default for Cpu {
 
 impl Cpu {
     pub fn new() -> Self {
+        Self::with_registers(Registers::dmg_post_boot())
+    }
+
+    /// A CPU at power-on with the given post-boot registers.
+    pub fn with_registers(regs: Registers) -> Self {
         Self {
-            regs: Registers::dmg_post_boot(),
+            regs,
             ime: false,
             ei_pending: false,
             halted: false,
@@ -137,12 +187,12 @@ impl Cpu {
 
     pub fn step<B: CpuBus>(&mut self, bus: &mut B) {
         if self.locked {
-            bus.tick();
+            bus.idle_tick();
             return;
         }
         if self.stopped {
             if !bus.joypad_line_low() {
-                bus.tick();
+                bus.idle_tick();
                 return;
             }
             self.stopped = false;
@@ -150,7 +200,7 @@ impl Cpu {
         if self.halted {
             // Pan Docs "halt": wakes when IE & IF != 0, regardless of IME.
             if bus.pending_interrupts() == 0 {
-                bus.tick();
+                bus.idle_tick();
                 return;
             }
             self.halted = false;
@@ -391,8 +441,11 @@ impl Cpu {
                 2 => {
                     // STOP (simplified, see module docs): skip padding byte.
                     self.regs.pc = self.regs.pc.wrapping_add(1);
-                    bus.stop();
-                    self.stopped = true;
+                    // A CGB speed switch (the pause is spent inside `stop`)
+                    // leaves the CPU running.
+                    if !bus.stop() {
+                        self.stopped = true;
+                    }
                 }
                 3 => {
                     // JR e

@@ -17,6 +17,13 @@
 //! calibration against `boot_sclk_align` with no hardware explanation yet;
 //! passing the raw counter would be one M-cycle late.
 //!
+//! A CGB in CGB mode (`Serial::new_cgb_mode`) also has SC bit 1, the clock speed
+//! (Pan Docs "SC"): set, the shifter runs at 262144 Hz (bit 3 of the counter,
+//! period 16 T) instead of 8192 Hz. On a DMG and in DMG-compatibility mode that
+//! bit is unused and reads 1, and the clock stays at 8192 Hz. The serial port
+//! is ticked per CPU M-cycle, so in double speed both rates run twice as fast
+//! in real time (16384 Hz / 524288 Hz) with no extra code.
+//!
 //! Edge detection is stateless (the counter advances by 4 per M-cycle, so the
 //! edge is the step `counter -> counter + 4`), which lets an idle port return
 //! immediately. A DIV reset in the middle of a transfer therefore never
@@ -32,6 +39,14 @@ use crate::state::{StateError, StateReader, StateWriter, check};
 
 /// Counter bit whose falling edge clocks the serial shifter (period 512 T).
 const CLOCK_BIT: u16 = 1 << 8;
+/// Counter bit for the CGB fast clock, SC bit 1 set (period 16 T).
+const FAST_CLOCK_BIT: u16 = 1 << 3;
+/// SC bit 1: CGB clock speed (1 = fast).
+const SC_FAST: u8 = 0x02;
+/// SC bits that read 1 on a DMG: bits 1-6.
+const SC_UNUSED_DMG: u8 = 0x7E;
+/// SC bits that read 1 on a CGB in CGB mode: bits 2-6 (bit 1 is the speed).
+const SC_UNUSED_CGB: u8 = 0x7C;
 /// Shifts per transferred byte.
 const BITS_PER_BYTE: u8 = 8;
 /// Cap captured output so a ROM spamming the port can't grow memory unboundedly.
@@ -41,6 +56,8 @@ const MAX_CAPTURE: usize = 64 * 1024;
 pub struct Serial {
     sb: u8,
     sc: u8,
+    /// CGB mode: SC bit 1 is the clock speed instead of an unused bit.
+    cgb: bool,
     /// Shifts still to do; 0 when no transfer is running.
     bits_left: u8,
     /// The byte the running transfer is sending (SB at the moment it started).
@@ -56,19 +73,40 @@ impl Default for Serial {
 
 impl Serial {
     pub fn new() -> Self {
+        Self::with_sc(0x7E, false)
+    }
+
+    /// Post-boot serial port of a CGB in CGB mode: SC = 0x7F (Pan Docs "Power
+    /// Up Sequence"). In DMG-compatibility mode it is [`Serial::new`]'s 0x7E,
+    /// which mooneye `boot_hwio-C` pins.
+    pub fn new_cgb_mode() -> Self {
+        Self::with_sc(0x7F, true)
+    }
+
+    fn with_sc(sc: u8, cgb: bool) -> Self {
         Self {
             sb: 0x00,
-            sc: 0x7E,
+            sc,
+            cgb,
             bits_left: 0,
             tx: 0,
             output: Vec::new(),
         }
     }
 
+    /// SC bits that always read 1.
+    fn unused_bits(&self) -> u8 {
+        if self.cgb {
+            SC_UNUSED_CGB
+        } else {
+            SC_UNUSED_DMG
+        }
+    }
+
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0xFF01 => self.sb,
-            _ => self.sc | 0x7E,
+            _ => self.sc | self.unused_bits(),
         }
     }
 
@@ -76,7 +114,7 @@ impl Serial {
         match addr {
             0xFF01 => self.sb = value,
             _ => {
-                self.sc = value | 0x7E;
+                self.sc = value | self.unused_bits();
                 if value & 0x81 == 0x81 {
                     self.tx = self.sb;
                     self.bits_left = BITS_PER_BYTE;
@@ -94,7 +132,12 @@ impl Serial {
         if self.bits_left == 0 {
             return;
         }
-        let falling_edge = counter & CLOCK_BIT != 0 && counter.wrapping_add(4) & CLOCK_BIT == 0;
+        let clock_bit = if self.cgb && self.sc & SC_FAST != 0 {
+            FAST_CLOCK_BIT
+        } else {
+            CLOCK_BIT
+        };
+        let falling_edge = counter & clock_bit != 0 && counter.wrapping_add(4) & clock_bit == 0;
         if falling_edge {
             self.shift(interrupts);
         }
@@ -136,7 +179,7 @@ impl Serial {
         let sc = r.u8()?;
         let bits_left = r.u8()?;
         let tx = r.u8()?;
-        check(sc & 0x7E == 0x7E, "SC")?;
+        check(sc & self.unused_bits() == self.unused_bits(), "SC")?;
         check(bits_left <= BITS_PER_BYTE, "serial bits")?;
         self.sb = sb;
         self.sc = sc;
@@ -160,10 +203,18 @@ mod tests {
 
     impl Rig {
         fn new() -> Self {
+            Self::with(Serial::new())
+        }
+
+        fn cgb() -> Self {
+            Self::with(Serial::new_cgb_mode())
+        }
+
+        fn with(s: Serial) -> Self {
             let mut i = Interrupts::new();
             i.write_if(0);
             Self {
-                s: Serial::new(),
+                s,
                 i,
                 counter: 0xABC8,
             }
@@ -303,5 +354,74 @@ mod tests {
         r.ticks(2048);
         assert!(!r.irq());
         assert!(r.s.output().is_empty());
+    }
+
+    #[test]
+    fn sc_bit_1_is_a_readable_writable_speed_bit_in_cgb_mode_only() {
+        let mut cgb = Serial::new_cgb_mode();
+        assert_eq!(cgb.read(0xFF02), 0x7F, "post-boot");
+        for (write, read) in [(0x00, 0x7C), (0x02, 0x7E), (0x01, 0x7D), (0x83, 0xFF)] {
+            cgb.write(0xFF02, write);
+            assert_eq!(cgb.read(0xFF02), read, "wrote {write:02X}");
+        }
+        // A DMG, and a CGB in compatibility mode (`Serial::new`), keep it at 1.
+        let mut dmg = Serial::new();
+        assert_eq!(dmg.read(0xFF02), 0x7E);
+        for (write, read) in [(0x00, 0x7E), (0x02, 0x7E), (0x01, 0x7F), (0x83, 0xFF)] {
+            dmg.write(0xFF02, write);
+            assert_eq!(dmg.read(0xFF02), read, "wrote {write:02X}");
+        }
+    }
+
+    #[test]
+    fn the_cgb_fast_clock_runs_a_transfer_32_times_faster() {
+        let transfer = |mut r: Rig, sc: u8| {
+            r.ticks(26);
+            r.s.write(0xFF01, b'F');
+            r.s.write(0xFF02, sc);
+            let n = r.run_to_interrupt();
+            assert_eq!(r.s.output(), b"F");
+            assert_eq!(r.s.read(0xFF02) & 0x80, 0);
+            n
+        };
+        // 8 edges, 4 M-cycles apart: the first within 4, the last 7 * 4 later.
+        let fast = transfer(Rig::cgb(), 0x83);
+        assert!((7 * 4 + 1..=8 * 4).contains(&fast), "took {fast}");
+        // Bit 1 clear is the normal 8192 Hz clock, as before.
+        let slow = transfer(Rig::cgb(), 0x81);
+        assert_eq!(slow, 1037 - 26);
+        // The bit means nothing on a DMG.
+        assert_eq!(transfer(Rig::new(), 0x83), slow);
+        assert_eq!(transfer(Rig::new(), 0x81), slow);
+    }
+
+    #[test]
+    fn load_state_checks_the_bits_this_mode_holds_at_1() {
+        let state = |sc: u8| {
+            let mut w = StateWriter::new();
+            for v in [0x12, sc, 0, 0x34] {
+                w.u8(v);
+            }
+            w.into_bytes()
+        };
+        let mut dmg = Serial::new();
+        let mut cgb = Serial::new_cgb_mode();
+        // Bit 1 is a free bit on a CGB only; bits 2-6 must be 1 on both.
+        assert_eq!(
+            dmg.load_state(&mut StateReader::new(&state(0x7C))),
+            Err(StateError::Invalid("SC"))
+        );
+        assert!(cgb.load_state(&mut StateReader::new(&state(0x7C))).is_ok());
+        assert_eq!(cgb.read(0xFF02), 0x7C);
+        assert!(dmg.load_state(&mut StateReader::new(&state(0x7E))).is_ok());
+        for sc in [0x7A, 0x6E, 0x3C] {
+            for s in [&mut dmg, &mut cgb] {
+                assert_eq!(
+                    s.load_state(&mut StateReader::new(&state(sc))),
+                    Err(StateError::Invalid("SC")),
+                    "{sc:02X}"
+                );
+            }
+        }
     }
 }

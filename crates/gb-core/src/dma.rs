@@ -56,6 +56,11 @@ impl Dma {
         }
     }
 
+    /// CGB post-boot DMA register: 0x00 (Pan Docs "Power Up Sequence").
+    pub fn new_cgb() -> Self {
+        Self::default()
+    }
+
     pub fn read_reg(&self) -> u8 {
         self.reg
     }
@@ -104,7 +109,23 @@ impl Dma {
 
     /// Advance one M-cycle. Returns `(source_addr, oam_index)` when a byte
     /// should be copied this cycle.
+    ///
+    /// Called every M-cycle and idle nearly always, so the idle case is inlined
+    /// into the bus tick and the rest stays out of line.
+    #[inline(always)]
     pub fn tick_mcycle(&mut self) -> Option<(u16, u8)> {
+        if self.pending.is_none() && self.active.is_none() {
+            // Nothing to start or copy: the bus is free (`video_bus` only
+            // means something while `busy`).
+            self.busy = false;
+            return None;
+        }
+        self.tick_transfer()
+    }
+
+    /// [`Dma::tick_mcycle`] with a transfer pending or running.
+    #[inline(never)]
+    fn tick_transfer(&mut self) -> Option<(u16, u8)> {
         if let Some(p) = &mut self.pending {
             p.delay -= 1;
             if p.delay == 0 {

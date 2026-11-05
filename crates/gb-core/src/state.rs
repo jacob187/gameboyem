@@ -1,9 +1,12 @@
 //! Save states: a versioned binary snapshot of the whole machine.
 //!
 //! Layout: magic `GBST`, a `u16` format version, the FNV-1a hash of the ROM
-//! the state was taken with, then one tagged section per component in a fixed
-//! order (see [`crate::GameBoy::save_state`]). All integers are little-endian;
-//! `f32`s are stored as their bit patterns so a round trip is bit-exact.
+//! the state was taken with, the model (`u8`: 0 DMG, 1 CGB), the hardware mode
+//! (`u8`: 0 DMG, 1 CGB in compatibility mode, 2 CGB), then one tagged section
+//! per component in a fixed order (see [`crate::GameBoy::save_state`]). All
+//! integers are little-endian; `f32`s are stored as their bit patterns so a
+//! round trip is bit-exact. Version 1 has neither the model nor the hardware
+//! byte (it predates the CGB; its sections are the DMG ones) and loads as a DMG.
 //!
 //! State bytes are untrusted input: every read is bounds-checked and every
 //! field that a component later uses as an index, a loop bound or a counter
@@ -17,7 +20,7 @@
 use std::fmt;
 
 pub(crate) const MAGIC: [u8; 4] = *b"GBST";
-pub(crate) const VERSION: u16 = 1;
+pub(crate) const VERSION: u16 = 2;
 
 /// Section tags, in file order.
 pub(crate) mod tag {
@@ -42,6 +45,8 @@ pub enum StateError {
     UnsupportedVersion(u16),
     /// The state was taken with a different ROM.
     RomMismatch,
+    /// The state was taken on a different model (DMG vs CGB).
+    ModelMismatch,
     /// The data ends before the state does.
     Truncated,
     /// A field holds a value the emulator can never be in.
@@ -56,6 +61,7 @@ impl fmt::Display for StateError {
             Self::BadMagic => write!(f, "not a save state"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported save-state version {v}"),
             Self::RomMismatch => write!(f, "save state is for a different ROM"),
+            Self::ModelMismatch => write!(f, "save state is for a different Game Boy model"),
             Self::Truncated => write!(f, "save state is truncated"),
             Self::Invalid(what) => write!(f, "save state is corrupt ({what})"),
             Self::TrailingBytes => write!(f, "save state has trailing data"),
@@ -92,6 +98,13 @@ pub struct StateWriter {
 impl StateWriter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A writer with room for `capacity` bytes, to avoid regrowing the buffer.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn into_bytes(self) -> Vec<u8> {

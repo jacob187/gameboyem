@@ -8,7 +8,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use gb_core::{Button, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gb_core::{Button, GameBoy, Model, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// The manifest, compiled in so tests and the CLI always agree.
 pub const MANIFEST: &str = include_str!("../expected.txt");
@@ -22,9 +22,11 @@ pub enum Kind {
     BlarggMem,
     /// Mooneye: `LD B,B` with Fibonacci registers on pass.
     Mooneye,
-    /// dmg-acid2: framebuffer compared to the reference image.
+    /// dmg-acid2: framebuffer compared to the reference image. With the `-cgb`
+    /// suffix (cgb-acid2) the RGB555 colour framebuffer is compared instead.
     Acid2,
-    /// Homebrew smoke test: framebuffer not blank after N frames.
+    /// Homebrew smoke test: framebuffer not blank after N frames. With the `-cgb` suffix
+    /// (`smoke-cgb`) the RGB555 frame must show 2+ colours and not be frozen (idle, Start, A).
     Smoke,
     /// Homebrew playability: boot snake, press Start, steer, framebuffer must change.
     PlaySnake,
@@ -46,6 +48,9 @@ pub enum Kind {
     SfxSnake,
     /// Same for breakout: Start, paddle hit, brick break, life lost, game over.
     SfxBreakout,
+    /// Homebrew `cgbdemo` (CGB only, run with the `-cgb` suffix): per-tile BG palettes and
+    /// flips, a bank-1 sprite moved by the D-pad, and A stepping a palette entry.
+    PlayCgbdemo,
 }
 
 #[derive(Clone, Debug)]
@@ -55,20 +60,26 @@ pub struct Case {
     pub kind: Kind,
     pub expect_pass: bool,
     pub max_frames: u32,
+    /// The console to run on: a `-cgb` suffix on the kind selects [`Model::Cgb`].
+    pub model: Model,
 }
 
 impl Case {
     /// Short display name, e.g. `blargg/cpu_instrs/individual/01-special`.
     pub fn name(&self) -> String {
         let p = self.path.strip_prefix("test/").unwrap_or(&self.path);
-        let p = p.strip_suffix(".gb").unwrap_or(p);
+        let p = p
+            .strip_suffix(".gbc")
+            .or_else(|| p.strip_suffix(".gb"))
+            .unwrap_or(p);
         match self.kind {
             // Same ROM as the smoke case; keep the names unique.
             Kind::PlaySnake
             | Kind::PlayBreakout
             | Kind::PlayTobu
             | Kind::PlayAdjustris
-            | Kind::PlayRenegade => format!("{p}-play"),
+            | Kind::PlayRenegade
+            | Kind::PlayCgbdemo => format!("{p}-play"),
             Kind::SaveSnake | Kind::SaveBreakout => format!("{p}-save"),
             Kind::SfxSnake | Kind::SfxBreakout => format!("{p}-sfx"),
             _ => p.to_string(),
@@ -161,7 +172,14 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "fail" => false,
                 o => panic!("expected.txt:{}: bad expectation {o:?}", n + 1),
             };
-            let kind = match next("kind") {
+            // `<kind>-cgb` runs <kind> on a CGB. Only the `-cgb` suffix is peeled
+            // off, so `blargg-mem` and friends keep parsing.
+            let kind_text = next("kind");
+            let (kind_text, model) = match kind_text.strip_suffix("-cgb") {
+                Some(base) => (base, Model::Cgb),
+                None => (kind_text, Model::Dmg),
+            };
+            let kind = match kind_text {
                 "blargg" => Kind::Blargg,
                 "blargg-mem" => Kind::BlarggMem,
                 "mooneye" => Kind::Mooneye,
@@ -176,6 +194,7 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "play-renegade" => Kind::PlayRenegade,
                 "sfx-snake" => Kind::SfxSnake,
                 "sfx-breakout" => Kind::SfxBreakout,
+                "play-cgbdemo" => Kind::PlayCgbdemo,
                 o => panic!("expected.txt:{}: bad kind {o:?}", n + 1),
             };
             let max_frames = next("max_frames")
@@ -187,6 +206,7 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 kind,
                 expect_pass,
                 max_frames,
+                model,
             }
         })
         .collect()
@@ -202,25 +222,29 @@ pub fn run_case(case: &Case) -> Outcome {
         return Outcome::Missing;
     };
     let frames = case.max_frames;
-    let on_machine = |run: &dyn Fn(&mut GameBoy) -> Outcome| match GameBoy::new(rom.clone()) {
-        Ok(mut gb) => run(&mut gb),
-        Err(e) => Outcome::Fail(format!("load error: {e}")),
-    };
+    let model = case.model;
+    let on_machine =
+        |run: &dyn Fn(&mut GameBoy) -> Outcome| match GameBoy::with_model(rom.clone(), model) {
+            Ok(mut gb) => run(&mut gb),
+            Err(e) => Outcome::Fail(format!("load error: {e}")),
+        };
     match case.kind {
         Kind::Blargg => on_machine(&|gb| run_blargg(gb, frames)),
         Kind::Mooneye => on_machine(&|gb| run_mooneye(gb, frames)),
         Kind::Acid2 => on_machine(&|gb| run_acid2(gb, case)),
+        Kind::Smoke if model == Model::Cgb => on_machine(&|gb| run_smoke_cgb(gb, frames)),
         Kind::Smoke => on_machine(&|gb| run_smoke(gb, frames)),
-        Kind::BlarggMem => run_blargg_mem(&rom, frames),
-        Kind::PlaySnake => run_play(&rom, PLAY_SNAKE, frames),
-        Kind::PlayBreakout => run_play(&rom, PLAY_BREAKOUT, frames),
-        Kind::PlayTobu => run_play(&rom, PLAY_TOBU, frames),
-        Kind::PlayAdjustris => run_play(&rom, PLAY_ADJUSTRIS, frames),
-        Kind::PlayRenegade => run_play(&rom, PLAY_RENEGADE, frames),
-        Kind::SaveSnake => run_save(&rom, drive_snake, frames),
-        Kind::SaveBreakout => run_save(&rom, drive_breakout, frames),
-        Kind::SfxSnake => run_sfx(&rom, sfx_snake, frames),
-        Kind::SfxBreakout => run_sfx(&rom, sfx_breakout, frames),
+        Kind::BlarggMem => run_blargg_mem(&rom, model, frames),
+        Kind::PlaySnake => run_play(&rom, model, PLAY_SNAKE, frames),
+        Kind::PlayBreakout => run_play(&rom, model, PLAY_BREAKOUT, frames),
+        Kind::PlayTobu => run_play(&rom, model, PLAY_TOBU, frames),
+        Kind::PlayAdjustris => run_play(&rom, model, PLAY_ADJUSTRIS, frames),
+        Kind::PlayRenegade => run_play(&rom, model, PLAY_RENEGADE, frames),
+        Kind::SaveSnake => run_save(&rom, model, drive_snake, frames),
+        Kind::SaveBreakout => run_save(&rom, model, drive_breakout, frames),
+        Kind::SfxSnake => run_sfx(&rom, model, sfx_snake, frames),
+        Kind::SfxBreakout => run_sfx(&rom, model, sfx_breakout, frames),
+        Kind::PlayCgbdemo => run_cgbdemo(&rom, model, frames),
     }
 }
 
@@ -304,7 +328,7 @@ impl Sram {
 /// On 0x81 the ROM wants a reset after >= 0.1 s with its SRAM kept (it is
 /// battery-backed on real carts): the machine is re-created from the ROM, the
 /// RAM carried over, and the run continues, at most `MAX_RESETS` times.
-fn run_blargg_mem(rom: &[u8], max_frames: u32) -> Outcome {
+fn run_blargg_mem(rom: &[u8], model: Model, max_frames: u32) -> Outcome {
     const STATUS: u16 = 0xA000;
     const TEXT: u16 = 0xA004;
     const RUNNING: u8 = 0x80;
@@ -315,7 +339,10 @@ fn run_blargg_mem(rom: &[u8], max_frames: u32) -> Outcome {
     /// Frames after a reset during which a leftover 0x81 is not a new request:
     /// the ROM has not rewritten the status byte yet.
     const BOOT_GRACE: u32 = 30;
-    let boot = || GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")));
+    let boot = || {
+        GameBoy::with_model(rom.to_vec(), model)
+            .map_err(|e| Outcome::Fail(format!("load error: {e}")))
+    };
     let report = |gb: &GameBoy, sram: &Sram| {
         let text: Vec<u8> = (0..0x1000u16)
             .map(|i| sram.read(gb, TEXT + i))
@@ -423,17 +450,8 @@ fn run_mooneye(gb: &mut GameBoy, max_frames: u32) -> Outcome {
 /// (0xFF→0 lightest, 0xAA→1, 0x55→2, 0x00→3), per the dmg-acid2 README.
 pub fn load_reference(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
-    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
-        return Err(format!("reference is {}x{}", info.width, info.height));
-    }
-    let channels = info.color_type.samples();
-    buf[..info.buffer_size()]
-        .chunks_exact(channels)
+    let (buf, color_type) = decode_screen_png(std::io::BufReader::new(file))?;
+    buf.chunks_exact(color_type.samples())
         .map(|px| match px[0] {
             0xFF => Ok(0),
             0xAA => Ok(1),
@@ -444,8 +462,26 @@ pub fn load_reference(path: &Path) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Write a framebuffer as a greyscale PNG (for debugging failed comparisons).
-pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
+/// Decode a PNG that must be exactly screen-sized, with palettes expanded and 16-bit samples
+/// reduced to 8: the samples (row-major, `color_type.samples()` per pixel) and the colour type.
+fn decode_screen_png(
+    src: impl std::io::BufRead + std::io::Seek,
+) -> Result<(Vec<u8>, png::ColorType), String> {
+    let mut decoder = png::Decoder::new(src);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
+        return Err(format!("reference is {}x{}", info.width, info.height));
+    }
+    buf.truncate(info.buffer_size());
+    Ok((buf, info.color_type))
+}
+
+/// Write screen-sized 8-bit `samples` as a PNG of the given colour type, creating parent
+/// directories (for debugging failed comparisons).
+fn save_screen_png(samples: &[u8], color: png::ColorType, path: &Path) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -455,12 +491,42 @@ pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
         SCREEN_WIDTH as u32,
         SCREEN_HEIGHT as u32,
     );
-    enc.set_color(png::ColorType::Grayscale);
+    enc.set_color(color);
     enc.set_depth(png::BitDepth::Eight);
-    let grey: Vec<u8> = fb.iter().map(|&s| 0xFF - 0x55 * (s & 3)).collect();
     enc.write_header()
-        .and_then(|mut w| w.write_image_data(&grey))
+        .and_then(|mut w| w.write_image_data(samples))
         .map_err(|e| e.to_string())
+}
+
+/// Write a framebuffer as a greyscale PNG (for debugging failed comparisons).
+pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
+    let grey: Vec<u8> = fb.iter().map(|&s| 0xFF - 0x55 * (s & 3)).collect();
+    save_screen_png(&grey, png::ColorType::Grayscale, path)
+}
+
+/// Load a 160x144 reference PNG as RGB888. Indexed (palette), greyscale and
+/// RGB(A) images are all expanded; alpha is dropped.
+pub fn load_reference_rgb(path: &Path) -> Result<Vec<[u8; 3]>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    decode_reference_rgb(std::io::BufReader::new(file))
+}
+
+fn decode_reference_rgb(
+    src: impl std::io::BufRead + std::io::Seek,
+) -> Result<Vec<[u8; 3]>, String> {
+    let (buf, color_type) = decode_screen_png(src)?;
+    let to_rgb: fn(&[u8]) -> [u8; 3] = match color_type {
+        png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => |px| [px[0]; 3],
+        png::ColorType::Rgb | png::ColorType::Rgba => |px| [px[0], px[1], px[2]],
+        png::ColorType::Indexed => return Err("palette was not expanded".into()),
+    };
+    Ok(buf.chunks_exact(color_type.samples()).map(to_rgb).collect())
+}
+
+/// Write an RGB888 framebuffer as a PNG (for debugging failed comparisons).
+pub fn save_rgb_png(fb: &[[u8; 3]], path: &Path) -> Result<(), String> {
+    let rgb: Vec<u8> = fb.iter().flatten().copied().collect();
+    save_screen_png(&rgb, png::ColorType::Rgb, path)
 }
 
 /// Where failing-test artifacts (actual framebuffers) are written.
@@ -469,15 +535,36 @@ pub fn artifact_dir() -> PathBuf {
 }
 
 fn run_acid2(gb: &mut GameBoy, case: &Case) -> Outcome {
+    if case.model == Model::Cgb {
+        return run_acid2_cgb(gb, case);
+    }
     let reference_path = case.rom_path().with_file_name("reference-dmg.png");
     let reference = match load_reference(&reference_path) {
         Ok(r) => r,
         Err(e) => return Outcome::Fail(format!("reference image: {e}")),
     };
-    // The test finishes setup within a few frames and signals with LD B,B;
-    // render a couple more frames after it (or stop at the frame limit).
+    if let Some(fail) = run_to_acid2_signal(gb, case.max_frames) {
+        return fail;
+    }
+    let fb = gb.framebuffer();
+    let diff = fb.iter().zip(&reference).filter(|(a, b)| a != b).count();
+    if diff == 0 {
+        Outcome::Pass
+    } else {
+        let out = acid2_failure_path(case);
+        let saved = save_framebuffer_png(fb, &out)
+            .map(|()| format!("; actual frame written to {}", out.display()))
+            .unwrap_or_default();
+        Outcome::Fail(format!("{diff} pixels differ from reference{saved}"))
+    }
+}
+
+/// The test finishes setup within a few frames and signals with LD B,B;
+/// render a couple more frames after it (or stop at the frame limit).
+/// Returns the failure if the CPU locks up.
+fn run_to_acid2_signal(gb: &mut GameBoy, max_frames: u32) -> Option<Outcome> {
     let mut frames_after_signal = None;
-    for _ in 0..case.max_frames {
+    for _ in 0..max_frames {
         gb.step_frame();
         if gb.take_ld_b_b_breakpoint() && frames_after_signal.is_none() {
             frames_after_signal = Some(0);
@@ -489,16 +576,42 @@ fn run_acid2(gb: &mut GameBoy, case: &Case) -> Outcome {
             }
         }
         if gb.cpu_locked() {
-            return Outcome::Fail(locked_message(gb));
+            return Some(Outcome::Fail(locked_message(gb)));
         }
     }
-    let fb = gb.framebuffer();
-    let diff = fb.iter().zip(&reference).filter(|(a, b)| a != b).count();
+    None
+}
+
+fn acid2_failure_path(case: &Case) -> PathBuf {
+    artifact_dir().join(format!("{}.png", case.name().replace('/', "_")))
+}
+
+/// cgb-acid2: the RGB555 framebuffer expanded to RGB888 (no colour correction)
+/// must equal `reference.png` exactly.
+fn run_acid2_cgb(gb: &mut GameBoy, case: &Case) -> Outcome {
+    let reference_path = case.rom_path().with_file_name("reference.png");
+    let reference = match load_reference_rgb(&reference_path) {
+        Ok(r) => r,
+        Err(e) => return Outcome::Fail(format!("reference image: {e}")),
+    };
+    if let Some(fail) = run_to_acid2_signal(gb, case.max_frames) {
+        return fail;
+    }
+    let fb = match cgb_frame(gb) {
+        Ok(fb) => fb,
+        Err(o) => return o,
+    };
+    let actual: Vec<[u8; 3]> = fb.iter().map(|&px| gb_core::rgb555_to_rgb888(px)).collect();
+    let diff = actual
+        .iter()
+        .zip(&reference)
+        .filter(|(a, b)| a != b)
+        .count();
     if diff == 0 {
         Outcome::Pass
     } else {
-        let out = artifact_dir().join(format!("{}.png", case.name().replace('/', "_")));
-        let saved = save_framebuffer_png(fb, &out)
+        let out = acid2_failure_path(case);
+        let saved = save_rgb_png(&actual, &out)
             .map(|()| format!("; actual frame written to {}", out.display()))
             .unwrap_or_default();
         Outcome::Fail(format!("{diff} pixels differ from reference{saved}"))
@@ -521,6 +634,68 @@ fn run_smoke(gb: &mut GameBoy, frames: u32) -> Outcome {
     } else {
         Outcome::Pass
     }
+}
+
+/// Frames [`run_smoke_cgb`] runs idle, and after each button press (held 5 frames), between samples.
+const SMOKE_CGB_STEP: u32 = 60;
+
+/// Distinct RGB555 values in a colour frame.
+fn distinct_colours(fb: &[u16]) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    seen.extend(fb.iter().copied());
+    seen.len()
+}
+
+/// `smoke` on a CGB: after `frames` frames the colour frame has at least 2 distinct colours, and
+/// the picture is not frozen: it changes by itself over [`SMOKE_CGB_STEP`] idle frames, or after
+/// Start, or after A (menus and dialogue boxes want one or the other). Passing means the game
+/// booted, drew in colour and kept running; the frame hash is not pinned.
+fn run_smoke_cgb(gb: &mut GameBoy, frames: u32) -> Outcome {
+    let step = |gb: &mut GameBoy, n: u32| -> Result<(), Outcome> {
+        for _ in 0..n {
+            gb.step_frame();
+            if gb.cpu_locked() {
+                return Err(Outcome::Fail(locked_message(gb)));
+            }
+        }
+        Ok(())
+    };
+    if let Err(o) = step(gb, frames) {
+        return o;
+    }
+    // Owned copies: the snapshots must outlive further stepping.
+    let mut shots = vec![match cgb_frame(gb) {
+        Ok(f) => f.to_vec(),
+        Err(o) => return o,
+    }];
+    let colours = distinct_colours(&shots[0]);
+    if colours < 2 {
+        return Outcome::Fail(format!(
+            "colour framebuffer blank ({colours} colour) after {frames} frames"
+        ));
+    }
+    for input in [None, Some(Button::Start), Some(Button::A)] {
+        if let Some(b) = input {
+            gb.set_button(b, true);
+        }
+        let run = step(gb, 5);
+        if let Some(b) = input {
+            gb.set_button(b, false);
+        }
+        if let Err(o) = run.and_then(|()| step(gb, SMOKE_CGB_STEP)) {
+            return o;
+        }
+        match cgb_frame(gb) {
+            Ok(f) => shots.push(f.to_vec()),
+            Err(o) => return o,
+        }
+    }
+    if shots.iter().all(|f| *f == shots[0]) {
+        return Outcome::Fail(format!(
+            "picture frozen ({colours} colours): unchanged when idle and after Start and A"
+        ));
+    }
+    Outcome::Pass
 }
 
 /// Frames the title screen gets before the script presses Start.
@@ -709,12 +884,13 @@ const PLAY_RENEGADE: &[Step] = &[
 /// `skip` replaces the `Hold` at that index with an equally long `Run`.
 fn play(
     rom: &[u8],
+    model: Model,
     script: &[Step],
     skip: Option<usize>,
     max_frames: u32,
 ) -> Result<Vec<Vec<u8>>, Outcome> {
-    let mut gb =
-        GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
+    let mut gb = GameBoy::with_model(rom.to_vec(), model)
+        .map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
     let mut frame = 0;
     let mut shots = Vec::new();
     for (i, step) in script.iter().enumerate() {
@@ -758,8 +934,8 @@ fn play(
 ///   different picture at the next `Shot` (the control run stops there; the
 ///   machine is not `Clone`, so each one replays from power-on). Without this, a game that animates
 ///   on its own would pass even with joypad input broken.
-fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
-    let shots = match play(rom, script, None, max_frames) {
+fn run_play(rom: &[u8], model: Model, script: &[Step], max_frames: u32) -> Outcome {
+    let shots = match play(rom, model, script, None, max_frames) {
         Ok(s) => s,
         Err(o) => return o,
     };
@@ -789,7 +965,7 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
                 else {
                     continue;
                 };
-                let control = match play(rom, &script[..=end], Some(i), max_frames) {
+                let control = match play(rom, model, &script[..=end], Some(i), max_frames) {
                     Ok(s) => s,
                     Err(o) => return o,
                 };
@@ -805,6 +981,416 @@ fn run_play(rom: &[u8], script: &[Step], max_frames: u32) -> Outcome {
     Outcome::Pass
 }
 
+/// RGB555 as the ROM's `RGB(r, g, b)` macro packs it (red in the low bits).
+const fn rgb555(r: u16, g: u16, b: u16) -> u16 {
+    r | g << 5 | b << 10
+}
+
+// Everything the cgbdemo case expects is written out by hand from
+// homebrew/cgbdemo/src/main.c, independently of the C tables. Each constant below
+// names the C symbol it mirrors: change one side and you must change the other (the ROM
+// only rebuilds in CI, so a drift shows up there as a failing case).
+
+/// One 8x8 tile: 2 bytes per row, low bitplane then high (colour = hi * 2 + lo).
+type Tile = [u8; 16];
+
+/// `bkg_tiles[0]` (TILE_EMPTY).
+const CGBDEMO_TILE_EMPTY: Tile = [0; 16];
+/// `bkg_tiles` TILE_SOLID + 0..=2: solid colours 1, 2, 3.
+const CGBDEMO_TILE_SOLID: [Tile; 3] = [
+    [
+        0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00,
+    ],
+    [
+        0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00,
+        0xFF,
+    ],
+    [0xFF; 16],
+];
+/// `bkg_tiles` TILE_QUAD: quadrants top left 1, top right 2, bottom left 3, bottom right 0.
+const CGBDEMO_TILE_QUAD: Tile = [
+    0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0,
+];
+/// `spr_tile` (bank 1 of VRAM): colour 3 core, colour 1 rim. (`spr_decoy` is the bank 0
+/// tile of the same number, solid colour 1.)
+const CGBDEMO_TILE_SPRITE: Tile = [
+    0xFF, 0x00, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x7E, 0xFF, 0x00,
+];
+
+/// `bkg_pal`: the ROM's eight BG palettes, colours 0-3. Palette 7 colour 3 is the one A
+/// steps (`CYCLED_PAL`, `CYCLED_COLOR`); here it holds `CYCLE[0]`, its power-on value.
+const CGBDEMO_BKG_PAL: [[u16; 4]; 8] = [
+    [
+        rgb555(2, 2, 6),
+        rgb555(6, 8, 16),
+        rgb555(10, 14, 24),
+        rgb555(14, 20, 31),
+    ],
+    [
+        rgb555(0, 0, 0),
+        rgb555(31, 6, 6),
+        rgb555(6, 28, 6),
+        rgb555(8, 8, 31),
+    ],
+    [
+        rgb555(8, 0, 0),
+        rgb555(14, 2, 2),
+        rgb555(22, 4, 4),
+        rgb555(31, 8, 8),
+    ],
+    [
+        rgb555(8, 4, 0),
+        rgb555(16, 10, 0),
+        rgb555(24, 16, 0),
+        rgb555(31, 22, 2),
+    ],
+    [
+        rgb555(8, 8, 0),
+        rgb555(15, 15, 0),
+        rgb555(23, 23, 2),
+        rgb555(31, 31, 6),
+    ],
+    [
+        rgb555(0, 8, 0),
+        rgb555(2, 14, 2),
+        rgb555(4, 22, 4),
+        rgb555(8, 31, 8),
+    ],
+    [
+        rgb555(0, 8, 8),
+        rgb555(0, 14, 14),
+        rgb555(2, 22, 22),
+        rgb555(6, 31, 31),
+    ],
+    [
+        rgb555(8, 0, 8),
+        rgb555(14, 2, 14),
+        rgb555(22, 4, 22),
+        rgb555(31, 8, 31),
+    ],
+];
+/// `CYCLE`: what the A presses write to BG palette 7, colour 3, in order. Press n shows
+/// `CYCLE[n % len]`; index 0 is the power-on colour and the wrap back to it is checked.
+const CGBDEMO_CYCLE: [u16; 5] = [
+    rgb555(31, 8, 31),
+    rgb555(22, 31, 4),
+    rgb555(10, 22, 31),
+    rgb555(31, 14, 10),
+    rgb555(31, 31, 31),
+];
+/// `CYCLED_PAL`, `CYCLED_COLOR`: the BG palette entry A writes.
+const CGBDEMO_CYCLED: (usize, usize) = (7, 3);
+/// `obj_pal`: the sprite's OBJ palette 1 (colour 0 is transparent). Core is colour 3, rim
+/// colour 1.
+const CGBDEMO_CORE: u16 = rgb555(31, 12, 24);
+const CGBDEMO_RIM: u16 = rgb555(28, 28, 31);
+const CGBDEMO_OBJ_PAL: [u16; 4] = [0, CGBDEMO_RIM, rgb555(0, 0, 0), CGBDEMO_CORE];
+/// `SPR_START_X`, `SPR_START_Y` (screen pixels of the sprite's top left) and `SPR_SPEED`
+/// (pixels per ROM poll with a D-pad direction held).
+const CGBDEMO_START: (usize, usize) = (80, 96);
+const CGBDEMO_SPEED: usize = 2;
+/// 8 swatch palettes x 3 colours, the quad tile's black, the backdrop, the colour 0 of
+/// palettes 3-5 (shown by the quad tiles) and the two sprite colours.
+const CGBDEMO_MIN_COLOURS: usize = 31;
+
+/// One BG map cell that is not the empty tile in palette 0: the layout of `draw_card`.
+struct Cell {
+    tile: (usize, usize),
+    data: &'static Tile,
+    pal: usize,
+    flip: (bool, bool),
+    name: &'static str,
+}
+
+fn cgbdemo_cells() -> Vec<Cell> {
+    let mut cells = Vec::new();
+    // Rows 1..=3: palette p, colours 1..=3, in columns 2 + 2p and 3 + 2p.
+    for pal in 0..8 {
+        for (row, data) in CGBDEMO_TILE_SOLID.iter().enumerate() {
+            for col in [2 + 2 * pal, 3 + 2 * pal] {
+                cells.push(Cell {
+                    tile: (col, 1 + row),
+                    data,
+                    pal,
+                    flip: (false, false),
+                    name: "swatch",
+                });
+            }
+        }
+    }
+    // Row 6: palette 1 plain, X, Y, X+Y; then the same tile in palettes 3, 4, 5.
+    for (tx, pal, flip, name) in [
+        (2, 1, (false, false), "quad plain"),
+        (5, 1, (true, false), "quad X flip"),
+        (8, 1, (false, true), "quad Y flip"),
+        (11, 1, (true, true), "quad X+Y flip"),
+        (14, 3, (false, false), "quad palette 3"),
+        (16, 4, (false, false), "quad palette 4"),
+        (18, 5, (false, false), "quad palette 5"),
+    ] {
+        cells.push(Cell {
+            tile: (tx, 6),
+            data: &CGBDEMO_TILE_QUAD,
+            pal,
+            flip,
+            name,
+        });
+    }
+    cells
+}
+
+/// Colour index (0-3) of pixel (x, y) of a tile.
+fn tile_colour(tile: &Tile, x: usize, y: usize) -> usize {
+    let bit = 7 - x;
+    (usize::from((tile[2 * y + 1] >> bit) & 1) << 1) | usize::from((tile[2 * y] >> bit) & 1)
+}
+
+/// The whole colour frame the ROM should show: the BG cells, the empty tile elsewhere, the
+/// sprite with its top left at `sprite`, and `cycled` in BG palette 7 colour 3.
+fn cgbdemo_expected(sprite: (usize, usize), cycled: u16) -> Vec<u16> {
+    let colour = |pal: usize, c: usize| {
+        if (pal, c) == CGBDEMO_CYCLED {
+            cycled
+        } else {
+            CGBDEMO_BKG_PAL[pal][c]
+        }
+    };
+    // The empty tile in palette 0 is colour 0 of palette 0 everywhere.
+    let empty = colour(0, tile_colour(&CGBDEMO_TILE_EMPTY, 0, 0));
+    let mut fb = vec![empty; SCREEN_WIDTH * SCREEN_HEIGHT];
+    for cell in cgbdemo_cells() {
+        for y in 0..8 {
+            for x in 0..8 {
+                let sx = if cell.flip.0 { 7 - x } else { x };
+                let sy = if cell.flip.1 { 7 - y } else { y };
+                let c = tile_colour(cell.data, sx, sy);
+                fb[(cell.tile.1 * 8 + y) * SCREEN_WIDTH + cell.tile.0 * 8 + x] =
+                    colour(cell.pal, c);
+            }
+        }
+    }
+    for y in 0..8 {
+        for x in 0..8 {
+            let c = tile_colour(&CGBDEMO_TILE_SPRITE, x, y);
+            if c != 0 {
+                fb[(sprite.1 + y) * SCREEN_WIDTH + sprite.0 + x] = CGBDEMO_OBJ_PAL[c];
+            }
+        }
+    }
+    fb
+}
+
+/// A borrow of the colour frame, or the failure if the machine is not in CGB colour mode.
+fn cgb_frame(gb: &GameBoy) -> Result<&[u16], Outcome> {
+    gb.cgb_framebuffer().map(|f| f.as_slice()).ok_or_else(|| {
+        Outcome::Fail(
+            "cgb_framebuffer() is None: the machine is not rendering in CGB colour mode".into(),
+        )
+    })
+}
+
+/// Bounding box `(min_x, min_y, max_x, max_y)` of the pixels equal to `colour`.
+fn cgb_bbox(fb: &[u16], colour: u16) -> Option<(usize, usize, usize, usize)> {
+    fb.iter()
+        .enumerate()
+        .filter(|&(_, &c)| c == colour)
+        .map(|(i, _)| (i % SCREEN_WIDTH, i / SCREEN_WIDTH))
+        .fold(None, |bb, (x, y)| match bb {
+            None => Some((x, y, x, y)),
+            Some((x0, y0, x1, y1)) => Some((x0.min(x), y0.min(y), x1.max(x), y1.max(y))),
+        })
+}
+
+fn check(ok: bool, what: impl FnOnce() -> String) -> Result<(), Outcome> {
+    if ok {
+        Ok(())
+    } else {
+        Err(Outcome::Fail(what()))
+    }
+}
+
+/// Every pixel of `got` equals `want`; the failure names the first differing pixel and
+/// the cell (tile) it is in.
+fn check_frame(got: &[u16], want: &[u16], cells: &[Cell], what: &str) -> Result<(), Outcome> {
+    let mut bad = (0..got.len()).filter(|&i| got[i] != want[i]);
+    let Some(first) = bad.next() else {
+        return Ok(());
+    };
+    let n = 1 + bad.count();
+    let (x, y) = (first % SCREEN_WIDTH, first / SCREEN_WIDTH);
+    let tile = (x / 8, y / 8);
+    let name = cells
+        .iter()
+        .find(|c| c.tile == tile)
+        .map_or("backdrop or sprite", |c| c.name);
+    Err(Outcome::Fail(format!(
+        "{what}: {n} pixels differ; first at ({x}, {y}) in tile {tile:?} ({name}): {:#06x}, want {:#06x}",
+        got[first], want[first]
+    )))
+}
+
+/// Top left of the sprite's colour 3 core, which must be 6x6.
+fn cgbdemo_core(fb: &[u16]) -> Result<(usize, usize), Outcome> {
+    let (x0, y0, x1, y1) = cgb_bbox(fb, CGBDEMO_CORE)
+        .ok_or_else(|| Outcome::Fail("sprite core colour not on screen".into()))?;
+    check((x1 - x0, y1 - y0) == (5, 5), || {
+        format!(
+            "sprite core is {}x{}, want 6x6 (bank 1 tile?)",
+            x1 - x0 + 1,
+            y1 - y0 + 1
+        )
+    })?;
+    Ok((x0, y0))
+}
+
+/// Holds `button` for `frames` frames, releases it and runs `settle` more. Returns the
+/// sprite core position after every one of those frames.
+fn cgbdemo_track(
+    s: &mut Session,
+    button: Button,
+    frames: u32,
+    settle: u32,
+) -> Result<Vec<(usize, usize)>, Outcome> {
+    let mut at = Vec::new();
+    s.gb.set_button(button, true);
+    for i in 0..frames + settle {
+        if i == frames {
+            s.gb.set_button(button, false);
+        }
+        s.step()?;
+        at.push(cgbdemo_core(cgb_frame(&s.gb)?)?);
+    }
+    Ok(at)
+}
+
+/// homebrew/cgbdemo (header 0x143 = 0xC0), on a CGB:
+/// 1. the colour frame exists, has many distinct colours, and matches the expected card
+///    pixel for pixel (every swatch and flip variant of the asymmetric tile, VRAM bank 1
+///    attributes, the backdrop, and the bank 1 sprite at its start position);
+/// 2. each D-pad direction moves the sprite that way and no other, in steps of exactly
+///    the ROM's speed, whatever the phase of the ROM's poll against the frame boundary;
+/// 3. each A press steps BG palette 7 colour 3 along all of `CYCLE` and back round to its
+///    first entry, and no other pixel of the frame changes.
+fn run_cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Outcome {
+    match cgbdemo(rom, model, max_frames) {
+        Ok(()) => Outcome::Pass,
+        Err(o) => o,
+    }
+}
+
+fn cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Result<(), Outcome> {
+    let mut s = Session::new(rom, model, max_frames)?;
+    s.run(30)?;
+    let cells = cgbdemo_cells();
+    let fb = cgb_frame(&s.gb)?;
+
+    let colours = distinct_colours(fb);
+    check(colours >= CGBDEMO_MIN_COLOURS, || {
+        format!("{colours} distinct colours, want at least {CGBDEMO_MIN_COLOURS}")
+    })?;
+
+    // The sprite's core starts one pixel in from the rim, at the ROM's start position.
+    let start = (CGBDEMO_START.0 + 1, CGBDEMO_START.1 + 1);
+    let at = cgbdemo_core(fb)?;
+    check(at == start, || {
+        format!("sprite core starts at {at:?}, want {start:?}")
+    })?;
+    check_frame(
+        fb,
+        &cgbdemo_expected(CGBDEMO_START, CGBDEMO_CYCLE[0]),
+        &cells,
+        "power-on card",
+    )?;
+
+    // Hold each direction for 8 frames, then release. The ROM polls once per frame, but
+    // where that poll falls against the harness's frame boundary decides whether 7, 8 or
+    // 9 of them see the button, so count the steps instead of assuming 8: every frame
+    // moves the sprite by 0 or exactly one step along the axis (never sideways), and the
+    // total is 7..=9 steps. The sprite must be still again by the last two frames.
+    // Left and Up undo Right and Down.
+    let (frames, settle) = (8, 3);
+    let speed = CGBDEMO_SPEED as isize;
+    for (button, dir) in [
+        (Button::Right, (1, 0)),
+        (Button::Left, (-1, 0)),
+        (Button::Down, (0, 1)),
+        (Button::Up, (0, -1)),
+    ] {
+        let mut prev = cgbdemo_core(cgb_frame(&s.gb)?)?;
+        let track = cgbdemo_track(&mut s, button, frames, settle)?;
+        let mut steps = Vec::new();
+        for &now in &track {
+            let d = (
+                now.0 as isize - prev.0 as isize,
+                now.1 as isize - prev.1 as isize,
+            );
+            let one = (dir.0 * speed, dir.1 * speed);
+            check(d == (0, 0) || d == one, || {
+                format!("{button:?}: a frame moved the sprite by {d:?}, want (0, 0) or {one:?}")
+            })?;
+            steps.push(d != (0, 0));
+            prev = now;
+        }
+        let n = steps.iter().filter(|&&m| m).count();
+        check((7..=9).contains(&n), || {
+            format!("{button:?}: the sprite stepped {n} times in {frames} held frames, want 7 to 9")
+        })?;
+        check(!steps[steps.len() - 2..].iter().any(|&m| m), || {
+            format!("{button:?}: the sprite was still moving after the button was released")
+        })?;
+        // Wherever it stopped, the whole frame is the card with the sprite there.
+        let (sx, sy) = (prev.0 - 1, prev.1 - 1);
+        check_frame(
+            cgb_frame(&s.gb)?,
+            &cgbdemo_expected((sx, sy), CGBDEMO_CYCLE[0]),
+            &cells,
+            &format!("after {button:?}"),
+        )?;
+    }
+
+    // A: each press steps palette 7 colour 3 along CYCLE (a held press steps once), five
+    // presses to go through every entry and wrap back to the first. Against the frame
+    // before the press, exactly the pixels showing the old colour (the swatch's 16x8
+    // area) become the new one and every other pixel is unchanged, so a BCPS
+    // auto-increment slip into a neighbouring entry shows up.
+    let (pal, col) = CGBDEMO_CYCLED;
+    // Colour c is in swatch row c - 1, which is map row 1 + (c - 1).
+    let (swatch_x, swatch_y) = ((2 + 2 * pal) * 8, col * 8);
+    let len = CGBDEMO_CYCLE.len();
+    for n in 1..=len {
+        let (old, new) = (CGBDEMO_CYCLE[(n - 1) % len], CGBDEMO_CYCLE[n % len]);
+        let before = cgb_frame(&s.gb)?.to_vec();
+        s.hold(Button::A, 4)?;
+        s.run(2)?;
+        let after = cgb_frame(&s.gb)?;
+        let showing: Vec<usize> = (0..before.len()).filter(|&i| before[i] == old).collect();
+        let area: Vec<usize> = (swatch_y..swatch_y + 8)
+            .flat_map(|y| (swatch_x..swatch_x + 16).map(move |x| y * SCREEN_WIDTH + x))
+            .collect();
+        check(showing == area, || {
+            format!(
+                "before A press {n}, {} pixels show {old:#06x}, want exactly the {} of the swatch",
+                showing.len(),
+                area.len()
+            )
+        })?;
+        for i in 0..before.len() {
+            let want = if before[i] == old { new } else { before[i] };
+            check(after[i] == want, || {
+                format!(
+                    "A press {n}: pixel ({}, {}) is {:#06x}, want {want:#06x} (was {:#06x})",
+                    i % SCREEN_WIDTH,
+                    i / SCREEN_WIDTH,
+                    after[i],
+                    before[i]
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// A homebrew game is driven by a bot until its game-over screen is up.
 type Bot = fn(&mut Session) -> Result<(), Outcome>;
 
@@ -816,9 +1402,9 @@ struct Session {
 }
 
 impl Session {
-    fn new(rom: &[u8], max_frames: u32) -> Result<Self, Outcome> {
-        let gb =
-            GameBoy::new(rom.to_vec()).map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
+    fn new(rom: &[u8], model: Model, max_frames: u32) -> Result<Self, Outcome> {
+        let gb = GameBoy::with_model(rom.to_vec(), model)
+            .map_err(|e| Outcome::Fail(format!("load error: {e}")))?;
         Ok(Self {
             gb,
             frame: 0,
@@ -951,16 +1537,16 @@ fn drive_breakout(s: &mut Session) -> Result<(), Outcome> {
 ///    the control: the HI digits show the saved score.
 ///
 /// No RAM addresses or save format are assumed; only that something persists.
-fn run_save(rom: &[u8], bot: Bot, max_frames: u32) -> Outcome {
-    match save_round_trip(rom, bot, max_frames) {
+fn run_save(rom: &[u8], model: Model, bot: Bot, max_frames: u32) -> Outcome {
+    match save_round_trip(rom, model, bot, max_frames) {
         Ok(()) => Outcome::Pass,
         Err(o) => o,
     }
 }
 
-fn save_round_trip(rom: &[u8], bot: Bot, max_frames: u32) -> Result<(), Outcome> {
+fn save_round_trip(rom: &[u8], model: Model, bot: Bot, max_frames: u32) -> Result<(), Outcome> {
     let fail = |m: &str| Outcome::Fail(m.to_string());
-    let mut first = Session::new(rom, max_frames)?;
+    let mut first = Session::new(rom, model, max_frames)?;
     first.run(PLAY_BOOT_FRAMES)?;
     let control = first.gb.framebuffer().to_vec();
     if control.iter().all(|&x| x == control[0]) {
@@ -986,7 +1572,7 @@ fn save_round_trip(rom: &[u8], bot: Bot, max_frames: u32) -> Result<(), Outcome>
         ));
     }
 
-    let mut second = Session::new(rom, max_frames)?;
+    let mut second = Session::new(rom, model, max_frames)?;
     second
         .gb
         .load_battery_ram(&saved)
@@ -1026,9 +1612,9 @@ struct Listener {
 }
 
 impl Listener {
-    fn new(rom: &[u8], max_frames: u32) -> Result<Self, Outcome> {
+    fn new(rom: &[u8], model: Model, max_frames: u32) -> Result<Self, Outcome> {
         Ok(Self {
-            s: Session::new(rom, max_frames)?,
+            s: Session::new(rom, model, max_frames)?,
             frames: Vec::new(),
         })
     }
@@ -1118,11 +1704,11 @@ impl SfxReport {
     }
 }
 
-type SfxScript = fn(&[u8], u32, &mut SfxReport) -> Result<(), Outcome>;
+type SfxScript = fn(&[u8], Model, u32, &mut SfxReport) -> Result<(), Outcome>;
 
-fn run_sfx(rom: &[u8], script: SfxScript, max_frames: u32) -> Outcome {
+fn run_sfx(rom: &[u8], model: Model, script: SfxScript, max_frames: u32) -> Outcome {
     let mut report = SfxReport::new();
-    match script(rom, max_frames, &mut report) {
+    match script(rom, model, max_frames, &mut report) {
         Ok(()) => report.finish(),
         Err(o) => o,
     }
@@ -1134,6 +1720,7 @@ fn run_sfx(rom: &[u8], script: SfxScript, max_frames: u32) -> Outcome {
 /// (snake: field up, breakout: serving).
 fn sfx_title_and_start(
     rom: &[u8],
+    model: Model,
     l: &mut Listener,
     max_frames: u32,
     r: &mut SfxReport,
@@ -1145,7 +1732,7 @@ fn sfx_title_and_start(
     let end = PLAY_BOOT_FRAMES as usize + SFX_WINDOW;
     r.loud("Start blip", l.level(PLAY_BOOT_FRAMES as usize, end));
 
-    let mut ctl = Listener::new(rom, max_frames)?;
+    let mut ctl = Listener::new(rom, model, max_frames)?;
     ctl.run(end as u32)?;
     r.quiet("Start omitted", ctl.level(PLAY_BOOT_FRAMES as usize, end));
 
@@ -1156,12 +1743,12 @@ fn sfx_title_and_start(
 /// Snake: Start blip, silent movement, the first eat, then game over.
 ///
 /// Controls: no Start press; and Start but no steering, over the eat window.
-fn sfx_snake(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
+fn sfx_snake(rom: &[u8], model: Model, max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
     const HEAD: u8 = 130;
     const FOOD: u8 = 131;
     let pads = [Button::Up, Button::Right, Button::Down, Button::Left];
-    let mut l = Listener::new(rom, max_frames)?;
-    sfx_title_and_start(rom, &mut l, max_frames, r)?;
+    let mut l = Listener::new(rom, model, max_frames)?;
+    sfx_title_and_start(rom, model, &mut l, max_frames, r)?;
     let moving_from = l.now();
 
     let food0 =
@@ -1200,7 +1787,7 @@ fn sfx_snake(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outco
     r.loud("eat", l.level(win.0, win.1));
 
     // Same timeline as the main run, but no steering: nothing is eaten.
-    let mut pre = Listener::new(rom, max_frames)?;
+    let mut pre = Listener::new(rom, model, max_frames)?;
     pre.run(PLAY_BOOT_FRAMES)?;
     pre.hold(Button::Start, 5)?;
     pre.run(win.1 as u32 - PLAY_BOOT_FRAMES - 5)?;
@@ -1228,10 +1815,15 @@ fn sfx_snake(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outco
 ///
 /// Controls: no Start press; and Start with Left held but A never pressed, so
 /// the ball is never launched, over the whole play span.
-fn sfx_breakout(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Outcome> {
+fn sfx_breakout(
+    rom: &[u8],
+    model: Model,
+    max_frames: u32,
+    r: &mut SfxReport,
+) -> Result<(), Outcome> {
     const LIFE: u8 = 132;
-    let mut l = Listener::new(rom, max_frames)?;
-    sfx_title_and_start(rom, &mut l, max_frames, r)?;
+    let mut l = Listener::new(rom, model, max_frames)?;
+    sfx_title_and_start(rom, model, &mut l, max_frames, r)?;
     let serving = (l.now() - 20, l.now());
     r.quiet("serving", l.level(serving.0, serving.1));
 
@@ -1306,7 +1898,7 @@ fn sfx_breakout(rom: &[u8], max_frames: u32, r: &mut SfxReport) -> Result<(), Ou
     r.loud("game over", worst(&l, &[over]));
 
     let span = (launch, over + SFX_WINDOW);
-    let mut ctl = Listener::new(rom, max_frames)?;
+    let mut ctl = Listener::new(rom, model, max_frames)?;
     ctl.run(PLAY_BOOT_FRAMES)?;
     ctl.hold(Button::Start, 5)?;
     ctl.s.gb.set_button(Button::Left, true);
@@ -1324,6 +1916,102 @@ mod tests {
         let cases = load_manifest();
         assert!(cases.len() > 50);
         assert!(cases.iter().any(|c| c.path.ends_with("03-op sp,hl.gb")));
+    }
+
+    #[test]
+    fn cgb_suffix_selects_the_model_and_only_the_suffix() {
+        let cases = parse_manifest(
+            "pass mooneye 10 a b.gb\n\
+             fail mooneye-cgb 20 c d.gb\n\
+             pass blargg-mem-cgb 30 e.gb\n\
+             pass blargg-mem 40 f.gb\n\
+             fail acid2-cgb 50 g.gbc\n",
+        );
+        let got: Vec<_> = cases
+            .iter()
+            .map(|c| (c.kind, c.model, c.max_frames))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Kind::Mooneye, Model::Dmg, 10),
+                (Kind::Mooneye, Model::Cgb, 20),
+                (Kind::BlarggMem, Model::Cgb, 30),
+                (Kind::BlarggMem, Model::Dmg, 40),
+                (Kind::Acid2, Model::Cgb, 50),
+            ]
+        );
+        assert_eq!(cases[1].path, "c d.gb");
+    }
+
+    /// A 160x144 4-bit palette PNG (the cgb-acid2 reference format) in memory.
+    fn indexed_png(width: u32, height: u32, palette: &[u8], indices: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, width, height);
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_depth(png::BitDepth::Four);
+        enc.set_palette(palette.to_vec());
+        let mut w = enc.write_header().unwrap();
+        // Two 4-bit pixels per byte, rows byte-aligned.
+        let row_bytes = (width as usize).div_ceil(2);
+        let mut packed = vec![0u8; row_bytes * height as usize];
+        for (i, &idx) in indices.iter().enumerate() {
+            let (y, x) = (i / width as usize, i % width as usize);
+            packed[y * row_bytes + x / 2] |= idx << (if x % 2 == 0 { 4 } else { 0 });
+        }
+        w.write_image_data(&packed).unwrap();
+        w.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn indexed_reference_png_loads_as_rgb888() {
+        let palette = [0xFF, 0x00, 0x00, 0x00, 0x80, 0x00, 0x12, 0x34, 0x56];
+        let indices: Vec<u8> = (0..SCREEN_WIDTH * SCREEN_HEIGHT)
+            .map(|i| (i % 3) as u8)
+            .collect();
+        let png = indexed_png(
+            SCREEN_WIDTH as u32,
+            SCREEN_HEIGHT as u32,
+            &palette,
+            &indices,
+        );
+        let px = decode_reference_rgb(std::io::Cursor::new(png)).unwrap();
+        assert_eq!(px.len(), SCREEN_WIDTH * SCREEN_HEIGHT);
+        assert_eq!(
+            &px[..4],
+            &[[255, 0, 0], [0, 128, 0], [0x12, 0x34, 0x56], [255, 0, 0]]
+        );
+        assert_eq!(px[SCREEN_WIDTH * SCREEN_HEIGHT - 1], {
+            let i = (SCREEN_WIDTH * SCREEN_HEIGHT - 1) % 3;
+            [palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]]
+        });
+    }
+
+    #[test]
+    fn reference_png_of_the_wrong_size_is_rejected() {
+        let png = indexed_png(4, 2, &[0, 0, 0, 255, 255, 255], &[0, 1, 0, 1, 1, 0, 1, 0]);
+        let err = decode_reference_rgb(std::io::Cursor::new(png)).unwrap_err();
+        assert!(err.contains("4x2"), "{err}");
+    }
+
+    #[test]
+    fn gbc_and_gb_extensions_are_stripped_from_names() {
+        let case = |path: &str| Case {
+            path: path.into(),
+            kind: Kind::Acid2,
+            expect_pass: true,
+            max_frames: 1,
+            model: Model::Cgb,
+        };
+        assert_eq!(
+            case("test/cgb-acid2/cgb-acid2.gbc").name(),
+            "cgb-acid2/cgb-acid2"
+        );
+        assert_eq!(
+            case("test/dmg-acid2/dmg-acid2.gb").name(),
+            "dmg-acid2/dmg-acid2"
+        );
     }
 
     /// A 32 KiB ROM with `code` at 0x150 (entry jumps there).
@@ -1376,16 +2064,97 @@ mod tests {
     #[test]
     fn play_control_run_passes_when_input_changes_the_picture() {
         let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
-        let out = run_play(&rom, &play_script(Button::Down), 100);
+        let out = run_play(&rom, Model::Dmg, &play_script(Button::Down), 100);
         assert_eq!(out, Outcome::Pass, "{out}");
     }
 
     #[test]
     fn play_control_run_fails_when_input_is_ignored() {
         let rom = synth_rom(0x00, 0, JOYPAD_TO_PALETTE);
-        let out = run_play(&rom, &play_script(Button::A), 100);
+        let out = run_play(&rom, Model::Dmg, &play_script(Button::A), 100);
         assert!(
             matches!(&out, Outcome::Fail(m) if m.contains("input had no effect")),
+            "{out}"
+        );
+    }
+
+    /// A CGB-flagged ROM that draws one BG tile with a stripe: BG palette 0 colour 0 is white
+    /// and colour 1 is `colour1` (RGB555, little-endian). It then latches every button in
+    /// `mask` (P1 bits 3:0 = Start, Select, B, A) it sees pressed into the low byte of colour 1
+    /// (the latch starts as that byte and survives the release), so the picture changes after such a press and
+    /// otherwise never does.
+    fn smoke_cgb_rom(colour1: [u8; 2], mask: u8) -> Vec<u8> {
+        #[rustfmt::skip]
+        let code = [
+            0xF3,                         // di
+            0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA, // wait for LY == 144
+            0xAF, 0xE0, 0x40,             // LCD off
+            0x21, 0x00, 0x80, 0x01, 0x00, 0x20, // hl = $8000, bc = $2000
+            0xAF, 0x22, 0x0B, 0x78, 0xB1, 0x20, 0xF9, // clear VRAM
+            0x21, 0x00, 0x80, 0x36, 0xFF, // tile 0, first row = colour 1
+            0x3E, 0x80, 0xE0, 0x68,       // BCPS: index 0, auto-increment
+            0x3E, 0xFF, 0xE0, 0x69, 0x3E, 0x7F, 0xE0, 0x69, // colour 0 = white
+            0x3E, colour1[0], 0xE0, 0x69, 0x3E, colour1[1], 0xE0, 0x69, // colour 1
+            0x3E, 0x91, 0xE0, 0x40,       // LCD on, BG on
+            0x06, colour1[0],             // b = latch = colour 1's low byte
+            // loop:
+            0x3E, 0x10, 0xE0, 0x00,       // select the buttons
+            0xF0, 0x00, 0x2F, 0xE6, mask, // a = pressed buttons in mask
+            0xB0, 0x47,                   // a |= b; b = a
+            0x3E, 0x82, 0xE0, 0x68,       // BCPS: colour 1, low byte
+            0x78, 0xE0, 0x69,             // BCPD = latch
+            0x18, 0xEC,                   // jr loop
+        ];
+        let mut rom = synth_rom(0x00, 0, &code);
+        rom[0x143] = 0xC0;
+        rom
+    }
+
+    /// Colour 1 starts black; the stripe is visible.
+    const BLACK: [u8; 2] = [0x00, 0x00];
+
+    fn smoke_cgb(rom: Vec<u8>, model: Model) -> Outcome {
+        let mut gb = GameBoy::with_model(rom, model).expect("synthetic ROM loads");
+        run_smoke_cgb(&mut gb, 20)
+    }
+
+    #[test]
+    fn smoke_cgb_passes_when_start_or_a_changes_the_picture() {
+        for mask in [0x08, 0x01] {
+            let out = smoke_cgb(smoke_cgb_rom(BLACK, mask), Model::Cgb);
+            assert_eq!(out, Outcome::Pass, "mask {mask:#04X}: {out}");
+        }
+    }
+
+    #[test]
+    fn smoke_cgb_fails_on_a_frozen_picture() {
+        // Nothing the script presses (Start, A) reaches the latch: B only, then nothing at all.
+        for mask in [0x02, 0x00] {
+            let out = smoke_cgb(smoke_cgb_rom(BLACK, mask), Model::Cgb);
+            assert!(
+                matches!(&out, Outcome::Fail(m) if m.contains("picture frozen (2 colours)")),
+                "mask {mask:#04X}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_cgb_fails_on_a_single_colour_picture() {
+        // Colour 1 is white too, so the stripe is invisible. Start would change it, but the
+        // colour check comes first.
+        let out = smoke_cgb(smoke_cgb_rom([0xFF, 0x7F], 0x08), Model::Cgb);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("colour framebuffer blank (1 colour)")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn smoke_cgb_fails_without_a_colour_frame() {
+        // The same ROM on a DMG never renders in colour.
+        let out = smoke_cgb(smoke_cgb_rom(BLACK, 0x08), Model::Dmg);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("cgb_framebuffer() is None")),
             "{out}"
         );
     }
@@ -1410,7 +2179,7 @@ mod tests {
     #[test]
     fn blargg_mem_resets_on_0x81_and_reads_sram_ungated() {
         let rom = synth_rom(0x03, 0x02, BLARGG_RESET_THEN_PASS);
-        assert_eq!(run_blargg_mem(&rom, 600), Outcome::Pass);
+        assert_eq!(run_blargg_mem(&rom, Model::Dmg, 600), Outcome::Pass);
     }
 
     #[test]
@@ -1418,7 +2187,7 @@ mod tests {
         let mut code = BLARGG_RESET_THEN_PASS.to_vec();
         code[23..26].fill(0x00); // NOP out `or a; jr nz`: every run reports "needs reset"
         let rom = synth_rom(0x03, 0x02, &code);
-        let out = run_blargg_mem(&rom, 3000);
+        let out = run_blargg_mem(&rom, Model::Dmg, 3000);
         assert!(
             matches!(&out, Outcome::Fail(m) if m.contains("needs reset")),
             "{out}"
@@ -1432,6 +2201,7 @@ mod tests {
             kind: Kind::Blargg,
             expect_pass: false,
             max_frames: 1,
+            model: Model::Dmg,
         };
         assert_eq!(run_case(&case), Outcome::Missing);
     }

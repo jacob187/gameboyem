@@ -14,11 +14,11 @@ use winit::window::{Window, WindowId};
 
 use crate::audio::{AudioOutput, ToneGen};
 use crate::keymap::{Action, InputState, map};
-use crate::pacer::FramePacer;
+use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
-use crate::video::{Palette, blit, test_pattern};
+use crate::video::{Palette, blit, blit_cgb, test_pattern};
 
 /// Speed multiplier while Tab is held.
 const FAST_FORWARD_SPEED: f64 = 4.0;
@@ -265,41 +265,64 @@ impl App {
         }
     }
 
-    /// Run `n` emulated frames, feed audio, and upload the last picture.
-    fn run_frames(&mut self, n: u32) {
-        for _ in 0..n {
-            self.audio_buf.clear();
-            match self.test.as_mut() {
-                Some(t) => {
-                    test_pattern(t.frame, &mut t.fb);
-                    t.frame = t.frame.wrapping_add(1);
-                    self.audio_buf.extend_from_slice(&t.tone.next_frame());
-                }
-                None => {
-                    self.gb.step_frame();
-                    // Always drain so the core's buffer cannot grow unbounded.
-                    self.gb.drain_audio_into(&mut self.audio_buf);
-                }
+    /// Run one `step_frame`, feed audio, and return the emulated seconds it
+    /// covered (see [`audio_seconds`]): usually one frame, but a CGB speed
+    /// switch makes a step span 0.4-1.9 frames.
+    fn step_once(&mut self) -> f64 {
+        self.audio_buf.clear();
+        let emulated = match self.test.as_mut() {
+            Some(t) => {
+                test_pattern(t.frame, &mut t.fb);
+                t.frame = t.frame.wrapping_add(1);
+                self.audio_buf.extend_from_slice(&t.tone.next_frame());
+                self.pacer.period()
             }
-            if !self.fast_forward
-                && let Some(a) = &self.audio
-            {
-                a.ring.push(&self.audio_buf);
+            None => {
+                self.gb.step_frame();
+                // Always drain so the core's buffer cannot grow unbounded.
+                self.gb.drain_audio_into(&mut self.audio_buf);
+                audio_seconds(self.audio_buf.len(), self.gb.audio_sample_rate())
             }
+        };
+        if !self.fast_forward
+            && let Some(a) = &self.audio
+        {
+            a.ring.push(&self.audio_buf);
         }
-        if n > 0 {
+        emulated
+    }
+
+    /// Run steps while the pacer says a frame is owed ([`run_due`]), then
+    /// upload the last picture. Returns whether any step ran.
+    fn run_due(&mut self) -> bool {
+        let ran = run_due(self);
+        if ran > 0 {
             self.upload();
         }
+        ran > 0
     }
 
     fn upload(&mut self) {
-        let fb: &Framebuffer = match &self.test {
-            Some(t) => &t.fb,
-            None => self.gb.framebuffer(),
+        let Some(p) = self.pixels.as_mut() else {
+            return;
         };
-        if let Some(p) = self.pixels.as_mut() {
-            blit(fb, &self.palette, p.frame_mut());
+        match &self.test {
+            Some(t) => blit(&t.fb, &self.palette, p.frame_mut()),
+            None => match self.gb.cgb_framebuffer() {
+                Some(fb) => blit_cgb(fb, p.frame_mut()),
+                None => blit(self.gb.framebuffer(), &self.palette, p.frame_mut()),
+            },
         }
+    }
+}
+
+impl Steps for App {
+    fn pacer(&mut self) -> &mut FramePacer {
+        &mut self.pacer
+    }
+
+    fn step(&mut self) -> f64 {
+        self.step_once()
     }
 }
 
@@ -407,14 +430,12 @@ impl ApplicationHandler for App {
                 .set_control_flow(status_until.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
             return;
         }
-        let n = self.pacer.advance(dt);
-        if n > 0 {
-            self.run_frames(n);
-            if self.surface_ok
-                && let Some(w) = &self.window
-            {
-                w.request_redraw();
-            }
+        self.pacer.advance(dt);
+        if self.run_due()
+            && self.surface_ok
+            && let Some(w) = &self.window
+        {
+            w.request_redraw();
         }
         self.saves.tick(&self.gb, now);
 
@@ -431,6 +452,7 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gb_core::{M_CYCLES_PER_FRAME, Model};
     use std::fs;
 
     #[test]
@@ -448,7 +470,10 @@ mod tests {
         let mut rom = vec![0u8; 0x8000];
         rom[0x147] = 0x03; // MBC1+RAM+BATTERY
         rom[0x149] = 0x02; // 8 KiB
-        let mut gb = GameBoy::new(rom).unwrap();
+        headless_app_with(dir, GameBoy::new(rom).unwrap())
+    }
+
+    fn headless_app_with(dir: &std::path::Path, mut gb: GameBoy) -> App {
         let mut saves = SaveManager::new(&dir.join("g.gb"), Instant::now());
         saves.load(&mut gb); // no .sav yet: the blank RAM is the baseline
         App::new(
@@ -489,6 +514,87 @@ mod tests {
     }
 
     #[test]
+    fn a_normal_step_covers_one_frame_of_emulated_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let period = app.pacer.period();
+        app.step_once(); // the first frame starts mid-frame after the boot state
+        let total: f64 = (0..120).map(|_| app.step_once()).sum();
+        // Samples are whole, so the total is within a sample of 120 periods.
+        let rate = f64::from(app.gb.audio_sample_rate());
+        assert!((total - 120.0 * period).abs() < 2.0 / rate, "{total}");
+    }
+
+    /// A CGB-only ROM that switches to double speed once (`LD A,1; LDH
+    /// (KEY1),A; STOP`) and then spins.
+    fn speed_switch_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x143] = 0xC0;
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]); // JP 0x150
+        let code = [0x3E, 0x01, 0xE0, 0x4D, 0x10, 0x00, 0x18, 0xFE];
+        rom[0x150..0x150 + code.len()].copy_from_slice(&code);
+        rom
+    }
+
+    #[test]
+    fn a_step_spanning_a_speed_switch_is_charged_its_real_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = || GameBoy::with_model(speed_switch_rom(), Model::Cgb).unwrap();
+        // Find the M-cycle the STOP starts at, on a second identical machine.
+        let mut probe = make();
+        let mut switch_at = probe.mcycles();
+        while !probe.double_speed() {
+            switch_at = probe.mcycles();
+            probe.step_instruction();
+        }
+
+        let mut app = headless_app_with(dir.path(), make());
+        let m_per_s = f64::from(M_CYCLES_PER_FRAME) * FRAMES_PER_SECOND;
+        let period = app.pacer.period();
+        let rate = f64::from(app.gb.audio_sample_rate());
+        for _ in 0..4 {
+            let start = app.gb.mcycles();
+            let was_double = app.gb.double_speed();
+            let emulated = app.step_once();
+            if was_double || !app.gb.double_speed() {
+                continue;
+            }
+            // Pre-switch cycles take 1/1048576 s each, the rest half that.
+            let end = app.gb.mcycles();
+            let real = ((switch_at - start) as f64 + (end - switch_at) as f64 / 2.0) / m_per_s;
+            assert!((emulated - real).abs() < 3.0 / rate, "{emulated} vs {real}");
+            // Not vacuous: counting every M-cycle at the normal rate is far off.
+            let naive = (end - start) as f64 / m_per_s;
+            assert!(naive - real > 0.4 * period, "{naive} vs {real}");
+            return;
+        }
+        panic!("no step contained the speed switch");
+    }
+
+    #[test]
+    fn run_due_runs_the_steps_the_pacer_owes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        assert!(!app.run_due(), "nothing owed yet");
+        let before = app.gb.mcycles();
+        app.pacer
+            .advance(Duration::from_secs_f64(2.5 * app.pacer.period()));
+        assert!(app.run_due());
+        let frames = (app.gb.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
+        assert!((1.9..=3.1).contains(&frames), "{frames}");
+        assert!(!app.pacer.frame_due(), "the debt is paid");
+        // A long stall is bounded by the catch-up cap.
+        app.pacer.advance(Duration::from_secs(60));
+        let before = app.gb.mcycles();
+        assert!(app.run_due());
+        let frames = (app.gb.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
+        assert!(
+            frames <= f64::from(crate::pacer::MAX_CATCHUP_FRAMES) + 1.1,
+            "{frames}"
+        );
+    }
+
+    #[test]
     fn save_and_load_state_keys_restore_the_machine() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
@@ -498,7 +604,9 @@ mod tests {
         assert!(dir.path().join("g.ss1").is_file());
         assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
 
-        app.run_frames(5);
+        for _ in 0..5 {
+            app.step_once();
+        }
         app.load_state();
         assert_eq!(app.gb.save_state(), snap);
         assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));

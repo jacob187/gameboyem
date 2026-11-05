@@ -3,7 +3,8 @@
 //!
 //! # Contract (frozen; propose changes to the orchestrator)
 //!
-//! * [`Ppu::new`] creates the PPU in the DMG post-boot state.
+//! * [`Ppu::new`] creates the PPU in the DMG post-boot state ([`Ppu::new_cgb`]:
+//!   the CGB one).
 //! * [`Ppu::tick_mcycle`] advances 4 dots and requests VBlank / STAT interrupts.
 //! * [`Ppu::take_frame_ready`] returns true once per frame: when LY reaches 144
 //!   with the LCD on, and every 70224 dots while the LCD is off (so
@@ -33,16 +34,21 @@
 //! write starts one M-cycle in. The interrupt line and the renderer use the
 //! internal timeline.
 //!
+//! On a CGB in colour mode (`Hw::Cgb`) the line is drawn by `render_cgb` into RGB555
+//! frames instead ([`Ppu::cgb_framebuffer`]); the shade buffer stays zero. In
+//! DMG-compatibility mode the DMG renderer runs unchanged (DECISIONS #36).
+//!
 //! Rendering goes to a back buffer that is swapped to the front on entering
 //! VBlank, so [`Ppu::framebuffer`] never shows a half-drawn frame.
 
 mod render;
+mod render_cgb;
 #[cfg(test)]
 mod tests;
 
 use crate::interrupts::{Interrupt, Interrupts};
 use crate::state::{StateError, StateReader, StateWriter, check};
-use crate::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
+use crate::{CgbFramebuffer, Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 const DOTS_PER_LINE: u16 = 456;
 const LINES_PER_FRAME: u8 = 154;
@@ -56,6 +62,28 @@ const MODE3_BASE_DOTS: u16 = 172;
 const LCD_ON_LINE_DOT: u16 = 4;
 /// Dot of line 153 at the first cartridge instruction (see [`Ppu::new`]).
 const POST_BOOT_LINE_DOT: u16 = 356;
+/// CGB hand-off: line 144 (LY = 0x90, the only value on record, from whichboot.gb
+/// on a mainline CGB boot ROM), at an arbitrary dot (DECISIONS #34).
+const CGB_POST_BOOT_LINE: u8 = VBLANK_LINE;
+const CGB_POST_BOOT_LINE_DOT: u16 = 100;
+
+/// Bytes per VRAM bank.
+const VRAM_BANK_SIZE: usize = 0x2000;
+
+/// Bytes of one CGB palette RAM (8 palettes x 4 colours x 2 bytes).
+const PALETTE_RAM_SIZE: usize = 64;
+/// BCPS / OCPS bit 7: auto-increment the index after a data write.
+const PAL_INDEX_AUTO_INC: u8 = 0x80;
+/// BCPS / OCPS index bits; bit 6 is unused (reads 1).
+const PAL_INDEX_MASK: u8 = 0x3F;
+/// Post-boot index registers as stored (bit 6 reads 1, so they read 0xC8 / 0xD0,
+/// mooneye `boot_hwio-C`): auto-increment on, index 8 (BG) and 16 (OBJ).
+const BCPS_POST_BOOT: u8 = 0x88;
+const OCPS_POST_BOOT: u8 = 0x90;
+/// RGB555 white, what the LCD shows when it is off.
+const CGB_WHITE: u16 = 0x7FFF;
+/// OPRI bit 0: 1 = DMG-style (lower X wins), 0 = CGB-style (lower OAM index wins).
+const OPRI_X_PRIORITY: u8 = 0x01;
 
 const LCDC_BG_ENABLE: u8 = 0x01;
 const LCDC_OBJ_ENABLE: u8 = 0x02;
@@ -73,7 +101,11 @@ const STAT_LYC_IRQ: u8 = 0x40;
 const STAT_WRITABLE: u8 = 0x78;
 
 pub struct Ppu {
-    vram: Box<[u8; 0x2000]>,
+    /// Both VRAM banks: bank 0 at `0..0x2000`, bank 1 at `0x2000..0x4000`. A DMG
+    /// only ever uses bank 0, so the renderer indexes `vram[..0x2000]` directly;
+    /// bank 1 is for CGB attributes and tiles (the CGB renderer indexes it
+    /// directly; [`Ppu::vram_bank`] is a read-only view of one bank).
+    vram: Box<[u8; 2 * VRAM_BANK_SIZE]>,
     oam: [u8; 0xA0],
     lcdc: u8,
     /// STAT bits 3..=6 (interrupt select). Mode / coincidence are derived.
@@ -120,6 +152,51 @@ pub struct Ppu {
     back: Box<Framebuffer>,
     front: Box<Framebuffer>,
     frame_ready: bool,
+    // ---- CGB additions (DECISIONS #31) ----
+    /// CGB hardware (bank 1 exists and is saved), in either CGB mode or
+    /// DMG-compatibility mode.
+    cgb: bool,
+    /// VBK (FF4F) bit 0: the VRAM bank the CPU and OAM DMA see. Always 0 on a DMG
+    /// and in DMG-compatibility mode.
+    vbk: u8,
+    /// BCPS / OCPS (FF68 / FF6A) as stored: bit 7 auto-increment and the 6-bit
+    /// index; bit 6 is unused and reads 1. Mapped in compat mode too (they are
+    /// plain registers there, the data ports stay unmapped).
+    bcps: u8,
+    ocps: u8,
+    /// OPRI (FF6C) bit 0 (colour mode only).
+    opri: u8,
+    /// Background / object palette RAM, little-endian RGB555 (colour mode only).
+    bg_pal: [u8; PALETTE_RAM_SIZE],
+    obj_pal: [u8; PALETTE_RAM_SIZE],
+    /// `bg_pal` / `obj_pal` decoded to RGB555 words for the renderer, rebuilt
+    /// lazily when the matching `*_stale` flag is set (a BCPD / OCPD write or a
+    /// state load). Derived data: never saved.
+    bg_decoded: render_cgb::Palettes,
+    obj_decoded: render_cgb::Palettes,
+    bg_stale: bool,
+    obj_stale: bool,
+    /// RGB555 back / front frames: `Some` (both) in CGB colour mode only, which
+    /// is what [`Ppu::colour`] reports. The DMG `back` / `front` stay all zero in
+    /// colour mode.
+    cgb_back: Option<Box<CgbFramebuffer>>,
+    cgb_front: Option<Box<CgbFramebuffer>>,
+    /// The PPU entered HBlank (mode 3 -> 0 on a visible line) since the bus last
+    /// took the signal, or the LCD was switched off outside HBlank (SameBoy:
+    /// HDMA then still gets its block). It is set whether or not an HDMA is
+    /// running; the bus clears it when it starts one. Saved on a CGB only.
+    hblank_entered: bool,
+    /// The CPU runs in double speed: the PPU gets 2 dots per M-cycle instead of
+    /// 4. Set by the bus (it owns the speed), not saved.
+    double_speed: bool,
+}
+
+/// A frame filled with `colour`.
+fn cgb_frame(colour: u16) -> Box<CgbFramebuffer> {
+    vec![colour; SCREEN_WIDTH * SCREEN_HEIGHT]
+        .into_boxed_slice()
+        .try_into()
+        .expect("a frame is SCREEN_WIDTH * SCREEN_HEIGHT pixels")
 }
 
 impl Default for Ppu {
@@ -139,7 +216,7 @@ impl Ppu {
     /// middle of that range is used.
     pub fn new() -> Self {
         Self {
-            vram: Box::new([0; 0x2000]),
+            vram: Box::new([0; 2 * VRAM_BANK_SIZE]),
             oam: [0; 0xA0],
             lcdc: 0x91,
             stat_select: 0x00,
@@ -167,7 +244,134 @@ impl Ppu {
             back: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             frame_ready: false,
+            cgb: false,
+            vbk: 0,
+            bcps: 0,
+            ocps: 0,
+            opri: 0,
+            bg_pal: [0; PALETTE_RAM_SIZE],
+            obj_pal: [0; PALETTE_RAM_SIZE],
+            bg_decoded: [[0; 4]; 8],
+            obj_decoded: [[0; 4]; 8],
+            bg_stale: true,
+            obj_stale: true,
+            cgb_back: None,
+            cgb_front: None,
+            hblank_entered: false,
+            double_speed: false,
         }
+    }
+
+    /// CGB post-boot state: the DMG one, but VBlank (line 144) instead of the
+    /// line-153 quirk window, and two VRAM banks. `colour` selects CGB mode (the
+    /// colour PPU) over DMG-compatibility mode.
+    ///
+    /// Palette RAM is white (the boot ROM clears it; SameBoy randomises it before
+    /// the boot ROM runs, Pan Docs leaves the OBJ half undefined): both halves
+    /// are 0xFF so the state is deterministic. DECISIONS #36.
+    pub(crate) fn new_cgb(colour: bool) -> Self {
+        Self {
+            ly: CGB_POST_BOOT_LINE,
+            line_dot: CGB_POST_BOOT_LINE_DOT,
+            // LYC (0) != 144, and the STAT select bits are clear.
+            lyc_flag: false,
+            cgb: true,
+            bcps: BCPS_POST_BOOT,
+            ocps: OCPS_POST_BOOT,
+            bg_pal: [0xFF; PALETTE_RAM_SIZE],
+            obj_pal: [0xFF; PALETTE_RAM_SIZE],
+            cgb_back: colour.then(|| cgb_frame(CGB_WHITE)),
+            cgb_front: colour.then(|| cgb_frame(CGB_WHITE)),
+            ..Self::new()
+        }
+    }
+
+    /// CGB colour mode (`Hw::Cgb`): the colour renderer, palette RAM and OPRI
+    /// exist. False on a DMG and in DMG-compatibility mode, whose output is the
+    /// DMG one (DECISIONS #36). Derived from the RGB555 frames, which exist
+    /// exactly then.
+    fn colour(&self) -> bool {
+        self.cgb_back.is_some()
+    }
+
+    /// One whole VRAM bank (0 or 1), unaffected by VBK and by PPU mode. A
+    /// read-only view (tests use it); the renderer indexes `vram` directly.
+    pub fn vram_bank(&self, bank: usize) -> &[u8; VRAM_BANK_SIZE] {
+        let start = (bank & 1) * VRAM_BANK_SIZE;
+        self.vram[start..start + VRAM_BANK_SIZE]
+            .try_into()
+            .expect("a bank is VRAM_BANK_SIZE bytes")
+    }
+
+    /// Offset of the CPU-selected bank in `vram`.
+    fn vram_base(&self) -> usize {
+        usize::from(self.vbk) * VRAM_BANK_SIZE
+    }
+
+    /// VBK (FF4F) as read: bit 0 is the bank, the rest read 1.
+    pub(crate) fn read_vbk(&self) -> u8 {
+        0xFE | self.vbk
+    }
+
+    pub(crate) fn write_vbk(&mut self, value: u8) {
+        self.vbk = value & 1;
+    }
+
+    /// BCPS / OCPS as read: bit 6 is unused and reads 1.
+    pub(crate) fn read_bcps(&self) -> u8 {
+        0x40 | self.bcps
+    }
+
+    pub(crate) fn read_ocps(&self) -> u8 {
+        0x40 | self.ocps
+    }
+
+    pub(crate) fn write_bcps(&mut self, value: u8) {
+        self.bcps = value & (PAL_INDEX_AUTO_INC | PAL_INDEX_MASK);
+    }
+
+    pub(crate) fn write_ocps(&mut self, value: u8) {
+        self.ocps = value & (PAL_INDEX_AUTO_INC | PAL_INDEX_MASK);
+    }
+
+    /// BCPD (FF69) / OCPD (FF6B) read: 0xFF while palette RAM is locked. It is
+    /// locked exactly like VRAM (Pan Docs: "inaccessible during mode 3").
+    pub(crate) fn read_pal_data(&self, obj: bool) -> u8 {
+        if self.vram_read_blocked() {
+            return 0xFF;
+        }
+        if obj {
+            self.obj_pal[usize::from(self.ocps & PAL_INDEX_MASK)]
+        } else {
+            self.bg_pal[usize::from(self.bcps & PAL_INDEX_MASK)]
+        }
+    }
+
+    /// BCPD / OCPD write. While locked the byte is dropped but the index still
+    /// auto-increments (SameBoy `cgb_palettes_blocked`).
+    pub(crate) fn write_pal_data(&mut self, obj: bool, value: u8) {
+        let blocked = self.vram_write_blocked();
+        let (index, ram, stale) = if obj {
+            (&mut self.ocps, &mut self.obj_pal, &mut self.obj_stale)
+        } else {
+            (&mut self.bcps, &mut self.bg_pal, &mut self.bg_stale)
+        };
+        if !blocked {
+            ram[usize::from(*index & PAL_INDEX_MASK)] = value;
+            *stale = true;
+        }
+        if *index & PAL_INDEX_AUTO_INC != 0 {
+            *index = PAL_INDEX_AUTO_INC | (*index).wrapping_add(1) & PAL_INDEX_MASK;
+        }
+    }
+
+    /// OPRI (FF6C) as read.
+    pub(crate) fn read_opri(&self) -> u8 {
+        0xFE | self.opri
+    }
+
+    pub(crate) fn write_opri(&mut self, value: u8) {
+        self.opri = value & OPRI_X_PRIORITY;
     }
 
     fn lcd_on(&self) -> bool {
@@ -217,10 +421,28 @@ impl Ppu {
         self.lyc_flag && !blanked
     }
 
-    /// Advance the PPU by one M-cycle (4 dots).
+    /// Advance the PPU by one M-cycle (4 dots). Forced inline into the bus's
+    /// plain tick path: without it the DMG loses about 8% of its speed (the
+    /// generic body made the compiler stop inlining it).
+    #[inline(always)]
     pub fn tick_mcycle(&mut self, interrupts: &mut Interrupts) {
+        self.tick_dots::<4>(interrupts);
+    }
+
+    /// Advance the PPU by one CPU M-cycle in double speed (2 dots). The PPU
+    /// keeps its real-time rate, so a CPU cycle is half as many dots
+    /// (DECISIONS #38).
+    pub(crate) fn tick_mcycle_double(&mut self, interrupts: &mut Interrupts) {
+        self.tick_dots::<2>(interrupts);
+    }
+
+    /// `DOTS` dots per M-cycle: 4 at normal speed, 2 in double speed. The
+    /// windows below measured in literal dots (the first M-cycle of a line, the
+    /// LY=153 quirk) are properties of the dot clock and stay as they are.
+    #[inline(always)]
+    fn tick_dots<const DOTS: u16>(&mut self, interrupts: &mut Interrupts) {
         if !self.lcd_on() {
-            self.off_dots += 4;
+            self.off_dots += u32::from(DOTS);
             if self.off_dots >= DOTS_PER_FRAME {
                 self.off_dots -= DOTS_PER_FRAME;
                 self.frame_ready = true;
@@ -229,9 +451,9 @@ impl Ppu {
         }
         self.vis_mode = self.mode();
         let dot = self.line_dot;
-        let next = dot + 4;
+        let next = dot + DOTS;
         if next < DOTS_PER_LINE && !(dot < OAM_SCAN_DOTS && next >= OAM_SCAN_DOTS) {
-            // None of the 4 dots ends the line or starts mode 3, so every
+            // None of the dots ends the line or starts mode 3, so every
             // `step_dot` would only have incremented `line_dot`.
             self.line_dot = next;
             // The LYC flag and STAT line were last evaluated at `dot` (every
@@ -240,13 +462,26 @@ impl Ppu {
             // (dots 0..4), the mode 2 -> 3 edge (excluded above) and the mode
             // 3 -> 0 edge, so with none of those crossed they cannot change.
             let mode3_end = OAM_SCAN_DOTS + self.mode3_len;
-            if dot >= 4 && !(dot < mode3_end && next >= mode3_end) {
+            // A CGB also re-evaluates when entering the line-144 STAT pulse
+            // window, the last M-cycle of line 143 (see `stat_line_level_for`).
+            let pulse_start = DOTS_PER_LINE - DOTS;
+            if dot >= 4
+                && !(dot < mode3_end && next >= mode3_end)
+                && !(next >= pulse_start
+                    && dot < pulse_start
+                    && self.cgb
+                    && self.ly == VBLANK_LINE - 1)
+            {
                 debug_assert_eq!(self.lyc_flag, self.lyc == self.visible_ly());
                 debug_assert_eq!(self.stat_line, self.stat_line_level());
                 return;
             }
+            // The HBlank edge of a visible line (a no-op for the other windows).
+            if dot < mode3_end && next >= mode3_end && self.ly < VBLANK_LINE {
+                self.hblank_entered = true;
+            }
         } else {
-            for _ in 0..4 {
+            for _ in 0..DOTS {
                 self.step_dot(interrupts);
             }
         }
@@ -268,6 +503,7 @@ impl Ppu {
                     self.skip_frame = false;
                 } else {
                     std::mem::swap(&mut self.front, &mut self.back);
+                    std::mem::swap(&mut self.cgb_front, &mut self.cgb_back);
                 }
                 interrupts.request(Interrupt::VBlank);
                 self.frame_ready = true;
@@ -325,7 +561,15 @@ impl Ppu {
     fn stat_line_level_for(&self, sel: u8) -> bool {
         let mode_line = self.lcd_on() && !(self.first_line && self.line_dot < OAM_SCAN_DOTS) && {
             let mode = self.mode();
-            let vblank_oam = self.ly == VBLANK_LINE && self.line_dot < 4;
+            // DMG: the M-cycle VBlank starts in. CGB: the one before it (mooneye
+            // `vblank_stat_intr-C`: the STAT interrupt precedes VBlank by a
+            // cycle), which is 4 dots at normal speed and 2 in double speed.
+            let vblank_oam = if self.cgb {
+                let m_cycle = if self.double_speed { 2 } else { 4 };
+                self.ly == VBLANK_LINE - 1 && self.line_dot >= DOTS_PER_LINE - m_cycle
+            } else {
+                self.ly == VBLANK_LINE && self.line_dot < 4
+            };
             (sel & STAT_HBLANK_IRQ != 0 && mode == 0)
                 || (sel & STAT_VBLANK_IRQ != 0 && mode == 1)
                 || (sel & STAT_OAM_IRQ != 0 && (mode == 2 || vblank_oam))
@@ -337,8 +581,15 @@ impl Ppu {
         std::mem::take(&mut self.frame_ready)
     }
 
+    /// The last completed frame as shades. In CGB colour mode this is all zero:
+    /// the frame is [`Ppu::cgb_framebuffer`] (DECISIONS #36).
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.front
+    }
+
+    /// The last completed frame in RGB555; `Some` only in CGB colour mode.
+    pub fn cgb_framebuffer(&self) -> Option<&CgbFramebuffer> {
+        self.cgb_front.as_deref()
     }
 
     /// The mode seen by CPU reads of STAT; 0 while the LCD is off.
@@ -379,14 +630,15 @@ impl Ppu {
         if self.vram_read_blocked() {
             0xFF
         } else {
-            self.vram[(addr & 0x1FFF) as usize]
+            self.vram[self.vram_base() + (addr & 0x1FFF) as usize]
         }
     }
 
     /// CPU VRAM write: ignored while the PPU is drawing (mode 3).
     pub fn write_vram(&mut self, addr: u16, value: u8) {
         if !self.vram_write_blocked() {
-            self.vram[(addr & 0x1FFF) as usize] = value;
+            let base = self.vram_base();
+            self.vram[base + (addr & 0x1FFF) as usize] = value;
         }
     }
 
@@ -435,9 +687,10 @@ impl Ppu {
         match addr {
             0xFF40 => {
                 let was_on = self.lcd_on();
+                let outside_hblank = was_on && !self.in_hdma_window();
                 self.lcdc = value;
                 match (was_on, self.lcd_on()) {
-                    (true, false) => self.lcd_turned_off(interrupts),
+                    (true, false) => self.lcd_turned_off(interrupts, outside_hblank),
                     (false, true) => self.lcd_turned_on(interrupts),
                     _ => {}
                 }
@@ -445,8 +698,13 @@ impl Ppu {
             0xFF41 => {
                 // DMG quirk (Pan Docs "STAT"): the write behaves as if $FF
                 // were written for one M-cycle before the real value, so any
-                // source that is currently true raises the line.
-                if self.lcd_on() && !self.stat_line && self.stat_line_level_for(STAT_WRITABLE) {
+                // source that is currently true raises the line. A CGB (in
+                // either mode) does not have it (SameBoy, DECISIONS #36).
+                if !self.cgb
+                    && self.lcd_on()
+                    && !self.stat_line
+                    && self.stat_line_level_for(STAT_WRITABLE)
+                {
                     interrupts.request(Interrupt::Stat);
                     self.stat_line = true;
                 }
@@ -471,7 +729,13 @@ impl Ppu {
 
     /// Pan Docs "LCDC.7": turning the LCD off resets LY and the mode, and the
     /// screen goes blank.
-    fn lcd_turned_off(&mut self, interrupts: &mut Interrupts) {
+    ///
+    /// SameBoy (`GB_lcd_off`): an armed HDMA still gets a block if the LCD goes
+    /// off outside HBlank (`outside_hblank`), because the STAT mode then reads 0.
+    fn lcd_turned_off(&mut self, interrupts: &mut Interrupts, outside_hblank: bool) {
+        if outside_hblank {
+            self.hblank_entered = true;
+        }
         self.ly = 0;
         self.line_dot = 0;
         self.off_dots = 0;
@@ -479,6 +743,12 @@ impl Ppu {
         self.win_line = 0;
         self.back.fill(0);
         self.front.fill(0);
+        for fb in [&mut self.cgb_back, &mut self.cgb_front]
+            .into_iter()
+            .flatten()
+        {
+            fb.fill(CGB_WHITE);
+        }
         self.update_stat_line(interrupts);
     }
 
@@ -486,7 +756,13 @@ impl Ppu {
     /// the first frame is not displayed (it stays blank).
     fn lcd_turned_on(&mut self, interrupts: &mut Interrupts) {
         self.ly = 0;
-        self.line_dot = LCD_ON_LINE_DOT;
+        // The write's own M-cycle is already ticked: 4 dots at normal speed, 2
+        // in double speed.
+        self.line_dot = if self.double_speed {
+            LCD_ON_LINE_DOT / 2
+        } else {
+            LCD_ON_LINE_DOT
+        };
         self.vis_mode = 0;
         self.first_line = true;
         self.skip_frame = true;
@@ -498,11 +774,46 @@ impl Ppu {
     }
 }
 
+/// Bus-facing hooks for CGB double speed and HDMA.
+impl Ppu {
+    pub(crate) fn set_double_speed(&mut self, double: bool) {
+        self.double_speed = double;
+    }
+
+    /// Take the "entered HBlank" signal (see [`Ppu::hblank_entered`] the field).
+    pub(crate) fn take_hblank_entered(&mut self) -> bool {
+        std::mem::take(&mut self.hblank_entered)
+    }
+
+    /// Raise (HDMA started in HBlank) or clear (HDMA started elsewhere, so a
+    /// stale signal from an earlier line cannot fire it) the signal.
+    pub(crate) fn set_hblank_entered(&mut self, signalled: bool) {
+        self.hblank_entered = signalled;
+    }
+
+    /// The HDMA copies a block now when it is armed: the internal mode is 0.
+    /// That is HBlank on a visible line, the LCD being off, and dots 4..80 of
+    /// the first line after LCD on, where the STAT mode also reads 0 (SameBoy
+    /// starts an FF55 HBlank transfer when `STAT & 3 == 0`, outside its
+    /// line-start `display_state` 7, which the first line does not have, and
+    /// `GB_lcd_off` arms one only when `STAT & 3` is non-zero).
+    pub(crate) fn in_hdma_window(&self) -> bool {
+        self.mode() == 0
+    }
+
+    /// HDMA write to VRAM: into the CPU-selected bank, whatever the PPU mode.
+    /// `offset` is 0..0x2000.
+    pub(crate) fn hdma_write_vram(&mut self, offset: u16, value: u8) {
+        let base = self.vram_base();
+        self.vram[base + usize::from(offset & 0x1FFF)] = value;
+    }
+}
+
 /// Bus-facing queries for OAM DMA and the unusable FEA0-FEFF range.
 impl Ppu {
     /// VRAM read for the OAM DMA engine, which is not gated by PPU mode (Pan Docs "OAM DMA Transfer").
     pub(crate) fn dma_read_vram(&self, addr: u16) -> u8 {
-        self.vram[(addr & 0x1FFF) as usize]
+        self.vram[self.vram_base() + (addr & 0x1FFF) as usize]
     }
 
     /// True while the CPU cannot read OAM (modes 2 and 3; Pan Docs "FEA0-FEFF range").
@@ -513,7 +824,7 @@ impl Ppu {
 
 impl Ppu {
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
-        w.bytes(&self.vram[..]);
+        w.bytes(&self.vram[..self.vram_len()]);
         w.bytes(&self.oam);
         for v in [
             self.lcdc,
@@ -542,13 +853,42 @@ impl Ppu {
         w.bool(self.lyc_flag);
         w.u8(self.vis_mode);
         w.bool(self.stat_line);
-        w.bytes(&self.back[..]);
-        w.bytes(&self.front[..]);
+        // In colour mode the shade frames are all zero by design (DECISIONS
+        // #36), so they are not saved; the RGB555 frames below carry the picture.
+        if !self.colour() {
+            w.bytes(&self.back[..]);
+            w.bytes(&self.front[..]);
+        }
         w.bool(self.frame_ready);
+        // CGB additions.
+        if self.cgb {
+            w.u8(self.vbk);
+            w.u8(self.bcps);
+            w.u8(self.ocps);
+            w.bool(self.hblank_entered);
+        }
+        if let (Some(back), Some(front)) = (&self.cgb_back, &self.cgb_front) {
+            w.u8(self.opri);
+            w.bytes(&self.bg_pal);
+            w.bytes(&self.obj_pal);
+            for &c in back.iter().chain(front.iter()) {
+                w.u16(c);
+            }
+        }
+    }
+
+    /// Bytes of `vram` in use: both banks on a CGB, bank 0 on a DMG.
+    fn vram_len(&self) -> usize {
+        if self.cgb {
+            2 * VRAM_BANK_SIZE
+        } else {
+            VRAM_BANK_SIZE
+        }
     }
 
     pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
-        r.bytes_into(&mut self.vram[..])?;
+        let len = self.vram_len();
+        r.bytes_into(&mut self.vram[..len])?;
         r.bytes_into(&mut self.oam)?;
         self.lcdc = r.u8()?;
         self.stat_select = r.u8()?;
@@ -592,13 +932,46 @@ impl Ppu {
         self.vis_mode = r.u8()?;
         check(self.vis_mode <= 3, "STAT mode")?;
         self.stat_line = r.bool()?;
-        r.bytes_into(&mut self.back[..])?;
-        r.bytes_into(&mut self.front[..])?;
-        check(
-            self.back.iter().chain(self.front.iter()).all(|&s| s <= 3),
-            "framebuffer shade",
-        )?;
+        if self.colour() {
+            self.back.fill(0);
+            self.front.fill(0);
+        } else {
+            r.bytes_into(&mut self.back[..])?;
+            r.bytes_into(&mut self.front[..])?;
+            check(
+                self.back.iter().chain(self.front.iter()).all(|&s| s <= 3),
+                "framebuffer shade",
+            )?;
+        }
         self.frame_ready = r.bool()?;
+        if self.cgb {
+            self.vbk = r.u8()?;
+            // Compatibility mode drops VBK writes, so there it stays bank 0.
+            check(self.vbk <= u8::from(self.colour()), "VBK")?;
+            self.bcps = r.u8()?;
+            self.ocps = r.u8()?;
+            check(
+                (self.bcps | self.ocps) & !(PAL_INDEX_AUTO_INC | PAL_INDEX_MASK) == 0,
+                "palette index",
+            )?;
+            self.hblank_entered = r.bool()?;
+        }
+        if let (Some(back), Some(front)) =
+            (self.cgb_back.as_deref_mut(), self.cgb_front.as_deref_mut())
+        {
+            self.opri = r.u8()?;
+            check(self.opri <= OPRI_X_PRIORITY, "OPRI")?;
+            r.bytes_into(&mut self.bg_pal)?;
+            r.bytes_into(&mut self.obj_pal)?;
+            self.bg_stale = true;
+            self.obj_stale = true;
+            for fb in [back, front] {
+                for c in fb.iter_mut() {
+                    *c = r.u16()?;
+                    check(*c <= CGB_WHITE, "framebuffer colour")?;
+                }
+            }
+        }
         Ok(())
     }
 }

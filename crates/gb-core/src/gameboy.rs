@@ -1,43 +1,68 @@
 //! The public emulator facade.
 
 use crate::bus::Bus;
+use crate::bus_cgb::SPEED_SWITCH_MCYCLES;
 use crate::cartridge::{self, CartridgeError, CartridgeHeader};
 use crate::cpu::{Cpu, Registers};
 use crate::joypad::Button;
-use crate::state::{self, StateError, StateReader, StateWriter, tag};
-use crate::{Framebuffer, M_CYCLES_PER_FRAME};
+use crate::model::{Hw, Model};
+use crate::state::{self, StateError, StateReader, StateWriter, check, tag};
+use crate::{CgbFramebuffer, Framebuffer, M_CYCLES_PER_FRAME};
 
-/// Magic + version + ROM hash.
-const STATE_HEADER_LEN: usize = 4 + 2 + 8;
+/// Magic + version + ROM hash + model + hardware mode.
+const STATE_HEADER_LEN: usize = 4 + 2 + 8 + 1 + 1;
 
-/// A complete DMG: CPU + bus (which owns every other component).
+/// The first state-format version, before there was a model: always a DMG, with
+/// no model or hardware-mode byte (the sections that follow are identical).
+const STATE_VERSION_DMG_ONLY: u16 = 1;
+
+/// A complete Game Boy (DMG or CGB): CPU + bus (which owns every other component).
 pub struct GameBoy {
     cpu: Cpu,
     bus: Bus,
     /// FNV-1a of the ROM image; ties save states to the ROM they came from.
     rom_hash: u64,
+    model: Model,
 }
 
 impl GameBoy {
-    /// Power on with `rom` inserted, in the DMG post-boot-ROM state.
+    /// Power on a DMG with `rom` inserted, in the post-boot-ROM state.
+    ///
+    /// Always a DMG, whatever the header says; see [`GameBoy::with_model`].
     pub fn new(rom: Vec<u8>) -> Result<Self, CartridgeError> {
+        Self::with_model(rom, Model::Dmg)
+    }
+
+    /// Power on `model` with `rom` inserted, in the post-boot-ROM state.
+    ///
+    /// The core never picks the model from the ROM (DECISIONS #31); a host that
+    /// wants that can call [`Model::from_header`] on a
+    /// [`CartridgeHeader::parse`] of the ROM first.
+    pub fn with_model(rom: Vec<u8>, model: Model) -> Result<Self, CartridgeError> {
         let rom_hash = state::fnv1a(&rom);
         let cart = cartridge::from_rom(rom)?;
+        let bus = Bus::with_model(cart, model);
         Ok(Self {
-            cpu: Cpu::new(),
-            bus: Bus::new(cart),
+            cpu: Cpu::with_registers(bus.post_boot_registers()),
+            bus,
             rom_hash,
+            model,
         })
     }
 
-    /// Replace the cartridge and power-cycle the machine.
+    /// The model this machine was powered on as.
+    pub fn model(&self) -> Model {
+        self.model
+    }
+
+    /// Replace the cartridge and power-cycle the machine (same model).
     ///
     /// Host configuration survives (the audio sample rate set by
     /// [`GameBoy::set_audio_sample_rate`]); all emulated state is reset,
     /// including held buttons, which the host must re-press. On error the
     /// machine is left untouched.
     pub fn load_rom(&mut self, rom: Vec<u8>) -> Result<(), CartridgeError> {
-        let mut fresh = Self::new(rom)?;
+        let mut fresh = Self::with_model(rom, self.model)?;
         fresh.set_audio_sample_rate(self.audio_sample_rate());
         *self = fresh;
         Ok(())
@@ -49,23 +74,64 @@ impl GameBoy {
 
     /// Run until the PPU completes a frame (≈70224 T-cycles).
     ///
-    /// A safety cap of two frames' worth of cycles guarantees termination even
-    /// if a component misbehaves.
+    /// A safety cap guarantees termination even if a component misbehaves.
     pub fn step_frame(&mut self) {
-        let limit = self.bus.mcycles() + 2 * M_CYCLES_PER_FRAME as u64;
-        while !self.bus.ppu.take_frame_ready() && self.bus.mcycles() < limit {
+        self.run_to_frame();
+    }
+
+    /// [`GameBoy::step_frame`]; false if the safety cap ended the run before a
+    /// frame was ready.
+    ///
+    /// The cap is two frames' worth of M-cycles (four in double speed, which has
+    /// twice as many per frame), plus one speed-switch pause on a CGB: the step
+    /// that switches spends [`SPEED_SWITCH_MCYCLES`] inside itself, and the cap is
+    /// only looked at between steps. A frame is never more than 70224 dots away and
+    /// an M-cycle is at least two dots, so 35112 M-cycles plus a pause always
+    /// reach one: the cap is out of reach for a healthy machine.
+    fn run_to_frame(&mut self) -> bool {
+        let frames = if self.bus.double_speed { 4 } else { 2 };
+        let pause = if self.model == Model::Cgb {
+            u64::from(SPEED_SWITCH_MCYCLES) + 1
+        } else {
+            0
+        };
+        let limit = self.bus.mcycles() + frames * M_CYCLES_PER_FRAME as u64 + pause;
+        while !self.bus.ppu.take_frame_ready() {
+            if self.bus.mcycles() >= limit {
+                return false;
+            }
             self.cpu.step(&mut self.bus);
         }
+        true
+    }
+
+    /// The CPU runs at CGB double speed (KEY1 bit 7). Always false on a DMG and
+    /// in compatibility mode. A frame is twice as many M-cycles then.
+    pub fn double_speed(&self) -> bool {
+        self.bus.double_speed()
     }
 
     /// Execute one CPU step (instruction, interrupt dispatch or halted cycle).
+    /// A CGB speed-switch `STOP` is one step too, and advances the clock by up to
+    /// `32768 + 2` M-cycles (see `Cpu`'s contract).
     pub fn step_instruction(&mut self) {
         self.cpu.step(&mut self.bus);
     }
 
-    /// Last completed frame: 160x144 shades 0..=3 (0 = lightest).
+    /// Last completed frame: 160x144 shades 0..=3 (0 = lightest). On a CGB
+    /// running in colour mode ([`GameBoy::cgb_framebuffer`] is `Some`) the frame is
+    /// not shades: this buffer is then all zero, never written (DECISIONS #36).
     pub fn framebuffer(&self) -> &Framebuffer {
         self.bus.ppu.framebuffer()
+    }
+
+    /// Last completed frame in RGB555 (`0bbbbbgggggrrrrr`, bit 15 clear), `Some`
+    /// iff the machine renders in CGB colour mode: a [`Model::Cgb`] running a
+    /// CGB-flagged cartridge. A DMG, and a CGB in DMG-compatibility mode, return
+    /// `None` and draw shades into [`GameBoy::framebuffer`]. The LCD-off frame is
+    /// white (0x7FFF).
+    pub fn cgb_framebuffer(&self) -> Option<&CgbFramebuffer> {
+        self.bus.ppu.cgb_framebuffer()
     }
 
     pub fn set_button(&mut self, button: Button, pressed: bool) {
@@ -124,17 +190,35 @@ impl GameBoy {
     /// Host configuration and buffers are not included: the audio sample rate,
     /// undrained audio samples and captured serial output.
     pub fn save_state(&self) -> Vec<u8> {
-        let mut w = StateWriter::new();
+        let mut w = StateWriter::with_capacity(self.state_size_hint());
         w.bytes(&state::MAGIC);
         w.u16(state::VERSION);
         w.u64(self.rom_hash);
+        w.u8(self.model.id());
+        w.u8(self.bus.hw.id());
         w.u8(tag::CPU);
         self.cpu.save_state(&mut w);
         self.bus.save_state(&mut w);
         w.into_bytes()
     }
 
-    /// Restore a snapshot from [`GameBoy::save_state`] taken with the same ROM.
+    /// Upper bound on the size of [`GameBoy::save_state`]'s output, so the
+    /// writer allocates once: the machine's fixed state (measured: 63 025 bytes
+    /// on a DMG, 95 802 in compatibility mode, 142 011 in colour mode, each
+    /// rounded up) plus the cartridge RAM. The test
+    /// `the_state_size_hint_covers_every_mode_without_much_slack` fails when the
+    /// layout outgrows these numbers (or they go stale), so update both together.
+    fn state_size_hint(&self) -> usize {
+        let fixed = match self.bus.hw {
+            Hw::Dmg => 64 * 1024,
+            Hw::CgbCompat => 96 * 1024,
+            Hw::Cgb => 140 * 1024,
+        };
+        fixed + self.bus.cart.header().ram_size + 1024
+    }
+
+    /// Restore a snapshot from [`GameBoy::save_state`] taken with the same ROM
+    /// and model.
     ///
     /// All-or-nothing: on error the machine is left exactly as it was. On
     /// success buffered audio is discarded (it belongs to the old timeline),
@@ -150,11 +234,25 @@ impl GameBoy {
             return Err(StateError::BadMagic);
         }
         let version = r.u16()?;
-        if version != state::VERSION {
+        if version != state::VERSION && version != STATE_VERSION_DMG_ONLY {
             return Err(StateError::UnsupportedVersion(version));
         }
         if r.u64()? != self.rom_hash {
             return Err(StateError::RomMismatch);
+        }
+        let model = if version == STATE_VERSION_DMG_ONLY {
+            Model::Dmg
+        } else {
+            Model::from_id(r.u8()?).ok_or(StateError::Invalid("model"))?
+        };
+        if model != self.model {
+            return Err(StateError::ModelMismatch);
+        }
+        if version != STATE_VERSION_DMG_ONLY {
+            // A function of the model and the ROM, so a mismatch with a matching
+            // hash and model means the byte is corrupt.
+            let hw = r.u8()?;
+            check(hw == self.bus.hw.id(), "hardware mode")?;
         }
         let backup = self.save_state();
         if let Err(e) = self.load_sections(r) {
@@ -223,6 +321,7 @@ impl GameBoy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::CpuBus;
 
     fn nop_rom() -> Vec<u8> {
         let mut rom = vec![0u8; 0x8000];
@@ -237,6 +336,59 @@ mod tests {
         let start = gb.mcycles();
         gb.step_frame();
         assert_eq!(gb.mcycles() - start, M_CYCLES_PER_FRAME as u64);
+    }
+
+    /// A CGB ROM that waits for the next start of VBlank, burns `d` loops of 7
+    /// M-cycles and switches speed, `switches` times over; then spins.
+    fn switching_rom(d: u16, switches: usize) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x143] = 0x80;
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]); // JP 0x150
+        let delay = [0x01, d as u8, (d >> 8) as u8, 0x0B, 0x78, 0xB1, 0x20, 0xFB];
+        let switch = [0x3E, 0x01, 0xE0, 0x4D, 0x10, 0x00]; // LD A,1; LDH (KEY1),A; STOP
+        // Leave LY = 144 (the boot state may sit on it), then wait for it.
+        let mut code = vec![
+            0xF0, 0x44, 0xFE, 0x90, 0x28, 0xFA, 0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA,
+        ];
+        for _ in 0..switches {
+            code.extend_from_slice(&delay);
+            code.extend_from_slice(&switch);
+        }
+        code.extend_from_slice(&[0x18, 0xFE]); // JR -2
+        rom[0x150..0x150 + code.len()].copy_from_slice(&code);
+        rom
+    }
+
+    #[test]
+    fn step_frame_returns_with_a_frame_whenever_the_speed_switches() {
+        // 2508 delay loops of 7 M-cycles are one frame (17556): the first STOP
+        // lands around the frame boundary, where a call that starts right on it
+        // spends nearly its whole cap on the pause. The second STOP (double to
+        // normal) lands a frame or so later.
+        for d in 2480..2540 {
+            let mut gb = GameBoy::with_model(switching_rom(d, 2), Model::Cgb).unwrap();
+            for n in 0..8 {
+                assert!(gb.run_to_frame(), "d={d}, call {n}: the cap ended it");
+            }
+            assert!(!gb.double_speed() && gb.mcycles() > 2 * 32768, "d={d}");
+        }
+    }
+
+    #[test]
+    fn step_frame_takes_a_frame_of_cycles_at_either_speed_after_a_switch() {
+        for (switches, frame) in [(1, 2), (2, 1)] {
+            let mut gb = GameBoy::with_model(switching_rom(1, switches), Model::Cgb).unwrap();
+            for _ in 0..6 {
+                gb.step_frame();
+            }
+            assert_eq!(gb.double_speed(), switches == 1);
+            let start = gb.mcycles();
+            gb.step_frame();
+            let took = gb.mcycles() - start;
+            let want = frame * M_CYCLES_PER_FRAME as u64;
+            // The frame is ready inside the spinning `JR`, which is 3 M-cycles.
+            assert!(took.abs_diff(want) <= 3, "{switches} switches: {took}");
+        }
     }
 
     #[test]
@@ -370,6 +522,355 @@ mod tests {
                     Ok(()) => gb.step_frame(),
                     Err(_) => assert_eq!(gb.save_state(), before, "pos {pos}"),
                 }
+            }
+        }
+    }
+
+    fn cgb_rom() -> Vec<u8> {
+        let mut rom = nop_rom();
+        rom[0x143] = 0x80;
+        rom
+    }
+
+    #[test]
+    fn new_is_always_a_dmg_and_with_model_is_explicit() {
+        assert_eq!(GameBoy::new(cgb_rom()).unwrap().model(), Model::Dmg);
+        let gb = GameBoy::with_model(cgb_rom(), Model::Dmg).unwrap();
+        assert_eq!(gb.model(), Model::Dmg);
+        assert_eq!(gb.cpu_registers().a, 0x01);
+        let mut gb = GameBoy::with_model(nop_rom(), Model::Cgb).unwrap();
+        assert_eq!(gb.model(), Model::Cgb);
+        assert_eq!(gb.cpu_registers().a, 0x11);
+        // A reload keeps the model.
+        gb.load_rom(cgb_rom()).unwrap();
+        assert_eq!(gb.model(), Model::Cgb);
+        assert_eq!(gb.cpu_registers().d, 0xFF);
+        // The hash is the same one `new` computes: a DMG state of the same ROM
+        // is refused for its model, not for its ROM.
+        let dmg = GameBoy::new(cgb_rom()).unwrap().save_state();
+        assert_eq!(gb.load_state(&dmg), Err(StateError::ModelMismatch));
+    }
+
+    #[test]
+    fn cgb_save_state_round_trips_banks_and_registers() {
+        let mut a = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        run(&mut a, 3);
+        for (addr, v) in [
+            (0xFF40, 0x00), // LCD off so VRAM is writable
+            (0xFF4F, 1),
+            (0x8010, 0xB1),
+            (0xFF4F, 0),
+            (0x8010, 0xA0),
+            (0xFF70, 5),
+            (0xD123, 0x55),
+            (0xFF70, 2),
+            (0xD123, 0x22),
+            (0xFF4D, 1),
+            (0xFF72, 0x99),
+            (0xFF74, 0x6B),
+            (0xFF75, 0x30),
+            (0xFF40, 0x91),
+        ] {
+            a.bus.write(addr, v);
+        }
+        a.audio_samples(); // host buffers are not part of a state
+        let snap = a.save_state();
+        let expected = run(&mut a, 10);
+
+        let mut b = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        run(&mut b, 5);
+        b.load_state(&snap).unwrap();
+        assert_eq!(b.save_state(), snap, "load then save is byte-identical");
+        assert_eq!(b.bus.ppu.vram_bank(1)[0x10], 0xB1);
+        assert_eq!(b.bus.ppu.vram_bank(0)[0x10], 0xA0);
+        assert_eq!(b.peek(0xFF70), 0xFA);
+        assert_eq!(b.peek(0xD123), 0x22);
+        assert_eq!(b.peek(0xFF4D), 0x7F);
+        assert_eq!(b.peek(0xFF72), 0x99);
+        assert_eq!(b.peek(0xFF74), 0x6B);
+        assert_eq!(b.peek(0xFF75), 0xBF);
+        assert_eq!(run(&mut b, 10), expected);
+        assert_eq!(a.save_state(), b.save_state());
+        // The other WRAM bank came across too.
+        b.bus.write(0xFF70, 5);
+        assert_eq!(b.bus.read(0xD123), 0x55);
+    }
+
+    #[test]
+    fn states_do_not_cross_models() {
+        let mut dmg = GameBoy::new(nop_rom()).unwrap();
+        let mut cgb = GameBoy::with_model(nop_rom(), Model::Cgb).unwrap();
+        let (dmg_state, cgb_state) = (dmg.save_state(), cgb.save_state());
+        assert_ne!(dmg_state.len(), cgb_state.len());
+        assert_eq!(dmg.load_state(&cgb_state), Err(StateError::ModelMismatch));
+        assert_eq!(cgb.load_state(&dmg_state), Err(StateError::ModelMismatch));
+        assert_eq!(dmg.save_state(), dmg_state, "nothing changed");
+        assert_eq!(cgb.save_state(), cgb_state, "nothing changed");
+        // An unknown model byte is corruption, not a mismatch.
+        let mut bad = cgb_state.clone();
+        bad[STATE_HEADER_LEN - 2] = 7;
+        assert_eq!(cgb.load_state(&bad), Err(StateError::Invalid("model")));
+    }
+
+    /// The index of the single byte that differs between two states.
+    fn only_diff(a: &[u8], b: &[u8]) -> usize {
+        assert_eq!(a.len(), b.len());
+        let d: Vec<_> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+        assert_eq!(d.len(), 1, "{d:?}");
+        d[0]
+    }
+
+    #[test]
+    fn corrupt_cgb_bank_selectors_are_rejected() {
+        // Two machines that differ only in the selector (same cycle counts).
+        let with = |addr, v| {
+            let mut gb = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+            gb.bus.write(addr, v);
+            gb
+        };
+        let svbk1 = with(0xFF70, 1).save_state();
+        let svbk6 = with(0xFF70, 6).save_state();
+        let svbk_at = only_diff(&svbk1, &svbk6);
+        let mut bad = svbk6.clone();
+        bad[svbk_at] = 8;
+        let mut gb = with(0xFF70, 3);
+        let before = gb.save_state();
+        assert_eq!(gb.load_state(&bad), Err(StateError::Invalid("SVBK")));
+        assert_eq!(gb.save_state(), before, "rolled back");
+
+        let mut a = with(0xFF4F, 0);
+        let vbk0 = a.save_state();
+        let vbk1 = with(0xFF4F, 1).save_state();
+        let vbk_at = only_diff(&vbk0, &vbk1);
+        let mut bad = vbk1.clone();
+        bad[vbk_at] = 2;
+        assert_eq!(a.load_state(&bad), Err(StateError::Invalid("VBK")));
+        assert_eq!(a.save_state(), vbk0);
+    }
+
+    #[test]
+    fn compat_mode_rejects_bank_selectors_it_can_never_reach() {
+        // Compatibility mode has no SVBK and drops VBK writes, so a state with
+        // either set (written here by poking a twin machine) is forged.
+        let compat = || GameBoy::with_model(nop_rom(), Model::Cgb).unwrap();
+        assert_eq!(compat().bus.hw, Hw::CgbCompat);
+        for (svbk, vbk, field) in [(1, 0, "SVBK"), (5, 0, "SVBK"), (0, 1, "VBK")] {
+            let mut twin = compat();
+            twin.bus.set_svbk(svbk);
+            twin.bus.ppu.write_vbk(vbk);
+            let bad = twin.save_state();
+            let mut gb = compat();
+            let before = gb.save_state();
+            assert_eq!(gb.load_state(&bad), Err(StateError::Invalid(field)));
+            assert_eq!(gb.save_state(), before, "rolled back");
+        }
+        // The same values are fine in colour mode.
+        let mut twin = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        twin.bus.set_svbk(5);
+        twin.bus.ppu.write_vbk(1);
+        let ok = twin.save_state();
+        let mut gb = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        gb.load_state(&ok).unwrap();
+        assert_eq!(gb.save_state(), ok);
+    }
+
+    #[test]
+    fn corrupt_undocumented_registers_are_rejected() {
+        // CGB mode: FF75 holds bits 4-6 only; FF74 is a free register.
+        let with = |rom: Vec<u8>, v| {
+            let mut gb = GameBoy::with_model(rom, Model::Cgb).unwrap();
+            gb.bus.write(0xFF75, v);
+            gb
+        };
+        for (rom, ff74_free) in [(cgb_rom(), true), (nop_rom(), false)] {
+            let at = only_diff(
+                &with(rom.clone(), 0x10).save_state(),
+                &with(rom.clone(), 0x20).save_state(),
+            );
+            let mut gb = with(rom.clone(), 0x30);
+            let before = gb.save_state();
+            let snap = before.clone();
+            for bad in [0x01, 0x08, 0x80, 0xFF] {
+                let mut s = snap.clone();
+                s[at] = bad;
+                assert_eq!(gb.load_state(&s), Err(StateError::Invalid("FF75")), "{bad}");
+                assert_eq!(gb.save_state(), before, "rolled back");
+            }
+            let mut ok = snap.clone();
+            ok[at] = 0x70;
+            gb.load_state(&ok).unwrap();
+            assert_eq!(gb.peek(0xFF75), 0xFF);
+            // FF74 follows FF75 in the state; compatibility mode cannot hold it.
+            let mut s = snap.clone();
+            s[at + 1] = 0x5A;
+            if ff74_free {
+                gb.load_state(&s).unwrap();
+                assert_eq!(gb.peek(0xFF74), 0x5A);
+            } else {
+                assert_eq!(gb.load_state(&s), Err(StateError::Invalid("FF74")));
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_cgb_fields_never_panic() {
+        let mut src = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        run(&mut src, 5);
+        let snap = src.save_state();
+        let mut gb = GameBoy::with_model(cgb_rom(), Model::Cgb).unwrap();
+        for pos in (STATE_HEADER_LEN..snap.len()).step_by(11) {
+            for v in [0xFF, 0x80, 0x02] {
+                let mut bad = snap.clone();
+                bad[pos] = v;
+                let before = gb.save_state();
+                match gb.load_state(&bad) {
+                    Ok(()) => gb.step_frame(),
+                    Err(_) => assert_eq!(gb.save_state(), before, "pos {pos}"),
+                }
+            }
+        }
+    }
+
+    /// The ROM `tests/fixtures/state_v1_dmg.bin` was taken with: fills WRAM,
+    /// starts CH1, then counts in HRAM forever.
+    fn v1_fixture_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]);
+        let prog: &[u8] = &[
+            0x21, 0x00, 0xC0, 0x06, 0x40, 0x78, 0x22, 0x05, 0x20, 0xFB, 0x3E, 0x77, 0xE0, 0x24,
+            0x3E, 0xF0, 0xE0, 0x12, 0x3E, 0x87, 0xE0, 0x14, 0x3C, 0xE0, 0x80, 0x18, 0xFB,
+        ];
+        rom[0x150..0x150 + prog.len()].copy_from_slice(prog);
+        rom
+    }
+
+    /// A real version-1 state: written by the `feat/save-states` writer
+    /// (`ae936d7`) after `GameBoy::new(v1_fixture_rom())` ran 3 frames.
+    const STATE_V1: &[u8] = include_bytes!("../tests/fixtures/state_v1_dmg.bin");
+    const V1_HEADER_LEN: usize = 4 + 2 + 8;
+
+    #[test]
+    fn version_1_states_load_as_a_dmg() {
+        assert_eq!(&STATE_V1[4..6], &[1, 0], "the fixture is a version-1 state");
+        let mut gb = GameBoy::new(v1_fixture_rom()).unwrap();
+        gb.load_state(STATE_V1).unwrap();
+        assert_eq!(gb.model(), Model::Dmg);
+        let r = gb.cpu_registers();
+        assert_eq!((r.a, r.pc, r.sp), (0x09, 0x0169, 0xFFFE));
+        assert_eq!(gb.mcycles(), 51554);
+        assert_eq!((gb.peek(0xC000), gb.peek(0xC03F)), (0x40, 0x01));
+        // It carries on exactly as the machine that wrote it did.
+        gb.step_frame();
+        gb.step_frame();
+        let r = gb.cpu_registers();
+        assert_eq!((gb.mcycles(), r.a, gb.peek(0xFF80)), (86666, 0xA1, 0xA1));
+        assert_eq!(state::fnv1a(gb.framebuffer()), 0xECA4_7F65_4990_2B25);
+    }
+
+    #[test]
+    fn version_1_layout_is_the_dmg_layout_of_today() {
+        // Same machine, same point in time: the current writer's sections are
+        // byte-identical to the v1 ones; only the header grew.
+        let mut gb = GameBoy::new(v1_fixture_rom()).unwrap();
+        for _ in 0..3 {
+            gb.step_frame();
+        }
+        let now = gb.save_state();
+        assert_eq!(&now[4..6], &state::VERSION.to_le_bytes());
+        assert_eq!(
+            &now[6..V1_HEADER_LEN],
+            &STATE_V1[6..V1_HEADER_LEN],
+            "ROM hash"
+        );
+        assert_eq!(&now[V1_HEADER_LEN..STATE_HEADER_LEN], &[0, 0], "DMG, DMG");
+        assert!(now[STATE_HEADER_LEN..] == STATE_V1[V1_HEADER_LEN..]);
+        // And a v1 state re-saves as the v2 state of the same machine.
+        let mut other = GameBoy::new(v1_fixture_rom()).unwrap();
+        other.load_state(STATE_V1).unwrap();
+        assert!(other.save_state() == now);
+    }
+
+    #[test]
+    fn version_1_states_do_not_load_into_a_cgb() {
+        let mut gb = GameBoy::with_model(v1_fixture_rom(), Model::Cgb).unwrap();
+        let before = gb.save_state();
+        assert_eq!(gb.load_state(STATE_V1), Err(StateError::ModelMismatch));
+        assert_eq!(gb.save_state(), before, "nothing changed");
+        // A truncated or corrupt v1 state is still an error, and rolls back.
+        let mut dmg = GameBoy::new(v1_fixture_rom()).unwrap();
+        let before = dmg.save_state();
+        assert_eq!(
+            dmg.load_state(&STATE_V1[..STATE_V1.len() - 1]),
+            Err(StateError::Truncated)
+        );
+        assert_eq!(dmg.save_state(), before);
+        let mut extra = STATE_V1.to_vec();
+        extra.push(0);
+        assert_eq!(dmg.load_state(&extra), Err(StateError::TrailingBytes));
+        assert_eq!(dmg.save_state(), before);
+    }
+
+    #[test]
+    fn unknown_versions_are_still_rejected() {
+        let mut gb = GameBoy::new(v1_fixture_rom()).unwrap();
+        for v in [0u16, 3, 0xFFFF] {
+            let mut s = STATE_V1.to_vec();
+            s[4..6].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(gb.load_state(&s), Err(StateError::UnsupportedVersion(v)));
+        }
+    }
+
+    #[test]
+    fn the_state_size_hint_covers_every_mode_without_much_slack() {
+        // (model, header flag, cart type, RAM size code): DMG, CGB compat, CGB
+        // mode, and a cart with 32 KiB of RAM on top of the colour machine.
+        for (model, flag, cart_type, ram_code) in [
+            (Model::Dmg, 0x00, 0x00, 0x00),
+            (Model::Cgb, 0x00, 0x00, 0x00),
+            (Model::Cgb, 0x80, 0x00, 0x00),
+            (Model::Cgb, 0x80, 0x03, 0x03),
+        ] {
+            let mut rom = nop_rom();
+            rom[0x143] = flag;
+            rom[0x147] = cart_type;
+            rom[0x149] = ram_code;
+            let mut gb = GameBoy::with_model(rom, model).unwrap();
+            for _ in 0..2 {
+                let (len, hint) = (gb.save_state().len(), gb.state_size_hint());
+                assert!(len <= hint, "{model:?} {flag:02X}: {len} > hint {hint}");
+                assert!(
+                    hint - len <= 4096,
+                    "{model:?} {flag:02X}: hint {hint} is far above {len}"
+                );
+                gb.step_frame();
+            }
+        }
+    }
+
+    #[test]
+    fn the_hardware_mode_is_saved_range_checked_and_matched() {
+        // (model, header flag, expected byte): DMG, CGB compat, CGB mode.
+        for (model, flag, hw) in [
+            (Model::Dmg, 0x80, 0),
+            (Model::Cgb, 0x00, 1),
+            (Model::Cgb, 0x80, 2),
+        ] {
+            let mut rom = nop_rom();
+            rom[0x143] = flag;
+            let mut gb = GameBoy::with_model(rom, model).unwrap();
+            let snap = gb.save_state();
+            assert_eq!(snap[STATE_HEADER_LEN - 1], hw);
+            gb.load_state(&snap).unwrap();
+            // Another valid mode (same ROM, same model) is refused, and so is an
+            // out-of-range byte; neither touches the machine.
+            for bad_hw in (0..=3).filter(|&b| b != hw) {
+                let mut bad = snap.clone();
+                bad[STATE_HEADER_LEN - 1] = bad_hw;
+                assert_eq!(
+                    gb.load_state(&bad),
+                    Err(StateError::Invalid("hardware mode"))
+                );
+                assert_eq!(gb.save_state(), snap);
             }
         }
     }

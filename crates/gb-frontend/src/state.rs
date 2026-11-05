@@ -5,16 +5,19 @@
 
 use std::path::{Path, PathBuf};
 
-use gb_core::GameBoy;
+use gb_core::{GameBoy, Model, StateError};
 
 use crate::save::{append_ext, backup_without_overwrite, read_capped, save_path, write_atomic};
 
 pub const FIRST_SLOT: u8 = 1;
 pub const LAST_SLOT: u8 = 9;
 
-/// Larger than any state the core produces: about 72 KiB of fixed machine
-/// state plus at most 128 KiB of cart RAM (a test checks the largest case).
-const MAX_STATE_BYTES: u64 = 256 * 1024;
+/// Larger than any state the core produces. The fixed machine state is about
+/// 62 KiB on a DMG and 139 KiB in CGB colour mode (both VRAM and WRAM banks plus
+/// the RGB555 back and front frames), plus at most 128 KiB of cart RAM: 267 KiB
+/// at worst, which is why this is 512 KiB and not 256 KiB. A test checks the
+/// largest cases.
+const MAX_STATE_BYTES: u64 = 512 * 1024;
 
 /// `game.gb` -> `game.ss<slot>`. Like the battery save, the extension is
 /// appended instead if that would name the ROM itself.
@@ -25,6 +28,21 @@ pub fn state_path(rom: &Path, slot: u8) -> PathBuf {
         append_ext(rom, &ext)
     } else {
         path
+    }
+}
+
+/// The text for a failed `load_state`. A model mismatch names the way out: a
+/// pre-CGB (v1) state is a DMG one, and `--model auto` now starts CGB-flagged
+/// ROMs as a Game Boy Color, so they need `--model dmg` to load it.
+fn load_error(e: &StateError, running: Model) -> String {
+    match (e, running) {
+        (StateError::ModelMismatch, Model::Cgb) => {
+            format!("{e}; this session is a Game Boy Color, for a DMG state start with --model dmg")
+        }
+        (StateError::ModelMismatch, Model::Dmg) => {
+            format!("{e}; this session is a DMG, for a Game Boy Color state start with --model cgb")
+        }
+        _ => e.to_string(),
     }
 }
 
@@ -75,8 +93,13 @@ impl StateSlots {
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
         let backup = self.backup_sav_once()?;
-        gb.load_state(&data)
-            .map_err(|e| format!("cannot load state {}: {e}", self.slot))?;
+        gb.load_state(&data).map_err(|e| {
+            format!(
+                "cannot load state {}: {}",
+                self.slot,
+                load_error(&e, gb.model())
+            )
+        })?;
         self.sav_backed_up = true;
         Ok(match backup {
             Some(b) => format!(
@@ -105,6 +128,7 @@ impl StateSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gb_core::Model;
     use std::fs;
 
     fn battery_rom(ram_code: u8) -> Vec<u8> {
@@ -135,6 +159,51 @@ mod tests {
         let gb = GameBoy::new(battery_rom(0x04)).unwrap(); // 128 KiB RAM
         let len = gb.save_state().len() as u64;
         assert!(len <= MAX_STATE_BYTES, "{len}");
+    }
+
+    /// A CGB-only cartridge (header flag 0xC0) so the machine runs in colour mode.
+    fn cgb_rom(ram_code: u8) -> Vec<u8> {
+        let mut rom = battery_rom(ram_code);
+        rom[0x143] = 0xC0;
+        rom
+    }
+
+    #[test]
+    fn cgb_states_fit_the_cap_with_margin() {
+        // Measured: 142 011 bytes with no cart RAM, 273 083 with 128 KiB (the
+        // MBC5 maximum). Both must stay under the cap, and the largest keeps
+        // at least ~100 KiB of room for future state.
+        let mut largest = 0;
+        for (ram_code, ram_len) in [(0x00, 0), (0x04, 128 * 1024)] {
+            let gb = GameBoy::with_model(cgb_rom(ram_code), Model::Cgb).unwrap();
+            assert!(gb.cgb_framebuffer().is_some(), "colour mode");
+            let len = gb.save_state().len() as u64;
+            assert!(len < MAX_STATE_BYTES, "{len}");
+            assert!(len < 150_000 + ram_len, "{len}: the fixed part grew");
+            largest = len;
+        }
+        assert!(
+            MAX_STATE_BYTES - largest >= 100 * 1024,
+            "margin {}",
+            MAX_STATE_BYTES - largest
+        );
+    }
+
+    #[test]
+    fn a_model_mismatch_names_the_model_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = dir.path().join("g.gb");
+        let mut slots = StateSlots::new(&rom);
+        let dmg = GameBoy::with_model(cgb_rom(0x02), Model::Dmg).unwrap();
+        let mut cgb = GameBoy::with_model(cgb_rom(0x02), Model::Cgb).unwrap();
+        slots.save(&dmg).unwrap(); // a DMG state, as every pre-CGB state is
+        let err = slots.load(&mut cgb).unwrap_err();
+        assert!(err.contains("different Game Boy model"), "{err}");
+        assert!(err.contains("--model dmg"), "{err}");
+
+        slots.save(&cgb).unwrap();
+        let mut dmg = dmg;
+        assert!(slots.load(&mut dmg).unwrap_err().contains("--model cgb"));
     }
 
     #[test]

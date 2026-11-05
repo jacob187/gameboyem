@@ -1,6 +1,6 @@
-//! Framebuffer presentation: DMG shade -> RGBA and a synthetic test pattern.
+//! Framebuffer presentation: DMG shade or CGB RGB555 -> RGBA and a synthetic test pattern.
 
-use gb_core::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
+use gb_core::{CgbFramebuffer, Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH, rgb555_to_rgb888};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteKind {
@@ -33,9 +33,26 @@ impl PaletteKind {
 
 /// Convert shades to RGBA8 in `out` (`160*144*4` bytes). Shades above 3 are masked.
 pub fn blit(fb: &Framebuffer, palette: &Palette, out: &mut [u8]) {
+    assert_eq!(out.len(), fb.len() * 4, "blit needs a 160x144 RGBA buffer");
     let (pixels, _) = out.as_chunks_mut::<4>();
     for (shade, px) in fb.iter().zip(pixels) {
         *px = palette[usize::from(shade & 3)];
+    }
+}
+
+/// Convert an RGB555 (`0bbbbbgggggrrrrr`) colour frame to RGBA8 in `out`
+/// (`160*144*4` bytes). Channels widen with [`gb_core::rgb555_to_rgb888`], with
+/// no colour correction (the cgb-acid2 rule); the DMG palette is not used.
+pub fn blit_cgb(fb: &CgbFramebuffer, out: &mut [u8]) {
+    assert_eq!(
+        out.len(),
+        fb.len() * 4,
+        "blit_cgb needs a 160x144 RGBA buffer"
+    );
+    let (pixels, _) = out.as_chunks_mut::<4>();
+    for (&px, out) in fb.iter().zip(pixels) {
+        let [r, g, b] = rgb555_to_rgb888(px);
+        *out = [r, g, b, 0xFF];
     }
 }
 
@@ -80,6 +97,38 @@ mod tests {
         assert_eq!(&out[8..12], &[0x55, 0x55, 0x55, 0xFF]);
         assert_eq!(&out[12..16], &[0, 0, 0, 0xFF]);
         assert_eq!(&out[16..20], &[0, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn blit_cgb_widens_rgb555_without_correction() {
+        let mut fb = [0u16; SCREEN_WIDTH * SCREEN_HEIGHT];
+        fb[1] = 0x7FFF;
+        fb[2] = 0x001F; // red is the low 5 bits
+        fb[3] = 0x7C00; // blue the high
+        fb[4] = 0b01111_00001_10000;
+        fb[5] = 0x8000; // bit 15 ignored
+        let mut out = vec![0x11u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4];
+        blit_cgb(&fb, &mut out);
+        assert_eq!(&out[0..4], &[0, 0, 0, 0xFF]);
+        assert_eq!(&out[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(&out[8..12], &[0xFF, 0, 0, 0xFF]);
+        assert_eq!(&out[12..16], &[0, 0, 0xFF, 0xFF]);
+        assert_eq!(&out[16..20], &[0x84, 0x08, 0x7B, 0xFF]);
+        assert_eq!(&out[20..24], &[0, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    #[should_panic(expected = "blit needs")]
+    fn blit_rejects_a_wrong_sized_buffer() {
+        let fb = [0u8; SCREEN_WIDTH * SCREEN_HEIGHT];
+        blit(&fb, &PaletteKind::Grey.colors(), &mut [0u8; 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "blit_cgb needs")]
+    fn blit_cgb_rejects_a_wrong_sized_buffer() {
+        let fb = [0u16; SCREEN_WIDTH * SCREEN_HEIGHT];
+        blit_cgb(&fb, &mut vec![0u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4 - 4]);
     }
 
     #[test]

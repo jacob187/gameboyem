@@ -9,6 +9,20 @@
 //! performance change can be checked for bit-identical behaviour by comparing
 //! the hashes before and after. Not part of `cargo test`.
 //!
+//! The ROMs run on a DMG, except cgb-acid2 and uCity, which run on a CGB in colour
+//! mode (`Model::Cgb`): cgb-acid2 covers the colour renderer, uCity switches to
+//! double speed at about frame 15 and so covers that clocking path. Their video
+//! hashes cover the RGB555 frame instead of the shade frame: every pixel as two little-endian bytes, in
+//! row-major order. The serial and audio hashes are computed the same way for all
+//! ROMs. A missing ROM fails the run, whichever ROM it is.
+//!
+//! The "overall" line is the mean speed across all ROMs (total frames over total
+//! emulation time), so it covers the colour renderer and double speed as well as
+//! the DMG path; `--min-speed` compares against it. It is not comparable with
+//! figures from before cgb-acid2 or uCity joined the set (about 2650-2730 fps over
+//! the four DMG ROMs).
+//! The per-ROM lines are unaffected.
+//!
 //! * `--check` compares each ROM against `crates/gb-test/bench-pins.txt` and fails
 //!   if the emulation output differs from the pin, if no pin exists for this
 //!   frame count, or if the ROM bytes differ from the pinned build (for example a
@@ -19,16 +33,19 @@
 
 use std::time::{Duration, Instant};
 
-use gb_core::{FRAMES_PER_SECOND, GameBoy};
+use gb_core::{FRAMES_PER_SECOND, GameBoy, Model};
 
 use gb_test::{roms_dir, workspace_root};
 
-/// ROMs (relative to the ROMs directory) in the benchmark.
-const ROMS: [&str; 4] = [
-    "test/dmg-acid2/dmg-acid2.gb",
-    "test/blargg/cpu_instrs/cpu_instrs.gb",
-    "homebrew/snake.gb",
-    "homebrew/breakout.gb",
+/// ROMs (relative to the ROMs directory) in the benchmark, with the model each
+/// one runs on.
+const ROMS: [(&str, Model); 6] = [
+    ("test/dmg-acid2/dmg-acid2.gb", Model::Dmg),
+    ("test/blargg/cpu_instrs/cpu_instrs.gb", Model::Dmg),
+    ("homebrew/snake.gb", Model::Dmg),
+    ("homebrew/breakout.gb", Model::Dmg),
+    ("test/cgb-acid2/cgb-acid2.gbc", Model::Cgb),
+    ("corpus/ucity.gb", Model::Cgb),
 ];
 
 const DEFAULT_FRAMES: u32 = 3600;
@@ -44,14 +61,23 @@ fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
+/// Fold an RGB555 frame into a hash as little-endian bytes, whatever the host.
+// Independent by design: tests/save_state.rs folds its own copy, and the two hashes are never compared.
+fn fnv_frame16(mut h: u64, frame: &[u16]) -> u64 {
+    for px in frame {
+        h = fnv(h, &px.to_le_bytes());
+    }
+    h
+}
+
 struct Run {
     elapsed: Duration,
     video_hash: u64,
     audio_hash: u64,
 }
 
-fn run_once(rom: &[u8], frames: u32) -> Result<Run, String> {
-    let mut gb = GameBoy::new(rom.to_vec()).map_err(|e| e.to_string())?;
+fn run_once(rom: &[u8], model: Model, frames: u32) -> Result<Run, String> {
+    let mut gb = GameBoy::with_model(rom.to_vec(), model).map_err(|e| e.to_string())?;
     let mut video_hash = FNV_OFFSET;
     let mut audio_hash = FNV_OFFSET;
     let mut elapsed = Duration::ZERO;
@@ -60,7 +86,14 @@ fn run_once(rom: &[u8], frames: u32) -> Result<Run, String> {
         gb.step_frame();
         let audio = gb.audio_samples();
         elapsed += t.elapsed();
-        video_hash = fnv(video_hash, gb.framebuffer());
+        video_hash = match model {
+            Model::Dmg => fnv(video_hash, gb.framebuffer()),
+            Model::Cgb => fnv_frame16(
+                video_hash,
+                gb.cgb_framebuffer()
+                    .ok_or("no colour frame: the ROM did not start in CGB mode")?,
+            ),
+        };
         for s in &audio {
             audio_hash = fnv(audio_hash, &s.to_bits().to_le_bytes());
         }
@@ -177,7 +210,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
     );
     let mut ok = true;
     let mut total = Duration::ZERO;
-    for name in ROMS {
+    for (name, model) in ROMS {
         let path = roms_dir().join(name);
         let Ok(rom) = std::fs::read(&path) else {
             println!("{name:<38} missing ({})", path.display());
@@ -186,7 +219,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         };
         let mut best: Option<Run> = None;
         for _ in 0..repeats {
-            match run_once(&rom, frames) {
+            match run_once(&rom, model, frames) {
                 Ok(r) => {
                     if let Some(b) = &best {
                         // Emulation is deterministic: every repeat must agree.
