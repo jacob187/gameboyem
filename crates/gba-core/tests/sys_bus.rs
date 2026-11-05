@@ -353,3 +353,27 @@ fn halt_with_a_pending_enabled_interrupt_does_not_halt() {
     b.write8(0x0400_0301, 0, N);
     assert!(b.halted);
 }
+
+#[test]
+fn only_halfword_data_reads_advance_the_eeprom() {
+    let mut b = bus_with(rom_with(b"EEPROM_V124"));
+    // A read request for a 512 B chip (9 bits), written by hand so the size is known.
+    b.cart.eeprom_begin_write_dma(9);
+    for bit in [1u16, 1, 0, 0, 0, 0, 0, 0, 0] {
+        b.write16(0x0D00_0000, bit, N);
+    }
+    // Opcode fetches and byte/word reads must not shift bits out.
+    b.fetch16(0x0D00_0000, N);
+    b.fetch32(0x0D00_0000, N);
+    b.read8(0x0D00_0000, N);
+    b.read32(0x0D00_0000, N);
+    // The 68-bit read still starts with its four leading zeros.
+    for i in 0..4 {
+        assert_eq!(b.read16(0x0D00_0000, N), 0, "bit {i}");
+    }
+    assert_eq!(
+        b.read16(0x0D00_0000, N) & 1,
+        1,
+        "erased block: first data bit"
+    );
+}

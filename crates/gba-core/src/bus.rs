@@ -389,7 +389,7 @@ impl CpuBus for Bus {
     fn fetch16(&mut self, addr: u32, access: Access) -> u16 {
         self.begin_fetch(addr);
         self.sched.advance(self.fetch_cost(addr, Width::H, access));
-        let v = self.read_value(addr, Width::H);
+        let v = self.read_region(addr, Width::H, false);
         self.note_fetch(addr, v, Width::H);
         v as u16
     }
@@ -397,7 +397,7 @@ impl CpuBus for Bus {
     fn fetch32(&mut self, addr: u32, access: Access) -> u32 {
         self.begin_fetch(addr);
         self.sched.advance(self.fetch_cost(addr, Width::W, access));
-        let v = self.read_value(addr, Width::W);
+        let v = self.read_region(addr, Width::W, false);
         self.note_fetch(addr, v, Width::W);
         v
     }

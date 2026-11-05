@@ -45,11 +45,15 @@ fn wr(s: &mut [u8], off: usize, v: u32, w: Width) {
 }
 
 impl Bus {
-    /// Read `w` at `addr` as the CPU (or DMA) sees it, with side effects (the
-    /// EEPROM's serial read pointer). No time is charged.
+    /// Read `w` at `addr` as a data access (CPU load or DMA), with side effects:
+    /// the EEPROM's serial read pointer. Only halfword reads advance it, since
+    /// the chip is accessed in 16-bit units through DMA3 (GBATEK "GBA Cart Backup
+    /// EEPROM"); byte and word reads of that region see plain ROM contents and
+    /// leave the chip alone (code-review S#7). Opcode fetches never come here.
+    /// No time is charged.
     #[inline]
     pub(crate) fn read_value(&mut self, addr: u32, w: Width) -> u32 {
-        if self.cart.eeprom_at(addr) {
+        if w == Width::H && self.cart.eeprom_at(addr) {
             return u32::from(self.cart.eeprom_read());
         }
         self.read_region(addr, w, false)
