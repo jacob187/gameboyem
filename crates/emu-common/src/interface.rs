@@ -177,12 +177,27 @@ pub trait Core {
     /// unchanged. Only meaningful when `battery_ram()` is `Some`.
     fn battery_generation(&self) -> u64;
 
+    /// Whether the cartridge has battery-backed storage at all, even while
+    /// [`Core::battery_ram`] is `None` (a GBA EEPROM's size, and so its image,
+    /// is unknown until the game first uses it). A host loads an existing
+    /// `.sav` only when this is true. Defaults to `battery_ram().is_some()`.
+    fn has_battery(&self) -> bool {
+        self.battery_ram().is_some()
+    }
+
     /// Restore a `.sav` image.
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), BatteryError>;
 
     /// The system-specific hardware variant as a recording stores it (Game
     /// Boy: 0 DMG, 1 CGB); 0 where a system has only one.
     fn hw_variant(&self) -> u8;
+
+    /// Whether [`Core::save_state`] and [`Core::load_state`] work. A core
+    /// that returns false has no state format yet (the GBA until P3); a host
+    /// must not call them, and says so instead. Defaults to true.
+    fn supports_save_state(&self) -> bool {
+        true
+    }
 
     /// Snapshot the whole machine.
     fn save_state(&self) -> Vec<u8>;
@@ -226,11 +241,17 @@ impl<T: Core + ?Sized> Core for Box<T> {
     fn battery_generation(&self) -> u64 {
         (**self).battery_generation()
     }
+    fn has_battery(&self) -> bool {
+        (**self).has_battery()
+    }
     fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), BatteryError> {
         (**self).load_battery_ram(data)
     }
     fn hw_variant(&self) -> u8 {
         (**self).hw_variant()
+    }
+    fn supports_save_state(&self) -> bool {
+        (**self).supports_save_state()
     }
     fn save_state(&self) -> Vec<u8> {
         (**self).save_state()
@@ -292,6 +313,12 @@ mod tests {
         fn hw_variant(&self) -> u8 {
             0
         }
+        fn has_battery(&self) -> bool {
+            true // while battery_ram() is None: a GBA EEPROM of unknown size
+        }
+        fn supports_save_state(&self) -> bool {
+            false
+        }
         fn save_state(&self) -> Vec<u8> {
             Vec::new()
         }
@@ -308,6 +335,9 @@ mod tests {
         assert_eq!(boxed.system(), System::Gba);
         assert_eq!(boxed.title(), "mock");
         assert!(boxed.load_battery_ram(&[]).is_err());
+        // The defaulted methods must be forwarded, not answered by the default.
+        assert!(boxed.has_battery() && boxed.battery_ram().is_none());
+        assert!(!boxed.supports_save_state());
         // A `Box<dyn Core>` is itself a `Core`, for generic host code.
         fn drive(mut core: impl Core) -> System {
             core.step_frame();

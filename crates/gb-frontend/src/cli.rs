@@ -4,18 +4,21 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use emu_common::System;
 use gb_core::{CartridgeHeader, Model};
 
 use crate::video::PaletteKind;
 
 pub const USAGE: &str = "\
-usage: gb [options] [--] <rom.gb|rom.gbc>
+usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)
   --mute             disable audio output
-  --palette NAME     green (default) or grey (DMG only; colour games use their own colours)
-  --model NAME       auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb
+  --system NAME      gb or gba (default: a .gba file, or a ROM with a GBA header, is a GBA game)
+  --palette NAME     green (default) or grey (Game Boy only; colour games use their own colours)
+  --model NAME       auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb (Game Boy only)
+  --bios FILE        boot through a real 16 KiB GBA BIOS dump (GBA only; default: built-in HLE BIOS)
   --test-pattern     show a synthetic test pattern and tone instead of running the core
   --record FILE      record every input to FILE (must not exist) for `gb-test --replay`
   -h, --help         show this help
@@ -24,6 +27,7 @@ options:
 controls:
   arrows or WASD = D-pad    X or E = A    Z = B    Enter = Start    Backspace / Right Shift = Select
   Q / R = GBA L / R shoulders (no effect on a Game Boy)
+  (GBA games have no save states yet: K and L say so)
   P = pause    Tab (hold) = fast-forward    C = screenshot (marks the frame when recording)
   K = save state    L = load state    1-9 = state slot (default 1)
   Esc = quit";
@@ -63,6 +67,13 @@ pub struct Options {
     pub model: ModelChoice,
     pub test_pattern: bool,
     pub record: Option<PathBuf>,
+    /// `--system`: overrides the choice made from the file name and header.
+    pub system: Option<System>,
+    /// `--bios`: a GBA BIOS dump.
+    pub bios: Option<PathBuf>,
+    /// Game Boy-only flags the user passed (a flag equal to its default still
+    /// counts), so a GBA run can say they are ignored; see [`check_system_flags`].
+    pub gb_only: Vec<&'static str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -83,6 +94,9 @@ where
     let mut model = ModelChoice::Auto;
     let mut test_pattern = false;
     let mut record: Option<PathBuf> = None;
+    let mut system: Option<System> = None;
+    let mut bios: Option<PathBuf> = None;
+    let mut gb_only: Vec<&'static str> = Vec::new();
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -107,10 +121,23 @@ where
             "--palette" => {
                 let value = option_value("--palette", args.next())?;
                 palette = parse_palette(&value)?;
+                gb_only.push("--palette");
             }
             "--model" => {
                 let value = option_value("--model", args.next())?;
                 model = parse_model(&value)?;
+                gb_only.push("--model");
+            }
+            "--system" => {
+                let value = option_value("--system", args.next())?;
+                system = Some(parse_system(&value)?);
+            }
+            "--bios" => bios = Some(path_value("--bios", args.next())?),
+            _ if text.starts_with("--bios=") && text.len() > "--bios=".len() => {
+                bios = Some(PathBuf::from(&text["--bios=".len()..]));
+            }
+            _ if text.starts_with("--system=") => {
+                system = Some(parse_system(&text["--system=".len()..])?);
             }
             "--record" => record = Some(path_value("--record", args.next())?),
             _ if text.starts_with("--record=") && text.len() > "--record=".len() => {
@@ -119,8 +146,12 @@ where
             _ if text.starts_with("--scale=") => scale = parse_scale(&text["--scale=".len()..])?,
             _ if text.starts_with("--palette=") => {
                 palette = parse_palette(&text["--palette=".len()..])?;
+                gb_only.push("--palette");
             }
-            _ if text.starts_with("--model=") => model = parse_model(&text["--model=".len()..])?,
+            _ if text.starts_with("--model=") => {
+                model = parse_model(&text["--model=".len()..])?;
+                gb_only.push("--model");
+            }
             _ if text.starts_with('-') && text.len() > 1 => {
                 return Err(format!("unknown option `{text}`"));
             }
@@ -140,7 +171,28 @@ where
         model,
         test_pattern,
         record,
+        system,
+        bios,
+        gb_only,
     }))
+}
+
+/// Check the options that depend on the system, once it is known. `--bios` on a
+/// Game Boy game is an error (a user mistake with no safe meaning). `--model`
+/// and `--palette` on a GBA game are harmless, so a launcher that always passes
+/// them keeps working: the warning to print (`Ok(Some(..))`) says they are ignored.
+pub fn check_system_flags(system: System, o: &Options) -> Result<Option<String>, String> {
+    match system {
+        System::Gba if !o.gb_only.is_empty() => {
+            Ok(Some(format!("{} ignored for GBA", o.gb_only.join(" and "))))
+        }
+        System::Gba => Ok(None),
+        System::Gb if o.bios.is_some() => Err(
+            "--bios only applies to GBA games (use --system gba to run this as a GBA ROM)"
+                .to_owned(),
+        ),
+        System::Gb => Ok(None),
+    }
 }
 
 /// Like [`option_value`] for a file path: kept as an `OsString` (no lossy UTF-8).
@@ -197,6 +249,14 @@ fn parse_palette(s: &str) -> Result<PaletteKind, String> {
     }
 }
 
+fn parse_system(s: &str) -> Result<System, String> {
+    match s {
+        "gb" => Ok(System::Gb),
+        "gba" => Ok(System::Gba),
+        _ => Err(format!("--system must be `gb` or `gba`, got `{s}`")),
+    }
+}
+
 fn parse_model(s: &str) -> Result<ModelChoice, String> {
     match s {
         "auto" => Ok(ModelChoice::Auto),
@@ -230,6 +290,71 @@ mod tests {
         assert_eq!(o.record, None);
         assert_eq!(o.palette, PaletteKind::Green);
         assert_eq!(o.model, ModelChoice::Auto);
+        assert_eq!((o.system, o.bios.as_deref()), (None, None));
+        assert!(o.gb_only.is_empty());
+    }
+
+    #[test]
+    fn system_flag() {
+        assert_eq!(run(&["--system", "gba", "g.gb"]).system, Some(System::Gba));
+        assert_eq!(run(&["g.gba", "--system=gb"]).system, Some(System::Gb));
+        assert!(p(&["--system", "gbc", "g.gb"]).is_err());
+        assert!(p(&["--system=", "g.gb"]).is_err());
+        assert!(
+            p(&["--system", "--mute", "g.gb"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+    }
+
+    #[test]
+    fn bios_flag() {
+        assert_eq!(
+            run(&["--bios", "b.bin", "g.gba"]).bios,
+            Some(PathBuf::from("b.bin"))
+        );
+        assert_eq!(
+            run(&["g.gba", "--bios=b.bin"]).bios,
+            Some(PathBuf::from("b.bin"))
+        );
+        assert!(
+            p(&["g.gba", "--bios"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+        assert!(p(&["--bios=", "g.gba"]).is_err());
+    }
+
+    #[test]
+    fn game_boy_only_flags_are_ignored_with_a_warning_for_a_gba() {
+        for (args, flags) in [
+            (&["--model", "auto", "g.gba"][..], "--model"),
+            (&["--model=dmg", "g.gba"], "--model"),
+            (&["--palette", "green", "g.gba"], "--palette"),
+            (&["--palette=grey", "g.gba"], "--palette"),
+            (
+                &["--model=cgb", "--palette=grey", "g.gba"],
+                "--model and --palette",
+            ),
+        ] {
+            let o = run(args);
+            assert_eq!(
+                check_system_flags(System::Gba, &o),
+                Ok(Some(format!("{flags} ignored for GBA"))),
+                "{args:?}"
+            );
+            assert_eq!(check_system_flags(System::Gb, &o), Ok(None));
+        }
+        let o = run(&["--scale", "2", "--mute", "g.gba"]);
+        assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
+    }
+
+    #[test]
+    fn bios_is_refused_for_a_game_boy() {
+        let o = run(&["--bios", "b.bin", "g.gb"]);
+        let e = check_system_flags(System::Gb, &o).unwrap_err();
+        assert!(e.contains("--bios only applies to GBA"), "{e}");
+        assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
     }
 
     #[test]

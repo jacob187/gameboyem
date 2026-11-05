@@ -21,6 +21,7 @@ pub mod apu;
 pub mod bios;
 pub mod bus;
 pub mod cart;
+mod core_impl;
 pub mod cpu;
 pub mod dma;
 pub mod gba;
@@ -63,17 +64,16 @@ pub const MAX_ROM_SIZE: usize = 32 * 1024 * 1024;
 /// The BIOS is exactly 16 KiB.
 pub const BIOS_SIZE: usize = 16 * 1024;
 
+/// Upper bound on a save state, which a frontend uses to refuse an oversized file
+/// unread. GBA states come in P3; this 1 MiB is a placeholder that P3 tightens to
+/// the real size (the machine's RAM plus the largest save chip is well under it).
+pub const MAX_STATE_BYTES: usize = 1024 * 1024;
+
 /// FNV-1a 64 of a byte slice (ties save states and recordings to their ROM).
 ///
-/// Same function as `gb-core`'s; it moves to `emu-common` when that crate lands.
-pub fn fnv1a(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
+/// The same function as `gb-core`'s: it lives in `emu-common` and is re-exported
+/// here so `gba_core::fnv1a` keeps working.
+pub use emu_common::fnv1a;
 
 #[cfg(test)]
 mod tests {
@@ -83,5 +83,14 @@ mod tests {
     fn frame_timing_constants() {
         assert_eq!(CYCLES_PER_FRAME, 280_896);
         assert!((FRAMES_PER_SECOND - 59.7275).abs() < 0.001);
+    }
+
+    #[test]
+    fn fnv1a_is_the_shared_one() {
+        // Known FNV-1a 64 vectors: the hash that tied ROMs to states before the
+        // move to emu-common must not change.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
     }
 }

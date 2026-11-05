@@ -58,11 +58,21 @@ fn buffer_plan(frame: (u32, u32), buffer: (u32, u32), resize_failed: bool) -> Bu
     }
 }
 
-/// The name shown in the window title before the game's.
-fn app_name(system: System) -> &'static str {
+/// The window title: the program name, then the game's title if it has one.
+/// Both systems use `gb` (the binary's name), so a GBA game is `gb - <title>`.
+fn window_title(game: &str) -> String {
+    if game.is_empty() {
+        "gb".to_owned()
+    } else {
+        format!("gb - {game}")
+    }
+}
+
+/// How the console is named in a message to the user.
+fn system_label(system: System) -> &'static str {
     match system {
-        System::Gb => "gb",
-        System::Gba => "gba",
+        System::Gb => "Game Boy",
+        System::Gba => "GBA",
     }
 }
 
@@ -141,13 +151,7 @@ impl<C: Core> App<C> {
         test_pattern: bool,
         shutdown: ShutdownFlag,
     ) -> Self {
-        let name = core.title();
-        let app = app_name(core.system());
-        let title = if name.is_empty() {
-            app.to_owned()
-        } else {
-            format!("{app} - {name}")
-        };
+        let title = window_title(&core.title());
         let fps = core.native_fps();
         let test = test_pattern.then(|| TestMode {
             frame: 0,
@@ -271,12 +275,29 @@ impl<C: Core> App<C> {
         }
     }
 
+    /// Say so, instead of touching a slot file, if the core has no state format
+    /// (the GBA until P3). True when states are available.
+    fn states_available(&mut self) -> bool {
+        if self.core.supports_save_state() {
+            return true;
+        }
+        let label = system_label(self.core.system());
+        self.show_status(format!("save states are not supported for {label} yet"));
+        false
+    }
+
     fn save_state(&mut self) {
+        if !self.states_available() {
+            return;
+        }
         let msg = self.states.save(&self.core).unwrap_or_else(|e| e);
         self.show_status(msg);
     }
 
     fn load_state(&mut self) {
+        if !self.states_available() {
+            return;
+        }
         match self.states.load(&mut self.core) {
             Ok(msg) => {
                 // The state replaces the machine (and the frame it is on), so
@@ -421,7 +442,15 @@ impl<C: Core> App<C> {
                 self.frame += 1;
                 // Always drain so the core's buffer cannot grow unbounded.
                 self.core.drain_audio_into(&mut self.audio_buf);
-                audio_seconds(self.audio_buf.len(), self.core.audio_sample_rate())
+                let seconds = audio_seconds(self.audio_buf.len(), self.core.audio_sample_rate());
+                // A step that made no audio (a core whose APU produces none yet)
+                // still covered a frame: without this the pacer would see zero
+                // time pass and run flat out. A Game Boy step always has samples.
+                if seconds > 0.0 {
+                    seconds
+                } else {
+                    self.pacer.period()
+                }
             }
         };
         if !self.fast_forward
@@ -607,6 +636,7 @@ impl<C: Core> ApplicationHandler for App<C> {
 mod tests {
     use super::*;
     use gb_core::{FRAMES_PER_SECOND, GameBoy, M_CYCLES_PER_FRAME, Model};
+    use gba_core::Gba;
     use std::fs;
 
     #[test]
@@ -976,6 +1006,165 @@ mod tests {
                 pressed: true
             }],
             "only the A press was recorded"
+        );
+    }
+
+    #[test]
+    fn the_window_title_is_gb_then_the_game() {
+        assert_eq!(window_title("TETRIS"), "gb - TETRIS");
+        assert_eq!(window_title(""), "gb");
+    }
+
+    /// A GBA ROM that spins on `b .`, titled `GBATEST`, with a Flash ID string.
+    fn gba_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x200];
+        rom[..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        rom[0xA0..0xA7].copy_from_slice(b"GBATEST");
+        rom[0x100..0x109].copy_from_slice(b"FLASH1M_V");
+        rom
+    }
+
+    /// A headless `App` (no window, graphics or audio) on any core, saving next
+    /// to `dir/g.gba`.
+    fn gba_app<C: Core>(dir: &std::path::Path, mut core: C) -> App<C> {
+        let mut saves = SaveManager::new(&dir.join("g.gba"), Instant::now());
+        saves.load(&mut core);
+        App::new(
+            core,
+            Storage {
+                saves,
+                states: StateSlots::new(&dir.join("g.gba")),
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(dir.join("g.gba"))
+    }
+
+    /// The path `main` takes: a GBA core held as `Box<dyn Core>`, stepped through
+    /// the trait, with a title, a 240x160 colour frame and a paced step.
+    #[test]
+    fn a_gba_runs_through_the_app_as_a_boxed_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let core: Box<dyn Core> = Box::new(Gba::new(gba_rom(), None).unwrap());
+        let mut app = gba_app(dir.path(), core);
+        assert_eq!(app.title, "gb - GBATEST");
+        assert_eq!(app.pacer.period(), 1.0 / gba_core::FRAMES_PER_SECOND);
+        for _ in 0..3 {
+            let emulated = app.step_once();
+            assert!(emulated > 0.0, "a step always covers time: {emulated}");
+        }
+        assert_eq!(app.frame, 3);
+        let f = frame_of(None, &app.core);
+        assert_eq!((f.width, f.height), (240, 160));
+        assert!(matches!(f.pixels, FramePixels::Rgb555(p) if p.len() == 240 * 160));
+        // The upload converts any size: the whole frame fits an RGBA buffer.
+        let mut rgba = vec![0u8; 240 * 160 * 4];
+        present(&f, &app.palette, &mut rgba);
+    }
+
+    /// K and L on a GBA say so and touch nothing: no slot file, the recording
+    /// goes on, and the answer comes through `Box<dyn Core>` (a defaulted trait
+    /// method that was not forwarded would say "supported").
+    #[test]
+    fn save_state_keys_on_a_gba_say_so_and_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let core: Box<dyn Core> = Box::new(Gba::new(gba_rom(), None).unwrap());
+        let mut app = gba_app(dir.path(), core);
+        app.step_once();
+        app.save_state();
+        assert_eq!(
+            app.status.as_ref().unwrap().0,
+            "save states are not supported for GBA yet"
+        );
+        app.status = None;
+        app.load_state();
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("not supported for GBA")
+        );
+        for n in 1..=9 {
+            assert!(!dir.path().join(format!("g.ss{n}")).exists());
+        }
+    }
+
+    /// L and R (Q and R on the keyboard) reach a GBA and its recording, which
+    /// its 10-button decoder reads back, with a 128 KiB flash save in the header.
+    #[test]
+    fn l_and_r_reach_a_gba_and_its_recording() {
+        use emu_common::replay::{decode_header, decode_records, rom_hash};
+        use winit::keyboard::KeyCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom_path = dir.path().join("g.gba");
+        let rom = gba_rom();
+        let mut gba = Gba::new(rom.clone(), None).unwrap();
+        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        saves.load(&mut gba);
+        let rec_path = dir.path().join("s.gbinput");
+        let header = record::header_for(&gba, rom_hash(&rom));
+        assert_eq!(header.system, System::Gba);
+        assert_eq!(header.battery.as_ref().map(Vec::len), Some(128 * 1024));
+        let mut app = App::new(
+            gba,
+            Storage {
+                saves,
+                states: StateSlots::new(&rom_path),
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(rom_path)
+        .with_recorder(Some(Recorder::create(&rec_path, &header).unwrap()));
+
+        const KEYINPUT: u32 = 0x0400_0130;
+        app.step_once();
+        app.on_key_input(KeyCode::KeyQ, true);
+        app.on_key_input(KeyCode::KeyR, true);
+        app.step_once();
+        assert_eq!(!app.core.peek16(KEYINPUT) & 0x3FF, 0x300, "L and R down");
+        app.on_key_input(KeyCode::KeyQ, false);
+        app.release_all_buttons();
+        assert_eq!(app.core.peek16(KEYINPUT) & 0x3FF, 0x3FF);
+        let total = app.frame;
+        app.recorder.as_mut().unwrap().finish(total);
+
+        let bytes = fs::read(&rec_path).unwrap();
+        let (h, rest) = decode_header(&bytes).unwrap();
+        assert_eq!((h.system, h.variant), (System::Gba, 0));
+        assert_eq!(h.battery.map(|b| b.len()), Some(128 * 1024));
+        let recs = decode_records(rest, System::Gba.button_count()).unwrap();
+        assert_eq!(recs.end_frame, Some(total));
+        let events: Vec<_> = recs.records.iter().map(|r| r.event).collect();
+        assert_eq!(
+            events,
+            vec![
+                Event::Button {
+                    button: Button::L,
+                    pressed: true
+                },
+                Event::Button {
+                    button: Button::R,
+                    pressed: true
+                },
+                Event::Button {
+                    button: Button::L,
+                    pressed: false
+                },
+                Event::Button {
+                    button: Button::R,
+                    pressed: false
+                },
+            ]
         );
     }
 

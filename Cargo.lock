@@ -703,6 +703,7 @@ dependencies = [
  "ctrlc",
  "emu-common",
  "gb-core",
+ "gba-core",
  "pixels",
  "png",
  "tempfile",
@@ -722,6 +723,9 @@ dependencies = [
 [[package]]
 name = "gba-core"
 version = "0.1.0"
+dependencies = [
+ "emu-common",
+]
 
 [[package]]
 name = "gethostname"
