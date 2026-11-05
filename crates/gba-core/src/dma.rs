@@ -178,15 +178,25 @@ impl Bus {
     /// an event falls due (so the run loop can dispatch it). Does nothing if no
     /// channel is active.
     pub fn run_dma(&mut self) {
-        while let Some(n) = self.dma.active_channel() {
-            if self.dma.ch[n].fresh {
-                self.dma_begin(n);
-            }
-            self.dma_unit(n);
+        while self.run_dma_unit() {
             if self.sched.next_at().is_some_and(|t| t <= self.sched.now()) {
                 return;
             }
         }
+    }
+
+    /// Run one unit (a read and a write) of the highest-priority active channel,
+    /// including its start delay if it has just been triggered. Returns false if
+    /// no channel is active.
+    pub fn run_dma_unit(&mut self) -> bool {
+        let Some(n) = self.dma.active_channel() else {
+            return false;
+        };
+        if self.dma.ch[n].fresh {
+            self.dma_begin(n);
+        }
+        self.dma_unit(n);
+        true
     }
 
     fn is_fifo(&self, n: usize) -> bool {
