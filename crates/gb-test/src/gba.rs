@@ -2,8 +2,9 @@
 //! `--dump-gba` screenshot aid. DECISIONS #57 has the rationale.
 //!
 //! * `jsmolka-gba`: jsmolka/gba-tests end in a single `b .` (`0xEAFFFFFE`). The runner finds that
-//!   word in the ROM, steps instruction by instruction until PC sits on it, and reads the
-//!   failed-test register (r12, r7 for `thumb.gba`): 0 is a pass, N is the first failed test.
+//!   word in the ROM, steps instruction by instruction until PC sits on it (or on a copy of it in
+//!   RAM: `nes.gba` copies itself to VRAM and idles there), and reads the failed-test register
+//!   (r12, r7 for `thumb.gba`): 0 is a pass, N is the first failed test.
 //! * `fuzzarm-gba`: FuzzARM leaves EWRAM 0x0200_0000 at 0 until a test fails, then dumps the
 //!   failure there and waits for a key. A pass also needs the ROM to reach its own idle `b .`,
 //!   otherwise a CPU that never ran would look like a pass.
@@ -13,12 +14,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gb_core::rgb555_to_rgb888;
+use gba_core::cpu::Registers;
 use gba_core::{CYCLES_PER_FRAME, Gba, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 use crate::{Case, Kind, Outcome, artifact_dir, save_sized_png};
 
 /// ARM `b .`: the idle loop every jsmolka ROM (and FuzzARM's `mainloop`) ends in.
 const IDLE_WORD: u32 = 0xEAFF_FFFE;
+/// CPSR Thumb-state bit.
+const CPSR_THUMB: u32 = 1 << 5;
 /// Where the cartridge is mapped (wait-state 0 mirror).
 const ROM_BASE: u32 = 0x0800_0000;
 const EWRAM_BASE: u32 = 0x0200_0000;
@@ -84,6 +88,15 @@ pub fn jsmolka_result(reg: usize, value: u32) -> Outcome {
     }
 }
 
+/// PC is on the ROM's idle `b .`, or on a copy of it that the ROM made in RAM and jumped to.
+/// `nes.gba` runs from VRAM (0x0601_4000), so its idle loop is never at the ROM address; any
+/// ARM-state `b .` is a CPU that can never leave, so reading the result there is as sound as at
+/// the ROM address.
+fn at_idle(gba: &Gba, r: &Registers, idle: u32) -> bool {
+    let pc = r.r[15];
+    pc == idle || (r.cpsr & CPSR_THUMB == 0 && gba.peek32(pc) == IDLE_WORD)
+}
+
 fn run_jsmolka(gba: &mut Gba, idle: u32, reg: usize, max_frames: u32) -> Outcome {
     run_jsmolka_capped(gba, idle, reg, max_frames, MAX_INSTRUCTIONS)
 }
@@ -101,7 +114,7 @@ fn run_jsmolka_capped(
     let mut executed = 0u64;
     loop {
         let r = gba.cpu_registers();
-        if r.r[15] == idle {
+        if at_idle(gba, &r, idle) {
             return jsmolka_result(reg, r.r[reg]);
         }
         if gba.cycles() >= budget {
@@ -358,9 +371,9 @@ mod tests {
 
     #[test]
     fn jsmolka_runner_stops_at_the_instruction_cap_whatever_the_clock_does() {
-        // The idle address is never reached (the ROM spins at its entry point), and the cycle
-        // budget is far away, so only the instruction cap can end the run.
-        let mut gba = Gba::new(rom_of(&[IDLE_WORD]), None).unwrap();
+        // The idle address is never reached (the ROM loops over a nop and a branch, which is not
+        // a `b .`), and the cycle budget is far away, so only the instruction cap can end the run.
+        let mut gba = Gba::new(rom_of(&[0xE1A0_0000, 0xEAFF_FFFD]), None).unwrap();
         let out = run_jsmolka_capped(&mut gba, 0x0800_0100, 12, 1_000_000, 1000);
         assert!(
             matches!(&out, Outcome::Timeout(d) if d.contains("1000 instructions")),
@@ -375,6 +388,40 @@ mod tests {
         let idle = find_idle(&rom).unwrap();
         let mut gba = Gba::new(rom, None).unwrap();
         assert_eq!(run_jsmolka(&mut gba, idle, 12, 2), Outcome::Pass);
+    }
+
+    /// A ROM that, like `nes.gba`, copies its `b .` into RAM (IWRAM here, VRAM there) and runs
+    /// it from there; the only `b .` word left in the ROM image is the data being copied.
+    fn ram_idle_rom(set_r12: u32) -> Vec<u8> {
+        rom_of(&[
+            0xE3A0_0403, // mov r0, #0x03000000
+            0xE59F_1008, // ldr r1, [pc, #8]   -> the `b .` word below
+            0xE580_1000, // str r1, [r0]
+            set_r12,     // mov r12, #N
+            0xE12F_FF10, // bx r0
+            IDLE_WORD,
+        ])
+    }
+
+    #[test]
+    fn jsmolka_runner_sees_an_idle_loop_the_rom_copied_to_ram() {
+        let rom = ram_idle_rom(0xE3A0_C000); // mov r12, #0
+        let idle = find_idle(&rom).unwrap();
+        assert_eq!(idle, 0x0800_0014);
+        let mut gba = Gba::new(rom, None).unwrap();
+        assert_eq!(run_jsmolka(&mut gba, idle, 12, 2), Outcome::Pass);
+        assert_eq!(gba.cpu_registers().r[15], 0x0300_0000);
+    }
+
+    #[test]
+    fn jsmolka_runner_reports_the_register_at_a_ram_idle_loop() {
+        let rom = ram_idle_rom(0xE3A0_C005); // mov r12, #5
+        let idle = find_idle(&rom).unwrap();
+        let mut gba = Gba::new(rom, None).unwrap();
+        assert_eq!(
+            run_jsmolka(&mut gba, idle, 12, 2),
+            Outcome::Fail("failed test 5 (r12)".into())
+        );
     }
 
     /// A FuzzARM failure record, with the given state tag and name.
