@@ -39,22 +39,34 @@ impl Gba {
         let start = self.bus.frames;
         let cap = self.bus.sched.now() + 2 * u64::from(CYCLES_PER_FRAME);
         while self.bus.frames == start && self.bus.sched.now() < cap {
-            if self.bus.halted {
-                if !self.bus.sched.skip_to_next() {
-                    break;
-                }
-            } else {
-                // P1-SYS: run an active DMA unit here instead of the CPU.
-                self.cpu.step(&mut self.bus);
+            if !self.step_once() {
+                break;
             }
-            self.bus.process_events();
         }
     }
 
-    /// Execute one CPU instruction and dispatch due events (test hook).
-    pub fn step_instruction(&mut self) {
-        self.cpu.step(&mut self.bus);
+    /// One step of the run loop: an active DMA (which holds the bus, even while
+    /// the CPU is halted), else the clock jumps to the next event while halted,
+    /// else one CPU instruction. Due events are dispatched afterwards. Returns
+    /// false if the machine is halted with nothing scheduled to wake it.
+    fn step_once(&mut self) -> bool {
+        if self.bus.dma.active_channel().is_some() {
+            self.bus.run_dma();
+        } else if self.bus.halted {
+            if !self.bus.sched.skip_to_next() {
+                return false;
+            }
+        } else {
+            self.cpu.step(&mut self.bus);
+        }
         self.bus.process_events();
+        true
+    }
+
+    /// Execute one CPU instruction, DMA burst or halt skip, and dispatch due
+    /// events (test hook).
+    pub fn step_instruction(&mut self) {
+        self.step_once();
     }
 
     pub fn framebuffer(&self) -> &Framebuffer {
@@ -62,8 +74,7 @@ impl Gba {
     }
 
     pub fn set_button(&mut self, b: Button, pressed: bool) {
-        self.bus.keypad.set(b, pressed);
-        // P1-SYS: keypad IRQ (KEYCNT) check.
+        self.bus.set_button(b, pressed);
     }
 
     /// The cartridge title from the header.
@@ -83,6 +94,35 @@ impl Gba {
     /// Read a byte with no side effects (test hook).
     pub fn peek8(&self, addr: u32) -> u8 {
         self.bus.peek8(addr)
+    }
+
+    /// Read a halfword (`addr & !1`) with no side effects (test hook).
+    pub fn peek16(&self, addr: u32) -> u16 {
+        self.bus.peek16(addr)
+    }
+
+    /// Read a word (`addr & !3`) with no side effects (test hook).
+    pub fn peek32(&self, addr: u32) -> u32 {
+        self.bus.peek32(addr)
+    }
+
+    /// The save data to write to a `.sav` file: SRAM, Flash, or EEPROM (`None`
+    /// without a backup chip, or for an EEPROM the game hasn't touched yet, whose
+    /// size is still unknown).
+    pub fn battery_ram(&self) -> Option<&[u8]> {
+        self.bus.cart.battery_ram()
+    }
+
+    /// Counter that advances only when the game changes save data (or a save is
+    /// loaded), so a host can skip rewriting an unchanged `.sav`.
+    pub fn battery_generation(&self) -> u64 {
+        self.bus.cart.battery_generation()
+    }
+
+    /// Restore save data from a `.sav` file. The size must match the detected
+    /// backup chip (an EEPROM accepts 512 or 8192 bytes).
+    pub fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartError> {
+        self.bus.cart.load_battery_ram(data)
     }
 
     /// Master clock in CPU cycles since power-on.

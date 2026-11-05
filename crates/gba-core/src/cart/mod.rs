@@ -180,8 +180,8 @@ impl Cart {
     /// 0x0D00_0000 region for ROMs up to 16 MiB, otherwise only the top 256 bytes.
     #[inline]
     pub fn eeprom_at(&self, addr: u32) -> bool {
-        matches!(self.backup, Backup::Eeprom(_))
-            && addr >> 24 == 0x0D
+        addr >> 24 == 0x0D
+            && matches!(self.backup, Backup::Eeprom(_))
             && (self.rom.len() <= 16 * 1024 * 1024 || addr >= 0x0DFF_FF00)
     }
 
