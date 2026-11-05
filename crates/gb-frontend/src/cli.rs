@@ -22,9 +22,10 @@ options:
   --                 end of options; the next argument is the ROM path, even if it starts with `-`
 
 controls:
-  arrows = D-pad    X = A    Z = B    Enter = Start    Backspace / Right Shift = Select
+  arrows or WASD = D-pad    X or E = A    Z = B    Enter = Start    Backspace / Right Shift = Select
+  Q / R = GBA L / R shoulders (no effect on a Game Boy)
   P = pause    Tab (hold) = fast-forward    C = screenshot (marks the frame when recording)
-  S = save state    L = load state    1-9 = state slot (default 1)
+  K = save state    L = load state    1-9 = state slot (default 1)
   Esc = quit";
 
 pub const DEFAULT_SCALE: u32 = 4;
