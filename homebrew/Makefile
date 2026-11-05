@@ -2,6 +2,7 @@
 #
 #   make -C homebrew                        # uses ../tools/gbdk/, writes ../roms/homebrew
 #   make -C homebrew GBDK_HOME=/path/gbdk/ OUT=/path/to/out
+#   make -C homebrew gba                    # the GBA games (see below), not part of `all`
 #
 # Objects, maps and linker output go to $(BUILD) (gitignored); only the
 # finished .gb files are copied to $(OUT).
@@ -83,3 +84,35 @@ usage:
 clean:
 	rm -rf $(BUILD)
 	rm -f $(foreach g,$(GAMES),$(OUT)/$(g).gb)
+
+# GBA games (agb, Rust nightly + build-std). Explicit target only: `all` stays
+# the GBDK games, and nothing here is needed for them. gba/ is its own cargo
+# project pinned by gba/rust-toolchain.toml; cargo must run from inside it so
+# rustup and .cargo/config.toml are found. agb-gbafix comes from ../tools/agb/bin
+# (cargo install agb-gbafix --version 0.25.0 --locked --root tools/agb) or PATH.
+#
+#   make -C homebrew gba                    # writes $(OUT)/grains.gba and moth.gba
+GBA_DIR    := gba
+# name:header title (<= 12 bytes):game code (4 bytes); the ELF is $(GBA_ELF)/<name>.
+GBA_GAMES  := grains:GRAINS:AGRN moth:MOTH:AMTH
+GBA_ELF    := $(GBA_DIR)/target/thumbv4t-none-eabi/release
+GBAFIX     ?= $(firstword $(wildcard ../tools/agb/bin/agb-gbafix) agb-gbafix)
+gba_field   = $(word $(2),$(subst :, ,$(1)))
+GBA_ROMS   := $(foreach g,$(GBA_GAMES),$(OUT)/$(call gba_field,$(g),1).gba)
+
+.PHONY: gba gba-clean
+
+# Fail before the (slow) nightly build if agb-gbafix is missing.
+gba:
+	@command -v $(GBAFIX) >/dev/null 2>&1 || { \
+	  echo "error: agb-gbafix not found (looked in ../tools/agb/bin and on PATH)." >&2; \
+	  echo "       install it: cargo install agb-gbafix --version 0.25.0 --locked --root tools/agb" >&2; \
+	  exit 1; }
+	cd $(GBA_DIR) && cargo build --release --locked
+	mkdir -p $(OUT)
+	$(foreach g,$(GBA_GAMES),$(GBAFIX) $(GBA_ELF)/$(call gba_field,$(g),1) -t $(call gba_field,$(g),2) -c $(call gba_field,$(g),3) -m 00 -o $(OUT)/$(call gba_field,$(g),1).gba && ) true
+	sh $(GBA_DIR)/check-header.sh $(GBA_ROMS)
+
+gba-clean:
+	rm -rf $(GBA_DIR)/target
+	rm -f $(GBA_ROMS)

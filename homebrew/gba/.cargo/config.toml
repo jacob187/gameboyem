@@ -1,0 +1,15 @@
+# From agb 0.25.0's template/.cargo/config.toml, minus the mgba-qt runner
+# (this repo never launches a window; the ROMs are checked headless).
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target = "thumbv4t-none-eabi"
+
+[target.thumbv4t-none-eabi]
+rustflags = [
+    "-Clink-arg=-Tgba.ld",
+    "-Ctarget-cpu=arm7tdmi",
+    "-Cforce-frame-pointers=yes",
+]
