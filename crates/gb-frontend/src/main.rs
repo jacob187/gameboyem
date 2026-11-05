@@ -67,10 +67,10 @@ fn main() -> ExitCode {
         }
     };
 
-    // The system comes first: the ROM size limit depends on it, and so do the
-    // flags that apply (DECISIONS #46).
-    let system = match rom::pick_system(&opts.rom, opts.system) {
-        Ok(s) => s,
+    // The file is read once; the system (and so the size cap) comes from the
+    // flag, the name or the header (DECISIONS #46).
+    let (system, rom) = match rom::load_rom(&opts.rom, opts.system) {
+        Ok(r) => r,
         Err(msg) => {
             eprintln!("error: {msg}");
             return ExitCode::FAILURE;
@@ -84,13 +84,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let rom = match rom::read_rom(&opts.rom, system) {
-        Ok(r) => r,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            return ExitCode::FAILURE;
-        }
-    };
     let rom_hash = emu_common::replay::rom_hash(&rom);
     let built = match system {
         System::Gb => build_gb(&opts, rom),

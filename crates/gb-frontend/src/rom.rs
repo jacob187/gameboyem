@@ -18,9 +18,6 @@ pub fn max_rom_bytes(system: System) -> u64 {
     }
 }
 
-/// Bytes of a GBA header that [`looks_like_gba`] needs (through the checksum at 0xBD).
-const GBA_HEADER_PEEK: usize = 0xC0;
-
 /// Whether `head` (the start of a file) has a GBA cartridge header: the fixed
 /// byte 0x96 at 0xB2 and a valid complement checksum at 0xBD (the sum of
 /// 0xA0..=0xBC, negated, minus 0x19). A Game Boy header never matches by chance
@@ -35,28 +32,41 @@ pub fn looks_like_gba(head: &[u8]) -> bool {
     head[0xBD] == 0u8.wrapping_sub(sum).wrapping_sub(0x19)
 }
 
-/// Which system to run `path` as (DECISIONS #46): `forced` (`--system`) if
-/// given, else GBA for a `.gba` file name, else GBA if the file's header looks
-/// like one, else Game Boy. Only the first 0xC0 bytes are read, and only when
-/// the name and flag leave it open, so this runs before [`read_rom`] (whose
-/// size limit depends on the answer). Archives are not unpacked, so there is
-/// no inside-the-archive case: a zip is reported by its magic later.
-pub fn pick_system(path: &Path, forced: Option<System>) -> Result<System, String> {
-    if let Some(system) = forced {
-        return Ok(system);
+/// The system `path` is for when the flag or the file name settles it without
+/// looking inside: `forced` (`--system`), else GBA for a `.gba` name (any case).
+fn system_without_reading(path: &Path, forced: Option<System>) -> Option<System> {
+    forced.or_else(|| {
+        path.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gba"))
+            .then_some(System::Gba)
+    })
+}
+
+/// Read the ROM at `path` once and say which system it is for (DECISIONS #46):
+/// `--system`, else a `.gba` name, else GBA if the header looks like one, else
+/// Game Boy. When the flag or name decides, the file is read with that system's
+/// size cap. Otherwise it is read with the largest cap (GBA's), the system is
+/// detected from the buffer, and the buffer is then cut to that system's cap + 1
+/// byte, so a Game Boy ROM over 8 MiB still reaches the core as `TooLarge`, as
+/// before. Archives are not unpacked, so there is no inside-the-archive case: a
+/// zip is reported by its magic later.
+pub fn load_rom(path: &Path, forced: Option<System>) -> Result<(System, Vec<u8>), String> {
+    if let Some(system) = system_without_reading(path, forced) {
+        return read_rom(path, system).map(|rom| (system, rom));
     }
-    if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("gba"))
-    {
-        return Ok(System::Gba);
-    }
-    let head = read_rom_io(path, GBA_HEADER_PEEK as u64).map_err(|e| io_message(path, &e))?;
-    Ok(if looks_like_gba(&head) {
+    let largest = max_rom_bytes(System::Gb).max(max_rom_bytes(System::Gba));
+    let mut rom = read_rom_io(path, largest + 1).map_err(|e| io_message(path, &e))?;
+    let system = if looks_like_gba(&rom) {
         System::Gba
     } else {
         System::Gb
-    })
+    };
+    let keep = usize::try_from(max_rom_bytes(system) + 1).unwrap_or(usize::MAX);
+    if rom.len() > keep {
+        rom.truncate(keep);
+        rom.shrink_to_fit();
+    }
+    Ok((system, rom))
 }
 
 /// Read and validate a GBA BIOS dump: exactly [`gba_core::BIOS_SIZE`] bytes.
@@ -216,6 +226,7 @@ pub fn gba_cartridge_message(path: &Path, e: &CartError, archive: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const P: &str = "g.gb";
 
@@ -258,36 +269,75 @@ mod tests {
             fs::write(&p, data).unwrap();
             p
         };
+        let sys = |name: &str, data: &[u8], forced| load_rom(&w(name, data), forced).map(|r| r.0);
         let gb = vec![0u8; 0x8000];
         // Extension, in any case, even with Game Boy contents.
-        assert_eq!(pick_system(&w("a.gba", &gb), None), Ok(System::Gba));
-        assert_eq!(pick_system(&w("b.GBA", &gb), None), Ok(System::Gba));
+        assert_eq!(sys("a.gba", &gb, None), Ok(System::Gba));
+        assert_eq!(sys("b.GBA", &gb, None), Ok(System::Gba));
         // Otherwise the header.
-        assert_eq!(pick_system(&w("c.bin", &gba_head()), None), Ok(System::Gba));
-        assert_eq!(pick_system(&w("d.gb", &gba_head()), None), Ok(System::Gba));
-        assert_eq!(pick_system(&w("e.gb", &gb), None), Ok(System::Gb));
+        assert_eq!(sys("c.bin", &gba_head(), None), Ok(System::Gba));
+        assert_eq!(sys("d.gb", &gba_head(), None), Ok(System::Gba));
+        assert_eq!(sys("e.gb", &gb, None), Ok(System::Gb));
         let mut bad = gba_head();
         bad[0xBD] ^= 0xFF;
-        assert_eq!(pick_system(&w("f.bin", &bad), None), Ok(System::Gb));
+        assert_eq!(sys("f.bin", &bad, None), Ok(System::Gb));
         // --system overrides all of it.
+        assert_eq!(sys("g.gba", &gb, Some(System::Gb)), Ok(System::Gb));
+        assert_eq!(sys("h.gb", &gb, Some(System::Gba)), Ok(System::Gba));
+        // A missing file is reported whichever way the system is chosen.
+        for forced in [None, Some(System::Gb)] {
+            let e = load_rom(&dir.path().join("nope.gb"), forced).unwrap_err();
+            assert!(e.contains("file not found"), "{e}");
+        }
+        // A tiny file is a Game Boy ROM (the core reports it too small), and the
+        // contents come back whole.
         assert_eq!(
-            pick_system(&w("g.gba", &gb), Some(System::Gb)),
-            Ok(System::Gb)
+            load_rom(&w("i.gb", b"abc"), None),
+            Ok((System::Gb, b"abc".to_vec()))
+        );
+    }
+
+    /// The file is read once with the largest cap and then cut to the detected
+    /// system's cap: 8 MiB + 1 for a Game Boy ROM, 32 MiB + 1 for a GBA one.
+    #[test]
+    fn the_detected_systems_cap_applies_to_the_single_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let gb_cap = MAX_ROM_SIZE;
+        let gba_cap = gba_core::MAX_ROM_SIZE;
+        assert!(gb_cap < gba_cap);
+        let w = |name: &str, head: &[u8], len: usize| -> PathBuf {
+            let mut data = vec![0u8; len];
+            data[..head.len()].copy_from_slice(head);
+            let p = dir.path().join(name);
+            fs::write(&p, data).unwrap();
+            p
+        };
+        let head = gba_head();
+        let len_of =
+            |p: PathBuf, forced: Option<System>| load_rom(&p, forced).map(|(s, r)| (s, r.len()));
+
+        // Undecided by name: a Game Boy file past its cap reaches the core as
+        // cap + 1 bytes (so it reports TooLarge), not the 32 MiB it was read at.
+        let big_gb = w("big.bin", &[], gb_cap + 4096);
+        assert_eq!(len_of(big_gb, None), Ok((System::Gb, gb_cap + 1)));
+        // The same size with a GBA header is whole: it is under the GBA cap.
+        let gba_mid = w("mid.bin", &head, gb_cap + 4096);
+        assert_eq!(len_of(gba_mid, None), Ok((System::Gba, gb_cap + 4096)));
+        // A GBA file past 32 MiB stops at the cap + 1.
+        let gba_big = w("huge.bin", &head, gba_cap + 4096);
+        assert_eq!(len_of(gba_big, None), Ok((System::Gba, gba_cap + 1)));
+        // When the name or flag decides, that system's cap applies directly.
+        let named = w("n.gb", &[], gb_cap + 4096);
+        assert_eq!(
+            len_of(named.clone(), Some(System::Gb)),
+            Ok((System::Gb, gb_cap + 1))
         );
         assert_eq!(
-            pick_system(&w("h.gb", &gb), Some(System::Gba)),
-            Ok(System::Gba)
+            len_of(named, Some(System::Gba)),
+            Ok((System::Gba, gb_cap + 4096))
         );
-        // A forced system does not even need the file (read_rom reports it).
-        assert_eq!(
-            pick_system(&dir.path().join("nope.gb"), Some(System::Gb)),
-            Ok(System::Gb)
-        );
-        // Without a flag or a .gba name the file has to be readable.
-        let e = pick_system(&dir.path().join("nope.gb"), None).unwrap_err();
-        assert!(e.contains("file not found"), "{e}");
-        // A tiny file is a Game Boy ROM (the core reports it too small).
-        assert_eq!(pick_system(&w("i.gb", b"abc"), None), Ok(System::Gb));
+        let dot_gba = w("m.gba", &[], gb_cap + 4096);
+        assert_eq!(len_of(dot_gba, None), Ok((System::Gba, gb_cap + 4096)));
     }
 
     #[test]
