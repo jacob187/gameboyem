@@ -97,7 +97,7 @@ jobs:
       - name: Benchmark (pinned hashes + speed floor)
         run: cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5
 
-  # gb-core must stay portable (no std I/O, threads or platform deps).
+  # gb-core and emu-common must stay portable (no std I/O, threads or platform deps).
   wasm32:
     name: gb-core-wasm32
     runs-on: ubuntu-latest
@@ -108,12 +108,12 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build and lint gb-core for wasm32
+      - name: Build and lint gb-core and emu-common for wasm32
         run: |
-          cargo build -p gb-core --target wasm32-unknown-unknown
-          cargo clippy -p gb-core --target wasm32-unknown-unknown -- -D warnings
+          cargo build -p gb-core -p emu-common --target wasm32-unknown-unknown
+          cargo clippy -p gb-core -p emu-common --target wasm32-unknown-unknown -- -D warnings
 
-  # gb-core and gb-test promise the workspace MSRV (gb-frontend needs newer:
+  # gb-core, emu-common and gb-test promise the workspace MSRV (gb-frontend needs newer:
   # pixels 0.17 / wgpu 29 want 1.88, so it is not checked here).
   msrv:
     name: msrv-1.85
@@ -122,8 +122,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - name: Check gb-core and gb-test on the MSRV
-        run: cargo check -p gb-core -p gb-test --all-targets
+      - name: Check gb-core, emu-common and gb-test on the MSRV
+        run: cargo check -p gb-core -p gb-test -p emu-common --all-targets
 
   # Phase 8. Non-blocking: a Windows failure never fails the workflow.
   # Homebrew ROMs come from the Linux leg (GBDK + make on Windows runners

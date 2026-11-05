@@ -52,7 +52,7 @@ If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than a
 
 ## Save states
 
-Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **S** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr.
+Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **K** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr.
 
 A state is tied to the exact ROM and the console model (DMG or Game Boy Color) it was taken with. A state from another ROM or model, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched. States from before CGB support (format version 1) are DMG states and still load on a DMG. Because `--model auto` now starts CGB-flagged ROMs (header 0x143 = 0x80 or 0xC0) as a Game Boy Color, such a ROM refuses an old state with a message pointing to `--model dmg`; start it with that flag to load the state.
 
@@ -62,15 +62,16 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 
 | Game Boy | Keyboard |
 |----------|----------|
-| D-pad | Arrow keys |
-| A / B | X / Z |
+| D-pad | Arrow keys or W / A / S / D |
+| A / B | X or E / Z |
 | Start | Enter |
 | Select | Backspace or Right Shift |
 | Pause | P |
 | Fast-forward (hold) | Tab |
-| Save state / load state | S / L |
+| Save state / load state | K / L |
 | Select state slot | 1-9 |
 | Screenshot (and mark the frame) | C |
+| GBA L / R shoulders (no effect on a Game Boy) | Q / R |
 | Quit | Esc |
 
 ## Recording, replay and screenshots

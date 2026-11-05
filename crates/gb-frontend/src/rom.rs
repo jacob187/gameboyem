@@ -5,19 +5,27 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
 
+use emu_common::System;
 use gb_core::CartridgeError;
 use gb_core::cartridge::MAX_ROM_SIZE;
 
-/// Reading stops one byte past the core's ROM limit (so the core still reports
-/// `TooLarge`), and a bogus huge file or device node cannot exhaust memory.
-const READ_LIMIT: u64 = MAX_ROM_SIZE as u64 + 1;
-
-/// Read the ROM at `path`. The error is a ready-to-print message.
-pub fn read_rom(path: &Path) -> Result<Vec<u8>, String> {
-    read_rom_io(path).map_err(|e| io_message(path, &e))
+/// The largest ROM image `system`'s core accepts.
+pub fn max_rom_bytes(system: System) -> u64 {
+    match system {
+        System::Gb => MAX_ROM_SIZE as u64,
+        // The GBA cartridge address space (32 MiB).
+        System::Gba => 32 * 1024 * 1024,
+    }
 }
 
-fn read_rom_io(path: &Path) -> io::Result<Vec<u8>> {
+/// Read the ROM at `path`. The error is a ready-to-print message. Reading
+/// stops one byte past `system`'s ROM limit (so the core still reports
+/// `TooLarge`), and a bogus huge file or device node cannot exhaust memory.
+pub fn read_rom(path: &Path, system: System) -> Result<Vec<u8>, String> {
+    read_rom_io(path, max_rom_bytes(system) + 1).map_err(|e| io_message(path, &e))
+}
+
+fn read_rom_io(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     // Opening a directory succeeds on Unix and only fails on read; check up front
     // so both platforms give the same message.
     if fs::metadata(path)?.is_dir() {
@@ -27,7 +35,7 @@ fn read_rom_io(path: &Path) -> io::Result<Vec<u8>> {
         ));
     }
     let mut data = Vec::new();
-    File::open(path)?.take(READ_LIMIT).read_to_end(&mut data)?;
+    File::open(path)?.take(limit).read_to_end(&mut data)?;
     Ok(data)
 }
 
@@ -166,15 +174,15 @@ mod tests {
     fn read_errors_are_friendly() {
         let dir = tempfile::tempdir().unwrap();
 
-        let missing = read_rom(&dir.path().join("nope.gb")).unwrap_err();
+        let missing = read_rom(&dir.path().join("nope.gb"), System::Gb).unwrap_err();
         assert!(missing.contains("file not found") && missing.contains("nope.gb"));
 
-        let is_dir = read_rom(dir.path()).unwrap_err();
+        let is_dir = read_rom(dir.path(), System::Gb).unwrap_err();
         assert!(is_dir.contains("directory"), "{is_dir}");
 
         let ok = dir.path().join("ok.gb");
         fs::write(&ok, b"abc").unwrap();
-        assert_eq!(read_rom(&ok).unwrap(), b"abc");
+        assert_eq!(read_rom(&ok, System::Gb).unwrap(), b"abc");
     }
 
     #[test]
@@ -182,7 +190,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let big = dir.path().join("big.gb");
         fs::write(&big, vec![0u8; MAX_ROM_SIZE + 4096]).unwrap();
-        assert_eq!(read_rom(&big).unwrap().len(), MAX_ROM_SIZE + 1);
+        assert_eq!(read_rom(&big, System::Gb).unwrap().len(), MAX_ROM_SIZE + 1);
     }
 
     #[cfg(unix)]
@@ -194,7 +202,7 @@ mod tests {
         fs::write(&f, b"abc").unwrap();
         fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
         if File::open(&f).is_err() {
-            let m = read_rom(&f).unwrap_err();
+            let m = read_rom(&f, System::Gb).unwrap_err();
             assert!(m.contains("permission denied"), "{m}");
         }
         fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();

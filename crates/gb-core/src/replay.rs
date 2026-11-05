@@ -2,61 +2,29 @@
 //!
 //! The core is deterministic, so a session is fully described by the ROM, the
 //! battery RAM it powered on with, and the ordered joypad changes keyed by
-//! frame. This module only encodes and decodes bytes (no I/O); the frontend
+//! frame. The byte format (header framing, records, decoding) is shared with
+//! the other cores and lives in [`emu_common::replay`]; its layout and the
+//! frame-numbering rules are documented there. This module adds what is
+//! Game Boy specific: the hardware model carried in the header's variant byte,
+//! the 8-button limit, the battery size cap and powering a [`GameBoy`] on from
+//! a recording. It only encodes and decodes bytes (no I/O); the frontend
 //! writes recordings and `gb-test --replay` plays them back.
 //!
-//! Layout (little-endian):
-//!
-//! ```text
-//! header:  magic "GBINPUT\0" | version u8 | ROM FNV-1a u64 | battery length u32 | battery bytes
-//!          | model u8 (version 2 and later)
-//!          (battery length 0xFFFF_FFFF means "no battery RAM")
-//! records: frame u64 | kind u8, repeated; 9 bytes each, append-only
-//! ```
-//!
-//! Version 2 appends the hardware model after the version-1 fields, so every
-//! earlier offset is unchanged. The byte is the one a save state stores
-//! (`Model::id`: 0 DMG, 1 CGB). A version 1 file has no model byte and
-//! replays as a DMG, which is all that existed when it was written.
-//!
-//! A record's `frame` is the number of frames completed before it took effect:
-//! a button change at frame `f` is applied before the `f+1`-th
-//! [`GameBoy::step_frame`], and a marker at frame `f` refers to the picture
-//! shown after `f` frames. Records are in the order they happened, so a press
-//! and release inside one frame both survive. The final `End` record holds the
-//! total frame count; a recording cut short (crash, power loss) lacks it.
+//! The variant byte is `Model::id` (0 DMG, 1 CGB). A version 1 file has none
+//! and replays as a DMG, which is all that existed when it was written; a
+//! version 2 file has no system byte and is a Game Boy by definition. Version
+//! 3 adds the system byte, and this decoder refuses a recording of another
+//! system.
 
-use crate::{Button, CartridgeError, GameBoy, Model};
+use emu_common::System;
+use emu_common::replay::{self as common, DecodeError};
 
-pub const MAGIC: [u8; 8] = *b"GBINPUT\0";
-/// Version 2 adds the hardware model. Version 1 files still decode (as a DMG).
-pub const VERSION: u8 = 2;
+use crate::{CartridgeError, GameBoy, Model};
+
+pub use emu_common::replay::{Event, MAGIC, RECORD_LEN, Record, VERSION, encode_record, rom_hash};
+
 /// Largest battery image any supported cartridge produces (128 KiB RAM + RTC footer).
 pub const MAX_BATTERY_LEN: usize = 128 * 1024 + 48;
-pub const RECORD_LEN: usize = 9;
-
-const NO_BATTERY: u32 = u32::MAX;
-const KIND_PRESSED: u8 = 0x80;
-const KIND_MARKER: u8 = 0x40;
-const KIND_END: u8 = 0x41;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Event {
-    Button {
-        button: Button,
-        pressed: bool,
-    },
-    /// The user flagged this frame (a screenshot was taken).
-    Marker,
-    /// The session ended; the frame is the total number of frames run.
-    End,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Record {
-    pub frame: u64,
-    pub event: Event,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -80,43 +48,30 @@ pub struct Recording {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReplayError {
-    NotARecording,
-    UnsupportedVersion(u8),
+    /// The shared format rejected the file (bad magic, version, record, ...).
+    Decode(DecodeError),
     BadModel(u8),
-    TruncatedHeader,
-    BatteryTooLarge(usize),
-    BadRecord { index: usize, kind: u8 },
-    FramesOutOfOrder { index: usize },
-    RecordAfterEnd { index: usize },
-    WrongRom { expected: u64, actual: u64 },
+    /// A well-formed recording of a console this core does not emulate.
+    WrongSystem(System),
+    WrongRom {
+        expected: u64,
+        actual: u64,
+    },
     Cartridge(CartridgeError),
+}
+
+impl From<DecodeError> for ReplayError {
+    fn from(e: DecodeError) -> Self {
+        Self::Decode(e)
+    }
 }
 
 impl std::fmt::Display for ReplayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotARecording => write!(f, "not an input recording (bad magic)"),
-            Self::UnsupportedVersion(v) => {
-                write!(
-                    f,
-                    "recording format version {v} is not supported (expected 1 or {VERSION})"
-                )
-            }
+            Self::Decode(e) => write!(f, "{e}"),
             Self::BadModel(m) => write!(f, "recording has an unknown hardware model byte {m:#04X}"),
-            Self::TruncatedHeader => write!(f, "recording header is truncated"),
-            Self::BatteryTooLarge(n) => {
-                write!(
-                    f,
-                    "recorded battery RAM is {n} bytes (max {MAX_BATTERY_LEN})"
-                )
-            }
-            Self::BadRecord { index, kind } => {
-                write!(f, "record {index} has an unknown kind {kind:#04X}")
-            }
-            Self::FramesOutOfOrder { index } => {
-                write!(f, "record {index} goes back in time")
-            }
-            Self::RecordAfterEnd { index } => write!(f, "record {index} follows the end record"),
+            Self::WrongSystem(s) => write!(f, "recording is for a {s:?} machine, not a Game Boy"),
             Self::WrongRom { expected, actual } => write!(
                 f,
                 "recording was made with a different ROM (hash {expected:016x}, this ROM {actual:016x})"
@@ -128,126 +83,34 @@ impl std::fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
-/// FNV-1a 64 of the ROM image; ties a recording to the ROM it was made with.
-pub fn rom_hash(rom: &[u8]) -> u64 {
-    rom.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 pub fn encode_header(header: &Header) -> Vec<u8> {
-    let battery = header.battery.as_deref();
-    let mut out = Vec::with_capacity(22 + battery.map_or(0, <[u8]>::len));
-    out.extend_from_slice(&MAGIC);
-    out.push(VERSION);
-    out.extend_from_slice(&header.rom_hash.to_le_bytes());
-    match battery {
-        Some(b) => {
-            let len = u32::try_from(b.len()).expect("battery RAM fits in u32");
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(b);
-        }
-        None => out.extend_from_slice(&NO_BATTERY.to_le_bytes()),
-    }
-    out.push(header.model.id());
-    out
-}
-
-pub fn encode_record(record: Record) -> [u8; RECORD_LEN] {
-    let kind = match record.event {
-        Event::Button { button, pressed } => {
-            let index = Button::ALL
-                .iter()
-                .position(|&b| b == button)
-                .expect("Button::ALL lists every button") as u8;
-            index | if pressed { KIND_PRESSED } else { 0 }
-        }
-        Event::Marker => KIND_MARKER,
-        Event::End => KIND_END,
-    };
-    let mut out = [0; RECORD_LEN];
-    out[..8].copy_from_slice(&record.frame.to_le_bytes());
-    out[8] = kind;
-    out
-}
-
-fn decode_kind(kind: u8) -> Option<Event> {
-    match kind {
-        KIND_MARKER => Some(Event::Marker),
-        KIND_END => Some(Event::End),
-        _ if kind & !KIND_PRESSED < 8 => Some(Event::Button {
-            button: Button::ALL[usize::from(kind & !KIND_PRESSED)],
-            pressed: kind & KIND_PRESSED != 0,
-        }),
-        _ => None,
-    }
+    common::encode_header(
+        System::Gb,
+        header.rom_hash,
+        header.battery.as_deref(),
+        header.model.id(),
+    )
 }
 
 impl Recording {
     /// Parse a recording. The input is untrusted: every length and value is checked.
     pub fn decode(bytes: &[u8]) -> Result<Self, ReplayError> {
-        if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
-            return Err(ReplayError::NotARecording);
+        let (header, rest) = common::decode_header(bytes)?;
+        if header.system != System::Gb {
+            return Err(ReplayError::WrongSystem(header.system));
         }
-        let rest = &bytes[MAGIC.len()..];
-        let (&version, rest) = rest.split_first().ok_or(ReplayError::TruncatedHeader)?;
-        if version == 0 || version > VERSION {
-            return Err(ReplayError::UnsupportedVersion(version));
-        }
-        if rest.len() < 12 {
-            return Err(ReplayError::TruncatedHeader);
-        }
-        let rom_hash = u64::from_le_bytes(rest[..8].try_into().expect("8 bytes"));
-        let len = u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes"));
-        let rest = &rest[12..];
-        let (battery, rest) = if len == NO_BATTERY {
-            (None, rest)
-        } else {
-            let len = len as usize;
-            if len > MAX_BATTERY_LEN {
-                return Err(ReplayError::BatteryTooLarge(len));
-            }
-            if rest.len() < len {
-                return Err(ReplayError::TruncatedHeader);
-            }
-            (Some(rest[..len].to_vec()), &rest[len..])
-        };
-        let (model, rest) = if version >= 2 {
-            let (&id, rest) = rest.split_first().ok_or(ReplayError::TruncatedHeader)?;
-            (Model::from_id(id).ok_or(ReplayError::BadModel(id))?, rest)
-        } else {
-            (Model::Dmg, rest)
-        };
-
-        let mut records = Vec::with_capacity(rest.len() / RECORD_LEN);
-        let mut end_frame = None;
-        let mut last_frame = 0;
-        let mut chunks = rest.chunks_exact(RECORD_LEN);
-        for (index, chunk) in chunks.by_ref().enumerate() {
-            if end_frame.is_some() {
-                return Err(ReplayError::RecordAfterEnd { index });
-            }
-            let frame = u64::from_le_bytes(chunk[..8].try_into().expect("8 bytes"));
-            let kind = chunk[8];
-            let event = decode_kind(kind).ok_or(ReplayError::BadRecord { index, kind })?;
-            if frame < last_frame {
-                return Err(ReplayError::FramesOutOfOrder { index });
-            }
-            last_frame = frame;
-            match event {
-                Event::End => end_frame = Some(frame),
-                _ => records.push(Record { frame, event }),
-            }
-        }
+        common::check_battery(&header, MAX_BATTERY_LEN)?;
+        let model = Model::from_id(header.variant).ok_or(ReplayError::BadModel(header.variant))?;
+        let records = common::decode_records(rest, System::Gb.button_count())?;
         Ok(Self {
             header: Header {
-                rom_hash,
-                battery,
+                rom_hash: header.rom_hash,
+                battery: header.battery,
                 model,
             },
-            records,
-            end_frame,
-            truncated: !chunks.remainder().is_empty(),
+            records: records.records,
+            end_frame: records.end_frame,
+            truncated: records.truncated,
         })
     }
 
@@ -289,45 +152,28 @@ impl Recording {
 }
 
 /// Feeds a recording's button changes into a machine, frame by frame.
-pub struct Replayer<'a> {
-    records: &'a [Record],
-    next: usize,
-    frame: u64,
-}
+pub struct Replayer<'a>(common::Replayer<'a>);
 
 impl<'a> Replayer<'a> {
     pub fn new(recording: &'a Recording) -> Self {
-        Self {
-            records: &recording.records,
-            next: 0,
-            frame: 0,
-        }
+        Self(common::Replayer::new(&recording.records))
     }
 
     /// Frames run so far.
     pub fn frame(&self) -> u64 {
-        self.frame
+        self.0.frame()
     }
 
     /// Apply the button changes due before the next frame, then run it.
     pub fn step_frame(&mut self, gb: &mut GameBoy) {
-        while let Some(r) = self.records.get(self.next) {
-            if r.frame > self.frame {
-                break;
-            }
-            if let Event::Button { button, pressed } = r.event {
-                gb.set_button(button, pressed);
-            }
-            self.next += 1;
-        }
-        gb.step_frame();
-        self.frame += 1;
+        self.0.step_frame(gb);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use emu_common::Button;
 
     fn sample() -> (Header, Vec<Record>) {
         let header = Header {
@@ -392,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn every_button_and_state_round_trips() {
+    fn every_game_boy_button_and_state_round_trips_and_l_r_are_refused() {
         for button in Button::ALL {
             for pressed in [false, true] {
                 let r = Record {
@@ -408,12 +254,20 @@ mod tests {
                     &[r],
                     None,
                 );
-                assert_eq!(Recording::decode(&bytes).unwrap().records, vec![r]);
+                let rec = Recording::decode(&bytes);
+                if System::Gb.has_button(button) {
+                    assert_eq!(rec.unwrap().records, vec![r]);
+                } else {
+                    assert!(matches!(
+                        rec,
+                        Err(ReplayError::Decode(DecodeError::BadRecord { index: 0, .. }))
+                    ));
+                }
             }
         }
     }
 
-    /// Offset of the model byte in `sample()`'s header (3 battery bytes).
+    /// Offset of the model (variant) byte in `sample()`'s header (3 battery bytes).
     const MODEL_AT: usize = 8 + 1 + 8 + 4 + 3;
 
     #[test]
@@ -429,25 +283,104 @@ mod tests {
         }
     }
 
+    /// Records shared by the hand-built files below: Start pressed at frame 0,
+    /// a marker at 7, the end at 12.
+    const RECORDS: [u8; 27] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0x87, //
+        7, 0, 0, 0, 0, 0, 0, 0, 0x40, //
+        12, 0, 0, 0, 0, 0, 0, 0, 0x41,
+    ];
+
+    fn hand_built(version: u8, tail: &[u8]) -> Vec<u8> {
+        let mut v = b"GBINPUT\0".to_vec();
+        v.push(version);
+        v.extend_from_slice(&[0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01]);
+        v.extend_from_slice(&[3, 0, 0, 0, 1, 2, 3]);
+        v.extend_from_slice(tail);
+        v.extend_from_slice(&RECORDS);
+        v
+    }
+
+    fn check_hand_built(rec: &Recording, model: Model) {
+        assert_eq!(rec.header.rom_hash, 0x0123_4567_89AB_CDEF);
+        assert_eq!(rec.header.battery, Some(vec![1, 2, 3]));
+        assert_eq!(rec.header.model, model);
+        assert_eq!(rec.records.len(), 2);
+        assert_eq!(rec.markers(), vec![7]);
+        assert_eq!(rec.end_frame, Some(12));
+    }
+
     #[test]
     fn version_1_decodes_as_dmg() {
-        // A v1 file: version byte 1 and no model byte after the battery.
+        // No variant byte and no system byte after the battery.
+        let rec = Recording::decode(&hand_built(1, &[])).unwrap();
+        check_hand_built(&rec, Model::Dmg);
+    }
+
+    #[test]
+    fn version_2_keeps_its_model() {
+        for (id, model) in [(0, Model::Dmg), (1, Model::Cgb)] {
+            let rec = Recording::decode(&hand_built(2, &[id])).unwrap();
+            check_hand_built(&rec, model);
+        }
+        // The model byte is validated as before.
+        assert_eq!(
+            Recording::decode(&hand_built(2, &[2])),
+            Err(ReplayError::BadModel(2))
+        );
+    }
+
+    #[test]
+    fn version_3_is_a_game_boy_with_system_byte_0() {
+        let rec = Recording::decode(&hand_built(3, &[1, 0])).unwrap();
+        check_hand_built(&rec, Model::Cgb);
+        assert_eq!(
+            Recording::decode(&hand_built(3, &[0, 1])),
+            Err(ReplayError::WrongSystem(System::Gba))
+        );
+        assert_eq!(
+            Recording::decode(&hand_built(3, &[0, 2])),
+            Err(ReplayError::Decode(DecodeError::UnknownSystem(2)))
+        );
+    }
+
+    /// A recording of another system is reported as that, whatever its battery
+    /// size: a GBA save can be larger than any Game Boy cartridge's.
+    #[test]
+    fn another_systems_big_battery_is_wrong_system_not_battery_too_large() {
+        for len in [128 * 1024, MAX_BATTERY_LEN + 1, 200 * 1024] {
+            let bytes = common::encode_header(System::Gba, 1, Some(&vec![0; len]), 0);
+            assert_eq!(
+                Recording::decode(&bytes),
+                Err(ReplayError::WrongSystem(System::Gba)),
+                "{len} bytes"
+            );
+        }
+        // The same size on a Game Boy recording is still refused, with its cap.
+        let bytes = common::encode_header(System::Gb, 1, Some(&vec![0; 200 * 1024]), 0);
+        assert_eq!(
+            Recording::decode(&bytes),
+            Err(ReplayError::Decode(DecodeError::BatteryTooLarge {
+                len: 200 * 1024,
+                max: MAX_BATTERY_LEN
+            }))
+        );
+    }
+
+    #[test]
+    fn the_writer_emits_version_3_and_a_v2_reader_layout_still_matches() {
         let (header, records) = sample();
-        let mut v = encode(&header, &records, Some(12));
-        v[8] = 1;
-        v.remove(MODEL_AT);
-        let rec = Recording::decode(&v).unwrap();
-        assert_eq!(rec.header.model, Model::Dmg);
-        assert_eq!(rec.header.battery, header.battery);
-        assert_eq!(rec.records, records);
-        assert_eq!(rec.end_frame, Some(12));
+        let v = encode(&header, &records, Some(12));
+        assert_eq!(v[8], 3);
+        assert_eq!(v[MODEL_AT], Model::Cgb.id());
+        assert_eq!(v[MODEL_AT + 1], 0, "system byte: Game Boy");
+        assert_eq!(&v[17..21], &3u32.to_le_bytes(), "battery length offset");
     }
 
     #[test]
     fn rejects_an_unknown_model_byte() {
         let (header, records) = sample();
         let good = encode(&header, &records, Some(12));
-        assert_eq!(good[MODEL_AT], Model::Cgb.id());
         for bad in [2, 0x7F, 0xFF] {
             let mut v = good.clone();
             v[MODEL_AT] = bad;
@@ -469,47 +402,46 @@ mod tests {
 
     #[test]
     fn rejects_malformed_input() {
+        use DecodeError as D;
+        let dec = |b: &[u8]| {
+            Recording::decode(b).map_err(|e| match e {
+                ReplayError::Decode(d) => d,
+                other => panic!("{other:?}"),
+            })
+        };
         let (header, records) = sample();
         let good = encode(&header, &records, Some(12));
-        assert_eq!(Recording::decode(b"nope"), Err(ReplayError::NotARecording));
+        assert_eq!(dec(b"nope"), Err(D::NotARecording));
         let mut v = good.clone();
         v[8] = VERSION + 1;
-        assert_eq!(
-            Recording::decode(&v),
-            Err(ReplayError::UnsupportedVersion(VERSION + 1))
-        );
+        assert_eq!(dec(&v), Err(D::UnsupportedVersion(VERSION + 1)));
         v[8] = 0;
-        assert_eq!(
-            Recording::decode(&v),
-            Err(ReplayError::UnsupportedVersion(0))
-        );
-        assert_eq!(
-            Recording::decode(&good[..15]),
-            Err(ReplayError::TruncatedHeader)
-        );
-        assert_eq!(
-            Recording::decode(&good[..22]),
-            Err(ReplayError::TruncatedHeader)
-        );
-        // The battery is complete but the model byte is missing.
-        assert_eq!(
-            Recording::decode(&good[..MODEL_AT]),
-            Err(ReplayError::TruncatedHeader)
-        );
+        assert_eq!(dec(&v), Err(D::UnsupportedVersion(0)));
+        assert_eq!(dec(&good[..15]), Err(D::TruncatedHeader));
+        assert_eq!(dec(&good[..22]), Err(D::TruncatedHeader));
+        // The battery is complete but the model byte, or the system byte, is missing.
+        assert_eq!(dec(&good[..MODEL_AT]), Err(D::TruncatedHeader));
+        assert_eq!(dec(&good[..MODEL_AT + 1]), Err(D::TruncatedHeader));
 
-        let mut v = good.clone();
-        v[17..21].copy_from_slice(&((MAX_BATTERY_LEN + 1) as u32).to_le_bytes());
+        let big = Header {
+            battery: Some(vec![0; MAX_BATTERY_LEN + 1]),
+            ..header.clone()
+        };
+        let v = encode_header(&big);
         assert_eq!(
-            Recording::decode(&v),
-            Err(ReplayError::BatteryTooLarge(MAX_BATTERY_LEN + 1))
+            dec(&v),
+            Err(D::BatteryTooLarge {
+                len: MAX_BATTERY_LEN + 1,
+                max: MAX_BATTERY_LEN
+            })
         );
 
         let first = encode_header(&header).len();
         let mut v = good.clone();
         v[first + 8] = 0x3F;
         assert_eq!(
-            Recording::decode(&v),
-            Err(ReplayError::BadRecord {
+            dec(&v),
+            Err(D::BadRecord {
                 index: 0,
                 kind: 0x3F
             })
@@ -520,20 +452,14 @@ mod tests {
             frame: 1,
             event: Event::Marker,
         }));
-        assert_eq!(
-            Recording::decode(&v),
-            Err(ReplayError::FramesOutOfOrder { index: 4 })
-        );
+        assert_eq!(dec(&v), Err(D::FramesOutOfOrder { index: 4 }));
 
         let mut v = good;
         v.extend_from_slice(&encode_record(Record {
             frame: 12,
             event: Event::Marker,
         }));
-        assert_eq!(
-            Recording::decode(&v),
-            Err(ReplayError::RecordAfterEnd { index: 5 })
-        );
+        assert_eq!(dec(&v), Err(D::RecordAfterEnd { index: 5 }));
     }
 
     #[test]
@@ -606,6 +532,6 @@ mod tests {
             player.step_frame(&mut gb);
         }
         assert_eq!(player.frame(), 4);
-        assert_eq!(player.next, 1, "the press was consumed");
+        assert_eq!(player.0.pending(), 0, "the press was consumed");
     }
 }

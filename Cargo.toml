@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gb-core", "crates/gb-frontend", "crates/gb-test", "crates/gba-core"]
+members = ["crates/emu-common", "crates/gb-core", "crates/gb-frontend", "crates/gb-test", "crates/gba-core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
+emu-common = { path = "crates/emu-common" }
 gb-core = { path = "crates/gb-core" }
 winit = "0.30.13"
 pixels = "0.17.2"
@@ -19,6 +20,10 @@ ctrlc = { version = "3", features = ["termination"] }
 # The emulator core is hot; keep it optimized even in debug/test builds so the
 # test-ROM harness runs at a useful speed.
 [profile.dev.package.gb-core]
+opt-level = 3
+
+# emu-common's fnv1a hashes every frame in the harness and the core tests, so keep it optimized like gb-core.
+[profile.dev.package.emu-common]
 opt-level = 3
 
 [profile.release]
