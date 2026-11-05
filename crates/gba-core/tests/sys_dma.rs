@@ -383,3 +383,21 @@ fn eeprom_8k_size_from_81_bit_dma() {
     // All-ones data on an erased (0xFF) chip changes nothing.
     assert_eq!(b.cart.battery_generation(), 0);
 }
+
+#[test]
+fn a_special_timing_channel_without_a_fifo_destination_is_not_sound_dma() {
+    let mut b = bus();
+    // DMA1 in special mode aimed at plain memory: never triggered by a FIFO
+    // request, and (if it ever ran) it would use its own count, not 4 words.
+    start_dma(
+        &mut b,
+        1,
+        IWRAM,
+        IWRAM + 0x100,
+        1,
+        0x8000 | 3 << 12 | 1 << 9,
+    );
+    b.dma.trigger(DmaTrigger::FifoA);
+    b.dma.trigger(DmaTrigger::FifoB);
+    assert!(b.dma.active_channel().is_none());
+}

@@ -201,7 +201,8 @@ impl Bus {
 
     fn is_fifo(&self, n: usize) -> bool {
         let c = &self.dma.ch[n];
-        matches!(n, 1 | 2) && c.timing() == 3
+        // Same test as `Dma::trigger` uses to start it (code-review S#5).
+        matches!(n, 1 | 2) && c.timing() == 3 && (c.dst == FIFO_A || c.dst == FIFO_B)
     }
 
     /// First run of a triggered transfer: charge the start delay and set up the
