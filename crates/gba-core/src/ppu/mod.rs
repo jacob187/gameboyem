@@ -211,29 +211,31 @@ impl Ppu {
             mask
         };
         self.io[i] = (self.io[i] & !mask) | (v & mask);
-        // Writing BGxX / BGxY copies the new value to the internal reference point at
-        // once (GBATEK "LCD I/O BG Rotation/Scaling").
+        // Writing BGxX / BGxY copies the new value to that internal reference point
+        // at once (GBATEK "LCD I/O BG Rotation/Scaling"): X and Y independently.
         for (n, &base) in AFFINE_PA.iter().enumerate() {
-            if (base + 8..base + 16).contains(&(i << 1)) {
-                self.reload_affine_latch(n);
+            let off = i << 1;
+            if (base + 8..base + 16).contains(&off) {
+                self.reload_affine_latch(n, (off - base - 8) >> 2);
             }
         }
     }
 
-    /// Reload BG2 (`n` = 0) or BG3's (`n` = 1) reference point from BGxX/BGxY.
-    fn reload_affine_latch(&mut self, n: usize) {
-        let at = (AFFINE_PA[n] + 8) >> 1;
-        for axis in 0..2 {
-            let raw =
-                u32::from(self.io[at + axis * 2]) | u32::from(self.io[at + axis * 2 + 1]) << 16;
-            // 28-bit signed: shift the sign bit (27) up to bit 31 and back.
-            self.affine_latch[n][axis] = ((raw << 4) as i32) >> 4;
-        }
+    /// Reload one axis (0 = x, 1 = y) of BG2's (`n` = 0) or BG3's (`n` = 1) reference
+    /// point from BGxX / BGxY.
+    fn reload_affine_latch(&mut self, n: usize, axis: usize) {
+        let at = ((AFFINE_PA[n] + 8) >> 1) + axis * 2;
+        let raw = u32::from(self.io[at]) | u32::from(self.io[at + 1]) << 16;
+        // 28-bit signed: shift the sign bit (27) up to bit 31 and back.
+        self.affine_latch[n][axis] = ((raw << 4) as i32) >> 4;
     }
 
     fn reload_affine_latches(&mut self) {
-        self.reload_affine_latch(0);
-        self.reload_affine_latch(1);
+        for n in 0..2 {
+            for axis in 0..2 {
+                self.reload_affine_latch(n, axis);
+            }
+        }
     }
 
     /// After a visible line: reference point += (PB, PD) (GBATEK: "The internal

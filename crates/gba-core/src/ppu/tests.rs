@@ -4,6 +4,7 @@
 use super::*;
 use crate::{CYCLES_PER_FRAME, SCREEN_WIDTH, VISIBLE_LINES};
 
+mod affine_tests;
 mod bg_tests;
 mod obj_tests;
 
