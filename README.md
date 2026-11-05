@@ -109,10 +109,10 @@ These are the results on `feat/cgb` at `e93d0b6`, run on macOS arm64 on 2026-11-
 | SameSuite `dma` (run as a CGB: GDMA / HDMA) | 4 / 4 |
 | AGE `speed-switch` (CGB) | 2 / 6 |
 | Blargg `cgb_sound` (CGB, 12 + combined) | 7 / 13 |
-| CGB homebrew corpus (six games, run as a CGB, `smoke-cgb`) | 5 / 6 |
-| **Total** | **161 / 172** |
+| CGB homebrew corpus (six games, run as a CGB, `smoke-cgb`) | 6 / 6 |
+| **Total** | **162 / 172** |
 
-The Mooneye CGB cases (`boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C`, `boot_div-cgbABCDE`, `ppu/vblank_stat_intr-C`) all pass. The eleven failing cases are expected failures in `expected.txt`, each with a note: four AGE speed-switch ROMs (DIV-reset edges of the fast timers, LCD / APU phase across a switch; DECISIONS #38), six `cgb_sound` ROMs (CGB APU differences), and the CGB homebrew Rebound, which boots and draws in colour but whose picture does not change under the smoke inputs (DECISIONS #39). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
+The Mooneye CGB cases (`boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C`, `boot_div-cgbABCDE`, `ppu/vblank_stat_intr-C`) all pass. The ten failing cases are expected failures in `expected.txt`, each with a note: four AGE speed-switch ROMs (DIV-reset edges of the fast timers, LCD / APU phase across a switch; DECISIONS #38), and six `cgb_sound` ROMs (CGB APU differences). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
 ## Cartridges
 
