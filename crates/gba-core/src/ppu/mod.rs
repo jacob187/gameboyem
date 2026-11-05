@@ -13,10 +13,28 @@
 use crate::scheduler::{Event, Scheduler};
 use crate::{CYCLES_PER_LINE, Framebuffer, LINES_PER_FRAME, SCREEN_HEIGHT, SCREEN_WIDTH};
 
-/// Cycles from the start of a line to HBlank (240 dots x 4 cycles; GBATEK gives
-/// 960 for the visible part, the HBlank flag itself rises a few cycles later; P1-PPU
-/// decides and records it).
-pub const HDRAW_CYCLES: u32 = 960;
+mod render;
+#[cfg(test)]
+mod tests;
+
+/// Cycles from the start of a line to the HBlank event: the line is rendered and
+/// the DISPSTAT HBlank flag rises here. 240 dots x 4 cycles = 960 is where the
+/// last visible pixel is drawn, but the flag (and the HBlank IRQ / DMA trigger)
+/// rises later, at cycle 1006 (GBATEK "LCD Status", measured by mGBA/NBA). See
+/// DECISIONS #55.
+pub const HDRAW_CYCLES: u32 = 1006;
+
+/// DISPSTAT bits.
+const STAT_VBLANK_IRQ: u16 = 1 << 3;
+const STAT_HBLANK_IRQ: u16 = 1 << 4;
+const STAT_VCOUNT_IRQ: u16 = 1 << 5;
+/// The writable DISPSTAT bits: the three IRQ enables and LYC (bits 8-15).
+const STAT_WRITE_MASK: u16 = 0xFF38;
+
+/// First line of VBlank and the last line whose DISPSTAT VBlank flag is set
+/// (GBATEK "LCD I/O Display Status": the flag is clear again in line 227).
+const VBLANK_FIRST_LINE: u16 = 160;
+const VBLANK_LAST_FLAG_LINE: u16 = 226;
 
 /// What the bus must do after a PPU event. **Contract.**
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,10 +56,15 @@ pub struct Ppu {
     pub vram: Box<[u8; 0x1_8000]>,
     /// 1 KiB OAM. **Contract.**
     pub oam: Box<[u8; 0x400]>,
-    /// The I/O registers 0x000..0x060 as halfwords (P1-PPU may replace this with
-    /// decoded fields).
+    /// The I/O registers 0x000..0x060 as halfwords, exactly as written (reads
+    /// apply per-register masks, see [`Ppu::read_io`]).
     io: [u16; 0x30],
     vcount: u16,
+    /// The HBlank flag: set by the HBlank event, cleared at line end.
+    hblank: bool,
+    /// The frame being drawn, one line per HBlank.
+    back: Box<Framebuffer>,
+    /// The last complete frame (swapped in at VBlank start).
     front: Box<Framebuffer>,
 }
 
@@ -59,6 +82,8 @@ impl Ppu {
             oam: Box::new([0; 0x400]),
             io: [0; 0x30],
             vcount: 0,
+            hblank: false,
+            back: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
         }
     }
@@ -72,17 +97,36 @@ impl Ppu {
     /// Handle a PPU event that fell due at `at`. **Contract.**
     pub fn on_event(&mut self, event: Event, at: u64, sched: &mut Scheduler) -> PpuSignals {
         let mut sig = PpuSignals::default();
+        let stat = self.io[STAT_INDEX];
         match event {
             Event::PpuHBlank => {
-                // P1-PPU: render line `vcount` here when vcount < 160; DISPSTAT
-                // HBlank flag/IRQ; hblank_dma on VDraw lines.
-                sig.hblank_dma = u32::from(self.vcount) < crate::VISIBLE_LINES;
+                let line = u32::from(self.vcount);
+                if line < crate::VISIBLE_LINES {
+                    // The line is drawn from the state at HBlank; writes the CPU or
+                    // an HBlank DMA makes after this point show on the next line.
+                    self.render_line(line);
+                    sig.hblank_dma = true;
+                }
+                self.hblank = true;
+                if stat & STAT_HBLANK_IRQ != 0 {
+                    sig.irq |= 1 << 1;
+                }
             }
             Event::PpuLineEnd => {
+                self.hblank = false;
                 self.vcount = (self.vcount + 1) % LINES_PER_FRAME as u16;
-                if u32::from(self.vcount) == crate::VISIBLE_LINES {
+                if self.vcount == VBLANK_FIRST_LINE {
+                    std::mem::swap(&mut self.back, &mut self.front);
                     sig.vblank_dma = true;
                     sig.frame_done = true;
+                    if stat & STAT_VBLANK_IRQ != 0 {
+                        sig.irq |= 1;
+                    }
+                }
+                // The VCount IRQ is requested as the line starts, not when DISPSTAT
+                // is written (DECISIONS #56).
+                if stat & STAT_VCOUNT_IRQ != 0 && self.vcount == stat >> 8 {
+                    sig.irq |= 1 << 2;
                 }
                 let next_line = at + u64::from(CYCLES_PER_LINE);
                 sched.schedule_at(Event::PpuHBlank, at + u64::from(HDRAW_CYCLES));
@@ -94,16 +138,47 @@ impl Ppu {
     }
 
     /// Read I/O halfword at offset `off` (even, 0x000..0x05F). **Contract.**
+    ///
+    /// Write-only registers (scroll, affine parameters, window sizes, MOSAIC,
+    /// BLDY) read as 0.
     pub fn read_io(&self, off: u32) -> u16 {
-        match off {
+        let i = (off as usize >> 1) % self.io.len();
+        match off & !1 {
+            0x004 => {
+                let line = self.vcount;
+                let vblank = (VBLANK_FIRST_LINE..=VBLANK_LAST_FLAG_LINE).contains(&line);
+                let lyc = self.io[STAT_INDEX] >> 8;
+                (self.io[STAT_INDEX] & STAT_WRITE_MASK)
+                    | u16::from(vblank)
+                    | u16::from(self.hblank) << 1
+                    | u16::from(line == lyc) << 2
+            }
             0x006 => self.vcount,
-            _ => self.io[(off as usize >> 1) % self.io.len()],
+            0x000 => self.io[i],
+            // Bit 0 is the (undocumented) green swap flag.
+            0x002 => self.io[i] & 1,
+            // BG0CNT/BG1CNT have no overflow bit (bit 13), GBATEK "LCD I/O BG Control".
+            0x008 | 0x00A => self.io[i] & 0xDFFF,
+            0x00C | 0x00E => self.io[i],
+            // WININ / WINOUT.
+            0x048 | 0x04A => self.io[i] & 0x3F3F,
+            // BLDCNT (bits 14-15 unused) / BLDALPHA.
+            0x050 => self.io[i] & 0x3FFF,
+            0x052 => self.io[i] & 0x1F1F,
+            _ => 0,
         }
     }
 
     /// Write I/O halfword at `off`; `mask` selects the byte lanes. **Contract.**
     pub fn write_io(&mut self, off: u32, v: u16, mask: u16) {
         let i = (off as usize >> 1) % self.io.len();
+        let mask = if i == STAT_INDEX {
+            mask & STAT_WRITE_MASK
+        } else if i == VCOUNT_INDEX {
+            return;
+        } else {
+            mask
+        };
         self.io[i] = (self.io[i] & !mask) | (v & mask);
     }
 
@@ -123,27 +198,6 @@ impl Ppu {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_frame_is_228_lines_and_signals_vblank_once() {
-        let mut ppu = Ppu::new();
-        let mut sched = Scheduler::new();
-        ppu.start(&mut sched);
-        let mut frames = 0;
-        let mut lines = 0;
-        while sched.now() < u64::from(crate::CYCLES_PER_FRAME) {
-            sched.skip_to_next();
-            while let Some((ev, at)) = sched.pop_due() {
-                let sig = ppu.on_event(ev, at, &mut sched);
-                frames += u32::from(sig.frame_done);
-                lines += u32::from(ev == Event::PpuLineEnd);
-            }
-        }
-        assert_eq!(lines, LINES_PER_FRAME);
-        assert_eq!(frames, 1);
-        assert_eq!(ppu.vcount(), 0);
-    }
-}
+/// Indices into `io` (halfword offset / 2).
+const STAT_INDEX: usize = 0x004 >> 1;
+const VCOUNT_INDEX: usize = 0x006 >> 1;
