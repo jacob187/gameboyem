@@ -19,13 +19,13 @@ pub fn sub_with_carry(a: u32, b: u32, carry_in: u32) -> (u32, bool, bool) {
     (res, carry, overflow)
 }
 
-/// Barrel shifter kinds (opcode bits 6:5).
-pub const LSL: u32 = 0;
-pub const LSR: u32 = 1;
-pub const ASR: u32 = 2;
-pub const ROR: u32 = 3;
+/// Barrel shifter kinds (opcode bits 6:5); anything else is ROR.
+const LSL: u32 = 0;
+const LSR: u32 = 1;
+const ASR: u32 = 2;
 
-/// Shift by an immediate amount (opcode bits 11:7). The encodings LSR #0 and
+/// Shift by an immediate amount (opcode bits 11:7). `kind` is opcode bits 6:5:
+/// 0 LSL, 1 LSR, 2 ASR, 3 ROR. The encodings LSR #0 and
 /// ASR #0 mean #32 and ROR #0 means RRX. Returns (value, carry out); `c` is the
 /// current C flag.
 #[inline(always)]
@@ -119,6 +119,8 @@ pub fn mul_cycles(rs: u32, signed: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ROR: u32 = 3;
 
     #[test]
     fn add_sub_flags() {

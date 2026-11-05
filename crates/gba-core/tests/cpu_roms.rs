@@ -157,7 +157,6 @@ struct RunEnd {
     pc: u32,
     steps: u64,
     r: [u32; 16],
-    bus: FlatBus,
 }
 
 /// Step until `stop(pc)` or `max_steps`; the final state is returned.
@@ -184,17 +183,16 @@ fn run(rom: Vec<u8>, max_steps: u64, stop: impl Fn(u32) -> bool) -> RunEnd {
         pc,
         steps,
         r: cpu.registers().r,
-        bus,
     }
 }
 
 /// jsmolka's tests end in `idle: b idle`; the result is r12 (r7 for Thumb), 0 on
 /// pass. A failing test calls SWI 6 to print its number, which lands in the
 /// (empty) BIOS region, so an exit there is also a failure.
-fn jsmolka(rel: &str, idle_addr: u32, thumb: bool, result_reg: usize) {
+fn jsmolka(rel: &str, idle_addr: u32, thumb_idle: bool, result_reg: usize) {
     let Some(rom) = load(rel) else { return };
     let off = (idle_addr & 0x01FF_FFFF) as usize;
-    if thumb {
+    if thumb_idle {
         assert_eq!(&rom[off..off + 2], &[0xFE, 0xE7], "no `b .` at {idle_addr:#X}");
     } else {
         assert_eq!(
@@ -219,7 +217,8 @@ fn jsmolka_arm() {
 
 #[test]
 fn jsmolka_thumb() {
-    jsmolka("jsmolka/thumb/thumb.gba", 0x0800_0AAC, true, 7);
+    // The Thumb tests return to ARM code for the shared `eval`/`idle` tail.
+    jsmolka("jsmolka/thumb/thumb.gba", 0x0800_0AAC, false, 7);
 }
 
 /// FuzzARM: EWRAM word 0 stays 0 unless a test failed ('AAAA'/'TTTT' dump). The
