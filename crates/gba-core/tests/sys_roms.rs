@@ -14,8 +14,9 @@ fn run_rom(rel: &str, idle: u32) -> Option<u32> {
     let path = Path::new(ROOT).join(rel);
     let rom = std::fs::read(&path).ok()?;
     let mut gba = Gba::new(rom, None).unwrap();
-    // A few frames is plenty: the tests are tiny (flash erases are instant).
-    for _ in 0..30 {
+    // The flash ROMs fill the whole 64 KiB chip a byte at a time through 8-bit SRAM-bus
+    // accesses and reach the idle loop at frame 74 (erases are instant); the rest need under 2.
+    for _ in 0..150 {
         gba.step_frame();
         if gba.cpu_registers().r[15] == idle {
             return Some(gba.cpu_registers().r[12]);

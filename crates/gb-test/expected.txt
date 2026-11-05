@@ -244,18 +244,20 @@ fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/12-wave.gb
 pass jsmolka-gba 60 test/gba/jsmolka/arm/arm.gba
 pass jsmolka-gba 60 test/gba/jsmolka/thumb/thumb.gba
 pass jsmolka-gba 60 test/gba/jsmolka/memory/memory.gba
-fail jsmolka-gba 60 test/gba/jsmolka/nes/nes.gba
+pass jsmolka-gba 60 test/gba/jsmolka/nes/nes.gba
 pass jsmolka-gba 60 test/gba/jsmolka/save/sram.gba
-fail jsmolka-gba 60 test/gba/jsmolka/save/flash64.gba
-fail jsmolka-gba 60 test/gba/jsmolka/save/flash128.gba
+pass jsmolka-gba 150 test/gba/jsmolka/save/flash64.gba
+pass jsmolka-gba 150 test/gba/jsmolka/save/flash128.gba
 pass jsmolka-gba 60 test/gba/jsmolka/save/none.gba
-# FuzzARM: 10000 random instruction tests per ROM. The frame budget is a first guess to be tuned
-# when the CPU lands.
-fail fuzzarm-gba 600 test/gba/fuzzarm/ARM_Any.gba
-fail fuzzarm-gba 600 test/gba/fuzzarm/ARM_DataProcessing.gba
-fail fuzzarm-gba 600 test/gba/fuzzarm/THUMB_Any.gba
-fail fuzzarm-gba 600 test/gba/fuzzarm/THUMB_DataProcessing.gba
-fail fuzzarm-gba 600 test/gba/fuzzarm/FuzzARM.gba
+# FuzzARM: 10000 random instruction tests per ROM. Each draws its test number as 8 hex glyphs from
+# ROM (16-bit bus, so 6+ cycles per ARM instruction), and the ROMs reach their idle loop at frames
+# 825.3-827.3, so the budget is 2x that. The flash ROMs need 73.9 frames (64 K fills of the chip a byte at
+# a time through 8-bit SRAM-bus accesses), hence 150.
+pass fuzzarm-gba 1650 test/gba/fuzzarm/ARM_Any.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/ARM_DataProcessing.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/THUMB_Any.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/THUMB_DataProcessing.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/FuzzARM.gba
 # Visual-only ROMs: they only prove the PPU draws something. Look at them with
 # `gb-test --dump-gba ROM FRAMES OUT_DIR` before trusting them.
 pass smoke-gba 120 test/gba/jsmolka/ppu/hello.gba
