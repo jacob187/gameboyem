@@ -298,7 +298,7 @@ fn sprite_vs_background_priority_obj_wins_ties() {
 }
 
 #[test]
-fn disabled_affine_and_prohibited_sprites_are_not_drawn() {
+fn disabled_and_prohibited_sprites_are_not_drawn() {
     let mut rig = Rig::new();
     rig.distinct_palette();
     solid_obj_tiles(&mut rig);
@@ -307,13 +307,6 @@ fn disabled_affine_and_prohibited_sprites_are_not_drawn() {
         0,
         attr0(0, 0, false) | 0x200,
         attr1(0, 0, 0),
-        attr2(1, 0, 0),
-    );
-    // Affine sprites are drawn by P2; P1 skips them.
-    rig.oam(
-        1,
-        attr0(0, 0, false) | 0x100,
-        attr1(16, 0, 0),
         attr2(1, 0, 0),
     );
     // Shape 3 is prohibited.
@@ -336,7 +329,7 @@ fn disabled_affine_and_prohibited_sprites_are_not_drawn() {
     rig.oam(5, attr0(0, 0, false), attr1(80, 0, 0), attr2(1, 0, 0));
     rig.write(DISPCNT, OBJ_ON | ONE_D);
     let f = rig.frame();
-    for x in [0, 16, 32, 48, 64] {
+    for x in [0, 32, 48, 64] {
         assert_eq!(px(&f, x, 0), pal_colour(0), "x {x}");
     }
     assert_eq!(px(&f, 80, 0), obj_colour(2));

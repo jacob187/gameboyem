@@ -289,13 +289,13 @@ fn bg_priority_then_index_orders_the_layers() {
 }
 
 #[test]
-fn mode1_draws_bg0_and_bg1_only() {
+fn mode1_has_no_bg3() {
     let mut rig = Rig::new();
     rig.distinct_palette();
     solid_bg(&mut rig, 0, 30, 2);
     solid_bg(&mut rig, 1, 31, 1);
-    solid_bg(&mut rig, 2, 32, 0);
-    rig.write(DISPCNT, 1 | 0x0F00);
-    // BG2 is affine in mode 1 (P2); until then it draws nothing.
+    solid_bg(&mut rig, 3, 33, 0);
+    rig.write(DISPCNT, 1 | 0x0B00);
+    // BG3 does not exist in mode 1; BG2 is affine (see affine_tests).
     assert_eq!(px(&rig.frame(), 5, 5), pal_colour(31));
 }

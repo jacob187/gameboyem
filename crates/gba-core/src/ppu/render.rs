@@ -1,19 +1,19 @@
 //! Line rendering: decode the registers, fill one line buffer per layer, then
 //! composite them into the back buffer (DECISIONS #56).
 //!
-//! The layer buffers are what P2 (windows, blending, mosaic, affine) builds on:
+//! The layer buffers:
 //!
 //! - `Layers::bg[n]` holds BGn's colour for the line, [`TRANSPARENT`] where the
 //!   layer has no pixel. A BG renderer fills the whole line.
 //! - `Layers::obj` holds one word per pixel (colour + OBJ priority + the
 //!   semi-transparent and OBJ-window flags, see [`OBJ_EMPTY`]).
 //! - `Layers::enable` is a per-pixel mask of layers allowed to show (bit n =
-//!   layer n, bit 5 = colour effects). P1 fills it with "all"; P2 fills it from the
-//!   windows.
+//!   layer n, bit 5 = colour effects), filled from the windows (`window.rs`).
 //! - [`resolve`] returns the top **two** visible candidates per pixel (layer id +
-//!   colour), P1 outputs the top one; blending needs the second as its target.
+//!   colour); `effects.rs` blends them where BLDCNT (or a semi-transparent sprite)
+//!   asks for it.
 
-use super::{Ppu, bg, obj};
+use super::{Ppu, bg, effects, obj, window};
 use crate::SCREEN_WIDTH;
 
 /// One line of 15-bit colours.
@@ -29,9 +29,9 @@ pub(super) const WHITE: u16 = 0x7FFF;
 pub(super) const LAYER_OBJ: u8 = 4;
 pub(super) const LAYER_BACKDROP: u8 = 5;
 /// `Layers::enable` bit for the colour-effects flag (window "special effects").
-const ENABLE_EFFECTS: u8 = 1 << 5;
+pub(super) const ENABLE_EFFECTS: u8 = 1 << 5;
 /// BG0-3 and OBJ (bits 0-4) plus effects.
-const ENABLE_ALL: u8 = 0x1F | ENABLE_EFFECTS;
+pub(super) const ENABLE_ALL: u8 = 0x1F | ENABLE_EFFECTS;
 
 /// An empty OBJ-line word: transparent, priority 0, no flags. Layout of an OBJ word:
 /// bits 0-14 colour, bit 15 [`TRANSPARENT`], bits 16-17 priority (attr2 bits
@@ -78,16 +78,40 @@ impl Mem<'_> {
     }
 }
 
+/// One affine background's parameters (BG2 or BG3): the 8.8 fixed-point matrix and
+/// the reference point latched for this line (20.8 fixed point, GBATEK "LCD I/O BG
+/// Rotation/Scaling").
+#[derive(Clone, Copy, Default)]
+pub(super) struct Affine {
+    pub pa: i32,
+    pub pb: i32,
+    pub pc: i32,
+    pub pd: i32,
+    pub x: i32,
+    pub y: i32,
+}
+
 /// The registers a line needs, decoded once per line.
 pub(super) struct Regs {
     pub dispcnt: u16,
     pub bgcnt: [u16; 4],
     pub hofs: [u16; 4],
     pub vofs: [u16; 4],
+    /// BG2 and BG3 (index `bg - 2`).
+    pub affine: [Affine; 2],
+    pub mosaic: u16,
+    pub win_h: [u16; 2],
+    pub win_v: [u16; 2],
+    pub winin: u16,
+    pub winout: u16,
+    pub bldcnt: u16,
+    pub bldalpha: u16,
+    pub bldy: u16,
 }
 
 impl Regs {
-    pub fn from_io(io: &[u16; 0x30]) -> Self {
+    /// `latch` holds the internal reference points `[bg2, bg3][x, y]`.
+    pub fn from_io(io: &[u16; 0x30], latch: &[[i32; 2]; 2]) -> Self {
         let mut r = Self {
             dispcnt: io[0],
             bgcnt: [
@@ -98,10 +122,31 @@ impl Regs {
             ],
             hofs: [0; 4],
             vofs: [0; 4],
+            affine: [Affine::default(); 2],
+            mosaic: io[0x04C >> 1],
+            win_h: [io[0x040 >> 1], io[0x042 >> 1]],
+            win_v: [io[0x044 >> 1], io[0x046 >> 1]],
+            winin: io[0x048 >> 1],
+            winout: io[0x04A >> 1],
+            bldcnt: io[0x050 >> 1],
+            bldalpha: io[0x052 >> 1],
+            bldy: io[0x054 >> 1],
         };
         for bg in 0..4 {
             r.hofs[bg] = io[(0x010 >> 1) + bg * 2] & 0x1FF;
             r.vofs[bg] = io[(0x012 >> 1) + bg * 2] & 0x1FF;
+        }
+        for (n, a) in r.affine.iter_mut().enumerate() {
+            let base = (0x020 >> 1) + n * 8;
+            // PA..PD are signed 16-bit.
+            *a = Affine {
+                pa: i32::from(io[base] as i16),
+                pb: i32::from(io[base + 1] as i16),
+                pc: i32::from(io[base + 2] as i16),
+                pd: i32::from(io[base + 3] as i16),
+                x: latch[n][0],
+                y: latch[n][1],
+            };
         }
         r
     }
@@ -120,6 +165,22 @@ impl Regs {
     #[inline]
     pub fn bg_priority(&self, bg: usize) -> u16 {
         self.bgcnt[bg] & 3
+    }
+
+    /// BG mosaic `(horizontal, vertical)` sizes in pixels when BGxCNT bit 6 is set and
+    /// the size is not 1x1 (MOSAIC bits 0-3 / 4-7 hold size - 1).
+    pub fn bg_mosaic(&self, bg: usize) -> Option<(u32, u32)> {
+        let h = u32::from(self.mosaic & 15) + 1;
+        let v = u32::from((self.mosaic >> 4) & 15) + 1;
+        (self.bgcnt[bg] & 0x40 != 0 && (h > 1 || v > 1)).then_some((h, v))
+    }
+
+    /// OBJ mosaic `(horizontal, vertical)` sizes (MOSAIC bits 8-11 / 12-15).
+    pub fn obj_mosaic(&self) -> (u32, u32) {
+        (
+            u32::from((self.mosaic >> 8) & 15) + 1,
+            u32::from((self.mosaic >> 12) & 15) + 1,
+        )
     }
 }
 
@@ -143,46 +204,80 @@ impl Layers {
 /// One visible pixel candidate at a position.
 #[derive(Clone, Copy)]
 pub(super) struct Candidate {
-    /// Read by P2's blender (which layers are the first/second target).
-    #[allow(dead_code)]
     pub layer: u8,
     pub colour: u16,
 }
 
-/// The two topmost visible pixels at `x`: `[top, second]`. A layer is visible if its
-/// pixel is opaque and its bit is set in `enable[x]`. The backdrop always
-/// qualifies, so when fewer than two layers show, the remaining slots are backdrop
-/// (P2's blend must treat a backdrop top as "no second target").
+/// The active BGs of a line, front to back, with their priorities precomputed so the
+/// per-pixel loop does no register lookups.
+pub(super) struct Order {
+    bg: [u8; 4],
+    priority: [u8; 4],
+    n: usize,
+}
+
+impl Order {
+    /// BGs by priority, then index (GBATEK "LCD I/O BG Control").
+    fn new(regs: &Regs, active: &[bool; 4]) -> Self {
+        let mut o = Self {
+            bg: [0; 4],
+            priority: [0; 4],
+            n: 0,
+        };
+        for priority in 0..4u16 {
+            for (bg, &a) in active.iter().enumerate() {
+                if a && regs.bg_priority(bg) == priority {
+                    o.bg[o.n] = bg as u8;
+                    o.priority[o.n] = priority as u8;
+                    o.n += 1;
+                }
+            }
+        }
+        o
+    }
+}
+
+/// The topmost visible pixel at `x` and, if `SECOND`, the one below it: `[top,
+/// second]`. A layer is visible if its pixel is opaque and its bit is set in
+/// `enable[x]`. The backdrop always qualifies, so when fewer layers show, the
+/// remaining slots are backdrop (a backdrop top has no second target, which the
+/// blender checks).
 ///
-/// `order` lists the active BGs sorted by (priority, index). An OBJ pixel goes in
-/// front of every BG whose priority number is not lower than the OBJ's own, so
-/// OBJ wins ties (GBATEK "LCD OBJ - Overview": "OBJ priority ... same as BG").
+/// An OBJ pixel goes in front of every BG whose priority number is not lower than the
+/// OBJ's own, so OBJ wins ties (GBATEK "LCD OBJ - Overview": "OBJ priority ... same
+/// as BG"). `SECOND = false` stops after the first candidate.
 #[inline]
-fn resolve(x: usize, layers: &Layers, regs: &Regs, order: &[u8], backdrop: u16) -> [Candidate; 2] {
+fn resolve<const SECOND: bool>(
+    x: usize,
+    layers: &Layers,
+    order: &Order,
+    backdrop: u16,
+) -> [Candidate; 2] {
     let none = Candidate {
         layer: LAYER_BACKDROP,
         colour: backdrop,
     };
     let mut out = [none; 2];
     let mut n = 0;
+    let last = usize::from(SECOND);
     let enable = layers.enable[x];
     let obj_word = layers.obj[x];
     let mut obj_pending = enable & (1 << LAYER_OBJ) != 0 && obj_word & u32::from(TRANSPARENT) == 0;
-    let obj_priority = ((obj_word >> 16) & 3) as u16;
+    let obj_priority = ((obj_word >> 16) & 3) as u8;
     let obj = Candidate {
         layer: LAYER_OBJ,
         colour: (obj_word & 0x7FFF) as u16,
     };
-    for &bg in order {
-        let bg = bg as usize;
-        if obj_pending && obj_priority <= regs.bg_priority(bg) {
+    for i in 0..order.n {
+        if obj_pending && obj_priority <= order.priority[i] {
             out[n] = obj;
-            n += 1;
-            obj_pending = false;
-            if n == 2 {
+            if n == last {
                 return out;
             }
+            n += 1;
+            obj_pending = false;
         }
+        let bg = order.bg[i] as usize;
         if enable >> bg & 1 != 0 {
             let colour = layers.bg[bg][x];
             if colour != TRANSPARENT {
@@ -190,10 +285,10 @@ fn resolve(x: usize, layers: &Layers, regs: &Regs, order: &[u8], backdrop: u16) 
                     layer: bg as u8,
                     colour,
                 };
-                n += 1;
-                if n == 2 {
+                if n == last {
                     return out;
                 }
+                n += 1;
             }
         }
     }
@@ -206,7 +301,7 @@ fn resolve(x: usize, layers: &Layers, regs: &Regs, order: &[u8], backdrop: u16) 
 impl Ppu {
     /// Draw line `y` (0..160) into the back buffer from the current state.
     pub(super) fn render_line(&mut self, y: u32) {
-        let regs = Regs::from_io(&self.io);
+        let regs = Regs::from_io(&self.io, &self.affine_latch);
         let start = y as usize * SCREEN_WIDTH;
         let row: &mut Line = (&mut self.back[start..start + SCREEN_WIDTH])
             .try_into()
@@ -224,64 +319,49 @@ impl Ppu {
 
         // Which BGs draw, and how (DISPCNT BG mode, GBATEK "LCD I/O Display Control").
         let mut active = [false; 4];
-        match regs.mode() {
-            0 => {
-                for (bg, a) in active.iter_mut().enumerate() {
-                    *a = regs.bg_enabled(bg);
-                }
-            }
-            // P2: BG2 is affine in mode 1, BG2/BG3 in mode 2.
-            1 => {
-                for (bg, a) in active.iter_mut().enumerate().take(2) {
-                    *a = regs.bg_enabled(bg);
-                }
-            }
-            3..=5 => active[2] = regs.bg_enabled(2),
-            _ => {}
+        let bgs = match regs.mode() {
+            0 => 0..4,
+            1 => 0..3,
+            2 => 2..4,
+            3..=5 => 2..3,
+            _ => 0..0,
+        };
+        for bg in bgs {
+            active[bg] = regs.bg_enabled(bg);
         }
         for (bg, &a) in active.iter().enumerate() {
-            if !a {
-                continue;
-            }
-            let line = &mut layers.bg[bg];
-            match regs.mode() {
-                0 | 1 => bg::render_text(bg, &regs, &mem, y, line),
-                3 => bg::render_mode3(&mem, y, line),
-                4 => bg::render_mode4(&mem, regs.dispcnt & 0x10 != 0, y, line),
-                _ => bg::render_mode5(&mem, regs.dispcnt & 0x10 != 0, y, line),
+            if a {
+                bg::render(bg, &regs, &mem, y, &mut layers.bg[bg]);
             }
         }
+        let order = Order::new(&regs, &active);
 
-        // BGs front to back: by priority, then index (GBATEK "LCD I/O BG Control").
-        let mut order = [0u8; 4];
-        let mut n = 0;
-        for priority in 0..4 {
-            for (bg, &a) in active.iter().enumerate() {
-                if a && regs.bg_priority(bg) == priority {
-                    order[n] = bg as u8;
-                    n += 1;
-                }
-            }
-        }
-        let order = &order[..n];
+        // `obj::render_line` clears the OBJ line itself, so it is filled exactly once.
+        let obj_line = if regs.dispcnt & 0x1000 != 0 {
+            obj::render_line(&regs, &mem, y, &mut layers.obj)
+        } else {
+            layers.obj.fill(OBJ_EMPTY);
+            obj::ObjLine::default()
+        };
 
-        let obj_drawn =
-            regs.dispcnt & 0x1000 != 0 && obj::render_line(&regs, &mem, y, &mut layers.obj);
-
-        // P2: fill `enable` from the windows here.
-        layers.enable.fill(ENABLE_ALL);
+        window::fill_enable(&regs, y, layers, obj_line.touched);
 
         let backdrop = mem.colour(0);
-        if order.is_empty() && !obj_drawn {
-            row.fill(backdrop);
-            return;
-        }
-        if !obj_drawn {
-            // No sprite on this line: resolve against an empty OBJ line.
-            layers.obj.fill(OBJ_EMPTY);
-        }
-        for (x, px) in row.iter_mut().enumerate() {
-            *px = resolve(x, layers, &regs, order, backdrop)[0].colour;
+        let blend = effects::Blend::new(&regs);
+        if blend.active(obj_line.semi) {
+            for (x, px) in row.iter_mut().enumerate() {
+                let [top, second] = resolve::<true>(x, layers, &order, backdrop);
+                *px = if layers.enable[x] & ENABLE_EFFECTS != 0 {
+                    let semi = top.layer == LAYER_OBJ && layers.obj[x] & OBJ_SEMI != 0;
+                    blend.apply(top, second, semi)
+                } else {
+                    top.colour
+                };
+            }
+        } else {
+            for (x, px) in row.iter_mut().enumerate() {
+                *px = resolve::<false>(x, layers, &order, backdrop)[0].colour;
+            }
         }
     }
 }

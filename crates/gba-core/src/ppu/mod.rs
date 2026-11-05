@@ -14,10 +14,12 @@ use crate::scheduler::{Event, Scheduler};
 use crate::{CYCLES_PER_LINE, Framebuffer, LINES_PER_FRAME, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 mod bg;
+mod effects;
 mod obj;
 mod render;
 #[cfg(test)]
 mod tests;
+mod window;
 
 /// Cycles from the start of a line to the HBlank event: the line is rendered and
 /// the DISPSTAT HBlank flag rises here. 240 dots x 4 cycles = 960 is where the
@@ -61,6 +63,11 @@ pub struct Ppu {
     /// The I/O registers 0x000..0x060 as halfwords, exactly as written (reads
     /// apply per-register masks, see [`Ppu::read_io`]).
     io: [u16; 0x30],
+    /// The internal affine reference points `[BG2, BG3][x, y]` (20.8 fixed point,
+    /// sign-extended from 28 bits): what a line is drawn from. Reloaded from
+    /// BGxX/BGxY at VBlank and whenever either register is written, advanced by
+    /// PB/PD after each visible line (DECISIONS #58).
+    affine_latch: [[i32; 2]; 2],
     vcount: u16,
     /// The HBlank flag: set by the HBlank event, cleared at line end.
     hblank: bool,
@@ -80,11 +87,24 @@ impl Default for Ppu {
 
 impl Ppu {
     pub fn new() -> Self {
+        // The BIOS leaves the rotation/scaling matrices as the identity (PA = PD =
+        // 0x100 = 1.0), which the bitmap modes 3-5 draw through. The core starts
+        // after the BIOS (DECISIONS #47), so the registers start in that state.
+        let mut io = [0; 0x30];
+        for off in [
+            AFFINE_PA[0],
+            AFFINE_PA[0] + 6,
+            AFFINE_PA[1],
+            AFFINE_PA[1] + 6,
+        ] {
+            io[off >> 1] = 0x100;
+        }
         Self {
             palette: Box::new([0; 0x400]),
             vram: Box::new([0; 0x1_8000]),
             oam: Box::new([0; 0x400]),
-            io: [0; 0x30],
+            io,
+            affine_latch: [[0; 2]; 2],
             vcount: 0,
             hblank: false,
             layers: render::Layers::new(),
@@ -110,6 +130,7 @@ impl Ppu {
                     // The line is drawn from the state at HBlank; writes the CPU or
                     // an HBlank DMA makes after this point show on the next line.
                     self.render_line(line);
+                    self.advance_affine_latches();
                     sig.hblank_dma = true;
                 }
                 self.hblank = true;
@@ -121,6 +142,7 @@ impl Ppu {
                 self.hblank = false;
                 self.vcount = (self.vcount + 1) % LINES_PER_FRAME as u16;
                 if self.vcount == VBLANK_FIRST_LINE {
+                    self.reload_affine_latches();
                     std::mem::swap(&mut self.back, &mut self.front);
                     sig.vblank_dma = true;
                     sig.frame_done = true;
@@ -181,10 +203,49 @@ impl Ppu {
             mask & STAT_WRITE_MASK
         } else if i == VCOUNT_INDEX {
             return;
+        } else if i == 0 {
+            // DISPCNT bit 3 is the CGB-mode bit; only BIOS opcodes can set it
+            // (GBATEK "LCD I/O Display Control"), so it always reads 0.
+            mask & !DISPCNT_CGB_MODE
         } else {
             mask
         };
         self.io[i] = (self.io[i] & !mask) | (v & mask);
+        // Writing BGxX / BGxY copies the new value to the internal reference point at
+        // once (GBATEK "LCD I/O BG Rotation/Scaling").
+        for (n, &base) in AFFINE_PA.iter().enumerate() {
+            if (base + 8..base + 16).contains(&(i << 1)) {
+                self.reload_affine_latch(n);
+            }
+        }
+    }
+
+    /// Reload BG2 (`n` = 0) or BG3's (`n` = 1) reference point from BGxX/BGxY.
+    fn reload_affine_latch(&mut self, n: usize) {
+        let at = (AFFINE_PA[n] + 8) >> 1;
+        for axis in 0..2 {
+            let raw =
+                u32::from(self.io[at + axis * 2]) | u32::from(self.io[at + axis * 2 + 1]) << 16;
+            // 28-bit signed: shift the sign bit (27) up to bit 31 and back.
+            self.affine_latch[n][axis] = ((raw << 4) as i32) >> 4;
+        }
+    }
+
+    fn reload_affine_latches(&mut self) {
+        self.reload_affine_latch(0);
+        self.reload_affine_latch(1);
+    }
+
+    /// After a visible line: reference point += (PB, PD) (GBATEK: "The internal
+    /// registers are then incremented by dmx and dmy after each scanline").
+    fn advance_affine_latches(&mut self) {
+        for (n, &base) in AFFINE_PA.iter().enumerate() {
+            let pb = i32::from(self.io[(base + 2) >> 1] as i16);
+            let pd = i32::from(self.io[(base + 6) >> 1] as i16);
+            let l = &mut self.affine_latch[n];
+            l[0] = l[0].wrapping_add(pb);
+            l[1] = l[1].wrapping_add(pd);
+        }
     }
 
     /// DISPCNT (the bus needs the BG mode for VRAM 8-bit write rules). **Contract.**
@@ -202,6 +263,11 @@ impl Ppu {
         self.vcount
     }
 }
+
+/// DISPCNT bit 3.
+const DISPCNT_CGB_MODE: u16 = 1 << 3;
+/// I/O offsets of BG2PA and BG3PA; PB/PC/PD follow, then BGxX and BGxY.
+const AFFINE_PA: [usize; 2] = [0x020, 0x030];
 
 /// Indices into `io` (halfword offset / 2).
 const STAT_INDEX: usize = 0x004 >> 1;
