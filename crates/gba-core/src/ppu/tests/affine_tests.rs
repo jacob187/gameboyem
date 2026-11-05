@@ -356,3 +356,25 @@ fn the_last_tile_of_char_base_3_ends_at_the_64k_boundary() {
     rig.write(DISPCNT, 2 | bg_on(2));
     assert_eq!(px(&rig.frame(), 3, 3), pal_colour(77));
 }
+
+#[test]
+fn the_reference_point_stays_a_28_bit_signed_value_as_it_advances() {
+    // BG2X just below +2^27 with PB = +0x100: the second line's point wraps to
+    // -2^27 (code-review P2#3).
+    let mut rig = Rig::new();
+    rig.write(DISPCNT, 2);
+    set_matrix(&mut rig, BG2PA, [0x100, 0x100, 0, 0x100]);
+    set_ref(&mut rig, BG2X, 0x07FF_FF00);
+    assert_eq!(rig.ppu.affine_latch[0][0], 0x07FF_FF00);
+    rig.run_to_line(0, 1100);
+    assert_eq!(rig.ppu.affine_latch[0][0], -0x0800_0000);
+    rig.run_to_line(1, 1100);
+    assert_eq!(rig.ppu.affine_latch[0][0], -0x07FF_FF00);
+    // And the other way: -2^27 with PB = -0x100 wraps to +0x07FF_FF00.
+    let mut rig = Rig::new();
+    rig.write(DISPCNT, 2);
+    set_matrix(&mut rig, BG2PA, [0x100, -0x100, 0, 0x100]);
+    set_ref(&mut rig, BG2X, -0x0800_0000);
+    rig.run_to_line(0, 1100);
+    assert_eq!(rig.ppu.affine_latch[0][0], 0x07FF_FF00);
+}

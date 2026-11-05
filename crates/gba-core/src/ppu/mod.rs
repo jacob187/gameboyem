@@ -226,8 +226,7 @@ impl Ppu {
     fn reload_affine_latch(&mut self, n: usize, axis: usize) {
         let at = ((AFFINE_PA[n] + 8) >> 1) + axis * 2;
         let raw = u32::from(self.io[at]) | u32::from(self.io[at + 1]) << 16;
-        // 28-bit signed: shift the sign bit (27) up to bit 31 and back.
-        self.affine_latch[n][axis] = ((raw << 4) as i32) >> 4;
+        self.affine_latch[n][axis] = sign_extend_28(raw as i32);
     }
 
     fn reload_affine_latches(&mut self) {
@@ -245,8 +244,10 @@ impl Ppu {
             let pb = i32::from(self.io[(base + 2) >> 1] as i16);
             let pd = i32::from(self.io[(base + 6) >> 1] as i16);
             let l = &mut self.affine_latch[n];
-            l[0] = l[0].wrapping_add(pb);
-            l[1] = l[1].wrapping_add(pd);
+            // The registers are 28 bits wide: re-sign-extend from bit 27 so the
+            // point wraps at 2^27 like the hardware's.
+            l[0] = sign_extend_28(l[0].wrapping_add(pb));
+            l[1] = sign_extend_28(l[1].wrapping_add(pd));
         }
     }
 
@@ -264,6 +265,12 @@ impl Ppu {
     pub fn vcount(&self) -> u16 {
         self.vcount
     }
+}
+
+/// Keep the low 28 bits of `v` as a signed value: the sign bit (27) is shifted up
+/// to bit 31 and back.
+fn sign_extend_28(v: i32) -> i32 {
+    (v << 4) >> 4
 }
 
 /// DISPCNT bit 3.
