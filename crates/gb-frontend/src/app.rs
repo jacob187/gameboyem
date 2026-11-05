@@ -818,6 +818,7 @@ mod tests {
         assert_eq!(rec.header.model, Model::Cgb);
         let live = app.gb.cgb_framebuffer().expect("colour mode");
         assert_ne!(live[0], first, "the colour frame follows the joypad");
+        assert_eq!(live[0] & 0x0F, 0x0E, "Right held: D-pad nibble 1110");
         assert!(
             app.gb.framebuffer().iter().all(|&s| s == 0),
             "shades unused"

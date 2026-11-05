@@ -39,7 +39,7 @@ usage: gb [options] [--] <rom.gb|rom.gbc>
   --palette NAME   green (default) or grey (DMG only; colour games use their own colours)
   --model NAME     auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb
   --test-pattern   show a synthetic test pattern and tone instead of running the core
-  --record FILE    record every input to FILE (must not exist yet) for replay
+  --record FILE    record every input to FILE (must not exist) for `gb-test --replay`
   -h, --help       show this help
   --               end of options; the next argument is the ROM path, even if it starts with `-`
 ```
