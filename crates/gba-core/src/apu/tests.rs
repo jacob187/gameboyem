@@ -291,7 +291,7 @@ fn direct_sound_level_and_volume() {
 #[test]
 fn direct_sound_enables_per_side_and_fifo_b() {
     let mut a = on();
-    fifo_a(&mut a, 0x0104 | 0x0000, 0x4040_4040); // A right only
+    fifo_a(&mut a, 0x0104, 0x4040_4040); // A right only
     assert_eq!(peak(&mut a, 1000), (0.0, 0.5));
     let mut a = on();
     w(&mut a, SOUNDCNT_H, 0x2000 | 0x0008); // B left, 100%
@@ -351,7 +351,7 @@ fn refill_is_requested_at_16_bytes() {
     }
     assert!(!a.on_timer_overflow(0).a);
     // Timers 2 and 3 never reach the APU, and an unselected timer asks for nothing.
-    assert_eq!(a.on_timer_overflow(1).a, false);
+    assert!(!a.on_timer_overflow(1).a);
 }
 
 #[test]
