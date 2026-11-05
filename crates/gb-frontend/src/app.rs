@@ -36,6 +36,28 @@ fn surface_extent(width: u32, height: u32) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+/// What `upload` does about the pixel buffer for a frame of a given size.
+#[derive(Debug, PartialEq, Eq)]
+enum BufferPlan {
+    /// The buffer already has the frame's size.
+    Present,
+    /// Resize the buffer first.
+    Resize,
+    /// A resize failed earlier: leave the picture alone rather than retry (and
+    /// warn) every frame.
+    Skip,
+}
+
+fn buffer_plan(frame: (u32, u32), buffer: (u32, u32), resize_failed: bool) -> BufferPlan {
+    if frame == buffer {
+        BufferPlan::Present
+    } else if resize_failed {
+        BufferPlan::Skip
+    } else {
+        BufferPlan::Resize
+    }
+}
+
 /// The name shown in the window title before the game's.
 fn app_name(system: System) -> &'static str {
     match system {
@@ -84,6 +106,8 @@ pub struct App<C: Core> {
     title: String,
     /// Size of the `pixels` buffer; follows the core's frame size.
     buffer_size: (u32, u32),
+    /// A buffer resize failed (and was reported once); see [`BufferPlan::Skip`].
+    resize_failed: bool,
     /// Save-state feedback shown in the title until the given instant.
     status: Option<(String, Instant)>,
     test: Option<TestMode>,
@@ -145,6 +169,7 @@ impl<C: Core> App<C> {
             scale,
             title,
             buffer_size: (SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32),
+            resize_failed: false,
             status: None,
             test,
             shutdown,
@@ -423,15 +448,20 @@ impl<C: Core> App<C> {
         let Some(p) = self.pixels.as_mut() else {
             return;
         };
-        if size != self.buffer_size {
-            if let Err(e) = p.resize_buffer(size.0, size.1) {
-                eprintln!(
-                    "warning: cannot resize the frame buffer to {}x{}: {e}",
-                    size.0, size.1
-                );
-                return;
-            }
-            self.buffer_size = size;
+        match buffer_plan(size, self.buffer_size, self.resize_failed) {
+            BufferPlan::Present => {}
+            BufferPlan::Skip => return,
+            BufferPlan::Resize => match p.resize_buffer(size.0, size.1) {
+                Ok(()) => self.buffer_size = size,
+                Err(e) => {
+                    self.resize_failed = true;
+                    eprintln!(
+                        "warning: cannot resize the frame buffer to {}x{}: {e}; the picture stops updating",
+                        size.0, size.1
+                    );
+                    return;
+                }
+            },
         }
         present(&frame, &self.palette, p.frame_mut());
     }
@@ -578,6 +608,17 @@ mod tests {
     use super::*;
     use gb_core::{FRAMES_PER_SECOND, GameBoy, M_CYCLES_PER_FRAME, Model};
     use std::fs;
+
+    #[test]
+    fn a_failed_buffer_resize_is_not_retried() {
+        let (old, new) = ((160, 144), (240, 160));
+        assert_eq!(buffer_plan(old, old, false), BufferPlan::Present);
+        assert_eq!(buffer_plan(new, old, false), BufferPlan::Resize);
+        // After a failure the new size is skipped every frame, not retried...
+        assert_eq!(buffer_plan(new, old, true), BufferPlan::Skip);
+        // ...and a frame that fits the old buffer still shows.
+        assert_eq!(buffer_plan(old, old, true), BufferPlan::Present);
+    }
 
     #[test]
     fn zero_sized_surface_is_not_drawable() {
