@@ -26,6 +26,7 @@ use gba_homebrew::font;
 const ROUND_FRAMES: u32 = 30 * 60;
 const TITLE_TIMEOUT: u32 = 600;
 const GLINTS: usize = 5;
+const RNG_SEED: u32 = 0xC0FF_EE11;
 
 /// Counts VBlank interrupts; animation clock only (game logic uses its own
 /// frame counters). thumbv4t has no atomic read-modify-write, so load+store.
@@ -366,7 +367,7 @@ fn main(mut gba: agb::Gba) -> ! {
     ];
     let glint_frames = [sprite(&GLINT[0], Size::S8x8), sprite(&GLINT[1], Size::S8x8)];
 
-    let mut rng = Rng(0xC0FF_EE11);
+    let mut rng = Rng(RNG_SEED);
     let mut glints = [Glint { x16: 0, y: 0 }; GLINTS];
     for (i, g) in glints.iter_mut().enumerate() {
         *g = respawn(&mut rng, true, i);
@@ -392,6 +393,11 @@ fn main(mut gba: agb::Gba) -> ! {
                 score = 0;
                 time_left = ROUND_FRAMES;
                 (mx, my) = (40, 72);
+                // Same glint layout every round, whatever the title lasted.
+                rng = Rng(RNG_SEED);
+                for (i, g) in glints.iter_mut().enumerate() {
+                    *g = respawn(&mut rng, true, i);
+                }
                 sfx(&mut mixer, START);
             }
             State::Title => my = 72 + ((state_frames as i32 / 2) % 32 - 16).abs() - 8,
