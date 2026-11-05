@@ -93,19 +93,26 @@ clean:
 #
 #   make -C homebrew gba                    # writes $(OUT)/grains.gba and moth.gba
 GBA_DIR    := gba
-GBA_GAMES  := grains moth
+# name:header title (<= 12 bytes):game code (4 bytes); the ELF is $(GBA_ELF)/<name>.
+GBA_GAMES  := grains:GRAINS:AGRN moth:MOTH:AMTH
 GBA_ELF    := $(GBA_DIR)/target/thumbv4t-none-eabi/release
 GBAFIX     ?= $(firstword $(wildcard ../tools/agb/bin/agb-gbafix) agb-gbafix)
+gba_field   = $(word $(2),$(subst :, ,$(1)))
+GBA_ROMS   := $(foreach g,$(GBA_GAMES),$(OUT)/$(call gba_field,$(g),1).gba)
 
 .PHONY: gba gba-clean
 
+# Fail before the (slow) nightly build if agb-gbafix is missing.
 gba:
+	@command -v $(GBAFIX) >/dev/null 2>&1 || { \
+	  echo "error: agb-gbafix not found (looked in ../tools/agb/bin and on PATH)." >&2; \
+	  echo "       install it: cargo install agb-gbafix --version 0.25.0 --locked --root tools/agb" >&2; \
+	  exit 1; }
 	cd $(GBA_DIR) && cargo build --release --locked
 	mkdir -p $(OUT)
-	$(GBAFIX) $(GBA_ELF)/grains -t GRAINS -c AGRN -m 00 -o $(OUT)/grains.gba
-	$(GBAFIX) $(GBA_ELF)/moth -t MOTH -c AMTH -m 00 -o $(OUT)/moth.gba
-	sh $(GBA_DIR)/check-header.sh $(foreach g,$(GBA_GAMES),$(OUT)/$(g).gba)
+	$(foreach g,$(GBA_GAMES),$(GBAFIX) $(GBA_ELF)/$(call gba_field,$(g),1) -t $(call gba_field,$(g),2) -c $(call gba_field,$(g),3) -m 00 -o $(OUT)/$(call gba_field,$(g),1).gba && ) true
+	sh $(GBA_DIR)/check-header.sh $(GBA_ROMS)
 
 gba-clean:
 	rm -rf $(GBA_DIR)/target
-	rm -f $(foreach g,$(GBA_GAMES),$(OUT)/$(g).gba)
+	rm -f $(GBA_ROMS)
