@@ -167,7 +167,6 @@ They stand in for commercial games in the harness. All 13 boot, and 3 of the DMG
   - Speed-switch edge cases: the LCD and APU phase across a switch and the DIV-reset edges of the fast timer rates are not exact (AGE `speed-switch` 2 / 6; DECISIONS #38). CGB APU differences fail 6 Blargg `cgb_sound` ROMs.
   - No colourisation of DMG games: a flag-less cartridge on a forced `--model cgb` runs in DMG-compatibility mode in the `--palette` shades, because the boot ROM's compatibility palettes aren't modelled.
   - No infrared port (RP, FF56).
-  - Serial fast clock: SC bit 1 (the 262144 Hz clock) is not modelled; in CGB mode it reads as 1 and transfers run at 8192 Hz.
   - CGB-mode post-boot timing is approximate. The DIV and serial phase and the PPU line and dot at hand-off are the compat-mode calibration or a guess, because no test ROM pins them (DECISIONS #33, #34). The CGB boot ROM's clearing of wave RAM isn't modelled either. The palette-port lock timing reuses the VRAM lock timing and is unverified (DECISIONS #36).
 - **Not supported:** link cable, debugger, rewind and shaders.
 - **No boot ROM.** The emulator starts in the documented post-boot state.
