@@ -2,8 +2,9 @@
 //! the FNV-1a hash of the framebuffer (little-endian bytes). Set `GBA_PPU_DUMP=1`
 //! to write the frames as PNGs into `target/gba-ppu/` for a visual check.
 //!
-//! The scenes use only P1 features (no windows, blending, mosaic, affine BGs or
-//! sprites) and leave those registers at zero, so P2 must not change any hash.
+//! The first six scenes use only P1 features (no windows, blending, mosaic, affine
+//! BGs or sprites) and leave those registers at zero, so P2 must not change their
+//! hashes. The last three pin the P2 features.
 
 mod common;
 
@@ -295,6 +296,136 @@ fn golden_mode5_small_bitmap_with_backdrop_border_and_sprites() {
     assert_eq!(render("mode5", &mut ppu, &mut sched), GOLDEN[5]);
 }
 
+/// Write `v` to OAM halfword `half` of entry `index`.
+fn oam16(ppu: &mut Ppu, index: usize, half: usize, v: u16) {
+    set16(&mut ppu.oam[..], index * 8 + half * 2, v);
+}
+
+/// OR `bits` into attribute 0 of sprite `index`.
+fn oam_attr0_or(ppu: &mut Ppu, index: usize, bits: u16) {
+    let o = index * 8;
+    let v = u16::from_le_bytes([ppu.oam[o], ppu.oam[o + 1]]) | bits;
+    set16(&mut ppu.oam[..], o, v);
+}
+
+/// Rotation/scaling parameter group `g` (the fourth halfword of OAM entries 4g..4g+3).
+fn oam_group(ppu: &mut Ppu, g: usize, m: [i16; 4]) {
+    for (i, v) in m.into_iter().enumerate() {
+        set16(&mut ppu.oam[..], g * 32 + 6 + i * 8, v as u16);
+    }
+}
+
+#[test]
+fn golden_mode2_affine_backgrounds_and_affine_sprites() {
+    let (mut ppu, mut sched) = new_ppu();
+    palettes(&mut ppu);
+    // 8bpp tiles 0..62 (62 and 63 stay empty: transparent).
+    tiles8(&mut ppu, 0, 62);
+    tiles4(&mut ppu, OBJ_VRAM, 1024);
+    // BG2: 512x512 (64x64 tiles) at screen block 2, wraparound on, priority 2,
+    // rotated 30 degrees about the screen centre.
+    for ty in 0..64usize {
+        for tx in 0..64usize {
+            ppu.vram[0x1000 + ty * 64 + tx] = ((tx * 5 + ty * 3) % 62 + 1) as u8;
+        }
+    }
+    reg(&mut ppu, 0x00C, 2 | 2 << 8 | 1 << 13 | 2 << 14);
+    for (i, v) in [222i16, -128, 128, 222].into_iter().enumerate() {
+        reg(&mut ppu, 0x020 + 2 * i as u32, v as u16);
+    }
+    // Texel (256, 256) at the screen centre (120, 80).
+    let x0 = 256 * 256 - (222 * 120 - 128 * 80);
+    let y0 = 256 * 256 - (128 * 120 + 222 * 80);
+    reg(&mut ppu, 0x028, x0 as u16);
+    reg(&mut ppu, 0x02A, (x0 >> 16) as u16);
+    reg(&mut ppu, 0x02C, y0 as u16);
+    reg(&mut ppu, 0x02E, (y0 >> 16) as u16);
+    // BG3: 128x128 (16x16 tiles) at screen block 6, no wrap, priority 1, zoomed out 2x,
+    // mostly transparent (tile 63).
+    for ty in 0..16usize {
+        for tx in 0..16usize {
+            ppu.vram[0x3000 + ty * 16 + tx] = if (tx + ty) % 3 == 0 {
+                ((tx * 4 + ty) % 62 + 1) as u8
+            } else {
+                63
+            };
+        }
+    }
+    reg(&mut ppu, 0x00E, 1 | 6 << 8);
+    for (i, v) in [0x200i16, 0, 0, 0x200].into_iter().enumerate() {
+        reg(&mut ppu, 0x030 + 2 * i as u32, v as u16);
+    }
+    sprites(&mut ppu, 1);
+    // Three double-size 32x32 affine sprites: 30 degree rotation, 2x zoom, 60 degrees
+    // at a 3/4 scale, on parameter groups 0, 1, 2.
+    oam_group(&mut ppu, 0, [222, -128, 128, 222]);
+    oam_group(&mut ppu, 1, [0x80, 0, 0, 0x80]);
+    oam_group(&mut ppu, 2, [96, -166, 166, 96]);
+    for (k, (x, y)) in [(20u16, 90u16), (100, 20), (170, 96)]
+        .into_iter()
+        .enumerate()
+    {
+        let i = 120 + k;
+        oam16(&mut ppu, i, 0, y | 0x300);
+        oam16(&mut ppu, i, 1, x | (k as u16) << 9 | 2 << 14);
+        oam16(&mut ppu, i, 2, (40 + k * 17) as u16 | (k as u16) << 12);
+    }
+    // 2D mapping (DISPCNT bit 6 clear), BG2 + BG3 + OBJ.
+    reg(&mut ppu, 0x000, 2 | 0x0C00 | 0x1000);
+    assert_eq!(render("mode2_affine", &mut ppu, &mut sched), GOLDEN[6]);
+}
+
+/// Mode 0 scene (as `text_scene`) under WIN0, WIN1 and an OBJ window with alpha blending.
+#[test]
+fn golden_mode0_windows_and_alpha_blending() {
+    let (mut ppu, mut sched) = new_ppu();
+    text_scene(&mut ppu, 0);
+    // Every sixth sprite is semi-transparent.
+    for i in (0..24).step_by(6) {
+        oam_attr0_or(&mut ppu, i, 1 << 10);
+    }
+    // An OBJ-window sprite (mode 2, 64x64, tile 5) at (150, 8).
+    oam16(&mut ppu, 126, 0, 8 | 2 << 10);
+    oam16(&mut ppu, 126, 1, 150 | 3 << 14);
+    oam16(&mut ppu, 126, 2, 5);
+    // WIN0 x 30..130 y 20..100: BG0, BG1, BG3, OBJ, effects.
+    reg(&mut ppu, 0x040, 30 << 8 | 130);
+    reg(&mut ppu, 0x044, 20 << 8 | 100);
+    // WIN1 x 110..220 y 60..140: BG1, BG2 only, no effects.
+    reg(&mut ppu, 0x042, 110 << 8 | 220);
+    reg(&mut ppu, 0x046, 60 << 8 | 140);
+    reg(&mut ppu, 0x048, 0x3B | 0x06 << 8);
+    // Outside: BG0, BG1, BG3, OBJ and effects; OBJ window: BG2 and OBJ, effects.
+    reg(&mut ppu, 0x04A, 0x3B | 0x34 << 8);
+    // Alpha: first BG1 | BG3 | OBJ, second BG0 | BG2 | backdrop, EVA 9, EVB 7.
+    reg(
+        &mut ppu,
+        0x050,
+        0x02 | 0x08 | 0x10 | 1 << 6 | (0x01 | 0x04 | 0x20) << 8,
+    );
+    reg(&mut ppu, 0x052, 9 | 7 << 8);
+    reg(&mut ppu, 0x000, 0x0F00 | 0x1000 | 0x40 | 0xE000);
+    assert_eq!(
+        render("mode0_window_blend", &mut ppu, &mut sched),
+        GOLDEN[7]
+    );
+}
+
+#[test]
+fn golden_mode0_bg_and_obj_mosaic() {
+    let (mut ppu, mut sched) = new_ppu();
+    text_scene(&mut ppu, 0);
+    // BG0 and BG2 take part in mosaic, BG1 and BG3 do not; half the sprites do.
+    reg(&mut ppu, 0x008, 3 | 16 << 8 | 1 << 6);
+    reg(&mut ppu, 0x00C, 3 | 20 << 8 | 3 << 14 | 1 << 6);
+    for i in (0..24).step_by(2) {
+        oam_attr0_or(&mut ppu, i, 1 << 12);
+    }
+    // BG 5x4, OBJ 3x2 (the register holds size - 1).
+    reg(&mut ppu, 0x04C, 4 | 3 << 4 | 2 << 8 | 1 << 12);
+    assert_eq!(render("mode0_mosaic", &mut ppu, &mut sched), GOLDEN[8]);
+}
+
 /// Pinned after checking the PNGs. What each shows (240x160, 2x scaled PNGs):
 /// 0. four text BGs (4bpp 32x32, 8bpp 64x32 scrolled, 4bpp 64x64 scrolled, sparse
 ///    BG3 in front) with 1D-mapped sprites;
@@ -302,12 +433,20 @@ fn golden_mode5_small_bitmap_with_backdrop_border_and_sprites() {
 /// 2. sprites only on the dark-blue backdrop (affine BGs are P2);
 /// 3. an RGB gradient with a checker (mode 3), sprites using tiles 512+;
 /// 4. diagonal colour bands from page 1 (page 0 is a decoy) around a backdrop hole;
-/// 5. a 160x128 gradient (page 0) with the backdrop to the right and below.
-const GOLDEN: [u64; 6] = [
+/// 5. a 160x128 gradient (page 0) with the backdrop to the right and below;
+/// 6. (P2) mode 2: a 512x512 wrapping affine BG2 rotated 30 degrees, a zoomed-out
+///    sparse BG3 in front, and three double-size affine sprites;
+/// 7. (P2) the mode 0 scene under WIN0, WIN1 and an OBJ window with alpha blending
+///    and semi-transparent sprites;
+/// 8. (P2) the mode 0 scene with BG0/BG2 mosaic (5x4) and OBJ mosaic (3x2).
+const GOLDEN: [u64; 9] = [
     0x0aa0448b2beba7aa,
     0xe6b20d59ec66d383,
     0xa66b48f4bce9452c,
     0xf8afc72b9c76adfb,
     0xa223c6968e134494,
     0x3bb8f624b318c130,
+    0xf1378c6038df51ef,
+    0x8046baf87e1d7b12,
+    0xec85c4d085ff35b0,
 ];

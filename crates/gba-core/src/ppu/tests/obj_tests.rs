@@ -298,7 +298,7 @@ fn sprite_vs_background_priority_obj_wins_ties() {
 }
 
 #[test]
-fn disabled_affine_and_prohibited_sprites_are_not_drawn() {
+fn disabled_and_prohibited_sprites_are_not_drawn() {
     let mut rig = Rig::new();
     rig.distinct_palette();
     solid_obj_tiles(&mut rig);
@@ -307,13 +307,6 @@ fn disabled_affine_and_prohibited_sprites_are_not_drawn() {
         0,
         attr0(0, 0, false) | 0x200,
         attr1(0, 0, 0),
-        attr2(1, 0, 0),
-    );
-    // Affine sprites are drawn by P2; P1 skips them.
-    rig.oam(
-        1,
-        attr0(0, 0, false) | 0x100,
-        attr1(16, 0, 0),
         attr2(1, 0, 0),
     );
     // Shape 3 is prohibited.
@@ -336,7 +329,7 @@ fn disabled_affine_and_prohibited_sprites_are_not_drawn() {
     rig.oam(5, attr0(0, 0, false), attr1(80, 0, 0), attr2(1, 0, 0));
     rig.write(DISPCNT, OBJ_ON | ONE_D);
     let f = rig.frame();
-    for x in [0, 16, 32, 48, 64] {
+    for x in [0, 32, 48, 64] {
         assert_eq!(px(&f, x, 0), pal_colour(0), "x {x}");
     }
     assert_eq!(px(&f, 80, 0), obj_colour(2));
@@ -419,4 +412,272 @@ fn obj_tile_index_wraps_in_the_32k_obj_area() {
     let f = rig.frame();
     assert_eq!(px(&f, 0, 0), obj_colour(1 + 1023 % 15));
     assert_eq!(px(&f, 8, 0), obj_colour(1));
+}
+
+// ---- Affine (rotation/scaling) sprites ----
+
+const AFFINE: u16 = 0x100;
+const DOUBLE: u16 = 0x200;
+
+/// Parameter group `g`: PA..PD are the fourth halfword of OAM entries 4g..4g+3.
+fn set_group(rig: &mut Rig, g: usize, [pa, pb, pc, pd]: [i16; 4]) {
+    for (i, v) in [pa, pb, pc, pd].into_iter().enumerate() {
+        let o = g * 32 + 6 + i * 8;
+        rig.ppu.oam[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// attr1 of an affine sprite: x, size and the parameter group in bits 9-13.
+fn affine_attr1(x: u16, size: u16, group: u16) -> u16 {
+    (x & 0x1FF) | group << 9 | size << 14
+}
+
+/// Colour of texel (u, v) of a 16x16 4bpp [`patterned_tiles`] sprite whose first tile
+/// is `base`.
+fn texel16(base: usize, one_d: bool, u: usize, v: usize) -> u16 {
+    let n = base
+        + if one_d {
+            (v / 8) * 2 + u / 8
+        } else {
+            (v / 8) * 32 + u / 8
+        };
+    obj_colour(1 + ((v % 8) * 3 + (u % 8) + n) % 15)
+}
+
+/// A rig with one 16x16 affine sprite (OAM 0) at (40, 30), tiles from 100, group 0.
+fn affine_rig(one_d: bool, double: bool, matrix: [i16; 4]) -> Rig {
+    let mut rig = Rig::new();
+    rig.distinct_palette();
+    rig.hide_all_sprites();
+    patterned_tiles(&mut rig);
+    set_group(&mut rig, 0, matrix);
+    let a0 = attr0(30, 0, false) | AFFINE | if double { DOUBLE } else { 0 };
+    rig.oam(0, a0, affine_attr1(40, 1, 0), attr2(100, 0, 0));
+    rig.write(DISPCNT, OBJ_ON | if one_d { ONE_D } else { 0 });
+    rig
+}
+
+#[test]
+fn affine_identity_matches_the_plain_sprite_in_1d_and_2d() {
+    for one_d in [false, true] {
+        let mut rig = affine_rig(one_d, false, [0x100, 0, 0, 0x100]);
+        let f = rig.frame();
+        for (u, v) in [(0, 0), (7, 7), (8, 0), (15, 15), (3, 12), (12, 4)] {
+            assert_eq!(
+                px(&f, 40 + u, 30 + v),
+                texel16(100, one_d, u, v),
+                "1d={one_d} ({u},{v})"
+            );
+        }
+        assert_eq!(px(&f, 56, 30), pal_colour(0), "right of the box");
+        assert_eq!(px(&f, 40, 46), pal_colour(0), "below the box");
+        assert_eq!(px(&f, 39, 30), pal_colour(0), "left of the box");
+    }
+}
+
+#[test]
+fn affine_zoom_in_is_clipped_to_the_box_without_double_size() {
+    // PA = PD = 0x80: each box pixel steps half a texel, the sprite shows its centre
+    // 8x8 texels at 2x, and nothing outside the 16x16 box.
+    let mut rig = affine_rig(true, false, [0x80, 0, 0, 0x80]);
+    let f = rig.frame();
+    for (ix, iy) in [(0, 0), (1, 1), (5, 9), (15, 15), (8, 8)] {
+        assert_eq!(
+            px(&f, 40 + ix, 30 + iy),
+            texel16(100, true, 4 + ix / 2, 4 + iy / 2),
+            "({ix},{iy})"
+        );
+    }
+    assert_eq!(px(&f, 56, 38), pal_colour(0));
+    assert_eq!(px(&f, 48, 46), pal_colour(0));
+}
+
+#[test]
+fn double_size_doubles_the_box_so_the_whole_sprite_shows() {
+    // Identity with double size: the 16x16 image sits centred in a 32x32 box.
+    let mut rig = affine_rig(true, true, [0x100, 0, 0, 0x100]);
+    let f = rig.frame();
+    assert_eq!(px(&f, 40, 30), pal_colour(0), "box corner is empty");
+    assert_eq!(
+        px(&f, 40 + 7, 30 + 8),
+        pal_colour(0),
+        "just left of the image"
+    );
+    assert_eq!(px(&f, 40 + 8, 30 + 8), texel16(100, true, 0, 0));
+    assert_eq!(px(&f, 40 + 23, 30 + 23), texel16(100, true, 15, 15));
+    assert_eq!(
+        px(&f, 40 + 24, 30 + 8),
+        pal_colour(0),
+        "just right of the image"
+    );
+    // At 2x zoom the image fills the whole 32x32 box.
+    set_group(&mut rig, 0, [0x80, 0, 0, 0x80]);
+    let f = rig.frame();
+    for (ix, iy) in [(0, 0), (31, 31), (17, 5), (9, 22)] {
+        assert_eq!(
+            px(&f, 40 + ix, 30 + iy),
+            texel16(100, true, ix / 2, iy / 2),
+            "({ix},{iy})"
+        );
+    }
+    assert_eq!(px(&f, 72, 30), pal_colour(0), "past the box");
+    assert_eq!(px(&f, 40, 62), pal_colour(0), "below the box");
+}
+
+#[test]
+fn affine_swapped_matrix_transposes() {
+    for double in [false, true] {
+        // u = y, v = x (about the centre).
+        let mut rig = affine_rig(false, double, [0, 0x100, 0x100, 0]);
+        let f = rig.frame();
+        let off = if double { 8 } else { 0 };
+        for (u, v) in [(0, 0), (3, 9), (15, 1), (12, 12)] {
+            // Box pixel (ix, iy) = (v + off, u + off) shows texel (iy - off, ix - off).
+            assert_eq!(
+                px(&f, 40 + v + off, 30 + u + off),
+                texel16(100, false, u, v),
+                "double={double} ({u},{v})"
+            );
+        }
+    }
+}
+
+#[test]
+fn rotated_sprites_are_cut_by_a_normal_box_but_not_by_a_double_one() {
+    // About 45 degrees: PA = PD = 181, PB = -181, PC = 181 (0xB5 / 256 ~ 0.707).
+    let m = [181, -181, 181, 181];
+    let count = |f: &[u16], size: usize| {
+        let mut n = 0;
+        for y in 0..size {
+            for x in 0..size {
+                n += usize::from(px(f, 40 + x, 30 + y) != pal_colour(0));
+            }
+        }
+        n
+    };
+    let normal = affine_rig(true, false, m).frame();
+    let double = affine_rig(true, true, m).frame();
+    let (n, d) = (count(&normal, 16), count(&double, 32));
+    // The rotated 16x16 square covers about 256 pixels, the normal box clips it.
+    assert!(d > n + 40, "double {d} vs normal {n}");
+    // The corners of the double box are empty, the centre is not.
+    assert_eq!(px(&double, 40, 30), pal_colour(0));
+    assert_eq!(px(&double, 71, 30), pal_colour(0));
+    assert_ne!(px(&double, 56, 46), pal_colour(0));
+    // The normal box loses the corner the rotation pushes outside the image.
+    assert_eq!(px(&normal, 40 + 15, 30), pal_colour(0));
+}
+
+#[test]
+fn affine_parameter_groups_are_independent_and_group_31_is_the_last_oam_slot() {
+    let mut rig = Rig::new();
+    rig.distinct_palette();
+    rig.hide_all_sprites();
+    patterned_tiles(&mut rig);
+    set_group(&mut rig, 0, [0x100, 0, 0, 0x100]);
+    set_group(&mut rig, 31, [0x80, 0, 0, 0x80]);
+    rig.oam(
+        0,
+        attr0(0, 0, false) | AFFINE,
+        affine_attr1(0, 1, 0),
+        attr2(100, 0, 0),
+    );
+    rig.oam(
+        1,
+        attr0(0, 0, false) | AFFINE,
+        affine_attr1(32, 1, 31),
+        attr2(100, 0, 0),
+    );
+    // Entry 127's attr3 (OAM 0x3FE) is group 31's PD: the hide_all fill did not
+    // break it because set_group wrote after.
+    rig.write(DISPCNT, OBJ_ON | ONE_D);
+    let f = rig.frame();
+    assert_eq!(px(&f, 5, 3), texel16(100, true, 5, 3));
+    assert_eq!(px(&f, 32 + 5, 3), texel16(100, true, 4 + 5 / 2, 4 + 3 / 2));
+    assert_eq!(rig.ppu.oam[0x3FE..0x400], 0x80i16.to_le_bytes());
+}
+
+#[test]
+fn affine_eight_bpp_sprite_uses_the_matrix() {
+    let mut rig = Rig::new();
+    rig.distinct_palette();
+    rig.hide_all_sprites();
+    // 16x16 8bpp: 4 tiles of 2 slots; fill tile slot pair `t` with index 1 + t / 2.
+    for t in (0..64usize).step_by(2) {
+        let a = OBJ_VRAM + (10 + t) * 32;
+        rig.ppu.vram[a..a + 64].fill((1 + t / 2) as u8);
+    }
+    set_group(&mut rig, 3, [0x100, 0, 0, 0x100]);
+    rig.oam(
+        0,
+        attr0(0, 0, true) | AFFINE,
+        affine_attr1(0, 1, 3),
+        attr2(10, 0, 5),
+    );
+    rig.write(DISPCNT, OBJ_ON | ONE_D);
+    let f = rig.frame();
+    // 1D: tiles of a row are consecutive, 2 slots each: (0,0)=slot 10, (8,0)=12,
+    // (0,8)=14, (8,8)=16 -> indices 1, 2, 3, 4 (the palette bank is ignored).
+    assert_eq!(px(&f, 2, 2), obj_colour(1));
+    assert_eq!(px(&f, 10, 2), obj_colour(2));
+    assert_eq!(px(&f, 2, 10), obj_colour(3));
+    assert_eq!(px(&f, 10, 10), obj_colour(4));
+}
+
+#[test]
+fn affine_sprites_clip_at_the_left_edge_and_wrap_in_y() {
+    let mut rig = affine_rig(true, false, [0x100, 0, 0, 0x100]);
+    // x = -10 (9-bit 502): screen column 0 is texel column 10.
+    rig.oam(
+        0,
+        attr0(30, 0, false) | AFFINE,
+        affine_attr1(502, 1, 0),
+        attr2(100, 0, 0),
+    );
+    let f = rig.frame();
+    assert_eq!(px(&f, 0, 30), texel16(100, true, 10, 0));
+    assert_eq!(px(&f, 5, 33), texel16(100, true, 15, 3));
+    assert_eq!(px(&f, 6, 30), pal_colour(0));
+    // A double-size box at y = 250 spans lines 250..256 and 0..26.
+    set_group(&mut rig, 0, [0x100, 0, 0, 0x100]);
+    rig.oam(
+        0,
+        attr0(250, 0, false) | AFFINE | DOUBLE,
+        affine_attr1(100, 1, 0),
+        attr2(100, 0, 0),
+    );
+    let f = rig.frame();
+    // Box row 14..24 holds the image: screen line 14 - 6 = 8 is box row 14, texel row 6.
+    assert_eq!(px(&f, 100 + 8, 8), texel16(100, true, 0, 6));
+    assert_eq!(
+        px(&f, 100 + 8, 25),
+        pal_colour(0),
+        "box row 31 is below the image"
+    );
+    assert_eq!(px(&f, 108, 27), pal_colour(0));
+}
+
+#[test]
+fn affine_sprites_obey_priority_and_the_bitmap_tile_rule() {
+    let mut rig = affine_rig(true, false, [0x100, 0, 0, 0x100]);
+    // A regular sprite of better priority on top of the affine one.
+    solid_obj_tiles(&mut rig);
+    rig.oam(1, attr0(30, 0, false), attr1(40, 0, 0), attr2(1, 0, 0));
+    rig.oam(
+        0,
+        attr0(30, 0, false) | AFFINE,
+        affine_attr1(40, 1, 0),
+        attr2(100, 1, 0),
+    );
+    let f = rig.frame();
+    assert_eq!(px(&f, 40, 30), obj_colour(2), "priority 0 sprite wins");
+    assert_ne!(px(&f, 48, 30), obj_colour(2));
+    // Mode 3: tiles below 512 are not shown, affine or not.
+    rig.write(DISPCNT, 3 | OBJ_ON | ONE_D);
+    let f = rig.frame();
+    assert_eq!(
+        px(&f, 48, 38),
+        pal_colour(0),
+        "tile 100 hidden in a bitmap mode"
+    );
 }
