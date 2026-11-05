@@ -27,11 +27,13 @@ impl Gba {
             Some(data) => (Cpu::reset(), Bios::Real(data)),
             None => (Cpu::post_bios(), Bios::Hle),
         };
-        Ok(Self {
-            cpu,
-            bus: Bus::new(cart, bios),
-            rom_hash,
-        })
+        let hle = matches!(bios, Bios::Hle);
+        let mut bus = Bus::new(cart, bios);
+        if hle {
+            // P2-BIOS: the I/O and IWRAM state the BIOS leaves (DECISIONS #64).
+            crate::bios::post_boot(&mut bus);
+        }
+        Ok(Self { cpu, bus, rom_hash })
     }
 
     /// Run until the next VBlank starts (one frame), with a two-frame safety cap.
