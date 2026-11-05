@@ -2,7 +2,7 @@
 
 use crate::bios::Bios;
 use crate::bus::Bus;
-use crate::cart::{Cart, CartError};
+use crate::cart::{Cart, CartError, SaveKind};
 use crate::cpu::{Cpu, Registers};
 use crate::keypad::Button;
 use crate::{CYCLES_PER_FRAME, Framebuffer};
@@ -134,6 +134,13 @@ impl Gba {
     /// size is still unknown).
     pub fn battery_ram(&self) -> Option<&[u8]> {
         self.bus.cart.battery_ram()
+    }
+
+    /// The backup chip the ROM's library string names, `SaveKind::None` without
+    /// one. Unlike [`Gba::battery_ram`] it is known from power-on, even for an
+    /// EEPROM whose size is not.
+    pub fn save_kind(&self) -> SaveKind {
+        self.bus.cart.save_kind()
     }
 
     /// Counter that advances only when the game changes save data (or a save is
