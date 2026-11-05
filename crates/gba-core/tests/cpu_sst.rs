@@ -238,6 +238,10 @@ struct Stats {
     state_bad: usize,
     tx_bad: usize,
     cycles_ok: usize,
+    /// Cases without a write transaction, and how many of those match the
+    /// `cycle` field (stores repeat the previous cycle in the data).
+    no_write: usize,
+    no_write_cycles_ok: usize,
     seq_ok: usize,
 }
 
@@ -305,6 +309,10 @@ fn run_case(c: &Case, verbose_budget: &mut usize, stats: &mut Stats) {
     stats.state_bad += usize::from(!state_ok);
     stats.tx_bad += usize::from(!tx_ok);
     stats.cycles_ok += usize::from(cycles_ok);
+    if c.txs.iter().all(|t| t.kind != 2) {
+        stats.no_write += 1;
+        stats.no_write_cycles_ok += usize::from(cycles_ok);
+    }
     stats.seq_ok += usize::from(seq_ok);
     if state_ok && tx_ok {
         stats.passed += 1;
@@ -373,9 +381,15 @@ fn run_file(name: &str) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../roms/test/gba/sst");
     let path = dir.join(format!("{name}.json.bin"));
     let Ok(bytes) = std::fs::read(&path) else {
+        // The 900 MB set is opt-in (`fetch-gba-test-roms.sh --with-sst`): skip if
+        // none of it is present; a partly fetched set is an error in CI.
+        let populated = std::fs::read_dir(&dir).is_ok_and(|d| {
+            d.flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".json.bin"))
+        });
         assert!(
-            std::env::var_os("CI").is_none(),
-            "{} missing in CI",
+            !(populated && std::env::var_os("CI").is_some()),
+            "{} missing in CI but other SST files are present",
             path.display()
         );
         eprintln!("skip {name}: {} not found", path.display());
@@ -394,14 +408,16 @@ fn run_file(name: &str) {
         run_case(c, &mut verbose, &mut stats);
     }
     eprintln!(
-        "{name}: {}/{} pass, {} excluded (state bad {}, transactions bad {}, N/S ok {}, cycle field ok {})",
+        "{name}: {}/{} pass, {} excluded (state bad {}, transactions bad {}, N/S ok {}, cycle field ok {}, without writes {}/{})",
         stats.passed,
         stats.total,
         stats.excluded,
         stats.state_bad,
         stats.tx_bad,
         stats.seq_ok,
-        stats.cycles_ok
+        stats.cycles_ok,
+        stats.no_write_cycles_ok,
+        stats.no_write
     );
     let failed = stats.total - stats.passed;
     assert!(

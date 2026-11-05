@@ -146,7 +146,14 @@ fn load(rel: &str) -> Option<Vec<u8>> {
     match std::fs::read(&p) {
         Ok(d) => Some(d),
         Err(_) => {
-            assert!(std::env::var_os("CI").is_none(), "{rel} missing in CI");
+            // Nothing fetched at all: skip. A partly fetched set is an error in CI.
+            let populated = p
+                .parent()
+                .is_some_and(|d| d.read_dir().is_ok_and(|mut i| i.next().is_some()));
+            assert!(
+                !(populated && std::env::var_os("CI").is_some()),
+                "{rel} missing in CI but the ROM set is present"
+            );
             eprintln!("skip {rel}: {} not found", p.display());
             None
         }
@@ -277,6 +284,14 @@ fn fuzzarm(name: &str) {
         stuck > 1000,
         "{name}: never reached an idle loop in {steps} instructions (pc {last:#X})"
     );
+    assert_eq!(
+        bus.rd32(last),
+        0xEAFF_FFFE,
+        "{name}: stopped in something other than `b .` at {last:#X}"
+    );
+    if std::env::var_os("ROM_TEST_SPEED").is_some() {
+        eprintln!("{name}: ended in `b .` at {last:#X}");
+    }
 }
 
 #[test]
