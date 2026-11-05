@@ -9,16 +9,18 @@
 //! performance change can be checked for bit-identical behaviour by comparing
 //! the hashes before and after. Not part of `cargo test`.
 //!
-//! The ROMs run on a DMG, except cgb-acid2, which runs on a CGB in colour mode
-//! (`Model::Cgb`) to cover the colour renderer. Its video hash covers the RGB555
-//! frame instead of the shade frame: every pixel as two little-endian bytes, in
+//! The ROMs run on a DMG, except cgb-acid2 and uCity, which run on a CGB in colour
+//! mode (`Model::Cgb`): cgb-acid2 covers the colour renderer, uCity switches to
+//! double speed at about frame 15 and so covers that clocking path. Their video
+//! hashes cover the RGB555 frame instead of the shade frame: every pixel as two little-endian bytes, in
 //! row-major order. The serial and audio hashes are computed the same way for all
 //! ROMs. A missing ROM fails the run, whichever ROM it is.
 //!
 //! The "overall" line is the mean speed across all ROMs (total frames over total
-//! emulation time), so it covers the colour renderer as well as the DMG one;
-//! `--min-speed` compares against it. It is not comparable with figures from
-//! before cgb-acid2 joined the set (about 2650-2730 fps over the four DMG ROMs).
+//! emulation time), so it covers the colour renderer and double speed as well as
+//! the DMG path; `--min-speed` compares against it. It is not comparable with
+//! figures from before cgb-acid2 or uCity joined the set (about 2650-2730 fps over
+//! the four DMG ROMs).
 //! The per-ROM lines are unaffected.
 //!
 //! * `--check` compares each ROM against `crates/gb-test/bench-pins.txt` and fails
@@ -37,12 +39,13 @@ use gb_test::{roms_dir, workspace_root};
 
 /// ROMs (relative to the ROMs directory) in the benchmark, with the model each
 /// one runs on.
-const ROMS: [(&str, Model); 5] = [
+const ROMS: [(&str, Model); 6] = [
     ("test/dmg-acid2/dmg-acid2.gb", Model::Dmg),
     ("test/blargg/cpu_instrs/cpu_instrs.gb", Model::Dmg),
     ("homebrew/snake.gb", Model::Dmg),
     ("homebrew/breakout.gb", Model::Dmg),
     ("test/cgb-acid2/cgb-acid2.gbc", Model::Cgb),
+    ("corpus/ucity.gb", Model::Cgb),
 ];
 
 const DEFAULT_FRAMES: u32 = 3600;
