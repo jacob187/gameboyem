@@ -706,6 +706,7 @@ name = "gb-test"
 version = "0.1.0"
 dependencies = [
  "gb-core",
+ "gba-core",
  "libtest-mimic",
  "png",
 ]
