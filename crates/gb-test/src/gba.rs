@@ -272,9 +272,20 @@ fn dump(args: &[String]) -> Result<(), String> {
     let stem = PathBuf::from(rom_path)
         .file_stem()
         .map_or_else(|| "rom".into(), |s| s.to_string_lossy().into_owned());
+    // `step_frame` should advance `frames()` by one each call; if it does not (a wedged core),
+    // give up after 4x the frames requested instead of spinning forever.
+    let max_calls = 4 * frames.last().copied().unwrap_or(0) + 4;
+    let mut calls = 0u64;
     for f in frames {
         while gba.frames() < f {
+            if calls >= max_calls {
+                return Err(format!(
+                    "frame counter stuck at {} after {calls} step_frame calls (wanted frame {f})",
+                    gba.frames()
+                ));
+            }
             gba.step_frame();
+            calls += 1;
         }
         let out = Path::new(out_dir).join(format!("{stem}-{f}.png"));
         save_gba_png(gba.framebuffer(), &out)?;
