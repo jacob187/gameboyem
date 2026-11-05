@@ -6,6 +6,7 @@ use crate::{CYCLES_PER_FRAME, SCREEN_WIDTH, VISIBLE_LINES};
 
 mod affine_tests;
 mod bg_tests;
+mod blend_tests;
 mod obj_tests;
 mod window_tests;
 
