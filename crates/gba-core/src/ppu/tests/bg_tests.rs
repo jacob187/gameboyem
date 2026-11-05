@@ -5,10 +5,6 @@ use super::*;
 const BG2_ON: u16 = 0x0400;
 const FRAME1: u16 = 0x0010;
 
-fn bg_on(bg: usize) -> u16 {
-    0x100 << bg
-}
-
 #[test]
 fn forced_blank_is_white_and_a_disabled_screen_shows_the_backdrop() {
     let mut rig = Rig::new();
@@ -88,22 +84,6 @@ fn bitmap_modes_need_the_bg2_enable_bit() {
         let f = rig.frame();
         assert!(f.iter().all(|&p| p == rgb(4, 5, 6)), "mode {mode}");
     }
-}
-
-/// Write a 4bpp tile whose pixel (r, c) is `1 + (r * 3 + c) % 15`.
-fn tile4(rig: &mut Rig, char_base: usize, tile: usize) {
-    for r in 0..8 {
-        for c in 0..4 {
-            let lo = 1 + (r * 3 + 2 * c) % 15;
-            let hi = 1 + (r * 3 + 2 * c + 1) % 15;
-            rig.ppu.vram[char_base + tile * 32 + r * 4 + c] = (lo | hi << 4) as u8;
-        }
-    }
-}
-
-/// The 4bpp test tile's palette index at row `r`, column `c`.
-fn t4(r: usize, c: usize) -> usize {
-    1 + (r * 3 + c) % 15
 }
 
 #[test]
@@ -284,19 +264,6 @@ fn bg_tile_data_beyond_64k_is_not_shown() {
     rig.write(DISPCNT, bg_on(0));
     let f = rig.frame();
     assert_eq!(px(&f, 0, 0), pal_colour(0));
-}
-
-/// A BG whose every cell is a solid 8bpp tile of palette index `idx` (char base 0,
-/// tile `1 + bg`, screen block `8 + bg`).
-fn solid_bg(rig: &mut Rig, bg: usize, idx: u8, priority: u16) {
-    let tile = 1 + bg;
-    rig.ppu.vram[tile * 64..tile * 64 + 64].fill(idx);
-    let screen_base = (8 + bg) * 0x800;
-    for i in 0..32 * 32 {
-        rig.vram16(screen_base + i * 2, tile as u16);
-    }
-    let cnt = priority | 1 << 7 | ((8 + bg) as u16) << 8;
-    rig.write(0x008 + 2 * bg as u32, cnt);
 }
 
 #[test]

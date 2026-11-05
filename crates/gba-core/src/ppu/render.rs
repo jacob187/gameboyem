@@ -38,18 +38,15 @@ const ENABLE_ALL: u8 = 0x1F | ENABLE_EFFECTS;
 /// 10-11), bit 18 [`OBJ_SEMI`], bit 19 [`OBJ_WINDOW`].
 pub(super) const OBJ_EMPTY: u32 = TRANSPARENT as u32;
 /// The sprite pixel came from a semi-transparent sprite (attr0 mode 1).
-#[allow(dead_code)]
 pub(super) const OBJ_SEMI: u32 = 1 << 18;
 /// Some OBJ-window sprite (attr0 mode 2) covers this pixel. Such sprites draw no
 /// colour; they only mark the OBJ window.
-#[allow(dead_code)]
 pub(super) const OBJ_WINDOW: u32 = 1 << 19;
 
 /// Read-only views of the three memories a line is drawn from.
 pub(super) struct Mem<'a> {
     pub vram: &'a [u8; 0x1_8000],
     pub palette: &'a [u8; 0x400],
-    #[allow(dead_code)]
     pub oam: &'a [u8; 0x400],
 }
 

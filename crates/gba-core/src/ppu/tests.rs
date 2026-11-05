@@ -113,6 +113,40 @@ impl Rig {
     }
 }
 
+/// DISPCNT enable bit of BG `bg`.
+pub(super) fn bg_on(bg: usize) -> u16 {
+    0x100 << bg
+}
+
+/// Write a 4bpp tile whose pixel (r, c) is `1 + (r * 3 + c) % 15`.
+pub(super) fn tile4(rig: &mut Rig, char_base: usize, tile: usize) {
+    for r in 0..8 {
+        for c in 0..4 {
+            let lo = 1 + (r * 3 + 2 * c) % 15;
+            let hi = 1 + (r * 3 + 2 * c + 1) % 15;
+            rig.ppu.vram[char_base + tile * 32 + r * 4 + c] = (lo | hi << 4) as u8;
+        }
+    }
+}
+
+/// The 4bpp test tile's palette index at row `r`, column `c`.
+pub(super) fn t4(r: usize, c: usize) -> usize {
+    1 + (r * 3 + c) % 15
+}
+
+/// A BG whose every cell is a solid 8bpp tile of palette index `idx` (char base 0,
+/// tile `1 + bg`, screen block `8 + bg`).
+pub(super) fn solid_bg(rig: &mut Rig, bg: usize, idx: u8, priority: u16) {
+    let tile = 1 + bg;
+    rig.ppu.vram[tile * 64..tile * 64 + 64].fill(idx);
+    let screen_base = (8 + bg) * 0x800;
+    for i in 0..32 * 32 {
+        rig.vram16(screen_base + i * 2, tile as u16);
+    }
+    let cnt = priority | 1 << 7 | ((8 + bg) as u16) << 8;
+    rig.write(0x008 + 2 * bg as u32, cnt);
+}
+
 /// The colour [`Rig::distinct_palette`] gives entry `i`.
 pub(super) fn pal_colour(i: usize) -> u16 {
     (i as u16) * 7 + 1
