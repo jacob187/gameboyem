@@ -13,11 +13,33 @@ use gb_test::{in_ci, roms_dir};
 
 const BEFORE: u32 = 240;
 const AFTER: u32 = 240;
-/// Where to save, in M-cycles after `step_frame` returns (the start of VBlank,
+/// Where to save, in lines after `step_frame` returns (the start of VBlank,
 /// line 144): lines 50 and 140 of the next frame. Mid-frame saves put per-line
 /// and per-frame PPU state (window line, sprite buffer, ...) in the snapshot,
 /// and line 140 falls inside the bottom status bars games draw with the window.
-const SAVE_OFFSETS: [u64; 2] = [(10 + 50) * 114, (10 + 140) * 114];
+const SAVE_LINES: [u64; 2] = [10 + 50, 10 + 140];
+
+/// CPU M-cycles per line (456 dots): 114 at normal speed, 228 in double speed, where the CPU
+/// runs twice as fast against the PPU.
+fn mcycles_per_line(gb: &GameBoy) -> u64 {
+    if gb.double_speed() { 228 } else { 114 }
+}
+
+/// Corpus ROMs that need a CGB (colour renderer, VRAM banks, palette RAM, double speed), and
+/// cgbdemo from `homebrew/`. They replay as `Model::Cgb`; the other corpus ROMs replay as DMG.
+const CGB_ROMS: [&str; 7] = [
+    "corpus/aevilia.gb",
+    "corpus/escape-obliterizer-dx.gb",
+    "corpus/geometrix.gb",
+    "corpus/rebound.gb",
+    "corpus/tobutobugirl-dx.gb",
+    "corpus/ucity.gb",
+    "homebrew/cgbdemo.gb",
+];
+
+/// ROMs that must be in double speed at the save point, so that case really replays that
+/// clocking path (uCity switches at about frame 15).
+const DOUBLE_SPEED_ROMS: [&str; 1] = ["corpus/ucity.gb"];
 
 /// A ROM and the console to run it on.
 type Case = (PathBuf, Model);
@@ -43,14 +65,24 @@ fn roms() -> Vec<Case> {
         .filter(|p| p.is_file()),
     );
     out.sort();
-    let mut cases: Vec<Case> = out.into_iter().map(|p| (p, Model::Dmg)).collect();
-    // CGB colour mode (cgb-acid2: RGB555 frames, palette RAM, attributes; Aevilia, a CGB-only
-    // MBC5 RPG with 128 KiB of cartridge RAM, from the corpus) and a flag-less ROM on a CGB
+    let cgb_roms = CGB_ROMS.map(|p| root.join(p));
+    let mut cases: Vec<Case> = out
+        .into_iter()
+        .map(|p| {
+            let model = if cgb_roms.contains(&p) {
+                Model::Cgb
+            } else {
+                Model::Dmg
+            };
+            (p, model)
+        })
+        .collect();
+    // CGB colour mode (cgb-acid2: RGB555 frames, palette RAM, attributes; the corpus and
+    // homebrew CGB games above, from the globs) and a flag-less ROM on a CGB
     // (DMG-compatibility mode).
     cases.extend(
         [
             ("test/cgb-acid2/cgb-acid2.gbc", Model::Cgb),
-            ("corpus/aevilia.gb", Model::Cgb),
             ("test/dmg-acid2/dmg-acid2.gb", Model::Cgb),
         ]
         .map(|(p, m)| (root.join(p), m))
@@ -98,11 +130,15 @@ fn run(gb: &mut GameBoy, start: u32, frames: u32) -> (u64, u64, Vec<u8>) {
     (video, audio, gb.take_serial_output())
 }
 
-fn check((path, model): &Case, offset: u64) -> Result<(), String> {
+fn check((path, model): &Case, lines: u64) -> Result<(), String> {
     let rom = std::fs::read(path).map_err(|e| e.to_string())?;
     let mut a = GameBoy::with_model(rom.clone(), *model).map_err(|e| format!("{e:?}"))?;
     run(&mut a, 0, BEFORE);
-    let target = a.mcycles() + offset;
+    let root = roms_dir();
+    if DOUBLE_SPEED_ROMS.iter().any(|p| root.join(p) == *path) && !a.double_speed() {
+        return Err(format!("not in double speed after {BEFORE} frames"));
+    }
+    let target = a.mcycles() + lines * mcycles_per_line(&a);
     while a.mcycles() < target {
         a.step_instruction();
     }
@@ -151,12 +187,12 @@ fn save_state_replays_identically() {
     let failures: Vec<String> = std::thread::scope(|s| {
         let handles: Vec<_> = roms
             .iter()
-            .flat_map(|p| SAVE_OFFSETS.map(|o| (p, o)))
-            .map(|(c, o)| {
+            .flat_map(|p| SAVE_LINES.map(|l| (p, l)))
+            .map(|(c, l)| {
                 s.spawn(move || {
-                    check(c, o)
+                    check(c, l)
                         .err()
-                        .map(|e| format!("{} ({:?}, offset {o}): {e}", c.0.display(), c.1))
+                        .map(|e| format!("{} ({:?}, line {l}): {e}", c.0.display(), c.1))
                 })
             })
             .collect();
