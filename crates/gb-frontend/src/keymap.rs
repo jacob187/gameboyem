@@ -16,6 +16,8 @@ pub enum Action {
     LoadState,
     /// Choose save-state slot 1..=9.
     SelectSlot(u8),
+    /// Save the current picture as a PNG (and mark the frame in a recording).
+    Screenshot,
 }
 
 pub fn map(key: KeyCode) -> Option<Action> {
@@ -42,6 +44,7 @@ pub fn map(key: KeyCode) -> Option<Action> {
         KeyCode::Digit7 => Action::SelectSlot(7),
         KeyCode::Digit8 => Action::SelectSlot(8),
         KeyCode::Digit9 => Action::SelectSlot(9),
+        KeyCode::KeyC => Action::Screenshot,
         _ => return None,
     })
 }
@@ -113,7 +116,45 @@ mod tests {
         assert_eq!(map(KeyCode::Digit1), Some(Action::SelectSlot(1)));
         assert_eq!(map(KeyCode::Digit9), Some(Action::SelectSlot(9)));
         assert_eq!(map(KeyCode::Digit0), None);
+        assert_eq!(map(KeyCode::KeyC), Some(Action::Screenshot));
         assert_eq!(map(KeyCode::KeyQ), None);
+    }
+
+    #[test]
+    fn every_non_button_action_has_its_own_key() {
+        // Screenshot (C) must not collide with save states (S, L, 1-9) or the
+        // joypad: each of these keys maps to a different action.
+        let keys = [
+            KeyCode::KeyC,
+            KeyCode::KeyS,
+            KeyCode::KeyL,
+            KeyCode::KeyP,
+            KeyCode::Tab,
+            KeyCode::Escape,
+        ]
+        .into_iter()
+        .chain([
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ]);
+        let mut seen = Vec::new();
+        for key in keys {
+            let action = map(key).expect("bound");
+            assert!(!seen.contains(&action), "{action:?} is bound twice");
+            seen.push(action);
+        }
+        assert_eq!(map(KeyCode::KeyC), Some(Action::Screenshot));
+        let mut s = InputState::default();
+        for key in [KeyCode::KeyC, KeyCode::KeyS, KeyCode::KeyL, KeyCode::Digit1] {
+            assert_eq!(s.key(key, true), None, "{key:?} must not move a button");
+        }
     }
 
     #[test]

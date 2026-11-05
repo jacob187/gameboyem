@@ -25,6 +25,7 @@ pub mod joypad;
 mod mmu;
 pub mod model;
 pub mod ppu;
+pub mod replay;
 pub mod serial;
 pub mod state;
 pub mod timer;

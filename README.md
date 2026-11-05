@@ -39,6 +39,7 @@ usage: gb [options] [--] <rom.gb|rom.gbc>
   --palette NAME   green (default) or grey (DMG only; colour games use their own colours)
   --model NAME     auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb
   --test-pattern   show a synthetic test pattern and tone instead of running the core
+  --record FILE    record every input to FILE (must not exist yet) for replay
   -h, --help       show this help
   --               end of options; the next argument is the ROM path, even if it starts with `-`
 ```
@@ -69,7 +70,25 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 | Fast-forward (hold) | Tab |
 | Save state / load state | S / L |
 | Select state slot | 1-9 |
+| Screenshot (and mark the frame) | C |
 | Quit | Esc |
+
+## Recording, replay and screenshots
+
+Press **C** to save the exact 160×144 picture as a PNG next to the ROM, named `<rom>-f<frame>.png`. It is greyscale for a DMG, and RGB (RGB555 widened with no colour correction) for a Game Boy Color game in colour mode.
+
+`gb --record session.gbinput game.gb` also records every button change, keyed by frame, plus the battery RAM and the console model (DMG or Game Boy Color, as `--model` resolved it) the session started from. The file grows by about 9 bytes per button change, which is roughly 20–100 KB per hour of play. Screenshots taken while recording mark their frame in the file. The window title shows `[rec]`.
+
+The core is deterministic, so a recording reproduces the session exactly without a window:
+
+```sh
+cargo run -p gb-test --release -- --replay session.gbinput game.gb               # dump every marked frame + the last one
+cargo run -p gb-test --release -- --replay session.gbinput game.gb --dump 600,900 --out shots/
+```
+
+Loading a save state (**L**) while recording ends the recording at that frame, with a note on stderr, because the replay could not follow the jump. The file still replays up to that point; start a new `--record` to go on. Saving a state does not affect a recording.
+
+Replayed frames go to `target/gb-test-out/replay/<recording>/` by default. A replayed marker frame is byte-identical to the screenshot taken while playing. A recording made with a different ROM is rejected, and a Game Boy Color session replays as a Game Boy Color. Recordings made before the model was stored (format version 1) replay as a DMG. If the game crashes or is killed, the file lacks its end record and replays up to the last input.
 
 ## Tests
 

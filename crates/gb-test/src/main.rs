@@ -5,6 +5,9 @@
 //! `-- --bench [FRAMES] [REPEATS] [--check] [--min-speed N] [--print-pins]` instead runs the
 //! speed benchmark (`bench.rs`).
 //!
+//! `-- --replay REC ROM [--dump F,F,...] [--out DIR]` instead plays back a
+//! recording made with `gb --record` (`replay.rs`).
+//!
 //! Exit status is nonzero with `--fail-on-mismatch` if any result differs from
 //! `expected.txt` (or a ROM is missing in CI).
 
@@ -14,6 +17,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 mod bench;
+mod replay;
 
 use gb_test::{Case, Outcome, in_ci, load_manifest, run_case};
 
@@ -23,6 +27,9 @@ fn main() -> ExitCode {
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if args.iter().any(|a| a == "--bench") {
         return bench::run(&args);
+    }
+    if args.iter().any(|a| a == "--replay") {
+        return replay::run(&args);
     }
     let cases: Vec<Case> = load_manifest()
         .into_iter()

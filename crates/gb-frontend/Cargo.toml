@@ -16,6 +16,7 @@ winit.workspace = true
 pixels.workspace = true
 cpal.workspace = true
 ctrlc.workspace = true
+png = "0.18"
 
 [dev-dependencies]
 tempfile.workspace = true

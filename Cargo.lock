@@ -696,6 +696,7 @@ dependencies = [
  "ctrlc",
  "gb-core",
  "pixels",
+ "png",
  "tempfile",
  "winit",
 ]

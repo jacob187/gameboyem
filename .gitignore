@@ -4,6 +4,7 @@
 /roms/
 /games/
 *.sav
+*.gbinput
 .DS_Store
 .claude/
 homebrew/**/build/

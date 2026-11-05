@@ -7,6 +7,7 @@ mod audio;
 mod cli;
 mod keymap;
 mod pacer;
+mod record;
 mod rom;
 mod save;
 mod shutdown;
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
     };
     let archive = rom::archive_kind(&rom);
     let model = opts.model.resolve(&rom);
+    let rom_hash = gb_core::replay::rom_hash(&rom);
     let mut gb = match GameBoy::with_model(rom, model) {
         Ok(gb) => gb,
         Err(e) => {
@@ -85,6 +87,28 @@ fn main() -> ExitCode {
     let mut saves = SaveManager::new(&opts.rom, Instant::now());
     saves.load(&mut gb);
 
+    // The recording starts from the battery RAM the session actually powered on with.
+    let recorder = match &opts.record {
+        None => None,
+        Some(path) => {
+            let header = gb_core::replay::Header {
+                rom_hash,
+                battery: gb.battery_ram(),
+                model,
+            };
+            match record::Recorder::create(path, &header) {
+                Ok(r) => {
+                    eprintln!("recording inputs to {}", path.display());
+                    Some(r)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
     let event_loop = match EventLoop::new() {
         Ok(l) => l,
         Err(e) => {
@@ -117,7 +141,9 @@ fn main() -> ExitCode {
         opts.scale,
         opts.test_pattern,
         shutdown,
-    );
+    )
+    .with_rom_path(opts.rom.clone())
+    .with_recorder(recorder);
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {
         eprintln!("error: {e}");
