@@ -62,6 +62,7 @@ fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
 }
 
 /// Fold an RGB555 frame into a hash as little-endian bytes, whatever the host.
+// Independent by design: tests/save_state.rs folds its own copy, and the two hashes are never compared.
 fn fnv_frame16(mut h: u64, frame: &[u16]) -> u64 {
     for px in frame {
         h = fnv(h, &px.to_le_bytes());

@@ -450,17 +450,8 @@ fn run_mooneye(gb: &mut GameBoy, max_frames: u32) -> Outcome {
 /// (0xFF→0 lightest, 0xAA→1, 0x55→2, 0x00→3), per the dmg-acid2 README.
 pub fn load_reference(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
-    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
-        return Err(format!("reference is {}x{}", info.width, info.height));
-    }
-    let channels = info.color_type.samples();
-    buf[..info.buffer_size()]
-        .chunks_exact(channels)
+    let (buf, color_type) = decode_screen_png(std::io::BufReader::new(file))?;
+    buf.chunks_exact(color_type.samples())
         .map(|px| match px[0] {
             0xFF => Ok(0),
             0xAA => Ok(1),
@@ -471,8 +462,26 @@ pub fn load_reference(path: &Path) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Write a framebuffer as a greyscale PNG (for debugging failed comparisons).
-pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
+/// Decode a PNG that must be exactly screen-sized, with palettes expanded and 16-bit samples
+/// reduced to 8: the samples (row-major, `color_type.samples()` per pixel) and the colour type.
+fn decode_screen_png(
+    src: impl std::io::BufRead + std::io::Seek,
+) -> Result<(Vec<u8>, png::ColorType), String> {
+    let mut decoder = png::Decoder::new(src);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
+        return Err(format!("reference is {}x{}", info.width, info.height));
+    }
+    buf.truncate(info.buffer_size());
+    Ok((buf, info.color_type))
+}
+
+/// Write screen-sized 8-bit `samples` as a PNG of the given colour type, creating parent
+/// directories (for debugging failed comparisons).
+fn save_screen_png(samples: &[u8], color: png::ColorType, path: &Path) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -482,12 +491,17 @@ pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
         SCREEN_WIDTH as u32,
         SCREEN_HEIGHT as u32,
     );
-    enc.set_color(png::ColorType::Grayscale);
+    enc.set_color(color);
     enc.set_depth(png::BitDepth::Eight);
-    let grey: Vec<u8> = fb.iter().map(|&s| 0xFF - 0x55 * (s & 3)).collect();
     enc.write_header()
-        .and_then(|mut w| w.write_image_data(&grey))
+        .and_then(|mut w| w.write_image_data(samples))
         .map_err(|e| e.to_string())
+}
+
+/// Write a framebuffer as a greyscale PNG (for debugging failed comparisons).
+pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
+    let grey: Vec<u8> = fb.iter().map(|&s| 0xFF - 0x55 * (s & 3)).collect();
+    save_screen_png(&grey, png::ColorType::Grayscale, path)
 }
 
 /// Load a 160x144 reference PNG as RGB888. Indexed (palette), greyscale and
@@ -500,43 +514,19 @@ pub fn load_reference_rgb(path: &Path) -> Result<Vec<[u8; 3]>, String> {
 fn decode_reference_rgb(
     src: impl std::io::BufRead + std::io::Seek,
 ) -> Result<Vec<[u8; 3]>, String> {
-    let mut decoder = png::Decoder::new(src);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
-    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
-        return Err(format!("reference is {}x{}", info.width, info.height));
-    }
-    let channels = info.color_type.samples();
-    let to_rgb: fn(&[u8]) -> [u8; 3] = match info.color_type {
+    let (buf, color_type) = decode_screen_png(src)?;
+    let to_rgb: fn(&[u8]) -> [u8; 3] = match color_type {
         png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => |px| [px[0]; 3],
         png::ColorType::Rgb | png::ColorType::Rgba => |px| [px[0], px[1], px[2]],
         png::ColorType::Indexed => return Err("palette was not expanded".into()),
     };
-    Ok(buf[..info.buffer_size()]
-        .chunks_exact(channels)
-        .map(to_rgb)
-        .collect())
+    Ok(buf.chunks_exact(color_type.samples()).map(to_rgb).collect())
 }
 
 /// Write an RGB888 framebuffer as a PNG (for debugging failed comparisons).
 pub fn save_rgb_png(fb: &[[u8; 3]], path: &Path) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(
-        std::io::BufWriter::new(file),
-        SCREEN_WIDTH as u32,
-        SCREEN_HEIGHT as u32,
-    );
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
     let rgb: Vec<u8> = fb.iter().flatten().copied().collect();
-    enc.write_header()
-        .and_then(|mut w| w.write_image_data(&rgb))
-        .map_err(|e| e.to_string())
+    save_screen_png(&rgb, png::ColorType::Rgb, path)
 }
 
 /// Where failing-test artifacts (actual framebuffers) are written.
@@ -607,10 +597,9 @@ fn run_acid2_cgb(gb: &mut GameBoy, case: &Case) -> Outcome {
     if let Some(fail) = run_to_acid2_signal(gb, case.max_frames) {
         return fail;
     }
-    let Some(fb) = gb.cgb_framebuffer() else {
-        return Outcome::Fail(
-            "cgb_framebuffer() is None: the machine is not rendering in CGB colour mode".into(),
-        );
+    let fb = match cgb_frame(gb) {
+        Ok(fb) => fb,
+        Err(o) => return o,
     };
     let actual: Vec<[u8; 3]> = fb.iter().map(|&px| gb_core::rgb555_to_rgb888(px)).collect();
     let diff = actual
@@ -1296,12 +1285,9 @@ fn cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Result<(), Outcome> {
     let cells = cgbdemo_cells();
     let fb = cgb_frame(&s.gb)?;
 
-    let seen: std::collections::HashSet<u16> = fb.iter().copied().collect();
-    check(seen.len() >= CGBDEMO_MIN_COLOURS, || {
-        format!(
-            "{} distinct colours, want at least {CGBDEMO_MIN_COLOURS}",
-            seen.len()
-        )
+    let colours = distinct_colours(fb);
+    check(colours >= CGBDEMO_MIN_COLOURS, || {
+        format!("{colours} distinct colours, want at least {CGBDEMO_MIN_COLOURS}")
     })?;
 
     // The sprite's core starts one pixel in from the rim, at the ROM's start position.
@@ -2088,6 +2074,87 @@ mod tests {
         let out = run_play(&rom, Model::Dmg, &play_script(Button::A), 100);
         assert!(
             matches!(&out, Outcome::Fail(m) if m.contains("input had no effect")),
+            "{out}"
+        );
+    }
+
+    /// A CGB-flagged ROM that draws one BG tile with a stripe: BG palette 0 colour 0 is white
+    /// and colour 1 is `colour1` (RGB555, little-endian). It then latches every button in
+    /// `mask` (P1 bits 3:0 = Start, Select, B, A) it sees pressed into the low byte of colour 1
+    /// (the latch starts as that byte and survives the release), so the picture changes after such a press and
+    /// otherwise never does.
+    fn smoke_cgb_rom(colour1: [u8; 2], mask: u8) -> Vec<u8> {
+        #[rustfmt::skip]
+        let code = [
+            0xF3,                         // di
+            0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA, // wait for LY == 144
+            0xAF, 0xE0, 0x40,             // LCD off
+            0x21, 0x00, 0x80, 0x01, 0x00, 0x20, // hl = $8000, bc = $2000
+            0xAF, 0x22, 0x0B, 0x78, 0xB1, 0x20, 0xF9, // clear VRAM
+            0x21, 0x00, 0x80, 0x36, 0xFF, // tile 0, first row = colour 1
+            0x3E, 0x80, 0xE0, 0x68,       // BCPS: index 0, auto-increment
+            0x3E, 0xFF, 0xE0, 0x69, 0x3E, 0x7F, 0xE0, 0x69, // colour 0 = white
+            0x3E, colour1[0], 0xE0, 0x69, 0x3E, colour1[1], 0xE0, 0x69, // colour 1
+            0x3E, 0x91, 0xE0, 0x40,       // LCD on, BG on
+            0x06, colour1[0],             // b = latch = colour 1's low byte
+            // loop:
+            0x3E, 0x10, 0xE0, 0x00,       // select the buttons
+            0xF0, 0x00, 0x2F, 0xE6, mask, // a = pressed buttons in mask
+            0xB0, 0x47,                   // a |= b; b = a
+            0x3E, 0x82, 0xE0, 0x68,       // BCPS: colour 1, low byte
+            0x78, 0xE0, 0x69,             // BCPD = latch
+            0x18, 0xEC,                   // jr loop
+        ];
+        let mut rom = synth_rom(0x00, 0, &code);
+        rom[0x143] = 0xC0;
+        rom
+    }
+
+    /// Colour 1 starts black; the stripe is visible.
+    const BLACK: [u8; 2] = [0x00, 0x00];
+
+    fn smoke_cgb(rom: Vec<u8>, model: Model) -> Outcome {
+        let mut gb = GameBoy::with_model(rom, model).expect("synthetic ROM loads");
+        run_smoke_cgb(&mut gb, 20)
+    }
+
+    #[test]
+    fn smoke_cgb_passes_when_start_or_a_changes_the_picture() {
+        for mask in [0x08, 0x01] {
+            let out = smoke_cgb(smoke_cgb_rom(BLACK, mask), Model::Cgb);
+            assert_eq!(out, Outcome::Pass, "mask {mask:#04X}: {out}");
+        }
+    }
+
+    #[test]
+    fn smoke_cgb_fails_on_a_frozen_picture() {
+        // Nothing the script presses (Start, A) reaches the latch: B only, then nothing at all.
+        for mask in [0x02, 0x00] {
+            let out = smoke_cgb(smoke_cgb_rom(BLACK, mask), Model::Cgb);
+            assert!(
+                matches!(&out, Outcome::Fail(m) if m.contains("picture frozen (2 colours)")),
+                "mask {mask:#04X}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_cgb_fails_on_a_single_colour_picture() {
+        // Colour 1 is white too, so the stripe is invisible. Start would change it, but the
+        // colour check comes first.
+        let out = smoke_cgb(smoke_cgb_rom([0xFF, 0x7F], 0x08), Model::Cgb);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("colour framebuffer blank (1 colour)")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn smoke_cgb_fails_without_a_colour_frame() {
+        // The same ROM on a DMG never renders in colour.
+        let out = smoke_cgb(smoke_cgb_rom(BLACK, 0x08), Model::Dmg);
+        assert!(
+            matches!(&out, Outcome::Fail(m) if m.contains("cgb_framebuffer() is None")),
             "{out}"
         );
     }
