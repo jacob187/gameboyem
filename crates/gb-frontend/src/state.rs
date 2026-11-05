@@ -24,8 +24,8 @@ const GB_MAX_STATE_BYTES: u64 = 512 * 1024;
 pub fn max_state_bytes(system: System) -> u64 {
     match system {
         System::Gb => GB_MAX_STATE_BYTES,
-        // Provisional: the GBA core sets the real bound once its state exists.
-        System::Gba => 2 * 1024 * 1024,
+        // From the core; P3 tightens it once a GBA state exists.
+        System::Gba => gba_core::MAX_STATE_BYTES as u64,
     }
 }
 
@@ -163,6 +163,15 @@ mod tests {
         s.select(0);
         s.select(10);
         assert_eq!(s.slot(), 9, "out-of-range slots are ignored");
+    }
+
+    #[test]
+    fn the_gba_cap_comes_from_the_core() {
+        assert_eq!(
+            max_state_bytes(System::Gba),
+            gba_core::MAX_STATE_BYTES as u64
+        );
+        assert_eq!(max_state_bytes(System::Gb), GB_MAX_STATE_BYTES);
     }
 
     #[test]
