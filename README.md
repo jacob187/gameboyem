@@ -33,11 +33,13 @@ cargo build --release
 **Command-line options:**
 
 ```
-usage: gb [options] [--] <rom.gb|rom.gbc>
+usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
   --scale N        integer window scale in logical points, 1..=8 (default 4)
   --mute           disable audio output
-  --palette NAME   green (default) or grey (DMG only; colour games use their own colours)
-  --model NAME     auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb
+  --system NAME    gb or gba (default: a .gba file, or a ROM with a GBA header, is a GBA game)
+  --palette NAME   green (default) or grey (Game Boy only; colour games use their own colours)
+  --model NAME     auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb (Game Boy only)
+  --bios FILE      boot through a real 16 KiB GBA BIOS dump (GBA only; default: built-in HLE BIOS)
   --test-pattern   show a synthetic test pattern and tone instead of running the core
   --record FILE    record every input to FILE (must not exist) for `gb-test --replay`
   -h, --help       show this help
@@ -68,10 +70,10 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 | Select | Backspace or Right Shift |
 | Pause | P |
 | Fast-forward (hold) | Tab |
-| Save state / load state | K / L |
+| Save state / load state (not yet for GBA games) | K / L |
 | Select state slot | 1-9 |
 | Screenshot (and mark the frame) | C |
-| GBA L / R shoulders (no effect on a Game Boy) | Q / R |
+| GBA L / R shoulders (GBA games only; ignored on a Game Boy) | Q / R |
 | Quit | Esc |
 
 ## Recording, replay and screenshots
