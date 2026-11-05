@@ -7,6 +7,7 @@ use crate::{CYCLES_PER_FRAME, SCREEN_WIDTH, VISIBLE_LINES};
 mod affine_tests;
 mod bg_tests;
 mod obj_tests;
+mod window_tests;
 
 pub(super) const DISPCNT: u32 = 0x000;
 pub(super) const DISPSTAT: u32 = 0x004;
