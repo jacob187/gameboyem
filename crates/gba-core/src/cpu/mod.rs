@@ -318,6 +318,17 @@ impl Cpu {
         }
     }
 
+    /// Read register `i` as an instruction with an internal cycle before the
+    /// read sees it: r15 is already one word further (instruction + 12).
+    #[inline(always)]
+    fn late_reg(&self, i: usize) -> u32 {
+        if i == 15 {
+            self.r[15].wrapping_add(4)
+        } else {
+            self.r[i]
+        }
+    }
+
     #[inline(always)]
     fn set_nz(&mut self, v: u32) {
         self.cpsr = (self.cpsr & !(FLAG_N | FLAG_Z)) | (v & FLAG_N) | (u32::from(v == 0) << 30);
@@ -354,10 +365,12 @@ impl Cpu {
     /// ahead (GBATEK "ARM CPU Instruction Cycle Times": branches are 2S+1N).
     fn refill<B: CpuBus>(&mut self, bus: &mut B, target: u32) {
         if self.cpsr & PSR_T == 0 {
+            // Fetches are word aligned, but r15 keeps the low bits of the target
+            // (the reference data, NanoBoyAdvance, does the same; DECISIONS #51).
             let t = target & !3;
             self.pipe[0] = bus.fetch32(t, Access::NonSeq);
             self.pipe[1] = bus.fetch32(t.wrapping_add(4), Access::Seq);
-            self.r[15] = t.wrapping_add(8);
+            self.r[15] = target.wrapping_add(8);
         } else {
             let t = target & !1;
             self.pipe[0] = u32::from(bus.fetch16(t, Access::NonSeq));
@@ -366,6 +379,24 @@ impl Cpu {
         }
         self.seq = true;
         self.flushed = true;
+    }
+
+    /// Charge `n` internal (I) cycles. The bus is idle for them, so the next
+    /// opcode fetch cannot be sequential.
+    #[inline(always)]
+    fn internal<B: CpuBus>(&mut self, bus: &mut B, n: u32) {
+        bus.idle(n);
+        self.seq = false;
+    }
+
+    /// Write register `i`; a write to r15 is a branch and refills the pipeline.
+    #[inline(always)]
+    fn write_reg<B: CpuBus>(&mut self, bus: &mut B, i: usize, value: u32) {
+        if i == 15 {
+            self.refill(bus, value);
+        } else {
+            self.r[i] = value;
+        }
     }
 
     // ---- exceptions -------------------------------------------------------

@@ -180,15 +180,20 @@ fn dp_exec<B: CpuBus, const F: u32>(
     };
     let rd = ((op >> 12) & 0xF) as usize;
     if (0x8..=0xB).contains(&opc) {
-        cpu.set_nz(res);
-        cpu.set_c(carry);
-        if arith {
-            cpu.set_v(ovf);
+        // TSTP/TEQP/CMPP/CMNP (Rd=R15): CPSR = SPSR where there is one.
+        if rd == 15 && cpu.spsr_index().is_some() {
+            cpu.restore_spsr();
+        } else {
+            cpu.set_nz(res);
+            cpu.set_c(carry);
+            if arith {
+                cpu.set_v(ovf);
+            }
         }
         return;
     }
     if s {
-        if rd == 15 {
+        if rd == 15 && cpu.spsr_index().is_some() {
             // GBATEK "ARM Opcodes: Data Processing": S with Rd=R15 restores CPSR.
             cpu.restore_spsr();
         } else {
@@ -230,7 +235,7 @@ fn dp_shift_reg<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     let rm = pc_adj(rm_i, cpu.r[rm_i]);
     let rn = pc_adj(rn_i, cpu.r[rn_i]);
     let (v, sc) = shift_reg((op >> 5) & 3, rm, amount, cpu.carry());
-    bus.idle(1);
+    cpu.internal(bus, 1);
     dp_exec::<B, F>(cpu, bus, op, rn, v, sc);
 }
 
@@ -269,7 +274,8 @@ fn msr_write(cpu: &mut Cpu, op: u32, value: u32) {
             // User mode may only change the condition flags.
             mask &= 0xFF00_0000;
         }
-        let new = (cpu.cpsr & !mask) | (value & mask);
+        // Mode bit 4 is hard-wired to 1.
+        let new = ((cpu.cpsr & !mask) | (value & mask)) | 0x10;
         cpu.set_cpsr(new);
     }
 }
@@ -310,16 +316,18 @@ fn swi<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 /// MUL/MLA. `F` = A (bit 1), S (bit 0).
 fn mul<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     let rd = ((op >> 16) & 0xF) as usize;
-    let rs = cpu.r[((op >> 8) & 0xF) as usize];
-    let mut res = cpu.r[(op & 0xF) as usize].wrapping_mul(rs);
+    let rs = cpu.late_reg(((op >> 8) & 0xF) as usize);
+    let mut res = cpu.late_reg((op & 0xF) as usize).wrapping_mul(rs);
     let mut cycles = mul_cycles(rs, true);
     if F & 2 != 0 {
-        res = res.wrapping_add(cpu.r[((op >> 12) & 0xF) as usize]);
+        res = res.wrapping_add(cpu.late_reg(((op >> 12) & 0xF) as usize));
         cycles += 1;
     }
-    bus.idle(cycles);
-    cpu.r[rd] = res;
+    cpu.internal(bus, cycles);
+    cpu.write_reg(bus, rd, res);
     if F & 1 != 0 {
+        // C is architecturally meaningless after a multiply; it is left alone
+        // (the reference data computes some Booth-adder carry; see cpu_sst.rs).
         cpu.set_nz(res);
     }
 }
@@ -328,8 +336,8 @@ fn mul<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 fn mul_long<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     let hi = ((op >> 16) & 0xF) as usize;
     let lo = ((op >> 12) & 0xF) as usize;
-    let rs = cpu.r[((op >> 8) & 0xF) as usize];
-    let rm = cpu.r[(op & 0xF) as usize];
+    let rs = cpu.late_reg(((op >> 8) & 0xF) as usize);
+    let rm = cpu.late_reg((op & 0xF) as usize);
     let signed = F & 4 != 0;
     let mut res = if signed {
         (i64::from(rm as i32) * i64::from(rs as i32)) as u64
@@ -338,12 +346,12 @@ fn mul_long<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     };
     let mut cycles = mul_cycles(rs, signed) + 1;
     if F & 2 != 0 {
-        res = res.wrapping_add((u64::from(cpu.r[hi]) << 32) | u64::from(cpu.r[lo]));
+        res = res.wrapping_add((u64::from(cpu.late_reg(hi)) << 32) | u64::from(cpu.late_reg(lo)));
         cycles += 1;
     }
-    bus.idle(cycles);
-    cpu.r[lo] = res as u32;
-    cpu.r[hi] = (res >> 32) as u32;
+    cpu.internal(bus, cycles);
+    cpu.write_reg(bus, lo, res as u32);
+    cpu.write_reg(bus, hi, (res >> 32) as u32);
     if F & 1 != 0 {
         cpu.cpsr = (cpu.cpsr & !(FLAG_N | FLAG_Z))
             | (((res >> 63) as u32) << 31)
@@ -384,16 +392,12 @@ fn single_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32)
         } else {
             rotate_load(bus.read32(addr, Access::NonSeq), addr)
         };
-        bus.idle(1);
+        cpu.internal(bus, 1);
         cpu.seq = false;
         if writeback {
-            cpu.r[rn_i] = moved;
+            cpu.write_reg(bus, rn_i, moved);
         }
-        if rd_i == 15 {
-            cpu.refill(bus, value);
-        } else {
-            cpu.r[rd_i] = value;
-        }
+        cpu.write_reg(bus, rd_i, value);
     } else {
         // A stored PC reads as instruction + 12.
         let value = if rd_i == 15 {
@@ -408,7 +412,7 @@ fn single_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32)
         }
         cpu.seq = false;
         if writeback {
-            cpu.r[rn_i] = moved;
+            cpu.write_reg(bus, rn_i, moved);
         }
     }
 }
@@ -437,25 +441,22 @@ fn halfword<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
             1 => u32::from(bus.read16(addr, Access::NonSeq)).rotate_right((addr & 1) * 8),
             // LDRSB.
             2 => i32::from(bus.read8(addr, Access::NonSeq) as i8) as u32,
-            // LDRSH: a misaligned one behaves like LDRSB.
+            // LDRSH: a misaligned one sign-extends the byte at the address.
             _ => {
+                let h = bus.read16(addr, Access::NonSeq);
                 if addr & 1 != 0 {
-                    i32::from(bus.read8(addr, Access::NonSeq) as i8) as u32
+                    i32::from((h >> 8) as i8) as u32
                 } else {
-                    i32::from(bus.read16(addr, Access::NonSeq) as i16) as u32
+                    i32::from(h as i16) as u32
                 }
             }
         };
-        bus.idle(1);
+        cpu.internal(bus, 1);
         cpu.seq = false;
         if writeback {
-            cpu.r[rn_i] = moved;
+            cpu.write_reg(bus, rn_i, moved);
         }
-        if rd_i == 15 {
-            cpu.refill(bus, value);
-        } else {
-            cpu.r[rd_i] = value;
-        }
+        cpu.write_reg(bus, rd_i, value);
     } else {
         let value = if rd_i == 15 {
             cpu.r[15].wrapping_add(4)
@@ -465,7 +466,7 @@ fn halfword<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
         bus.write16(addr, value as u16, Access::NonSeq);
         cpu.seq = false;
         if writeback {
-            cpu.r[rn_i] = moved;
+            cpu.write_reg(bus, rn_i, moved);
         }
     }
 }
@@ -502,7 +503,7 @@ pub(super) fn block_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B
         (true, true) => base.wrapping_add(4),
         (false, false) => base.wrapping_sub(span).wrapping_add(4),
         (false, true) => base.wrapping_sub(span),
-    } & !3;
+    };
 
     // S bit: LDM with R15 restores CPSR; otherwise the user bank is transferred.
     let user_bank = s_bit && !(load && list & (1 << 15) != 0);
@@ -520,8 +521,13 @@ pub(super) fn block_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B
             addr = addr.wrapping_add(4);
             if first && wb {
                 // The base is written back before the loads land, so a loaded
-                // base register wins (ARMv4).
-                cpu.r[rn_i] = wb_value;
+                // base register wins (ARMv4). With the S bit the transfer runs
+                // with the user bank switched in, writeback included.
+                if user_bank {
+                    *cpu.user_reg(rn_i) = wb_value;
+                } else {
+                    cpu.write_reg(bus, rn_i, wb_value);
+                }
             }
             first = false;
             if i == 15 {
@@ -532,7 +538,7 @@ pub(super) fn block_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B
                 cpu.r[i] = value;
             }
         }
-        bus.idle(1);
+        cpu.internal(bus, 1);
         cpu.seq = false;
         if let Some(pc) = pc_value {
             if s_bit {
@@ -545,7 +551,8 @@ pub(super) fn block_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B
             let i = rest.trailing_zeros() as usize;
             rest &= rest - 1;
             let value = if i == 15 {
-                cpu.r[15].wrapping_add(4)
+                // A stored PC reads as instruction + 12 (ARM) or + 6 (Thumb).
+                cpu.r[15].wrapping_add(if cpu.cpsr & PSR_T != 0 { 2 } else { 4 })
             } else if user_bank {
                 *cpu.user_reg(i)
             } else {
@@ -557,7 +564,11 @@ pub(super) fn block_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B
             if first && wb {
                 // Written back after the first store: a base that is not the
                 // lowest register in the list is stored with its new value.
-                cpu.r[rn_i] = wb_value;
+                if user_bank {
+                    *cpu.user_reg(rn_i) = wb_value;
+                } else {
+                    cpu.write_reg(bus, rn_i, wb_value);
+                }
             }
             first = false;
         }
@@ -569,9 +580,9 @@ pub(super) fn block_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B
 
 /// SWP/SWPB. `F` = B (byte).
 fn swp<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
-    let addr = cpu.r[((op >> 16) & 0xF) as usize];
+    let addr = cpu.late_reg(((op >> 16) & 0xF) as usize);
     let rd_i = ((op >> 12) & 0xF) as usize;
-    let src = cpu.r[(op & 0xF) as usize];
+    let src = cpu.late_reg((op & 0xF) as usize);
     let value = if F != 0 {
         let v = u32::from(bus.read8(addr, Access::NonSeq));
         bus.write8(addr, src as u8, Access::NonSeq);
@@ -581,7 +592,7 @@ fn swp<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
         bus.write32(addr, src, Access::NonSeq);
         v
     };
-    bus.idle(1);
+    cpu.internal(bus, 1);
     cpu.seq = false;
-    cpu.r[rd_i] = value;
+    cpu.write_reg(bus, rd_i, value);
 }

@@ -157,7 +157,7 @@ fn alu_op<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
                 _ => 3,
             };
             let (v, c) = shift_reg(kind, a, b, cpu.carry());
-            bus.idle(1);
+            cpu.internal(bus, 1);
             cpu.set_c(c);
             v
         }
@@ -176,7 +176,7 @@ fn alu_op<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
         12 => a | b,
         13 => {
             // MUL Rd,Rs is ARM `MULS Rd,Rs,Rd`: the multiplier is the old Rd.
-            bus.idle(mul_cycles(a, true));
+            cpu.internal(bus, mul_cycles(a, true));
             a.wrapping_mul(b)
         }
         14 => a & !b,
@@ -220,7 +220,7 @@ fn hi_reg<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 fn ldr_pc<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     let addr = (cpu.r[15] & !2).wrapping_add((op & 0xFF) << 2);
     let v = bus.read32(addr, Access::NonSeq);
-    bus.idle(1);
+    cpu.internal(bus, 1);
     cpu.seq = false;
     cpu.r[lo(op, 8)] = v.rotate_right((addr & 3) * 8);
 }
@@ -228,7 +228,7 @@ fn ldr_pc<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 #[inline(always)]
 fn load_word<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
     let v = bus.read32(addr, Access::NonSeq);
-    bus.idle(1);
+    cpu.internal(bus, 1);
     cpu.seq = false;
     cpu.r[rd] = v.rotate_right((addr & 3) * 8);
 }
@@ -236,7 +236,7 @@ fn load_word<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
 #[inline(always)]
 fn load_byte<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
     let v = bus.read8(addr, Access::NonSeq);
-    bus.idle(1);
+    cpu.internal(bus, 1);
     cpu.seq = false;
     cpu.r[rd] = u32::from(v);
 }
@@ -244,7 +244,7 @@ fn load_byte<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
 #[inline(always)]
 fn load_half<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
     let v = bus.read16(addr, Access::NonSeq);
-    bus.idle(1);
+    cpu.internal(bus, 1);
     cpu.seq = false;
     cpu.r[rd] = u32::from(v).rotate_right((addr & 1) * 8);
 }
@@ -268,7 +268,7 @@ fn ls_reg<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
         }
         3 => {
             let v = bus.read8(addr, Access::NonSeq);
-            bus.idle(1);
+            cpu.internal(bus, 1);
             cpu.seq = false;
             cpu.r[rd] = i32::from(v as i8) as u32;
         }
@@ -277,12 +277,13 @@ fn ls_reg<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
         6 => load_byte(cpu, bus, addr, rd),
         _ => {
             // LDSH: a misaligned address behaves like LDSB.
+            let h = bus.read16(addr, Access::NonSeq);
             let v = if addr & 1 != 0 {
-                i32::from(bus.read8(addr, Access::NonSeq) as i8) as u32
+                i32::from((h >> 8) as i8) as u32
             } else {
-                i32::from(bus.read16(addr, Access::NonSeq) as i16) as u32
+                i32::from(h as i16) as u32
             };
-            bus.idle(1);
+            cpu.internal(bus, 1);
             cpu.seq = false;
             cpu.r[rd] = v;
         }
@@ -378,9 +379,7 @@ fn ldm_stm<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 fn bcc<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     if F == 0xF {
         cpu.software_interrupt(bus, op as u8);
-    } else if F == 0xE {
-        cpu.undefined(bus);
-    } else if COND_PASS[F as usize] >> (cpu.cpsr >> 28) & 1 != 0 {
+    } else if F == 0xE || COND_PASS[F as usize] >> (cpu.cpsr >> 28) & 1 != 0 {
         let target = cpu.r[15].wrapping_add(((op as u8 as i8 as i32) << 1) as u32);
         cpu.refill(bus, target);
     }
