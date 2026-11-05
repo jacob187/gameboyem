@@ -35,9 +35,15 @@ impl Button {
 pub struct Keypad {
     /// Bit n set = button n held.
     held: u16,
-    /// KEYCNT.
+    /// KEYCNT (0x0400_0132): bits 0-9 button mask, 14 IRQ enable, 15 AND mode.
     pub keycnt: u16,
+    /// Whether the interrupt condition held at the last check, so the IRQ fires
+    /// on the rising edge only.
+    irq_level: bool,
 }
+
+/// KEYCNT's writable bits.
+pub const KEYCNT_MASK: u16 = 0xC3FF;
 
 impl Keypad {
     pub fn set(&mut self, b: Button, pressed: bool) {
@@ -47,6 +53,31 @@ impl Keypad {
         } else {
             self.held &= !bit;
         }
+    }
+
+    /// Write KEYCNT through a byte-lane `mask`.
+    pub fn write_keycnt(&mut self, v: u16, mask: u16) {
+        let mask = mask & KEYCNT_MASK;
+        self.keycnt = (self.keycnt & !mask) | (v & mask);
+    }
+
+    /// Re-evaluate the keypad interrupt condition (GBATEK "GBA Keypad Input",
+    /// KEYCNT): IRQ enabled and either any (OR mode) or all (AND mode) of the
+    /// selected buttons held. Returns true when the condition just became true,
+    /// i.e. an IF.Keypad flag should be raised.
+    pub fn irq_edge(&mut self) -> bool {
+        let sel = self.keycnt & 0x03FF;
+        let held = self.held & sel;
+        let cond = self.keycnt & 0x4000 != 0
+            && if self.keycnt & 0x8000 != 0 {
+                // AND mode with nothing selected never fires.
+                sel != 0 && held == sel
+            } else {
+                held != 0
+            };
+        let edge = cond && !self.irq_level;
+        self.irq_level = cond;
+        edge
     }
 
     /// KEYINPUT: 0 = pressed.
@@ -68,5 +99,51 @@ mod tests {
         assert_eq!(k.keyinput(), 0x1FE);
         k.set(Button::A, false);
         assert_eq!(k.keyinput(), 0x1FF);
+    }
+
+    #[test]
+    fn or_mode_fires_on_the_rising_edge_only() {
+        let mut k = Keypad::default();
+        k.write_keycnt(0x4000 | 0b11, 0xFFFF);
+        assert!(!k.irq_edge());
+        k.set(Button::B, true);
+        assert!(k.irq_edge());
+        k.set(Button::A, true);
+        assert!(!k.irq_edge(), "already true");
+        k.set(Button::A, false);
+        k.set(Button::B, false);
+        assert!(!k.irq_edge());
+        k.set(Button::A, true);
+        assert!(k.irq_edge());
+    }
+
+    #[test]
+    fn and_mode_needs_every_selected_button() {
+        let mut k = Keypad::default();
+        k.write_keycnt(0xC000 | 0b101, 0xFFFF);
+        k.set(Button::A, true);
+        assert!(!k.irq_edge());
+        k.set(Button::Select, true);
+        assert!(k.irq_edge());
+        // An empty AND selection never fires.
+        k.write_keycnt(0xC000, 0xFFFF);
+        assert!(!k.irq_edge());
+    }
+
+    #[test]
+    fn enabling_irq_with_buttons_already_held_fires() {
+        let mut k = Keypad::default();
+        k.set(Button::Start, true);
+        k.write_keycnt(1 << 3, 0xFFFF);
+        assert!(!k.irq_edge(), "IRQ enable bit is clear");
+        k.write_keycnt(0x4000 | 1 << 3, 0xFFFF);
+        assert!(k.irq_edge());
+    }
+
+    #[test]
+    fn keycnt_only_keeps_defined_bits() {
+        let mut k = Keypad::default();
+        k.write_keycnt(0xFFFF, 0xFFFF);
+        assert_eq!(k.keycnt, 0xC3FF);
     }
 }
