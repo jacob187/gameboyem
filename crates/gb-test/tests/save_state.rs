@@ -84,6 +84,7 @@ fn run(gb: &mut GameBoy, start: u32, frames: u32) -> (u64, u64, Vec<u8>) {
         gb.step_frame();
         video = fnv(video, gb.framebuffer());
         if let Some(fb) = gb.cgb_framebuffer() {
+            // Independent by design: bench.rs folds its own copy, and the two hashes are never compared.
             for px in fb {
                 video = fnv(video, &px.to_le_bytes());
             }

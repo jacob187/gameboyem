@@ -450,17 +450,8 @@ fn run_mooneye(gb: &mut GameBoy, max_frames: u32) -> Outcome {
 /// (0xFF→0 lightest, 0xAA→1, 0x55→2, 0x00→3), per the dmg-acid2 README.
 pub fn load_reference(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
-    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
-        return Err(format!("reference is {}x{}", info.width, info.height));
-    }
-    let channels = info.color_type.samples();
-    buf[..info.buffer_size()]
-        .chunks_exact(channels)
+    let (buf, color_type) = decode_screen_png(std::io::BufReader::new(file))?;
+    buf.chunks_exact(color_type.samples())
         .map(|px| match px[0] {
             0xFF => Ok(0),
             0xAA => Ok(1),
@@ -471,8 +462,26 @@ pub fn load_reference(path: &Path) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Write a framebuffer as a greyscale PNG (for debugging failed comparisons).
-pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
+/// Decode a PNG that must be exactly screen-sized, with palettes expanded and 16-bit samples
+/// reduced to 8: the samples (row-major, `color_type.samples()` per pixel) and the colour type.
+fn decode_screen_png(
+    src: impl std::io::BufRead + std::io::Seek,
+) -> Result<(Vec<u8>, png::ColorType), String> {
+    let mut decoder = png::Decoder::new(src);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
+        return Err(format!("reference is {}x{}", info.width, info.height));
+    }
+    buf.truncate(info.buffer_size());
+    Ok((buf, info.color_type))
+}
+
+/// Write screen-sized 8-bit `samples` as a PNG of the given colour type, creating parent
+/// directories (for debugging failed comparisons).
+fn save_screen_png(samples: &[u8], color: png::ColorType, path: &Path) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -482,12 +491,17 @@ pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
         SCREEN_WIDTH as u32,
         SCREEN_HEIGHT as u32,
     );
-    enc.set_color(png::ColorType::Grayscale);
+    enc.set_color(color);
     enc.set_depth(png::BitDepth::Eight);
-    let grey: Vec<u8> = fb.iter().map(|&s| 0xFF - 0x55 * (s & 3)).collect();
     enc.write_header()
-        .and_then(|mut w| w.write_image_data(&grey))
+        .and_then(|mut w| w.write_image_data(samples))
         .map_err(|e| e.to_string())
+}
+
+/// Write a framebuffer as a greyscale PNG (for debugging failed comparisons).
+pub fn save_framebuffer_png(fb: &[u8], path: &Path) -> Result<(), String> {
+    let grey: Vec<u8> = fb.iter().map(|&s| 0xFF - 0x55 * (s & 3)).collect();
+    save_screen_png(&grey, png::ColorType::Grayscale, path)
 }
 
 /// Load a 160x144 reference PNG as RGB888. Indexed (palette), greyscale and
@@ -500,43 +514,19 @@ pub fn load_reference_rgb(path: &Path) -> Result<Vec<[u8; 3]>, String> {
 fn decode_reference_rgb(
     src: impl std::io::BufRead + std::io::Seek,
 ) -> Result<Vec<[u8; 3]>, String> {
-    let mut decoder = png::Decoder::new(src);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("png too large")?];
-    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if info.width as usize != SCREEN_WIDTH || info.height as usize != SCREEN_HEIGHT {
-        return Err(format!("reference is {}x{}", info.width, info.height));
-    }
-    let channels = info.color_type.samples();
-    let to_rgb: fn(&[u8]) -> [u8; 3] = match info.color_type {
+    let (buf, color_type) = decode_screen_png(src)?;
+    let to_rgb: fn(&[u8]) -> [u8; 3] = match color_type {
         png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => |px| [px[0]; 3],
         png::ColorType::Rgb | png::ColorType::Rgba => |px| [px[0], px[1], px[2]],
         png::ColorType::Indexed => return Err("palette was not expanded".into()),
     };
-    Ok(buf[..info.buffer_size()]
-        .chunks_exact(channels)
-        .map(to_rgb)
-        .collect())
+    Ok(buf.chunks_exact(color_type.samples()).map(to_rgb).collect())
 }
 
 /// Write an RGB888 framebuffer as a PNG (for debugging failed comparisons).
 pub fn save_rgb_png(fb: &[[u8; 3]], path: &Path) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(
-        std::io::BufWriter::new(file),
-        SCREEN_WIDTH as u32,
-        SCREEN_HEIGHT as u32,
-    );
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
     let rgb: Vec<u8> = fb.iter().flatten().copied().collect();
-    enc.write_header()
-        .and_then(|mut w| w.write_image_data(&rgb))
-        .map_err(|e| e.to_string())
+    save_screen_png(&rgb, png::ColorType::Rgb, path)
 }
 
 /// Where failing-test artifacts (actual framebuffers) are written.
@@ -607,10 +597,9 @@ fn run_acid2_cgb(gb: &mut GameBoy, case: &Case) -> Outcome {
     if let Some(fail) = run_to_acid2_signal(gb, case.max_frames) {
         return fail;
     }
-    let Some(fb) = gb.cgb_framebuffer() else {
-        return Outcome::Fail(
-            "cgb_framebuffer() is None: the machine is not rendering in CGB colour mode".into(),
-        );
+    let fb = match cgb_frame(gb) {
+        Ok(fb) => fb,
+        Err(o) => return o,
     };
     let actual: Vec<[u8; 3]> = fb.iter().map(|&px| gb_core::rgb555_to_rgb888(px)).collect();
     let diff = actual
@@ -1296,12 +1285,9 @@ fn cgbdemo(rom: &[u8], model: Model, max_frames: u32) -> Result<(), Outcome> {
     let cells = cgbdemo_cells();
     let fb = cgb_frame(&s.gb)?;
 
-    let seen: std::collections::HashSet<u16> = fb.iter().copied().collect();
-    check(seen.len() >= CGBDEMO_MIN_COLOURS, || {
-        format!(
-            "{} distinct colours, want at least {CGBDEMO_MIN_COLOURS}",
-            seen.len()
-        )
+    let colours = distinct_colours(fb);
+    check(colours >= CGBDEMO_MIN_COLOURS, || {
+        format!("{colours} distinct colours, want at least {CGBDEMO_MIN_COLOURS}")
     })?;
 
     // The sprite's core starts one pixel in from the rim, at the ROM's start position.
