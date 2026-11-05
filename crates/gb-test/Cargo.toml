@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 gb-core.workspace = true
-gba-core = { path = "../gba-core" }
+gba-core.workspace = true
 png = "0.18"
 
 [dev-dependencies]
