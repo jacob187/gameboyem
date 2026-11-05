@@ -1,20 +1,36 @@
-//! The system bus: memory map, I/O dispatch, wait states and event dispatch.
+//! The system bus: wait-state accounting, event dispatch and the [`CpuBus`] impl.
 //!
 //! [`CpuBus`], [`Access`] and [`SwiResult`] are the **Contract** between the CPU
 //! and everything else; the CPU is generic over `CpuBus`, so its tests can use a
-//! flat-memory stub. [`Bus`] itself is owned by the system agent: the memory map
-//! below is a placeholder (every access costs 1 cycle, little-endian byte
-//! composition, no open bus, no WAITCNT) that P1-SYS replaces.
+//! flat-memory stub. [`Bus`] itself is owned by the system agent. The memory map
+//! (region reads/writes) lives in `memory.rs`, the I/O registers in `io.rs`.
+//!
+//! # How time is charged
+//!
+//! Every `CpuBus` access first advances the master clock by [`Bus::cost`] (1 cycle
+//! plus the region's wait states for that width and [`Access`] kind), then does its
+//! effect, so a timer read sees the clock at the end of its own access. Events
+//! that fall due are dispatched by the run loop after the instruction. All
+//! cartridge-ROM costs go through [`Bus::rom_cost`]; that is where the P3-TIMING
+//! prefetch buffer hooks in (see its doc).
 
 use crate::apu::Apu;
 use crate::bios::Bios;
 use crate::cart::Cart;
-use crate::dma::Dma;
+use crate::dma::{Dma, DmaTrigger};
 use crate::irq::Irq;
 use crate::keypad::Keypad;
 use crate::ppu::Ppu;
 use crate::scheduler::{Event, Scheduler};
 use crate::timer::Timers;
+
+/// Width of a bus access, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Width {
+    B = 1,
+    H = 2,
+    W = 4,
+}
 
 /// Bus cycle kind (GBATEK "Memory Timings"). A sequential access is the one
 /// directly after an access to the preceding address in the same region; the
@@ -77,6 +93,37 @@ pub trait CpuBus {
     }
 }
 
+/// Per-region access costs derived from WAITCNT, rebuilt on every WAITCNT write.
+///
+/// `rom[ws][seq][wide]` is the total cycle count (1 + waits) of a ROM access in
+/// wait-state area `ws` (0x08/0x0A/0x0C), where `seq` is 0 for a non-sequential
+/// and 1 for a sequential access, and `wide` is 0 for 8/16-bit and 1 for 32-bit
+/// (two 16-bit accesses: N+S or S+S). GBATEK "GBA System Control", WAITCNT.
+#[derive(Debug, Clone, Copy)]
+pub struct WaitTable {
+    pub rom: [[[u8; 2]; 2]; 3],
+    /// SRAM / Flash (8-bit bus; N and S cost the same).
+    pub sram: u8,
+}
+
+impl WaitTable {
+    pub fn from_waitcnt(w: u16) -> Self {
+        const N: [u8; 4] = [4, 3, 2, 8];
+        const S: [[u8; 2]; 3] = [[2, 1], [4, 1], [8, 1]];
+        let mut rom = [[[0; 2]; 2]; 3];
+        for (ws, table) in rom.iter_mut().enumerate() {
+            let shift = 2 + 3 * ws as u16;
+            let n = 1 + N[usize::from((w >> shift) & 3)];
+            let s = 1 + S[ws][usize::from((w >> (shift + 2)) & 1)];
+            *table = [[n, n + s], [s, 2 * s]];
+        }
+        Self {
+            rom,
+            sram: 1 + N[usize::from(w & 3)],
+        }
+    }
+}
+
 /// Every component except the CPU, plus the memory they share.
 pub struct Bus {
     pub sched: Scheduler,
@@ -94,8 +141,29 @@ pub struct Bus {
     pub iwram: Box<[u8]>,
     /// Set by HALTCNT or an HLE wait; cleared when `irq.wakes_halt()`.
     pub halted: bool,
+    /// HALTCNT bit 7 (stop): wakes only on keypad / cartridge / serial IRQs.
+    pub stopped: bool,
     /// Frames completed (incremented at VBlank start).
     pub frames: u64,
+    /// WAITCNT (0x0400_0204) and the costs derived from it.
+    pub waitcnt: u16,
+    pub waits: WaitTable,
+    /// The last value the CPU fetched, replicated to 32 bits for a halfword
+    /// fetch: what unmapped regions read as (open bus, DECISIONS #52).
+    pub open_bus: u32,
+    /// The last word fetched from the BIOS: what BIOS reads return while the CPU
+    /// executes outside the BIOS (read protection).
+    pub bios_latch: u32,
+    /// The most recent opcode fetch came from the BIOS region.
+    pub fetching_bios: bool,
+    /// POSTFLG (0x0400_0300, low byte).
+    pub postflg: u8,
+    /// Sound registers 0x060..0x0A0 as the APU (P2) will see them.
+    pub sound_regs: [u16; 0x20],
+    /// FIFO A/B words being assembled from halfword/byte writes.
+    pub fifo_latch: [u32; 2],
+    /// Serial/JOY registers 0x120..0x160: stored, not emulated.
+    pub sio_regs: [u16; 0x20],
 }
 
 impl Bus {
@@ -113,7 +181,19 @@ impl Bus {
             ewram: vec![0; 256 * 1024].into_boxed_slice(),
             iwram: vec![0; 32 * 1024].into_boxed_slice(),
             halted: false,
+            stopped: false,
             frames: 0,
+            waitcnt: 0,
+            waits: WaitTable::from_waitcnt(0),
+            open_bus: 0,
+            // What the BIOS leaves behind after startup (GBATEK "BIOS Memory
+            // Protection"); P2-BIOS refines it.
+            bios_latch: 0xE129_F000,
+            fetching_bios: false,
+            postflg: 0,
+            sound_regs: [0; 0x20],
+            fifo_latch: [0; 2],
+            sio_regs: [0; 0x20],
         };
         bus.ppu.start(&mut bus.sched);
         bus
@@ -130,128 +210,196 @@ impl Bus {
                     if sig.frame_done {
                         self.frames += 1;
                     }
-                    // P1-SYS: sig.hblank_dma / sig.vblank_dma -> self.dma.trigger(..)
+                    if sig.hblank_dma {
+                        self.dma.trigger(DmaTrigger::HBlank);
+                    }
+                    if sig.vblank_dma {
+                        self.dma.trigger(DmaTrigger::VBlank);
+                    }
+                    if event == Event::PpuLineEnd {
+                        // Video capture (DMA3 special) runs on lines 2..=161 and
+                        // stops at 162; the PPU has no signal for it, so read the
+                        // line it just advanced to (GBATEK "Video Capture Mode").
+                        match self.ppu.read_io(0x006) {
+                            2..=161 => self.dma.trigger(DmaTrigger::VideoCapture),
+                            162 => self.dma.stop_video_capture(),
+                            _ => {}
+                        }
+                    }
                 }
-                Event::TimerOverflow(_) | Event::ApuSample | Event::DmaStart(_) => {
-                    // P1-SYS / P2-APU.
-                }
+                Event::TimerOverflow(n) => self.timer_overflow(usize::from(n), at),
+                // P2-APU's sample clock; DMA and IRQ delays are folded into the
+                // run loop, so these never fire yet.
+                Event::ApuSample | Event::DmaStart(_) => {}
                 Event::IrqLine => {}
             }
         }
-        if self.halted && self.irq.wakes_halt() {
+        self.check_wake();
+    }
+
+    /// End a halt (or stop) if its wake condition holds. Called after events and
+    /// whenever something outside the run loop raises an interrupt.
+    pub fn check_wake(&mut self) {
+        if !self.halted {
+            return;
+        }
+        let wake = if self.stopped {
+            // Stop wakes on the keypad, cartridge and serial interrupts only.
+            self.irq.ie & self.irq.if_ & STOP_WAKE_MASK != 0
+        } else {
+            self.irq.wakes_halt()
+        };
+        if wake {
             self.halted = false;
+            self.stopped = false;
         }
     }
 
-    /// Read a byte with no side effects and no time cost (test and debug hook).
-    pub fn peek8(&self, addr: u32) -> u8 {
+    /// Cycles for one access of `w` to `addr` (1 + wait states). Pure, so DMA and
+    /// the CPU share it.
+    #[inline]
+    pub fn cost(&self, addr: u32, w: Width, access: Access) -> u64 {
         match addr >> 24 {
-            0x00 => self.bios.read8(addr),
-            0x02 => self.ewram[(addr & 0x3_FFFF) as usize],
-            0x03 => self.iwram[(addr & 0x7FFF) as usize],
-            0x04 => {
-                let half = self.read_io16(addr & 0x3FE);
-                (half >> ((addr & 1) * 8)) as u8
-            }
-            0x05 => self.ppu.palette[(addr & 0x3FF) as usize],
-            0x06 => self.ppu.vram[vram_index(addr)],
-            0x07 => self.ppu.oam[(addr & 0x3FF) as usize],
-            0x08..=0x0D => self.cart.read_rom8(addr & 0x01FF_FFFF),
-            0x0E | 0x0F => self.cart.read_save8(addr & 0xFFFF),
-            _ => 0,
-        }
-    }
-
-    fn poke8(&mut self, addr: u32, v: u8) {
-        match addr >> 24 {
-            0x02 => self.ewram[(addr & 0x3_FFFF) as usize] = v,
-            0x03 => self.iwram[(addr & 0x7FFF) as usize] = v,
-            0x04 => {
-                let mask = 0xFFu16 << ((addr & 1) * 8);
-                self.write_io16(addr & 0x3FE, u16::from(v) << ((addr & 1) * 8), mask);
-            }
-            0x05 => self.ppu.palette[(addr & 0x3FF) as usize] = v,
-            0x06 => self.ppu.vram[vram_index(addr)] = v,
-            0x07 => self.ppu.oam[(addr & 0x3FF) as usize] = v,
-            0x0E | 0x0F => self.cart.write_save8(addr & 0xFFFF, v),
-            _ => {}
-        }
-    }
-
-    /// I/O read at offset `off` (even, 0..0x3FF from 0x0400_0000).
-    fn read_io16(&self, off: u32) -> u16 {
-        match off {
-            0x000..=0x05F => self.ppu.read_io(off),
-            0x130 => self.keypad.keyinput(),
-            0x200 => self.irq.ie,
-            0x202 => self.irq.if_,
-            0x208 => u16::from(self.irq.ime),
-            _ => 0,
-        }
-    }
-
-    /// I/O write: `mask` selects the byte lanes written (0x00FF, 0xFF00, 0xFFFF).
-    fn write_io16(&mut self, off: u32, v: u16, mask: u16) {
-        match off {
-            0x000..=0x05F => self.ppu.write_io(off, v, mask),
-            0x200 => self.irq.ie = (self.irq.ie & !mask) | (v & mask),
-            0x202 => self.irq.write_if(v & mask),
-            0x208 => {
-                if mask & 1 != 0 {
-                    self.irq.ime = v & 1 != 0;
+            // EWRAM: 16-bit bus, 2 wait states; a word is two accesses.
+            0x02 => {
+                if w == Width::W {
+                    6
+                } else {
+                    3
                 }
             }
-            // HALTCNT is the high byte of 0x300 (POSTFLG is the low byte).
-            0x300 if mask & 0xFF00 != 0 => self.halted = true,
-            _ => {}
+            // Palette and VRAM: 16-bit bus, no waits (the PPU contention penalty
+            // is P3-TIMING); a word is two accesses.
+            0x05 | 0x06 => {
+                if w == Width::W {
+                    2
+                } else {
+                    1
+                }
+            }
+            0x08..=0x0D => self.rom_cost(addr, w, access, false),
+            0x0E | 0x0F => u64::from(self.waits.sram),
+            // BIOS, IWRAM, I/O, OAM (32-bit buses), and open bus.
+            _ => 1,
+        }
+    }
+
+    /// Cost of a cartridge ROM access.
+    ///
+    /// A sequential access is only sequential if the CPU/DMA says so *and* it
+    /// doesn't start a new 128 KiB page (the cart's address latch rolls over;
+    /// GBATEK "GBA Cart ROM" / nba hw-test `128kb-boundary`).
+    ///
+    /// P3-TIMING: the prefetch buffer hooks in here. `fetch` is true for opcode
+    /// fetches (the only accesses the buffer serves); a buffered opcode would
+    /// cost 1 cycle, and every other ROM access would first have to account for
+    /// the prefetch in flight. The caller already passes everything needed.
+    #[inline]
+    pub fn rom_cost(&self, addr: u32, w: Width, access: Access, fetch: bool) -> u64 {
+        let _ = fetch;
+        let ws = ((addr >> 25) & 3) as usize;
+        let seq = access == Access::Seq && addr & 0x1_FFFF != 0;
+        u64::from(self.waits.rom[ws][usize::from(seq)][usize::from(w == Width::W)])
+    }
+
+    /// Open-bus value for an access of `w` at `addr` (the CPU's last fetch).
+    #[inline]
+    pub fn open_bus_value(&self, addr: u32, w: Width) -> u32 {
+        match w {
+            Width::B => self.open_bus >> ((addr & 3) * 8) & 0xFF,
+            Width::H => self.open_bus >> ((addr & 2) * 8) & 0xFFFF,
+            Width::W => self.open_bus,
+        }
+    }
+
+    /// An opcode fetch is about to read `addr`: from now on the CPU executes in
+    /// the BIOS or not, which decides whether BIOS reads are protected. Done
+    /// before the read so a fetch from the BIOS itself sees the real contents.
+    #[inline]
+    fn begin_fetch(&mut self, addr: u32) {
+        self.fetching_bios = addr < crate::BIOS_SIZE as u32;
+    }
+
+    /// Cost of an opcode fetch (ROM fetches go through the prefetch hook).
+    #[inline]
+    fn fetch_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
+        if (0x08..=0x0D).contains(&(addr >> 24)) {
+            self.rom_cost(addr, w, access, true)
+        } else {
+            self.cost(addr, w, access)
+        }
+    }
+
+    /// Record an opcode fetch for open bus and BIOS read protection.
+    #[inline]
+    fn note_fetch(&mut self, addr: u32, value: u32, w: Width) {
+        self.open_bus = if w == Width::H {
+            value & 0xFFFF | value << 16
+        } else {
+            value
+        };
+        if self.fetching_bios {
+            // The latch holds a full word; a halfword fetch latches its word.
+            let a = addr & !3;
+            self.bios_latch = u32::from_le_bytes([
+                self.bios.read8(a),
+                self.bios.read8(a + 1),
+                self.bios.read8(a + 2),
+                self.bios.read8(a + 3),
+            ]);
         }
     }
 }
 
-/// VRAM is 96 KiB mirrored in 128 KiB steps; the top 32 KiB of each 128 KiB
-/// window mirrors the 32 KiB OBJ area above it (0x1_8000..0x2_0000 -> 0x1_0000..).
-fn vram_index(addr: u32) -> usize {
-    let a = addr & 0x1_FFFF;
-    (if a >= 0x1_8000 { a - 0x8000 } else { a }) as usize
-}
+/// IF bits that wake a stopped CPU: serial (7), keypad (12), game pak (13).
+const STOP_WAKE_MASK: u16 = 1 << 7 | 1 << 12 | 1 << 13;
 
 impl CpuBus for Bus {
-    fn read8(&mut self, addr: u32, _access: Access) -> u8 {
-        self.sched.advance(1);
-        self.peek8(addr)
+    #[inline]
+    fn read8(&mut self, addr: u32, access: Access) -> u8 {
+        self.sched.advance(self.cost(addr, Width::B, access));
+        self.read_value(addr, Width::B) as u8
     }
-    fn read16(&mut self, addr: u32, _access: Access) -> u16 {
-        self.sched.advance(1);
-        let a = addr & !1;
-        u16::from_le_bytes([self.peek8(a), self.peek8(a + 1)])
+    #[inline]
+    fn read16(&mut self, addr: u32, access: Access) -> u16 {
+        self.sched.advance(self.cost(addr, Width::H, access));
+        self.read_value(addr, Width::H) as u16
     }
-    fn read32(&mut self, addr: u32, _access: Access) -> u32 {
-        self.sched.advance(1);
-        let a = addr & !3;
-        u32::from_le_bytes([
-            self.peek8(a),
-            self.peek8(a + 1),
-            self.peek8(a + 2),
-            self.peek8(a + 3),
-        ])
+    #[inline]
+    fn read32(&mut self, addr: u32, access: Access) -> u32 {
+        self.sched.advance(self.cost(addr, Width::W, access));
+        self.read_value(addr, Width::W)
     }
-    fn write8(&mut self, addr: u32, value: u8, _access: Access) {
-        self.sched.advance(1);
-        self.poke8(addr, value);
+    #[inline]
+    fn write8(&mut self, addr: u32, value: u8, access: Access) {
+        self.sched.advance(self.cost(addr, Width::B, access));
+        self.write_value(addr, u32::from(value), Width::B);
     }
-    fn write16(&mut self, addr: u32, value: u16, _access: Access) {
-        self.sched.advance(1);
-        let a = addr & !1;
-        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
-            self.poke8(a + i as u32, b);
-        }
+    #[inline]
+    fn write16(&mut self, addr: u32, value: u16, access: Access) {
+        self.sched.advance(self.cost(addr, Width::H, access));
+        self.write_value(addr, u32::from(value), Width::H);
     }
-    fn write32(&mut self, addr: u32, value: u32, _access: Access) {
-        self.sched.advance(1);
-        let a = addr & !3;
-        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
-            self.poke8(a + i as u32, b);
-        }
+    #[inline]
+    fn write32(&mut self, addr: u32, value: u32, access: Access) {
+        self.sched.advance(self.cost(addr, Width::W, access));
+        self.write_value(addr, value, Width::W);
+    }
+    #[inline]
+    fn fetch16(&mut self, addr: u32, access: Access) -> u16 {
+        self.begin_fetch(addr);
+        self.sched.advance(self.fetch_cost(addr, Width::H, access));
+        let v = self.read_region(addr, Width::H, false);
+        self.note_fetch(addr, v, Width::H);
+        v as u16
+    }
+    #[inline]
+    fn fetch32(&mut self, addr: u32, access: Access) -> u32 {
+        self.begin_fetch(addr);
+        self.sched.advance(self.fetch_cost(addr, Width::W, access));
+        let v = self.read_region(addr, Width::W, false);
+        self.note_fetch(addr, v, Width::W);
+        v
     }
     fn idle(&mut self, cycles: u32) {
         self.sched.advance(u64::from(cycles));
@@ -261,17 +409,5 @@ impl CpuBus for Bus {
     }
     fn swi(&mut self, number: u8, r: &mut [u32; 4]) -> SwiResult {
         crate::bios::swi(self, number, r)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vram_mirrors_obj_area() {
-        assert_eq!(vram_index(0x0601_7FFF), 0x1_7FFF);
-        assert_eq!(vram_index(0x0601_8000), 0x1_0000);
-        assert_eq!(vram_index(0x0602_0000), 0);
     }
 }
