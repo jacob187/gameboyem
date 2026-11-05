@@ -42,6 +42,11 @@ pub const MAGIC: [u8; 8] = *b"GBINPUT\0";
 pub const VERSION: u8 = 3;
 pub const RECORD_LEN: usize = 9;
 
+/// The most battery bytes [`decode_header`] accepts from any system. It is only
+/// a sanity bound (so a hostile length cannot make us slice or copy far past the
+/// file); each core then applies its own, smaller cap with [`check_battery`].
+pub const MAX_BATTERY_BOUND: usize = 256 * 1024;
+
 const NO_BATTERY: u32 = u32::MAX;
 const KIND_PRESSED: u8 = 0x80;
 const KIND_MARKER: u8 = 0x40;
@@ -98,7 +103,7 @@ pub enum DecodeError {
     UnsupportedVersion(u8),
     UnknownSystem(u8),
     TruncatedHeader,
-    BatteryTooLarge(usize),
+    BatteryTooLarge { len: usize, max: usize },
     BadRecord { index: usize, kind: u8 },
     FramesOutOfOrder { index: usize },
     RecordAfterEnd { index: usize },
@@ -114,11 +119,8 @@ impl fmt::Display for DecodeError {
             ),
             Self::UnknownSystem(s) => write!(f, "recording has an unknown system byte {s:#04X}"),
             Self::TruncatedHeader => write!(f, "recording header is truncated"),
-            Self::BatteryTooLarge(n) => {
-                write!(
-                    f,
-                    "recorded battery RAM is {n} bytes, more than the system has"
-                )
+            Self::BatteryTooLarge { len, max } => {
+                write!(f, "recorded battery RAM is {len} bytes (max {max})")
             }
             Self::BadRecord { index, kind } => {
                 write!(f, "record {index} has an unknown kind {kind:#04X}")
@@ -170,8 +172,11 @@ pub fn encode_record(record: Record) -> [u8; RECORD_LEN] {
 }
 
 /// Parse the header; returns it and the bytes after it (the records). The
-/// input is untrusted. A battery image over `max_battery` bytes is refused.
-pub fn decode_header(bytes: &[u8], max_battery: usize) -> Result<(Header, &[u8]), DecodeError> {
+/// input is untrusted. A battery image over [`MAX_BATTERY_BOUND`] is refused
+/// here; the caller checks the header's system and then its own cap
+/// ([`check_battery`]), so a recording of another system is reported as that,
+/// not as having too large a battery for this one.
+pub fn decode_header(bytes: &[u8]) -> Result<(Header, &[u8]), DecodeError> {
     if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
         return Err(DecodeError::NotARecording);
     }
@@ -190,8 +195,11 @@ pub fn decode_header(bytes: &[u8], max_battery: usize) -> Result<(Header, &[u8])
         (None, rest)
     } else {
         let len = len as usize;
-        if len > max_battery {
-            return Err(DecodeError::BatteryTooLarge(len));
+        if len > MAX_BATTERY_BOUND {
+            return Err(DecodeError::BatteryTooLarge {
+                len,
+                max: MAX_BATTERY_BOUND,
+            });
         }
         if rest.len() < len {
             return Err(DecodeError::TruncatedHeader);
@@ -220,6 +228,15 @@ pub fn decode_header(bytes: &[u8], max_battery: usize) -> Result<(Header, &[u8])
         variant,
     };
     Ok((header, rest))
+}
+
+/// Refuse a header whose battery image is over `max` bytes, the cap of the
+/// system that is about to replay it.
+pub fn check_battery(header: &Header, max: usize) -> Result<(), DecodeError> {
+    match &header.battery {
+        Some(b) if b.len() > max => Err(DecodeError::BatteryTooLarge { len: b.len(), max }),
+        _ => Ok(()),
+    }
 }
 
 /// The records of a recording.
@@ -360,12 +377,8 @@ mod tests {
         ]
     }
 
-    fn decode(
-        bytes: &[u8],
-        max_battery: usize,
-        buttons: usize,
-    ) -> Result<(Header, Records), DecodeError> {
-        let (h, rest) = decode_header(bytes, max_battery)?;
+    fn decode(bytes: &[u8], buttons: usize) -> Result<(Header, Records), DecodeError> {
+        let (h, rest) = decode_header(bytes)?;
         Ok((h, decode_records(rest, buttons)?))
     }
 
@@ -373,7 +386,7 @@ mod tests {
     fn a_hand_built_version_1_file_is_a_game_boy_dmg() {
         let mut v = prefix(1);
         v.extend_from_slice(&RECORDS);
-        let (h, r) = decode(&v, 100, 8).unwrap();
+        let (h, r) = decode(&v, 8).unwrap();
         assert_eq!(h.system, System::Gb);
         assert_eq!(h.variant, 0);
         assert_eq!(h.rom_hash, HASH);
@@ -387,7 +400,7 @@ mod tests {
         let mut v = prefix(2);
         v.push(1); // variant: CGB
         v.extend_from_slice(&RECORDS);
-        let (h, r) = decode(&v, 100, 8).unwrap();
+        let (h, r) = decode(&v, 8).unwrap();
         assert_eq!(h.system, System::Gb);
         assert_eq!(h.variant, 1);
         assert_eq!(h.battery, Some(vec![1, 2, 3]));
@@ -400,7 +413,7 @@ mod tests {
         let mut v = prefix(3);
         v.extend_from_slice(&[0, 1]); // variant 0, system GBA
         v.extend_from_slice(&RECORDS);
-        let (h, r) = decode(&v, 100, 10).unwrap();
+        let (h, r) = decode(&v, 10).unwrap();
         assert_eq!(h.system, System::Gba);
         assert_eq!(h.variant, 0);
         assert_eq!(r.records, expected_records());
@@ -428,7 +441,7 @@ mod tests {
                     variant: 1,
                 };
                 let bytes = h.encode();
-                let (back, rest) = decode_header(&bytes, 40).unwrap();
+                let (back, rest) = decode_header(&bytes).unwrap();
                 assert_eq!(back, h);
                 assert!(rest.is_empty());
             }
@@ -444,33 +457,44 @@ mod tests {
             variant: 0,
         }
         .encode();
-        assert_eq!(decode_header(b"nope", 9), Err(DecodeError::NotARecording));
+        assert_eq!(decode_header(b"nope"), Err(DecodeError::NotARecording));
         let mut v = good.clone();
         v[8] = VERSION + 1;
         assert_eq!(
-            decode_header(&v, 9),
+            decode_header(&v),
             Err(DecodeError::UnsupportedVersion(VERSION + 1))
         );
         v[8] = 0;
         assert_eq!(
-            decode_header(&v, 9),
+            decode_header(&v),
             Err(DecodeError::UnsupportedVersion(0))
         );
         // Cut at every length short of the full header: always TruncatedHeader.
         for cut in 9..good.len() {
             assert_eq!(
-                decode_header(&good[..cut], 9),
+                decode_header(&good[..cut]),
                 Err(DecodeError::TruncatedHeader),
                 "cut at {cut}"
             );
         }
         assert_eq!(
-            decode_header(&good, 2),
-            Err(DecodeError::BatteryTooLarge(3))
+            check_battery(&decode_header(&good).unwrap().0, 2),
+            Err(DecodeError::BatteryTooLarge { len: 3, max: 2 })
+        );
+        assert_eq!(check_battery(&decode_header(&good).unwrap().0, 3), Ok(()));
+        // The sanity bound itself.
+        let mut v = good.clone();
+        v[17..21].copy_from_slice(&((MAX_BATTERY_BOUND + 1) as u32).to_le_bytes());
+        assert_eq!(
+            decode_header(&v),
+            Err(DecodeError::BatteryTooLarge {
+                len: MAX_BATTERY_BOUND + 1,
+                max: MAX_BATTERY_BOUND
+            })
         );
         let mut v = good.clone();
         *v.last_mut().unwrap() = 2;
-        assert_eq!(decode_header(&v, 9), Err(DecodeError::UnknownSystem(2)));
+        assert_eq!(decode_header(&v), Err(DecodeError::UnknownSystem(2)));
     }
 
     #[test]

@@ -95,10 +95,11 @@ pub fn encode_header(header: &Header) -> Vec<u8> {
 impl Recording {
     /// Parse a recording. The input is untrusted: every length and value is checked.
     pub fn decode(bytes: &[u8]) -> Result<Self, ReplayError> {
-        let (header, rest) = common::decode_header(bytes, MAX_BATTERY_LEN)?;
+        let (header, rest) = common::decode_header(bytes)?;
         if header.system != System::Gb {
             return Err(ReplayError::WrongSystem(header.system));
         }
+        common::check_battery(&header, MAX_BATTERY_LEN)?;
         let model = Model::from_id(header.variant).ok_or(ReplayError::BadModel(header.variant))?;
         let records = common::decode_records(rest, System::Gb.button_count())?;
         Ok(Self {
@@ -343,6 +344,29 @@ mod tests {
         );
     }
 
+    /// A recording of another system is reported as that, whatever its battery
+    /// size: a GBA save can be larger than any Game Boy cartridge's.
+    #[test]
+    fn another_systems_big_battery_is_wrong_system_not_battery_too_large() {
+        for len in [128 * 1024, MAX_BATTERY_LEN + 1, 200 * 1024] {
+            let bytes = common::encode_header(System::Gba, 1, Some(&vec![0; len]), 0);
+            assert_eq!(
+                Recording::decode(&bytes),
+                Err(ReplayError::WrongSystem(System::Gba)),
+                "{len} bytes"
+            );
+        }
+        // The same size on a Game Boy recording is still refused, with its cap.
+        let bytes = common::encode_header(System::Gb, 1, Some(&vec![0; 200 * 1024]), 0);
+        assert_eq!(
+            Recording::decode(&bytes),
+            Err(ReplayError::Decode(DecodeError::BatteryTooLarge {
+                len: 200 * 1024,
+                max: MAX_BATTERY_LEN
+            }))
+        );
+    }
+
     #[test]
     fn the_writer_emits_version_3_and_a_v2_reader_layout_still_matches() {
         let (header, records) = sample();
@@ -401,7 +425,13 @@ mod tests {
 
         let mut v = good.clone();
         v[17..21].copy_from_slice(&((MAX_BATTERY_LEN + 1) as u32).to_le_bytes());
-        assert_eq!(dec(&v), Err(D::BatteryTooLarge(MAX_BATTERY_LEN + 1)));
+        assert_eq!(
+            dec(&v),
+            Err(D::BatteryTooLarge {
+                len: MAX_BATTERY_LEN + 1,
+                max: MAX_BATTERY_LEN
+            })
+        );
 
         let first = encode_header(&header).len();
         let mut v = good.clone();
