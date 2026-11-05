@@ -335,3 +335,21 @@ fn an_8bit_io_access_uses_one_lane() {
         "I/O is a 32-bit bus"
     );
 }
+
+#[test]
+fn halt_with_a_pending_enabled_interrupt_does_not_halt() {
+    let mut b = bus();
+    b.write16(0x0400_0200, 1, N);
+    b.irq.raise(Interrupt::VBlank);
+    b.write8(0x0400_0301, 0, N);
+    assert!(!b.halted, "no wait for the next event");
+    // Stop likewise ends at once if a stop-wake interrupt is pending.
+    b.write16(0x0400_0200, 1 << 12, N);
+    b.irq.raise(Interrupt::Keypad);
+    b.write8(0x0400_0301, 0x80, N);
+    assert!(!b.halted && !b.stopped);
+    // With nothing pending it halts.
+    b.irq.write_if(0xFFFF);
+    b.write8(0x0400_0301, 0, N);
+    assert!(b.halted);
+}

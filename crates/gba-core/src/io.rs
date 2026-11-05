@@ -141,6 +141,9 @@ impl Bus {
                 if mask & 0xFF00 != 0 {
                     self.halted = true;
                     self.stopped = v & 0x8000 != 0;
+                    // An enabled interrupt that is already pending ends the halt
+                    // at once, without a clock skip (code-review S#3).
+                    self.check_wake();
                 }
             }
             _ => {}
