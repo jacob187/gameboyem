@@ -110,9 +110,9 @@ fn address_and_count_masks() {
     );
     assert_eq!(b.read16(EWRAM + 0x8000, N), 0x1000);
     // The control register keeps only its defined bits; bit 11 only on DMA3.
-    b.write16(0x0400_00BA, 0xFFFF & !0x8000, N);
+    b.write16(0x0400_00BA, 0x7FFF, N);
     assert_eq!(b.read16(0x0400_00BA, N), 0x77E0);
-    b.write16(0x0400_00DE, 0xFFFF & !0x8000, N);
+    b.write16(0x0400_00DE, 0x7FFF, N);
     assert_eq!(b.read16(0x0400_00DE, N), 0x7FE0);
 }
 
