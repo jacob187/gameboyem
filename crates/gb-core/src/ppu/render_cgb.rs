@@ -2,7 +2,18 @@
 //! "LCD Color Palettes (CGB only)", "Object Priority and Conflicts").
 //!
 //! A separate path from `render_line` so the DMG renderer carries no per-pixel
-//! model branch. Same structure: the whole line is drawn at the start of mode 3,
+//! model branch. Deliberately a mirror of the DMG functions in `render.rs`, not
+//! a shared implementation, to keep the DMG hot path branch-free (perf is
+//! measured; the pinned DMG output must not change). The pairs, which a fix to
+//! either has to be applied to both of:
+//!
+//! * `render_line_cgb` mirrors `render_line` (and `render_bg_cgb` mirrors
+//!   `render_bg`: map selection, window start, refetch rule, `win_line`);
+//! * `tile_row_in_bank` mirrors `bg_tile_row` (tile addressing) with a bank;
+//! * `SpriteRow` mirrors `SpriteRow` in `render.rs`, plus the OAM index;
+//! * `render_sprites_cgb` mirrors `render_sprites` (8x16 pairs, Y flip, X).
+//!
+//! Same structure: the whole line is drawn at the start of mode 3,
 //! BG / window first (colour id plus attribute per pixel), sprites over it.
 //! Palette RAM is read once per line, so a mid-line palette write applies from
 //! the next line, like the other mid-line register changes.

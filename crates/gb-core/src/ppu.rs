@@ -103,7 +103,8 @@ const STAT_WRITABLE: u8 = 0x78;
 pub struct Ppu {
     /// Both VRAM banks: bank 0 at `0..0x2000`, bank 1 at `0x2000..0x4000`. A DMG
     /// only ever uses bank 0, so the renderer indexes `vram[..0x2000]` directly;
-    /// bank 1 is for CGB attributes and tiles (see [`Ppu::vram_bank`]).
+    /// bank 1 is for CGB attributes and tiles (the CGB renderer indexes it
+    /// directly; [`Ppu::vram_bank`] is a read-only view of one bank).
     vram: Box<[u8; 2 * VRAM_BANK_SIZE]>,
     oam: [u8; 0xA0],
     lcdc: u8,
@@ -155,10 +156,6 @@ pub struct Ppu {
     /// CGB hardware (bank 1 exists and is saved), in either CGB mode or
     /// DMG-compatibility mode.
     cgb: bool,
-    /// CGB colour mode (`Hw::Cgb`): the colour renderer, palette RAM and OPRI
-    /// exist. False on a DMG and in DMG-compatibility mode, whose output is the
-    /// DMG one (DECISIONS #36).
-    colour: bool,
     /// VBK (FF4F) bit 0: the VRAM bank the CPU and OAM DMA see. Always 0 on a DMG
     /// and in DMG-compatibility mode.
     vbk: u8,
@@ -179,8 +176,9 @@ pub struct Ppu {
     obj_decoded: render_cgb::Palettes,
     bg_stale: bool,
     obj_stale: bool,
-    /// RGB555 back / front frames (colour mode only; `None` otherwise). The DMG
-    /// `back` / `front` stay all zero in colour mode.
+    /// RGB555 back / front frames: `Some` (both) in CGB colour mode only, which
+    /// is what [`Ppu::colour`] reports. The DMG `back` / `front` stay all zero in
+    /// colour mode.
     cgb_back: Option<Box<CgbFramebuffer>>,
     cgb_front: Option<Box<CgbFramebuffer>>,
     /// The PPU entered HBlank (mode 3 -> 0 on a visible line) since the bus last
@@ -247,7 +245,6 @@ impl Ppu {
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             frame_ready: false,
             cgb: false,
-            colour: false,
             vbk: 0,
             bcps: 0,
             ocps: 0,
@@ -279,7 +276,6 @@ impl Ppu {
             // LYC (0) != 144, and the STAT select bits are clear.
             lyc_flag: false,
             cgb: true,
-            colour,
             bcps: BCPS_POST_BOOT,
             ocps: OCPS_POST_BOOT,
             bg_pal: [0xFF; PALETTE_RAM_SIZE],
@@ -290,8 +286,16 @@ impl Ppu {
         }
     }
 
-    /// One whole VRAM bank (0 or 1), unaffected by VBK and by PPU mode. This is
-    /// how the renderer reads bank 1 (BG attributes, CGB tiles).
+    /// CGB colour mode (`Hw::Cgb`): the colour renderer, palette RAM and OPRI
+    /// exist. False on a DMG and in DMG-compatibility mode, whose output is the
+    /// DMG one (DECISIONS #36). Derived from the RGB555 frames, which exist
+    /// exactly then.
+    fn colour(&self) -> bool {
+        self.cgb_back.is_some()
+    }
+
+    /// One whole VRAM bank (0 or 1), unaffected by VBK and by PPU mode. A
+    /// read-only view (tests use it); the renderer indexes `vram` directly.
     pub fn vram_bank(&self, bank: usize) -> &[u8; VRAM_BANK_SIZE] {
         let start = (bank & 1) * VRAM_BANK_SIZE;
         self.vram[start..start + VRAM_BANK_SIZE]
@@ -787,10 +791,14 @@ impl Ppu {
         self.hblank_entered = signalled;
     }
 
-    /// The HDMA copies a block now when it is armed: the PPU is in HBlank on a
-    /// visible line, or the LCD is off (the STAT mode reads 0 then; SameBoy).
+    /// The HDMA copies a block now when it is armed: the internal mode is 0.
+    /// That is HBlank on a visible line, the LCD being off, and dots 4..80 of
+    /// the first line after LCD on, where the STAT mode also reads 0 (SameBoy
+    /// starts an FF55 HBlank transfer when `STAT & 3 == 0`, outside its
+    /// line-start `display_state` 7, which the first line does not have, and
+    /// `GB_lcd_off` arms one only when `STAT & 3` is non-zero).
     pub(crate) fn in_hdma_window(&self) -> bool {
-        !self.lcd_on() || (self.ly < VBLANK_LINE && self.line_dot >= OAM_SCAN_DOTS + self.mode3_len)
+        self.mode() == 0
     }
 
     /// HDMA write to VRAM: into the CPU-selected bank, whatever the PPU mode.
@@ -847,7 +855,7 @@ impl Ppu {
         w.bool(self.stat_line);
         // In colour mode the shade frames are all zero by design (DECISIONS
         // #36), so they are not saved; the RGB555 frames below carry the picture.
-        if !self.colour {
+        if !self.colour() {
             w.bytes(&self.back[..]);
             w.bytes(&self.front[..]);
         }
@@ -859,7 +867,7 @@ impl Ppu {
             w.u8(self.ocps);
             w.bool(self.hblank_entered);
         }
-        if let (true, Some(back), Some(front)) = (self.colour, &self.cgb_back, &self.cgb_front) {
+        if let (Some(back), Some(front)) = (&self.cgb_back, &self.cgb_front) {
             w.u8(self.opri);
             w.bytes(&self.bg_pal);
             w.bytes(&self.obj_pal);
@@ -924,7 +932,7 @@ impl Ppu {
         self.vis_mode = r.u8()?;
         check(self.vis_mode <= 3, "STAT mode")?;
         self.stat_line = r.bool()?;
-        if self.colour {
+        if self.colour() {
             self.back.fill(0);
             self.front.fill(0);
         } else {
@@ -938,7 +946,8 @@ impl Ppu {
         self.frame_ready = r.bool()?;
         if self.cgb {
             self.vbk = r.u8()?;
-            check(self.vbk <= 1, "VBK")?;
+            // Compatibility mode drops VBK writes, so there it stays bank 0.
+            check(self.vbk <= u8::from(self.colour()), "VBK")?;
             self.bcps = r.u8()?;
             self.ocps = r.u8()?;
             check(
@@ -947,15 +956,16 @@ impl Ppu {
             )?;
             self.hblank_entered = r.bool()?;
         }
-        if self.colour {
+        if let (Some(back), Some(front)) =
+            (self.cgb_back.as_deref_mut(), self.cgb_front.as_deref_mut())
+        {
             self.opri = r.u8()?;
             check(self.opri <= OPRI_X_PRIORITY, "OPRI")?;
             r.bytes_into(&mut self.bg_pal)?;
             r.bytes_into(&mut self.obj_pal)?;
             self.bg_stale = true;
             self.obj_stale = true;
-            for fb in [&mut self.cgb_back, &mut self.cgb_front] {
-                let fb = fb.as_deref_mut().expect("colour mode has RGB555 frames");
+            for fb in [back, front] {
                 for c in fb.iter_mut() {
                     *c = r.u16()?;
                     check(*c <= CGB_WHITE, "framebuffer colour")?;

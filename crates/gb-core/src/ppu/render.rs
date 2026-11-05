@@ -79,7 +79,7 @@ impl Ppu {
     pub(super) fn window_on_line(&self) -> bool {
         // On a CGB in colour mode LCDC.0 only strips the BG's priority; the
         // window is still drawn.
-        (self.colour || self.lcdc & LCDC_BG_ENABLE != 0)
+        (self.colour() || self.lcdc & LCDC_BG_ENABLE != 0)
             && self.lcdc & LCDC_WIN_ENABLE != 0
             && self.wy_triggered
             && self.wx <= 166
@@ -138,7 +138,7 @@ impl Ppu {
 
     /// Draw the current line into the back buffer.
     pub(super) fn render_line(&mut self) {
-        if self.colour {
+        if self.colour() {
             return self.render_line_cgb();
         }
         let ly = self.ly;

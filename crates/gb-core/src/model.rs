@@ -23,11 +23,29 @@ impl Model {
             Self::Dmg
         }
     }
+
+    /// The byte a save state stores for this model.
+    pub(crate) fn id(self) -> u8 {
+        match self {
+            Self::Dmg => 0,
+            Self::Cgb => 1,
+        }
+    }
+
+    /// The inverse of [`Model::id`]; `None` for a byte no model writes.
+    pub(crate) fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Dmg),
+            1 => Some(Self::Cgb),
+            _ => None,
+        }
+    }
 }
 
 /// What the machine behaves like: the model plus, on a CGB, the mode the boot
-/// ROM picked from the cartridge header. Fixed at power-on, never saved (it is
-/// a function of the model and the ROM, and the ROM hash is saved).
+/// ROM picked from the cartridge header. Fixed at power-on; it is a function of
+/// the model and the ROM, so a save state only carries it as a corruption check
+/// (a header byte that must equal the machine's own [`Hw::id`]), never to set it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Hw {
     Dmg,
@@ -45,9 +63,6 @@ impl Hw {
             Model::Cgb => Self::CgbCompat,
         }
     }
-
-    /// Highest value of [`Hw::id`].
-    pub(crate) const MAX_ID: u8 = 2;
 
     /// The byte a save state stores for this variant.
     pub(crate) fn id(self) -> u8 {

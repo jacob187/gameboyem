@@ -56,6 +56,10 @@
 //!   the LCD is switched off outside HBlank (SameBoy: the STAT mode reads 0).
 //!   A general-purpose DMA is unaffected by the LCD.
 //! * Starting an HBlank DMA while the PPU is in HBlank copies a block at once.
+//!   "In HBlank" is the internal STAT mode 0 ([`crate::ppu::Ppu::in_hdma_window`]):
+//!   that includes dots 4..80 of the first line after LCD on, which read mode 0
+//!   but have no OAM scan (SameBoy `memory.c`: `STAT & 3 == 0`). Switching the LCD
+//!   off there arms nothing, for the same reason.
 //! * Sources: ROM, cartridge RAM and WRAM (0000-7FFF, A000-DFFF) are read
 //!   directly (no OAM DMA bus conflicts). VRAM and E000+ are open bus on
 //!   hardware (Pan Docs: "garbage"); they read `0xFF` here. Writes go to the
@@ -100,27 +104,13 @@ impl Bus {
         self.tick_core();
     }
 
-    /// One CPU M-cycle of the CGB clocking (see the module docs).
+    /// One CPU M-cycle of the CGB clocking (see the module docs): the shared
+    /// [`Bus::tick_units`] in the current speed's variant.
     pub(crate) fn tick_core(&mut self) {
-        self.mcycles += 1;
-        self.timer.tick_mcycle(&mut self.interrupts);
-        self.serial
-            .tick_mcycle(&mut self.interrupts, self.timer.div_counter());
-        self.step_dma();
         if self.double_speed {
-            self.ppu.tick_mcycle_double(&mut self.interrupts);
-            if self.mcycles & 1 == 0 {
-                self.apu.tick_mcycle(self.timer.div_counter() >> 1);
-                if self.cart_ticks {
-                    self.cart.tick_mcycle();
-                }
-            }
+            self.tick_units::<true>();
         } else {
-            self.ppu.tick_mcycle(&mut self.interrupts);
-            self.apu.tick_mcycle(self.timer.div_counter());
-            if self.cart_ticks {
-                self.cart.tick_mcycle();
-            }
+            self.tick_units::<false>();
         }
     }
 
@@ -170,7 +160,7 @@ impl Bus {
         loop {
             let (src, dst) = self.hdma.next_block();
             self.hdma_copy_block(src, dst);
-            if !general || self.hdma.general_done() {
+            if !general || self.hdma.finished() {
                 break;
             }
         }

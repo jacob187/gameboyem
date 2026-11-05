@@ -3,8 +3,8 @@
 //! DMG-compatibility mode.
 //!
 //! This unit holds the register file and the transfer bookkeeping. The copy and
-//! the CPU stall live in `Bus` (`bus.rs`), because they tick every other
-//! component while the CPU waits.
+//! the CPU stall live in `Bus` (`bus_cgb.rs`: `tick_slow`, `write_hdma5`,
+//! `hdma_burst`), because they tick every other component while the CPU waits.
 //!
 //! * Source (FF51/FF52) is masked to `& 0xFFF0`; the destination (FF53/FF54) is
 //!   stored as an offset into VRAM, `x & 0x1FF0` (the bus address is `0x8000 |`
@@ -94,17 +94,16 @@ impl Hdma {
 
     /// CPU write to FF55. The caller does the copying.
     pub(crate) fn write5(&mut self, v: u8) -> Start {
+        self.blocks_left = (v & 0x7F) + 1;
         if v & 0x80 == 0 && self.hblank {
             // The cancelling write also loads the length bits: FF55 then reads
             // `0x80 | (v & 0x7F)`, not the blocks that were left (SameBoy; the
             // hardware-verified SameSuite `hdma_lcd_off` / `hdma_mode0` expect
             // $80 after cancelling with 0; Pan Docs says the remaining length
             // stays, DECISIONS #40).
-            self.blocks_left = (v & 0x7F) + 1;
             self.hblank = false;
             return Start::Cancelled;
         }
-        self.blocks_left = (v & 0x7F) + 1;
         self.hblank = v & 0x80 != 0;
         if self.hblank {
             Start::HBlank
@@ -114,23 +113,23 @@ impl Hdma {
     }
 
     /// Take the next block: returns its `(source, VRAM offset)` and advances the
-    /// registers. The transfer ends when no blocks are left or the destination
-    /// wraps out of VRAM.
+    /// registers. The transfer ends when [`Hdma::finished`].
     pub(crate) fn next_block(&mut self) -> (u16, u16) {
         debug_assert!(self.blocks_left > 0);
         let at = (self.src, self.dst);
         self.src = self.src.wrapping_add(BLOCK_BYTES);
         self.dst = (self.dst + BLOCK_BYTES) & DST_MASK;
         self.blocks_left -= 1;
-        if self.blocks_left == 0 || self.dst == 0 {
+        if self.finished() {
             self.hblank = false;
         }
         at
     }
 
-    /// A general-purpose transfer is over when the blocks ran out or the
-    /// destination wrapped (the HBlank case clears `hblank` the same way).
-    pub(crate) fn general_done(&self) -> bool {
+    /// The one end rule of a transfer, checked after each block: the blocks ran
+    /// out or the destination wrapped. [`Hdma::next_block`] clears `hblank` on
+    /// it; a general-purpose transfer loops until it holds.
+    pub(crate) fn finished(&self) -> bool {
         self.blocks_left == 0 || self.dst == 0
     }
 
@@ -156,5 +155,80 @@ impl Hdma {
             blocks_left,
             hblank,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state as `Hdma::save_state` lays it out, with any field value.
+    fn bytes(src: u16, dst: u16, blocks_left: u8, hblank: bool) -> Vec<u8> {
+        let mut w = StateWriter::new();
+        w.u16(src);
+        w.u16(dst);
+        w.u8(blocks_left);
+        w.bool(hblank);
+        w.into_bytes()
+    }
+
+    fn load(bytes: &[u8]) -> Result<Hdma, StateError> {
+        Hdma::load_state(&mut StateReader::new(bytes))
+    }
+
+    #[test]
+    fn load_state_round_trips_what_save_state_writes() {
+        let mut h = Hdma::new();
+        h.write_src_hi(0xC1);
+        h.write_dst_hi(0x92);
+        assert_eq!(h.write5(0x84), Start::HBlank);
+        let mut w = StateWriter::new();
+        h.save_state(&mut w);
+        let saved = w.into_bytes();
+        assert_eq!(saved, bytes(0xC1F0, 0x12F0, 5, true));
+        assert_eq!(load(&saved), Ok(h));
+    }
+
+    #[test]
+    fn load_state_accepts_the_edges() {
+        assert!(load(&bytes(0xFFF0, 0x1FF0, MAX_BLOCKS, true)).is_ok());
+        assert!(load(&bytes(0x0000, 0x0000, 0, false)).is_ok());
+    }
+
+    #[test]
+    fn load_state_rejects_each_bad_field() {
+        let cases: [(Vec<u8>, &str); 7] = [
+            (bytes(0xC001, 0x0000, 1, false), "HDMA source"),
+            (bytes(0x000F, 0x0000, 1, false), "HDMA source"),
+            (bytes(0xC000, 0x0001, 1, false), "HDMA destination"),
+            (bytes(0xC000, 0x2000, 1, false), "HDMA destination"),
+            (bytes(0xC000, 0x0000, MAX_BLOCKS + 1, false), "HDMA length"),
+            (bytes(0xC000, 0x0000, 0, true), "HDMA active without blocks"),
+            (bytes(0xC000, 0x0000, 0xFF, true), "HDMA length"),
+        ];
+        for (state, field) in cases {
+            assert_eq!(load(&state), Err(StateError::Invalid(field)), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_transfer_ends_on_the_last_block_or_when_the_destination_wraps() {
+        let mut h = Hdma::new();
+        h.write_src_hi(0xC0);
+        h.write_src_lo(0x00);
+        h.write_dst_hi(0x00);
+        h.write_dst_lo(0x00);
+        assert_eq!(h.write5(0x81), Start::HBlank);
+        assert_eq!(h.next_block(), (0xC000, 0x0000));
+        assert!(!h.finished() && h.hblank_active());
+        assert_eq!(h.next_block(), (0xC010, 0x0010));
+        assert!(h.finished() && !h.hblank_active(), "no blocks left");
+        // Three blocks wanted, but the destination wraps after the first.
+        h.write_dst_hi(0x1F);
+        h.write_dst_lo(0xF0);
+        assert_eq!(h.write5(0x82), Start::HBlank);
+        h.next_block();
+        assert!(h.finished() && !h.hblank_active(), "destination wrapped");
+        assert_eq!(h.read5(), 0x80 | 1, "two blocks were never copied");
     }
 }
