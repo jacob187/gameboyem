@@ -17,6 +17,7 @@ mod video;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use emu_common::{Core, System};
 use gb_core::GameBoy;
 use winit::event_loop::EventLoop;
 
@@ -40,7 +41,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let rom = match rom::read_rom(&opts.rom) {
+    // The only system so far; a GBA core chooses here (by extension or header)
+    // and builds its own `Box<dyn Core>` below.
+    let system = System::Gb;
+    let rom = match rom::read_rom(&opts.rom, system) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -49,27 +53,27 @@ fn main() -> ExitCode {
     };
     let archive = rom::archive_kind(&rom);
     let model = opts.model.resolve(&rom);
-    let rom_hash = gb_core::replay::rom_hash(&rom);
-    let mut gb = match GameBoy::with_model(rom, model) {
+    let rom_hash = emu_common::replay::rom_hash(&rom);
+    let gb = match GameBoy::with_model(rom, model) {
         Ok(gb) => gb,
         Err(e) => {
             eprintln!("error: {}", rom::cartridge_message(&opts.rom, &e, archive));
             return ExitCode::FAILURE;
         }
     };
-    let header = gb.cartridge_header();
-    if !header.header_checksum_ok {
+    if !gb.cartridge_header().header_checksum_ok {
         eprintln!("warning: ROM header checksum is wrong (running anyway)");
     }
+    let mut core: Box<dyn Core> = Box::new(gb);
 
     let audio = if opts.mute {
         None
     } else {
         match AudioOutput::start() {
             Ok(a) => {
-                gb.set_audio_sample_rate(a.sample_rate);
+                core.set_audio_sample_rate(a.sample_rate);
                 // The core clamps the rate; a mismatch would mean wrong pitch.
-                match audio::check_core_rate(a.sample_rate, gb.audio_sample_rate()) {
+                match audio::check_core_rate(a.sample_rate, core.audio_sample_rate()) {
                     Ok(()) => Some(a),
                     Err(e) => {
                         eprintln!("warning: audio disabled: {e}");
@@ -85,17 +89,13 @@ fn main() -> ExitCode {
     };
 
     let mut saves = SaveManager::new(&opts.rom, Instant::now());
-    saves.load(&mut gb);
+    saves.load(core.as_mut());
 
     // The recording starts from the battery RAM the session actually powered on with.
     let recorder = match &opts.record {
         None => None,
         Some(path) => {
-            let header = gb_core::replay::Header {
-                rom_hash,
-                battery: gb.battery_ram(),
-                model,
-            };
+            let header = record::header_for(core.as_ref(), rom_hash);
             match record::Recorder::create(path, &header) {
                 Ok(r) => {
                     eprintln!("recording inputs to {}", path.display());
@@ -134,7 +134,7 @@ fn main() -> ExitCode {
         states: StateSlots::new(&opts.rom),
     };
     let mut app = App::new(
-        gb,
+        core,
         storage,
         audio,
         opts.palette.colors(),

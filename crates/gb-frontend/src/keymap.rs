@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use gb_core::Button;
+use emu_common::Button;
 use winit::keyboard::KeyCode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

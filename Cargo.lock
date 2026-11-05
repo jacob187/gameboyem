@@ -701,6 +701,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "ctrlc",
+ "emu-common",
  "gb-core",
  "pixels",
  "png",

@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use gb_core::GameBoy;
+use emu_common::Core;
 
 /// How often battery RAM is compared against what is on disk.
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -235,7 +235,7 @@ impl SaveManager {
     }
 
     /// Load an existing save into the cartridge. Problems are logged, never fatal.
-    pub fn load(&mut self, gb: &mut GameBoy) {
+    pub fn load(&mut self, gb: &mut dyn Core) {
         if gb.battery_ram().is_none() {
             return; // no battery: nothing to load or save
         }
@@ -277,7 +277,7 @@ impl SaveManager {
     }
 
     /// Periodic check; writes if the cartridge reports a battery change.
-    pub fn tick(&mut self, gb: &GameBoy, now: Instant) {
+    pub fn tick(&mut self, gb: &dyn Core, now: Instant) {
         if now >= self.next_check {
             self.next_check = now + SAVE_INTERVAL;
             self.sync_gb(gb, now, false, false);
@@ -286,21 +286,21 @@ impl SaveManager {
 
     /// Write now if the cartridge reports a battery change (e.g. on pause).
     /// Failures are rate-limited.
-    pub fn flush(&mut self, gb: &GameBoy) {
+    pub fn flush(&mut self, gb: &dyn Core) {
         self.sync_gb(gb, Instant::now(), false, false);
     }
 
     /// Last write before exiting: a failure is always reported, never throttled,
     /// because it means data is being lost. Ignores the generation counter and
     /// always looks at the RAM image, so a free-running RTC is saved on quit.
-    pub fn flush_final(&mut self, gb: &GameBoy) {
+    pub fn flush_final(&mut self, gb: &dyn Core) {
         self.sync_gb(gb, Instant::now(), true, true);
     }
 
     /// Cheap pre-check on the cartridge's battery generation (no RAM clone, no
     /// write while it is unchanged), then [`Self::sync`]. `force` skips the
     /// pre-check.
-    fn sync_gb(&mut self, gb: &GameBoy, now: Instant, urgent: bool, force: bool) {
+    fn sync_gb(&mut self, gb: &dyn Core, now: Instant, urgent: bool, force: bool) {
         let generation = gb.battery_generation();
         if !force && self.last_gen == Some(generation) {
             return;
@@ -378,6 +378,7 @@ enum Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gb_core::GameBoy;
 
     fn sync(m: &mut SaveManager, ram: Option<Vec<u8>>) -> bool {
         m.sync(ram, Instant::now(), false)
@@ -564,7 +565,7 @@ mod tests {
 
     /// Load `contents` as `g.sav`, change RAM, and try every kind of write.
     /// Returns the manager (for inspection) after asserting nothing was written.
-    fn load_then_try_to_save(dir: &Path, gb: &mut GameBoy) -> SaveManager {
+    fn load_then_try_to_save(dir: &Path, gb: &mut dyn Core) -> SaveManager {
         let t0 = Instant::now();
         let mut m = SaveManager::new(&dir.join("g.gb"), t0);
         m.load(gb);

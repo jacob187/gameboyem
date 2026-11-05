@@ -8,10 +8,19 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use gb_core::replay::{self, Header, Record};
-use gb_core::{
-    CgbFramebuffer, Framebuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH, rgb555_to_rgb888,
-};
+use emu_common::replay::{self, Header, Record};
+use emu_common::{Core, FrameRef, Pixels, rgb555_to_rgb888};
+
+/// The header of a recording of `core`'s session: call it right after the save
+/// was loaded, so the battery bytes are what the session really powered on with.
+pub fn header_for(core: &dyn Core, rom_hash: u64) -> Header {
+    Header {
+        system: core.system(),
+        rom_hash,
+        battery: core.battery_ram(),
+        variant: core.hw_variant(),
+    }
+}
 
 pub struct Recorder {
     file: File,
@@ -27,7 +36,7 @@ impl Recorder {
             .create_new(true)
             .open(path)
             .map_err(|e| format!("cannot create recording {}: {e}", path.display()))?;
-        file.write_all(&replay::encode_header(header))
+        file.write_all(&header.encode())
             .map_err(|e| format!("cannot write recording {}: {e}", path.display()))?;
         Ok(Self {
             file,
@@ -78,42 +87,22 @@ pub fn screenshot_path(rom: &Path, frame: u64) -> PathBuf {
     rom.with_file_name(format!("{stem}-f{frame:07}.png"))
 }
 
-/// The picture a screenshot saves: the shade frame of a DMG (or of a CGB in
-/// DMG-compatibility mode), or the RGB555 frame of a CGB in colour mode.
-#[derive(Clone, Copy)]
-pub enum Picture<'a> {
-    Shades(&'a Framebuffer),
-    Colour(&'a CgbFramebuffer),
-}
-
-impl<'a> Picture<'a> {
-    /// What the machine is showing now.
-    pub fn of(gb: &'a GameBoy) -> Self {
-        match gb.cgb_framebuffer() {
-            Some(fb) => Self::Colour(fb),
-            None => Self::Shades(gb.framebuffer()),
-        }
-    }
-}
-
-/// Write the raw 160x144 picture as a PNG: greyscale for shades, which map
-/// exactly as `gb-test` dumps them (0xFF, 0xAA, 0x55, 0x00), and RGB for a
-/// colour frame, widened with no colour correction (as `blit_cgb` and
+/// Write the raw frame as a PNG at its own size: greyscale for shades, which
+/// map exactly as `gb-test` dumps them (0xFF, 0xAA, 0x55, 0x00), and RGB for an
+/// RGB555 frame, widened with no colour correction (as `video::blit_rgb555` and
 /// `gb-test` do). A screenshot and the replayed frame compare byte for byte.
-pub fn write_png(picture: Picture<'_>, path: &Path) -> Result<(), String> {
+pub fn write_png(frame: FrameRef<'_>, path: &Path) -> Result<(), String> {
+    let width = u32::try_from(frame.width).map_err(|e| e.to_string())?;
+    let height = u32::try_from(frame.height).map_err(|e| e.to_string())?;
     let file = File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(
-        std::io::BufWriter::new(file),
-        SCREEN_WIDTH as u32,
-        SCREEN_HEIGHT as u32,
-    );
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     enc.set_depth(png::BitDepth::Eight);
-    let samples: Vec<u8> = match picture {
-        Picture::Shades(fb) => {
+    let samples: Vec<u8> = match frame.pixels {
+        Pixels::Shades(fb) => {
             enc.set_color(png::ColorType::Grayscale);
             fb.iter().map(|&s| 0xFF - 0x55 * (s & 3)).collect()
         }
-        Picture::Colour(fb) => {
+        Pixels::Rgb555(fb) => {
             enc.set_color(png::ColorType::Rgb);
             fb.iter().flat_map(|&c| rgb555_to_rgb888(c)).collect()
         }
@@ -140,14 +129,31 @@ mod tests {
     }
 
     #[test]
+    fn png_has_the_frames_own_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.png");
+        let px: Vec<u16> = (0..240 * 160).map(|i| i as u16 & 0x7FFF).collect();
+        let frame = FrameRef {
+            width: 240,
+            height: 160,
+            pixels: Pixels::Rgb555(&px),
+        };
+        write_png(frame, &path).unwrap();
+        let dec = png::Decoder::new(std::io::BufReader::new(File::open(&path).unwrap()));
+        let reader = dec.read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (240, 160));
+    }
+
+    #[test]
     fn refuses_to_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("r.gbinput");
         std::fs::write(&path, b"keep").unwrap();
         let header = Header {
+            system: emu_common::System::Gb,
             rom_hash: 0,
             battery: None,
-            model: gb_core::Model::Dmg,
+            variant: 0,
         };
         assert!(Recorder::create(&path, &header).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");

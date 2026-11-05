@@ -1,6 +1,8 @@
-//! Framebuffer presentation: DMG shade or CGB RGB555 -> RGBA and a synthetic test pattern.
+//! Framebuffer presentation: any `FrameRef` (DMG shades or RGB555) -> RGBA, and
+//! a synthetic test pattern.
 
-use gb_core::{CgbFramebuffer, Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH, rgb555_to_rgb888};
+use emu_common::{FrameRef, Pixels, rgb555_to_rgb888};
+use gb_core::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteKind {
@@ -31,28 +33,46 @@ impl PaletteKind {
     }
 }
 
-/// Convert shades to RGBA8 in `out` (`160*144*4` bytes). Shades above 3 are masked.
-pub fn blit(fb: &Framebuffer, palette: &Palette, out: &mut [u8]) {
-    assert_eq!(out.len(), fb.len() * 4, "blit needs a 160x144 RGBA buffer");
+/// Convert shades to RGBA8 in `out` (`4 * fb.len()` bytes). Shades above 3 are masked.
+pub fn blit(fb: &[u8], palette: &Palette, out: &mut [u8]) {
+    assert_eq!(
+        out.len(),
+        fb.len() * 4,
+        "blit needs a width * height * 4 byte RGBA buffer"
+    );
     let (pixels, _) = out.as_chunks_mut::<4>();
     for (shade, px) in fb.iter().zip(pixels) {
         *px = palette[usize::from(shade & 3)];
     }
 }
 
-/// Convert an RGB555 (`0bbbbbgggggrrrrr`) colour frame to RGBA8 in `out`
-/// (`160*144*4` bytes). Channels widen with [`gb_core::rgb555_to_rgb888`], with
-/// no colour correction (the cgb-acid2 rule); the DMG palette is not used.
-pub fn blit_cgb(fb: &CgbFramebuffer, out: &mut [u8]) {
+/// Convert an RGB555 (`0bbbbbgggggrrrrr`) frame of any size to RGBA8 in `out`
+/// (`4 * fb.len()` bytes). Channels widen with [`rgb555_to_rgb888`], with no
+/// colour correction (the cgb-acid2 rule); the DMG palette is not used.
+pub fn blit_rgb555(fb: &[u16], out: &mut [u8]) {
     assert_eq!(
         out.len(),
         fb.len() * 4,
-        "blit_cgb needs a 160x144 RGBA buffer"
+        "blit_rgb555 needs a width * height * 4 byte RGBA buffer"
     );
     let (pixels, _) = out.as_chunks_mut::<4>();
     for (&px, out) in fb.iter().zip(pixels) {
         let [r, g, b] = rgb555_to_rgb888(px);
         *out = [r, g, b, 0xFF];
+    }
+}
+
+/// Convert whatever a core produced to RGBA8 in `out`, which must be exactly
+/// `width * height * 4` bytes.
+pub fn present(frame: &FrameRef<'_>, palette: &Palette, out: &mut [u8]) {
+    assert_eq!(
+        frame.pixels.len(),
+        frame.width * frame.height,
+        "frame size and pixel count disagree"
+    );
+    match frame.pixels {
+        Pixels::Shades(fb) => blit(fb, palette, out),
+        Pixels::Rgb555(fb) => blit_rgb555(fb, out),
     }
 }
 
@@ -100,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn blit_cgb_widens_rgb555_without_correction() {
+    fn blit_rgb555_widens_without_correction() {
         let mut fb = [0u16; SCREEN_WIDTH * SCREEN_HEIGHT];
         fb[1] = 0x7FFF;
         fb[2] = 0x001F; // red is the low 5 bits
@@ -108,7 +128,7 @@ mod tests {
         fb[4] = 0b01111_00001_10000;
         fb[5] = 0x8000; // bit 15 ignored
         let mut out = vec![0x11u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4];
-        blit_cgb(&fb, &mut out);
+        blit_rgb555(&fb, &mut out);
         assert_eq!(&out[0..4], &[0, 0, 0, 0xFF]);
         assert_eq!(&out[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]);
         assert_eq!(&out[8..12], &[0xFF, 0, 0, 0xFF]);
@@ -125,10 +145,55 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "blit_cgb needs")]
-    fn blit_cgb_rejects_a_wrong_sized_buffer() {
+    #[should_panic(expected = "blit_rgb555 needs")]
+    fn blit_rgb555_rejects_a_wrong_sized_buffer() {
         let fb = [0u16; SCREEN_WIDTH * SCREEN_HEIGHT];
-        blit_cgb(&fb, &mut vec![0u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4 - 4]);
+        blit_rgb555(&fb, &mut vec![0u8; SCREEN_WIDTH * SCREEN_HEIGHT * 4 - 4]);
+    }
+
+    /// A frame of another size (a GBA is 240x160) converts pixel for pixel,
+    /// whatever its width and height.
+    #[test]
+    fn present_handles_any_frame_size() {
+        let (w, h) = (240, 160);
+        let rgb: Vec<u16> = (0..w * h).map(|i| (i * 37) as u16 & 0x7FFF).collect();
+        let mut out = vec![0u8; w * h * 4];
+        let frame = FrameRef {
+            width: w,
+            height: h,
+            pixels: Pixels::Rgb555(&rgb),
+        };
+        present(&frame, &PaletteKind::Grey.colors(), &mut out);
+        for (i, px) in out.as_chunks::<4>().0.iter().enumerate() {
+            let [r, g, b] = rgb555_to_rgb888(rgb[i]);
+            assert_eq!(*px, [r, g, b, 0xFF], "pixel {i}");
+        }
+        // The last pixel of the last row is written (nothing assumes 160x144).
+        assert_eq!(out.len(), 240 * 160 * 4);
+
+        // Shades of a non-standard size too, e.g. 3x2.
+        let shades = [0u8, 1, 2, 3, 3, 0];
+        let mut out = [0u8; 3 * 2 * 4];
+        let frame = FrameRef {
+            width: 3,
+            height: 2,
+            pixels: Pixels::Shades(&shades),
+        };
+        present(&frame, &PaletteKind::Grey.colors(), &mut out);
+        assert_eq!(&out[20..24], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(&out[12..16], &[0, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    #[should_panic(expected = "frame size and pixel count disagree")]
+    fn present_rejects_a_frame_whose_pixels_do_not_fit() {
+        let px = [0u16; 5];
+        let frame = FrameRef {
+            width: 2,
+            height: 3,
+            pixels: Pixels::Rgb555(&px),
+        };
+        present(&frame, &PaletteKind::Grey.colors(), &mut [0u8; 24]);
     }
 
     #[test]
