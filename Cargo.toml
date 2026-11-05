@@ -27,6 +27,10 @@ opt-level = 3
 [profile.dev.package.emu-common]
 opt-level = 3
 
+# gba-core is the GBA hot path (CPU, bus, PPU); same reason as gb-core.
+[profile.dev.package.gba-core]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
