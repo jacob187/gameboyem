@@ -14,7 +14,7 @@ use winit::window::{Window, WindowId};
 
 use crate::audio::{AudioOutput, ToneGen};
 use crate::keymap::{Action, InputState, map};
-use crate::pacer::{FramePacer, MAX_STEPS_PER_ADVANCE, audio_seconds};
+use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
@@ -292,15 +292,10 @@ impl App {
         emulated
     }
 
-    /// Run steps while the pacer says a frame is owed, then upload the last
-    /// picture. Returns whether any step ran.
+    /// Run steps while the pacer says a frame is owed ([`run_due`]), then
+    /// upload the last picture. Returns whether any step ran.
     fn run_due(&mut self) -> bool {
-        let mut ran = 0;
-        while ran < MAX_STEPS_PER_ADVANCE && self.pacer.frame_due() {
-            let emulated = self.step_once();
-            self.pacer.consume(emulated);
-            ran += 1;
-        }
+        let ran = run_due(self);
         if ran > 0 {
             self.upload();
         }
@@ -318,6 +313,16 @@ impl App {
                 None => blit(self.gb.framebuffer(), &self.palette, p.frame_mut()),
             },
         }
+    }
+}
+
+impl Steps for App {
+    fn pacer(&mut self) -> &mut FramePacer {
+        &mut self.pacer
+    }
+
+    fn step(&mut self) -> f64 {
+        self.step_once()
     }
 }
 
@@ -447,6 +452,7 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gb_core::{M_CYCLES_PER_FRAME, Model};
     use std::fs;
 
     #[test]
@@ -464,7 +470,10 @@ mod tests {
         let mut rom = vec![0u8; 0x8000];
         rom[0x147] = 0x03; // MBC1+RAM+BATTERY
         rom[0x149] = 0x02; // 8 KiB
-        let mut gb = GameBoy::new(rom).unwrap();
+        headless_app_with(dir, GameBoy::new(rom).unwrap())
+    }
+
+    fn headless_app_with(dir: &std::path::Path, mut gb: GameBoy) -> App {
         let mut saves = SaveManager::new(&dir.join("g.gb"), Instant::now());
         saves.load(&mut gb); // no .sav yet: the blank RAM is the baseline
         App::new(
@@ -514,6 +523,75 @@ mod tests {
         // Samples are whole, so the total is within a sample of 120 periods.
         let rate = f64::from(app.gb.audio_sample_rate());
         assert!((total - 120.0 * period).abs() < 2.0 / rate, "{total}");
+    }
+
+    /// A CGB-only ROM that switches to double speed once (`LD A,1; LDH
+    /// (KEY1),A; STOP`) and then spins.
+    fn speed_switch_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x143] = 0xC0;
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]); // JP 0x150
+        let code = [0x3E, 0x01, 0xE0, 0x4D, 0x10, 0x00, 0x18, 0xFE];
+        rom[0x150..0x150 + code.len()].copy_from_slice(&code);
+        rom
+    }
+
+    #[test]
+    fn a_step_spanning_a_speed_switch_is_charged_its_real_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = || GameBoy::with_model(speed_switch_rom(), Model::Cgb).unwrap();
+        // Find the M-cycle the STOP starts at, on a second identical machine.
+        let mut probe = make();
+        let mut switch_at = probe.mcycles();
+        while !probe.double_speed() {
+            switch_at = probe.mcycles();
+            probe.step_instruction();
+        }
+
+        let mut app = headless_app_with(dir.path(), make());
+        let m_per_s = f64::from(M_CYCLES_PER_FRAME) * FRAMES_PER_SECOND;
+        let period = app.pacer.period();
+        let rate = f64::from(app.gb.audio_sample_rate());
+        for _ in 0..4 {
+            let start = app.gb.mcycles();
+            let was_double = app.gb.double_speed();
+            let emulated = app.step_once();
+            if was_double || !app.gb.double_speed() {
+                continue;
+            }
+            // Pre-switch cycles take 1/1048576 s each, the rest half that.
+            let end = app.gb.mcycles();
+            let real = ((switch_at - start) as f64 + (end - switch_at) as f64 / 2.0) / m_per_s;
+            assert!((emulated - real).abs() < 3.0 / rate, "{emulated} vs {real}");
+            // Not vacuous: counting every M-cycle at the normal rate is far off.
+            let naive = (end - start) as f64 / m_per_s;
+            assert!(naive - real > 0.4 * period, "{naive} vs {real}");
+            return;
+        }
+        panic!("no step contained the speed switch");
+    }
+
+    #[test]
+    fn run_due_runs_the_steps_the_pacer_owes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        assert!(!app.run_due(), "nothing owed yet");
+        let before = app.gb.mcycles();
+        app.pacer
+            .advance(Duration::from_secs_f64(2.5 * app.pacer.period()));
+        assert!(app.run_due());
+        let frames = (app.gb.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
+        assert!((1.9..=3.1).contains(&frames), "{frames}");
+        assert!(!app.pacer.frame_due(), "the debt is paid");
+        // A long stall is bounded by the catch-up cap.
+        app.pacer.advance(Duration::from_secs(60));
+        let before = app.gb.mcycles();
+        assert!(app.run_due());
+        let frames = (app.gb.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
+        assert!(
+            frames <= f64::from(crate::pacer::MAX_CATCHUP_FRAMES) + 1.1,
+            "{frames}"
+        );
     }
 
     #[test]

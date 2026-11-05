@@ -106,6 +106,28 @@ impl FramePacer {
     }
 }
 
+/// Something that owns a [`FramePacer`] and can run one emulation step. The
+/// event loop's catch-up ([`run_due`]) is written once against this, so the
+/// tests exercise the loop the app really runs.
+pub trait Steps {
+    fn pacer(&mut self) -> &mut FramePacer;
+    /// Run one step; return the emulated seconds it covered.
+    fn step(&mut self) -> f64;
+}
+
+/// Run steps while the pacer says a frame is owed, charging each for the
+/// emulated time it covered, at most [`MAX_STEPS_PER_ADVANCE`] of them.
+/// Returns how many ran.
+pub fn run_due(s: &mut impl Steps) -> u32 {
+    let mut ran = 0;
+    while ran < MAX_STEPS_PER_ADVANCE && s.pacer().frame_due() {
+        let emulated = s.step();
+        s.pacer().consume(emulated);
+        ran += 1;
+    }
+    ran
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,94 +138,106 @@ mod tests {
         Duration::from_secs_f64(s)
     }
 
-    /// Add `dt`, then run nominal one-frame steps while due (what the old
-    /// count-based pacer returned).
-    fn run(p: &mut FramePacer, dt: Duration) -> u32 {
-        p.advance(dt);
-        let mut n = 0;
-        while p.frame_due() && n < MAX_STEPS_PER_ADVANCE {
-            p.consume(p.period());
-            n += 1;
-        }
-        n
+    /// A scripted stand-in for the emulator: each step covers the next of
+    /// `steps` frame periods (cycled) and the emulated seconds are summed.
+    struct Script<'a> {
+        pacer: FramePacer,
+        steps: &'a [f64],
+        at: usize,
+        total: f64,
     }
 
-    /// Like `run` but each step covers the next of `steps` frame periods
-    /// (cycled); returns the steps run and the emulated seconds they covered.
-    fn run_steps(p: &mut FramePacer, dt: Duration, steps: &[f64], at: &mut usize) -> (u32, f64) {
-        p.advance(dt);
-        let (mut n, mut total) = (0, 0.0);
-        while p.frame_due() && n < MAX_STEPS_PER_ADVANCE {
-            let s = steps[*at % steps.len()] * p.period();
-            *at += 1;
-            p.consume(s);
-            total += s;
-            n += 1;
+    impl Steps for Script<'_> {
+        fn pacer(&mut self) -> &mut FramePacer {
+            &mut self.pacer
         }
-        (n, total)
+
+        fn step(&mut self) -> f64 {
+            let s = self.steps[self.at % self.steps.len()] * self.pacer.period();
+            self.at += 1;
+            self.total += s;
+            s
+        }
     }
+
+    impl<'a> Script<'a> {
+        fn new(fps: f64, steps: &'a [f64]) -> Self {
+            Self {
+                pacer: FramePacer::new(fps),
+                steps,
+                at: 0,
+                total: 0.0,
+            }
+        }
+
+        /// Add `dt`, then run the real catch-up loop; returns the steps run.
+        fn tick(&mut self, dt: Duration) -> u32 {
+            self.pacer.advance(dt);
+            run_due(self)
+        }
+    }
+
+    const NORMAL: &[f64] = &[1.0];
 
     #[test]
     fn native_rate_on_a_60hz_display() {
-        let mut p = FramePacer::new(FPS);
-        let frames: u64 = (0..6000)
-            .map(|_| u64::from(run(&mut p, secs(1.0 / 60.0))))
-            .sum();
+        let mut s = Script::new(FPS, NORMAL);
+        let frames: u64 = (0..6000).map(|_| u64::from(s.tick(secs(1.0 / 60.0)))).sum();
         assert!((frames as f64 - FPS * 100.0).abs() <= 1.0, "{frames}");
     }
 
     #[test]
     fn native_rate_on_a_144hz_display() {
-        let mut p = FramePacer::new(FPS);
+        let mut s = Script::new(FPS, NORMAL);
         let frames: u64 = (0..14_400)
-            .map(|_| u64::from(run(&mut p, secs(1.0 / 144.0))))
+            .map(|_| u64::from(s.tick(secs(1.0 / 144.0))))
             .sum();
         assert!((frames as f64 - FPS * 100.0).abs() <= 1.0, "{frames}");
     }
 
     #[test]
     fn exact_period_yields_one_frame() {
-        let mut p = FramePacer::new(60.0);
-        assert_eq!(run(&mut p, secs(1.0 / 60.0)), 1);
-        assert_eq!(run(&mut p, Duration::from_millis(1)), 0);
+        let mut s = Script::new(60.0, NORMAL);
+        assert_eq!(s.tick(secs(1.0 / 60.0)), 1);
+        assert_eq!(s.tick(Duration::from_millis(1)), 0);
     }
 
     #[test]
     fn catch_up_is_capped_and_backlog_dropped() {
-        let mut p = FramePacer::new(FPS);
-        assert_eq!(run(&mut p, Duration::from_secs(10)), MAX_CATCHUP_FRAMES);
+        let mut s = Script::new(FPS, NORMAL);
+        assert_eq!(s.tick(Duration::from_secs(10)), MAX_CATCHUP_FRAMES);
         // The backlog is gone: the next short tick does not burst.
-        assert!(run(&mut p, Duration::from_millis(1)) <= 1);
+        assert!(s.tick(Duration::from_millis(1)) <= 1);
     }
 
     #[test]
     fn speed_multiplies_frame_rate_and_rejects_bad_values() {
-        let mut p = FramePacer::new(60.0);
-        p.set_speed(2.0);
-        let frames: u32 = (0..60).map(|_| run(&mut p, secs(1.0 / 60.0))).sum();
+        let mut s = Script::new(60.0, NORMAL);
+        s.pacer.set_speed(2.0);
+        let frames: u32 = (0..60).map(|_| s.tick(secs(1.0 / 60.0))).sum();
         assert!((119..=121).contains(&frames), "{frames}");
-        p.set_speed(f64::NAN);
-        p.set_speed(-1.0);
-        p.set_speed(0.0);
-        p.reset();
-        assert_eq!(run(&mut p, secs(1.0 / 60.0)), 2, "speed must still be 2x");
+        s.pacer.set_speed(f64::NAN);
+        s.pacer.set_speed(-1.0);
+        s.pacer.set_speed(0.0);
+        s.pacer.reset();
+        assert_eq!(s.tick(secs(1.0 / 60.0)), 2, "speed must still be 2x");
     }
 
     #[test]
     fn reset_clears_accumulator() {
-        let mut p = FramePacer::new(60.0);
-        run(&mut p, secs(0.9 / 60.0));
-        p.reset();
-        assert_eq!(run(&mut p, secs(0.5 / 60.0)), 0);
+        let mut s = Script::new(60.0, NORMAL);
+        s.tick(secs(0.9 / 60.0));
+        s.pacer.reset();
+        assert_eq!(s.tick(secs(0.5 / 60.0)), 0);
     }
 
     #[test]
     fn time_until_next_shrinks_as_time_accrues() {
-        let mut p = FramePacer::new(60.0);
-        let full = p.time_until_next();
-        run(&mut p, Duration::from_millis(10));
-        assert!(p.time_until_next() < full);
-        assert!(p.time_until_next() <= secs(1.0 / 60.0));
+        let mut s = Script::new(60.0, NORMAL);
+        let full = s.pacer.time_until_next();
+        s.tick(Duration::from_millis(10));
+        assert!(s.pacer.time_until_next() < full);
+        assert!(s.pacer.time_until_next() <= secs(1.0 / 60.0));
     }
 
     #[test]
@@ -252,22 +286,21 @@ mod tests {
         // simulated seconds the emulated time run matches real time to
         // within one step.
         let steps = [1.71, 1.63, 0.37, 1.0, 1.0, 1.9, 0.1];
-        let mut p = FramePacer::new(FPS);
-        let (mut at, mut emulated) = (0, 0.0);
+        let mut s = Script::new(FPS, &steps);
         for _ in 0..(100 * 144) {
-            emulated += run_steps(&mut p, secs(1.0 / 144.0), &steps, &mut at).1;
+            s.tick(secs(1.0 / 144.0));
         }
-        let drift = (emulated - 100.0).abs();
-        assert!(drift <= 1.9 * p.period(), "drift {drift} s");
+        let drift = (s.total - 100.0).abs();
+        assert!(drift <= 1.9 * s.pacer.period(), "drift {drift} s");
     }
 
     #[test]
     fn a_ceaseless_switcher_is_not_run_fast() {
         // Every step 1.9 frames long: only 1/1.9 as many steps per second.
-        let mut p = FramePacer::new(FPS);
-        let (mut at, mut steps) = (0, 0u32);
+        let mut s = Script::new(FPS, &[1.9]);
+        let mut steps = 0u32;
         for _ in 0..6000 {
-            steps += run_steps(&mut p, secs(1.0 / 60.0), &[1.9], &mut at).0;
+            steps += s.tick(secs(1.0 / 60.0));
         }
         let expected = FPS * 100.0 / 1.9;
         assert!((f64::from(steps) - expected).abs() <= 2.0, "{steps}");
@@ -275,22 +308,24 @@ mod tests {
 
     #[test]
     fn fast_forward_runs_variable_steps_at_the_multiple() {
-        let mut p = FramePacer::new(FPS);
-        p.set_speed(4.0);
-        let (mut at, mut emulated) = (0, 0.0);
+        let mut s = Script::new(FPS, &[1.71, 0.37, 1.0]);
+        s.pacer.set_speed(4.0);
         for _ in 0..6000 {
-            emulated += run_steps(&mut p, secs(1.0 / 60.0), &[1.71, 0.37, 1.0], &mut at).1;
+            s.tick(secs(1.0 / 60.0));
         }
         // 100 s of real time at 4x.
-        assert!((emulated - 400.0).abs() <= 1.9 * p.period(), "{emulated}");
+        assert!(
+            (s.total - 400.0).abs() <= 1.9 * s.pacer.period(),
+            "{}",
+            s.total
+        );
     }
 
     #[test]
     fn zero_length_steps_cannot_spin_the_catch_up() {
-        let mut p = FramePacer::new(FPS);
-        let mut at = 0;
-        let (n, total) = run_steps(&mut p, Duration::from_secs(1), &[0.0], &mut at);
-        assert_eq!((n, total), (MAX_STEPS_PER_ADVANCE, 0.0));
+        let mut s = Script::new(FPS, &[0.0]);
+        let n = s.tick(Duration::from_secs(1));
+        assert_eq!((n, s.total), (MAX_STEPS_PER_ADVANCE, 0.0));
     }
 
     #[test]
