@@ -91,7 +91,9 @@ pub struct Bus {
     /// Whether the cartridge needs a per-M-cycle tick (only an MBC3 RTC does).
     pub(crate) cart_ticks: bool,
     // ---- CGB additions (DECISIONS #31, #33); VBK lives in the PPU ----
-    /// The machine variant; only the IO paths in `mmu.rs` look at it.
+    /// The machine variant. Read by the IO paths in `mmu.rs`, by construction
+    /// (`Bus::with_model`, `post_boot_registers`, `wram_len`), by `stop` (speed
+    /// switch) and by the save-state layout here and in `gameboy.rs`.
     pub(crate) hw: Hw,
     /// SVBK (FF70) bits 0-2 as written (0 selects bank 1).
     pub(crate) svbk: u8,
@@ -233,20 +235,42 @@ impl Bus {
     /// The order is load-bearing: timer, serial, DMA, PPU, APU, cartridge,
     /// then the CPU's access (in `CpuBus` read/write). The mooneye timer and
     /// OAM DMA tests and `bus_tests.rs` pin it down, so don't reorder casually.
+    /// The order lives in [`Bus::tick_units`], the one copy both this plain path
+    /// and the CGB clocking (`Bus::tick_core`) share.
     #[inline]
     pub(crate) fn tick_components(&mut self) {
         if self.slow {
             return self.tick_slow(false);
         }
+        self.tick_units::<false>();
+    }
+
+    /// One CPU M-cycle of every non-CPU component, in the load-bearing order
+    /// (see [`Bus::tick_components`]). `DOUBLE` is the CGB double-speed variant:
+    /// the PPU runs 2 dots instead of 4 and the APU and cartridge only on every
+    /// other CPU M-cycle (see `bus_cgb.rs`). With `DOUBLE` false this is the
+    /// plain path a DMG runs, which the compiler folds into the caller.
+    #[inline(always)]
+    pub(crate) fn tick_units<const DOUBLE: bool>(&mut self) {
         self.mcycles += 1;
         self.timer.tick_mcycle(&mut self.interrupts);
         self.serial
             .tick_mcycle(&mut self.interrupts, self.timer.div_counter());
         self.step_dma();
-        self.ppu.tick_mcycle(&mut self.interrupts);
-        self.apu.tick_mcycle(self.timer.div_counter());
-        if self.cart_ticks {
-            self.cart.tick_mcycle();
+        if DOUBLE {
+            self.ppu.tick_mcycle_double(&mut self.interrupts);
+            if self.mcycles & 1 == 0 {
+                self.apu.tick_mcycle(self.timer.div_counter() >> 1);
+                if self.cart_ticks {
+                    self.cart.tick_mcycle();
+                }
+            }
+        } else {
+            self.ppu.tick_mcycle(&mut self.interrupts);
+            self.apu.tick_mcycle(self.timer.div_counter());
+            if self.cart_ticks {
+                self.cart.tick_mcycle();
+            }
         }
     }
 
@@ -353,7 +377,8 @@ impl Bus {
         self.mcycles = r.u64()?;
         if self.hw.is_cgb() {
             let svbk = r.u8()?;
-            check(svbk < 8, "SVBK")?;
+            // Compatibility mode has no SVBK: it stays 0 (bank 1).
+            check(svbk < 8 && (self.hw == Hw::Cgb || svbk == 0), "SVBK")?;
             self.set_svbk(svbk);
             self.key1_prepare = r.bool()?;
             self.cgb_scratch = CgbScratch::load_state(r, self.hw == Hw::Cgb)?;
