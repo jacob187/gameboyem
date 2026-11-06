@@ -286,6 +286,10 @@ fn msr_write(cpu: &mut Cpu, op: u32, value: u32) {
             // User mode may only change the condition flags.
             mask &= 0xFF00_0000;
         }
+        // The state bit (T) is writable here, as in the SingleStepTests reference
+        // (the ARM ARM leaves it UNPREDICTABLE): no refill happens, so the
+        // pipeline keeps its opcodes and runs as the new state. Thumb decode masks
+        // them to 16 bits, so that cannot fault the host (code-review ST#9).
         // Mode bit 4 is hard-wired to 1.
         let new = ((cpu.cpsr & !mask) | (value & mask)) | 0x10;
         cpu.set_cpsr(new);

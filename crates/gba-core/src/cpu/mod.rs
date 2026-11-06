@@ -294,8 +294,8 @@ impl Cpu {
     /// The CPSR mode is not checked: MSR can write any value to an SPSR and
     /// `restore_spsr` copies it into the CPSR, and `bank_of` maps all 32 mode
     /// values (an invalid one to the user bank), so every value is reachable and
-    /// harmless. The one thing that would index out of range is a Thumb-state
-    /// opcode wider than 16 bits (`THUMB[op >> 6]`), which is checked.
+    /// harmless. Nor is the pipeline checked against the state bit: the Thumb
+    /// decode masks its index, so no pipeline contents can fault.
     pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
         let regs = get_u32s::<16>(r)?;
         let cpsr = r.u32()?;
@@ -310,10 +310,6 @@ impl Cpu {
         let (seq, flushed, needs_refill) = (r.bool()?, r.bool()?, r.bool()?);
         let has_retry = r.bool()?;
         let retry_op = r.u32()?;
-        check(
-            cpsr & PSR_T == 0 || pipe.iter().all(|&op| op <= 0xFFFF),
-            "Thumb pipeline opcode wider than 16 bits",
-        )?;
         check(has_retry || retry_op == 0, "retry opcode without a retry")?;
         *self = Self {
             r: regs,
@@ -600,7 +596,10 @@ impl Cpu {
 
     #[inline(always)]
     fn step_thumb<B: CpuBus>(&mut self, bus: &mut B) {
-        let op = self.pipe[0];
+        // Thumb opcodes are 16 bits. The pipeline holds ARM words only after an MSR
+        // flipped the state bit without a refill (UNPREDICTABLE on hardware, kept
+        // as the reference does); masking makes the decode safe for any contents.
+        let op = self.pipe[0] & 0xFFFF;
         self.pipe[0] = self.pipe[1];
         let acc = self.fetch_access();
         self.pipe[1] = u32::from(bus.fetch16(self.r[15], acc));
