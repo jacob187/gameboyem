@@ -123,6 +123,10 @@ pub struct Cart {
     backup: Backup,
     /// The GPIO port and the clock behind it.
     gpio: Gpio,
+    /// Cached `gpio.reads_enabled()`: false for a cartridge that never enabled GPIO
+    /// reads, so the ROM read path tests one bool instead of the address range
+    /// (updated by every GPIO write, the only thing that can change it).
+    gpio_reads: bool,
     /// Bumps on every change to the save data and on a successful load.
     generation: u64,
 }
@@ -159,6 +163,7 @@ impl Cart {
             rom,
             backup,
             gpio: Gpio::new(options.rtc),
+            gpio_reads: false,
             generation: 0,
         })
     }
@@ -379,6 +384,13 @@ impl Cart {
         self.gpio.live()
     }
 
+    /// Whether a GPIO register can currently shadow ROM on a read. When false,
+    /// [`Cart::gpio_read`] would return `None` for every address.
+    #[inline]
+    pub fn gpio_reads(&self) -> bool {
+        self.gpio_reads
+    }
+
     /// A data read at ROM offset `off` (0..0x0200_0000) of width `w`, if it hits
     /// a GPIO register that is currently readable: `None` means read the ROM.
     /// Registers are 0xC4 data, 0xC6 direction, 0xC8 control; a word covering a
@@ -413,6 +425,7 @@ impl Cart {
             Width::H => self.gpio.write16(off & !1, v as u16, now),
             Width::W => self.gpio.write32(off & !3, v, now),
         };
+        self.gpio_reads = self.gpio.reads_enabled();
         self.generation += u64::from(fx.rtc_changed);
         fx.irq
     }

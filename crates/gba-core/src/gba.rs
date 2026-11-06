@@ -77,7 +77,13 @@ impl Gba {
         } else {
             self.cpu.step(&mut self.bus);
         }
-        self.bus.process_events();
+        // Dispatch only when something is due, or while halted (the wake check at
+        // the end of `process_events` is what ends a halt). Most instructions
+        // cross no event, and the call is not free (P3-TIMING).
+        let now = self.bus.sched.now();
+        if self.bus.halted || self.bus.sched.next_at().is_some_and(|t| t <= now) {
+            self.bus.process_events();
+        }
         true
     }
 

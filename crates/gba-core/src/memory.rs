@@ -25,7 +25,7 @@ pub(crate) fn vram_index(addr: u32) -> usize {
 }
 
 #[inline(always)]
-fn rd(s: &[u8], off: usize, w: Width) -> u32 {
+pub(crate) fn rd(s: &[u8], off: usize, w: Width) -> u32 {
     let off = off & !(w as usize - 1);
     match w {
         Width::B => u32::from(s[off]),
@@ -99,18 +99,7 @@ impl Bus {
             0x05 => rd(&*self.ppu.palette, addr as usize & 0x3FF, w),
             0x06 => rd(&*self.ppu.vram, vram_index(addr), w),
             0x07 => rd(&*self.ppu.oam, addr as usize & 0x3FF, w),
-            0x08..=0x0D => {
-                let off = addr & 0x01FF_FFFF;
-                // P3-CART: the GPIO port overlays ROM at 0xC4..0xC9 once enabled.
-                if let Some(v) = self.cart.gpio_read(off, w) {
-                    return v;
-                }
-                match w {
-                    Width::B => u32::from(self.cart.read_rom8(off)),
-                    Width::H => u32::from(self.cart.read_rom16(off & !1)),
-                    Width::W => self.cart.read_rom32(off & !3),
-                }
-            }
+            0x08..=0x0D => self.read_rom(addr, w),
             0x0E | 0x0F => {
                 let b = u32::from(self.cart.read_save8(addr & 0xFFFF));
                 b * match w {
@@ -120,6 +109,25 @@ impl Bus {
                 }
             }
             _ => self.open_bus_value(addr, w),
+        }
+    }
+
+    /// A cartridge-ROM read of `w` (the GPIO port shadows ROM at 0xC4..0xC9 once
+    /// it is enabled). The address range is only tested when the cartridge has
+    /// enabled GPIO reads, so the common case is one flag test.
+    #[inline]
+    pub(crate) fn read_rom(&self, addr: u32, w: Width) -> u32 {
+        let off = addr & 0x01FF_FFFF;
+        if self.cart.gpio_reads() {
+            // P3-CART: the GPIO port overlays ROM at 0xC4..0xC9 once enabled.
+            if let Some(v) = self.cart.gpio_read(off, w) {
+                return v;
+            }
+        }
+        match w {
+            Width::B => u32::from(self.cart.read_rom8(off)),
+            Width::H => u32::from(self.cart.read_rom16(off & !1)),
+            Width::W => self.cart.read_rom32(off & !3),
         }
     }
 

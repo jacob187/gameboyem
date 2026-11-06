@@ -122,6 +122,12 @@ impl Gpio {
         self.live
     }
 
+    /// Whether any register currently reads back instead of ROM (the port exists
+    /// and its control register enabled reads): what `read16` tests first.
+    pub fn reads_enabled(&self) -> bool {
+        self.live && self.control & 1 != 0
+    }
+
     pub fn rtc(&self) -> &Rtc {
         &self.rtc
     }
@@ -153,7 +159,7 @@ impl Gpio {
     /// The register at even ROM offset `reg` as a halfword, or `None` where the
     /// address reads as ROM (port absent, reads not enabled, or not a register).
     pub fn read16(&self, reg: u32) -> Option<u16> {
-        if !self.live || self.control & 1 == 0 {
+        if !self.reads_enabled() {
             return None;
         }
         match reg {

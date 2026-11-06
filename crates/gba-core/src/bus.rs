@@ -19,6 +19,7 @@ use crate::bios::Bios;
 use crate::cart::Cart;
 use crate::dma::{Dma, DmaTrigger};
 use crate::irq::Irq;
+use crate::memory::rd;
 use crate::keypad::Keypad;
 use crate::ppu::Ppu;
 use crate::scheduler::{Event, Scheduler};
@@ -290,7 +291,7 @@ impl Bus {
                     1
                 }
             }
-            0x08..=0x0D => self.rom_cost(addr, w, access, false),
+            0x08..=0x0D => self.rom_cost(addr, w, access),
             0x0E | 0x0F => u64::from(self.waits.sram),
             // BIOS, IWRAM, I/O, OAM (32-bit buses), and open bus.
             _ => 1,
@@ -308,8 +309,7 @@ impl Bus {
     /// cost 1 cycle, and every other ROM access would first have to account for
     /// the prefetch in flight. The caller already passes everything needed.
     #[inline]
-    pub fn rom_cost(&self, addr: u32, w: Width, access: Access, fetch: bool) -> u64 {
-        let _ = fetch;
+    pub fn rom_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
         let ws = ((addr >> 25) & 3) as usize;
         let seq = access == Access::Seq && addr & 0x1_FFFF != 0;
         u64::from(self.waits.rom[ws][usize::from(seq)][usize::from(w == Width::W)])
@@ -333,14 +333,11 @@ impl Bus {
         self.fetching_bios = addr < crate::BIOS_SIZE as u32;
     }
 
-    /// Cost of an opcode fetch (ROM fetches go through the prefetch hook).
+    /// Cost of a cartridge-ROM opcode fetch: the only access the prefetch buffer
+    /// serves (P3-TIMING hooks in here).
     #[inline]
-    fn fetch_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
-        if (0x08..=0x0D).contains(&(addr >> 24)) {
-            self.rom_cost(addr, w, access, true)
-        } else {
-            self.cost(addr, w, access)
-        }
+    fn rom_fetch_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
+        self.rom_cost(addr, w, access)
     }
 
     /// Record an opcode fetch for open bus and BIOS read protection.
@@ -400,19 +397,74 @@ impl CpuBus for Bus {
     }
     #[inline]
     fn fetch16(&mut self, addr: u32, access: Access) -> u16 {
-        self.begin_fetch(addr);
-        self.sched.advance(self.fetch_cost(addr, Width::H, access));
-        let v = self.read_region(addr, Width::H, false);
-        self.note_fetch(addr, v, Width::H);
-        v as u16
+        // Per-region fast paths for the regions code runs from. Each does what the
+        // general path does: the BIOS-fetch flag is cleared (no BIOS latch update
+        // is needed), the open-bus value is latched and the clock charged.
+        match addr >> 24 {
+            0x08..=0x0D => {
+                self.fetching_bios = false;
+                let c = self.rom_fetch_cost(addr, Width::H, access);
+                self.sched.advance(c);
+                let v = self.read_rom(addr, Width::H);
+                self.open_bus = v | v << 16;
+                v as u16
+            }
+            0x03 => {
+                self.fetching_bios = false;
+                self.sched.advance(1);
+                let v = rd(&self.iwram, addr as usize & 0x7FFF, Width::H);
+                self.open_bus = v | v << 16;
+                v as u16
+            }
+            0x02 => {
+                self.fetching_bios = false;
+                self.sched.advance(3);
+                let v = rd(&self.ewram, addr as usize & 0x3_FFFF, Width::H);
+                self.open_bus = v | v << 16;
+                v as u16
+            }
+            _ => {
+                self.begin_fetch(addr);
+                self.sched.advance(self.cost(addr, Width::H, access));
+                let v = self.read_region(addr, Width::H, false);
+                self.note_fetch(addr, v, Width::H);
+                v as u16
+            }
+        }
     }
     #[inline]
     fn fetch32(&mut self, addr: u32, access: Access) -> u32 {
-        self.begin_fetch(addr);
-        self.sched.advance(self.fetch_cost(addr, Width::W, access));
-        let v = self.read_region(addr, Width::W, false);
-        self.note_fetch(addr, v, Width::W);
-        v
+        match addr >> 24 {
+            0x08..=0x0D => {
+                self.fetching_bios = false;
+                let c = self.rom_fetch_cost(addr, Width::W, access);
+                self.sched.advance(c);
+                let v = self.read_rom(addr, Width::W);
+                self.open_bus = v;
+                v
+            }
+            0x03 => {
+                self.fetching_bios = false;
+                self.sched.advance(1);
+                let v = rd(&self.iwram, addr as usize & 0x7FFF, Width::W);
+                self.open_bus = v;
+                v
+            }
+            0x02 => {
+                self.fetching_bios = false;
+                self.sched.advance(6);
+                let v = rd(&self.ewram, addr as usize & 0x3_FFFF, Width::W);
+                self.open_bus = v;
+                v
+            }
+            _ => {
+                self.begin_fetch(addr);
+                self.sched.advance(self.cost(addr, Width::W, access));
+                let v = self.read_region(addr, Width::W, false);
+                self.note_fetch(addr, v, Width::W);
+                v
+            }
+        }
     }
     fn idle(&mut self, cycles: u32) {
         self.sched.advance(u64::from(cycles));

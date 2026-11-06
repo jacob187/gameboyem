@@ -43,10 +43,12 @@ pub struct FifoRequest {
 /// Default host sample rate until the frontend sets its device rate.
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 
-/// Interval of the bus's `Event::ApuSample` pump in CPU cycles: one hardware
-/// output sample (32.768 kHz, GBATEK SOUNDBIAS). It only bounds how far the
-/// APU can lag the clock; the output is exact without it.
-pub const PUMP_CYCLES: u64 = 512;
+/// Interval of the bus's `Event::ApuSample` pump in CPU cycles (4096, about 4096
+/// Hz). It only bounds how far the APU can lag the clock; the output is exact
+/// without it, because every register read and write, FIFO timer overflow and
+/// drain syncs the APU itself (code-review A2#1). It was 512, one hardware
+/// output sample; the pump then dispatched 8x more events than it needed to.
+pub const PUMP_CYCLES: u64 = 4096;
 
 /// CPU cycles per frame-sequencer step: 512 Hz (length 256 Hz on even steps,
 /// sweep 128 Hz on steps 2 and 6, envelope 64 Hz on step 7; the GB sequencer
