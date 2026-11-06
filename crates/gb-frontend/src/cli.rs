@@ -139,12 +139,12 @@ where
             "--palette" => {
                 let value = option_value("--palette", args.next())?;
                 palette = parse_palette(&value)?;
-                gb_only.push("--palette");
+                push_unique(&mut gb_only, "--palette");
             }
             "--model" => {
                 let value = option_value("--model", args.next())?;
                 model = parse_model(&value)?;
-                gb_only.push("--model");
+                push_unique(&mut gb_only, "--model");
             }
             "--system" => {
                 let value = option_value("--system", args.next())?;
@@ -153,29 +153,29 @@ where
             "--save-type" => {
                 let value = option_value("--save-type", args.next())?;
                 save_type = parse_save_type(&value)?;
-                gba_only.push("--save-type");
+                push_unique(&mut gba_only, "--save-type");
             }
             "--rtc" => {
                 let value = option_value("--rtc", args.next())?;
                 rtc = parse_rtc(&value)?;
-                gba_only.push("--rtc");
+                push_unique(&mut gba_only, "--rtc");
             }
             "--rtc-start" => {
                 let value = option_value("--rtc-start", args.next())?;
                 rtc_start = Some(parse_rtc_start(&value)?);
-                gba_only.push("--rtc-start");
+                push_unique(&mut gba_only, "--rtc-start");
             }
             _ if text.starts_with("--save-type=") => {
                 save_type = parse_save_type(&text["--save-type=".len()..])?;
-                gba_only.push("--save-type");
+                push_unique(&mut gba_only, "--save-type");
             }
             _ if text.starts_with("--rtc=") => {
                 rtc = parse_rtc(&text["--rtc=".len()..])?;
-                gba_only.push("--rtc");
+                push_unique(&mut gba_only, "--rtc");
             }
             _ if text.starts_with("--rtc-start=") => {
                 rtc_start = Some(parse_rtc_start(&text["--rtc-start=".len()..])?);
-                gba_only.push("--rtc-start");
+                push_unique(&mut gba_only, "--rtc-start");
             }
             "--bios" => bios = Some(path_value("--bios", args.next())?),
             _ if text.starts_with("--bios=") && text.len() > "--bios=".len() => {
@@ -191,11 +191,11 @@ where
             _ if text.starts_with("--scale=") => scale = parse_scale(&text["--scale=".len()..])?,
             _ if text.starts_with("--palette=") => {
                 palette = parse_palette(&text["--palette=".len()..])?;
-                gb_only.push("--palette");
+                push_unique(&mut gb_only, "--palette");
             }
             _ if text.starts_with("--model=") => {
                 model = parse_model(&text["--model=".len()..])?;
-                gb_only.push("--model");
+                push_unique(&mut gb_only, "--model");
             }
             _ if text.starts_with('-') && text.len() > 1 => {
                 return Err(format!("unknown option `{text}`"));
@@ -224,6 +224,14 @@ where
         gba_only,
         gb_only,
     }))
+}
+
+/// Record that `flag` was passed, once however often it was (the warning names
+/// each flag one time).
+fn push_unique(flags: &mut Vec<&'static str>, flag: &'static str) {
+    if !flags.contains(&flag) {
+        flags.push(flag);
+    }
 }
 
 /// Check the options that depend on the system, once it is known. `--bios` on a
@@ -555,6 +563,35 @@ mod tests {
             );
             assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
         }
+        // A flag repeated on the command line is named once (code-review K#5).
+        let o = run(&[
+            "--rtc",
+            "on",
+            "--save-type=sram",
+            "--rtc=off",
+            "--rtc",
+            "auto",
+            "g.gb",
+        ]);
+        assert_eq!(
+            check_system_flags(System::Gb, &o),
+            Ok(Some(
+                "--rtc and --save-type ignored for Game Boy games".to_owned()
+            ))
+        );
+        let o = run(&[
+            "--model",
+            "dmg",
+            "--model=cgb",
+            "--palette=grey",
+            "--palette",
+            "green",
+            "g.gba",
+        ]);
+        assert_eq!(
+            check_system_flags(System::Gba, &o),
+            Ok(Some("--model and --palette ignored for GBA".to_owned()))
+        );
         // --bios on a Game Boy game stays an error, even next to a GBA-only flag.
         let o = run(&["--bios", "b.bin", "--rtc", "on", "g.gb"]);
         assert!(check_system_flags(System::Gb, &o).is_err());
