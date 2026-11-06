@@ -8,7 +8,9 @@
 
 use crate::bus::{Bus, Width};
 use crate::irq::Interrupt;
-use crate::scheduler::Event;
+
+/// SOUNDCNT_H, whose bits 10 and 14 select the timer that clocks FIFO A and B.
+const SOUNDCNT_H: u32 = 0x082;
 
 /// WAITCNT's writable bits (bit 15, the cart type, is read-only).
 const WAITCNT_MASK: u16 = 0x7FFF;
@@ -92,15 +94,26 @@ impl Bus {
             0x060..=0x09F => {
                 self.apu.advance_to(self.sched.now());
                 self.apu.write_reg(off, v, mask);
+                if off == SOUNDCNT_H {
+                    // The timer select decides which timers clock a FIFO.
+                    self.refresh_sound_clock();
+                }
             }
             0x0A0..=0x0A7 => self.write_fifo_half(off, v, mask),
-            0x0B0..=0x0DF => self.dma.write_reg(off - 0xB0, v, mask),
+            0x0B0..=0x0DF => {
+                self.dma.write_reg(off - 0xB0, v, mask);
+                if (off - 0xB0) % 12 == 10 {
+                    // A sound-FIFO DMA channel makes the FIFO timers observed.
+                    self.refresh_sound_clock();
+                }
+            }
             0x100..=0x10F => {
                 let n = ((off - 0x100) >> 2) as usize;
+                let now = self.sched.now();
+                self.flush_timers();
                 if off & 2 == 0 {
-                    self.timers.write_reload(n, v, mask);
+                    self.timers.write_reload(n, v, mask, now, &mut self.sched);
                 } else {
-                    let now = self.sched.now();
                     self.timers.write_control(n, v, mask, now, &mut self.sched);
                 }
             }
@@ -150,6 +163,10 @@ impl Bus {
         self.fifo_latch[b] = (self.fifo_latch[b] & !m) | (u32::from(v) << shift & m);
         if hi && mask & 0xFF00 != 0 {
             self.apu.write_fifo(b == 1, self.fifo_latch[b]);
+            if !self.timers.fifo_written[b] {
+                self.timers.fifo_written[b] = true;
+                self.refresh_sound_clock();
+            }
         }
     }
 
@@ -167,15 +184,70 @@ impl Bus {
         self.keypad_irq();
     }
 
-    /// Timer `n` overflowed at `at`: reload, IRQ, APU clocking, FIFO DMA and the
-    /// cascade into the next timer.
+    /// Work out which of timers 0 and 1 clock a Direct Sound FIFO that is in use
+    /// and tell the timers (they schedule overflow events only for observed
+    /// timers, DECISIONS #69). A FIFO is in use once a word was written to it or
+    /// a sound-FIFO DMA channel (DMA1/2, start timing 3) is enabled; until then
+    /// a pop is a no-op and a refill request starts nothing. The timer is the
+    /// SOUNDCNT_H select, whatever the output enables say, because the APU pops
+    /// regardless of them. Call after anything that changes those inputs;
+    /// P3-STATE calls it after loading a state.
+    pub fn refresh_sound_clock(&mut self) {
+        let select = self.apu.read_reg(SOUNDCNT_H);
+        let dma_fifo = (1..3).any(|c| {
+            let ctl = self.dma.ch[c].control;
+            ctl & 0x8000 != 0 && ctl >> 12 & 3 == 3
+        });
+        let mut clock = [false; 2];
+        for b in 0..2 {
+            if self.timers.fifo_written[b] || dma_fifo {
+                clock[usize::from(select >> (10 + 4 * b) & 1)] = true;
+            }
+        }
+        if clock != self.timers.sound {
+            self.flush_timers();
+            let now = self.sched.now();
+            self.timers.set_sound(clock, now, &mut self.sched);
+        }
+    }
+
+    /// Deliver the overflows of coalesced timers that are already past, so a
+    /// change to the timers or to what observes them takes effect after them.
+    pub(crate) fn flush_timers(&mut self) {
+        if !self.timers.any_batched() {
+            return;
+        }
+        let now = self.sched.now();
+        for n in 0..4 {
+            if self.timers.t[n].batch > 1 {
+                let count = self.timers.pending_overflows(n, now);
+                self.timers.sync(n, now);
+                if count > 0 {
+                    self.timer_effects(n, now, count);
+                }
+            }
+        }
+        self.check_wake();
+    }
+
+    /// Timer `n` overflowed at `at`: reload, schedule the next event, then the
+    /// effects of the overflow(s) the event stood for.
     pub(crate) fn timer_overflow(&mut self, n: usize, at: u64) {
-        let mut n = n;
+        let count = self.timers.t[n].batch.max(1);
+        self.timers.overflow(n, at, &mut self.sched);
+        self.timer_effects(n, at, count);
+    }
+
+    /// The effects of `count` overflows of timer `n` ending at `at`: IRQ, APU
+    /// clocking, FIFO DMA and the cascade into the following timers. `count` is
+    /// 1 for any timer that clocks a FIFO (it is never coalesced), so each pop
+    /// lands at the overflow's own time.
+    fn timer_effects(&mut self, mut n: usize, at: u64, mut count: u32) {
         loop {
-            if self.timers.overflow(n, at, &mut self.sched) {
+            if self.timers.t[n].irq_enabled() {
                 self.irq.raise(Interrupt::timer(n));
             }
-            if n < 2 {
+            if n < 2 && self.timers.sound[n] {
                 // P2-APU: the FIFO pop lands at the overflow's own time.
                 self.apu.advance_to(at);
                 let req = self.apu.on_timer_overflow(n);
@@ -186,12 +258,15 @@ impl Bus {
                     self.dma.trigger(crate::dma::DmaTrigger::FifoB);
                 }
             }
-            if n < 3 && self.timers.cascade(n + 1) {
-                n += 1;
-                // The cascaded timer overflowed too: handle it at the same instant
-                // (it is count-up, so it has no event of its own to cancel).
-                self.sched.cancel(Event::TimerOverflow(n as u8));
-                continue;
+            if n < 3 {
+                let wraps = self.timers.cascade(n + 1, count);
+                if wraps > 0 {
+                    // The cascaded timer overflowed too: handle it at the same
+                    // instant (it is count-up, so it has no event of its own).
+                    n += 1;
+                    count = wraps;
+                    continue;
+                }
             }
             return;
         }
