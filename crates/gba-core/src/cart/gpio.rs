@@ -205,6 +205,32 @@ impl Gpio {
         fx
     }
 
+    /// A 32-bit write to the word-aligned ROM offset `reg`. At 0xC4 it sets data
+    /// (low half) and direction (high half) together: the pin state is computed
+    /// once from both, so no intermediate "new data, old direction" state can
+    /// clock the chip (code-review K#1). At 0xC8 only the control register (low
+    /// half) is a register.
+    pub fn write32(&mut self, reg: u32, v: u32, now: u64) -> GpioEffect {
+        let mut fx = GpioEffect::default();
+        if reg != REG_DATA {
+            return self.write16(reg, v as u16, now);
+        }
+        let (data, dir) = (v as u16, (v >> 16) as u16);
+        if !self.live {
+            if self.mode != RtcMode::Auto
+                || !Self::plausible(REG_DATA, data)
+                || !Self::plausible(REG_DIR, dir)
+            {
+                return fx;
+            }
+            self.live = true;
+        }
+        self.data = (data & 0xF) as u8;
+        self.dir = (dir & 0xF) as u8;
+        self.pins_changed(now, &mut fx);
+        fx
+    }
+
     /// Re-evaluate the pins after `data` or `dir` changed.
     fn pins_changed(&mut self, now: u64, fx: &mut GpioEffect) {
         let was = self.driven;

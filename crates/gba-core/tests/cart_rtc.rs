@@ -231,3 +231,33 @@ fn the_standard_drivers_first_transfer_works_from_a_fresh_auto_cart() {
         "power-loss flag on a fresh clock"
     );
 }
+
+/// Code-review K#1: a 32-bit store at 0xC4 sets data and direction together.
+/// Applied one after the other, "new data, old direction" would raise SCK for a
+/// moment and clock an extra bit into the command.
+#[test]
+fn a_word_store_to_data_and_direction_is_atomic() {
+    let mut b = bus_in(RtcMode::On);
+    b.write16(CTRL, 1, N);
+    b.write16(DIR, 7, N);
+    b.write16(DATA, SCK, N);
+    b.write16(DATA, SCK | CS, N);
+    // Seven bits of the status-write command 0x62, then SCK low, CS high.
+    for i in (1..8).rev() {
+        bit_out(&mut b, u16::from(0x62u8 >> i & 1));
+    }
+    b.write16(DATA, CS, N);
+    // data = SCK|CS, direction = CS only: the driven pins stay {CS}.
+    b.write32(DATA, u32::from(SCK | CS) | u32::from(CS) << 16, N);
+    assert_eq!(b.read32(DATA, N), u32::from(CS) | u32::from(CS) << 16);
+    // Direction back to all-out raises SCK: that is the command's last bit (0).
+    b.write16(DIR, 7, N);
+    write_data(&mut b, &[0x40]);
+    b.write16(DATA, SCK, N);
+    b.write16(DIR, 7, N);
+    assert_eq!(
+        read_reg(&mut b, 1, 1),
+        [0xC0],
+        "24h bit set, power flag kept"
+    );
+}

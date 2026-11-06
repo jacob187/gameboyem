@@ -408,18 +408,13 @@ impl Cart {
     /// reach the port (a byte store is ignored, GBATEK); a word store at 0xC4
     /// sets data and direction. Returns whether the game pak interrupt fires.
     pub fn gpio_write(&mut self, off: u32, v: u32, w: Width, now: u64) -> bool {
-        let regs: &[(u32, u16)] = match w {
+        let fx = match w {
             Width::B => return false,
-            Width::H => &[(off & !1, v as u16)],
-            Width::W => &[(off & !3, v as u16), ((off & !3) + 2, (v >> 16) as u16)],
+            Width::H => self.gpio.write16(off & !1, v as u16, now),
+            Width::W => self.gpio.write32(off & !3, v, now),
         };
-        let mut irq = false;
-        for &(reg, value) in regs {
-            let fx = self.gpio.write16(reg, value, now);
-            self.generation += u64::from(fx.rtc_changed);
-            irq |= fx.irq;
-        }
-        irq
+        self.generation += u64::from(fx.rtc_changed);
+        fx.irq
     }
 }
 
