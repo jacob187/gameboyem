@@ -29,8 +29,8 @@ use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
 
-/// A Game Boy core for `rom`, as `--model` asks.
-fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<Box<dyn Core>, String> {
+/// A Game Boy core for `rom`, as `--model` asks, and the hash of the ROM it hashed.
+fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), String> {
     let archive = rom::archive_kind(&rom);
     let model = opts.model.resolve(&rom);
     let gb = GameBoy::with_model(rom, model)
@@ -38,12 +38,13 @@ fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<Box<dyn Core>, String> 
     if !gb.cartridge_header().header_checksum_ok {
         eprintln!("warning: ROM header checksum is wrong (running anyway)");
     }
-    Ok(Box::new(gb))
+    let rom_hash = gb.rom_hash();
+    Ok((Box::new(gb), rom_hash))
 }
 
 /// A GBA core for `rom`, booted through `--bios` if given (else the built-in
-/// HLE BIOS, DECISIONS #47).
-fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<Box<dyn Core>, String> {
+/// HLE BIOS, DECISIONS #47), and the hash of the ROM it hashed.
+fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), String> {
     let archive = rom::archive_kind(&rom);
     let bios = match &opts.bios {
         Some(path) => Some(rom::read_bios(path)?),
@@ -59,7 +60,8 @@ fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<Box<dyn Core>, String>
     if let Some(start) = opts.rtc_start {
         gba.set_rtc(start);
     }
-    Ok(Box::new(gba))
+    let rom_hash = gba.rom_hash();
+    Ok((Box::new(gba), rom_hash))
 }
 
 fn main() -> ExitCode {
@@ -92,12 +94,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let rom_hash = emu_common::replay::rom_hash(&rom);
     let built = match system {
         System::Gb => build_gb(&opts, rom),
         System::Gba => build_gba(&opts, rom),
     };
-    let mut core = match built {
+    // The core hashed the ROM as it was built; the recording header reuses that.
+    let (mut core, rom_hash) = match built {
         Ok(c) => c,
         Err(msg) => {
             eprintln!("error: {msg}");
