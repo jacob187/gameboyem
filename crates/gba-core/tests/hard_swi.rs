@@ -232,3 +232,50 @@ fn honest_large_calls_complete_inside_the_budget() {
     assert!(cycles < SWI_CYCLE_CAP * 3 / 4, "{cycles}");
     assert!(b.ewram[..size as usize].iter().all(|&v| v == 0xAB));
 }
+
+/// Cycles of an honest call that writes `n` bytes (IWRAM to IWRAM, 1-cycle
+/// accesses), to see what each extra output byte costs.
+fn rl_cycles(n: u32) -> u64 {
+    let mut b = bus();
+    let mut rl = (0x30 | n << 8).to_le_bytes().to_vec();
+    rl.extend_from_slice(&[0xFF, 0x11].repeat(n as usize / 130 + 2));
+    put(&mut b, IWRAM, &rl);
+    call(&mut b, 0x14, [IWRAM, IWRAM + 0x4000, 0, 0])
+}
+
+fn lz_cycles(n: u32) -> u64 {
+    let mut b = bus();
+    let mut lz = (0x10 | n << 8).to_le_bytes().to_vec();
+    lz.extend_from_slice(&[0x7F, 0xAB]);
+    lz.extend_from_slice(&[0xF0, 0x00].repeat(7 * (n as usize / 127 + 2)));
+    put(&mut b, IWRAM, &lz);
+    call(&mut b, 0x11, [IWRAM, IWRAM + 0x4000, 0, 0])
+}
+
+#[test]
+fn decompression_compute_is_charged_per_output_byte() {
+    // 4 cycles a byte of compute on top of the accesses, however the output is
+    // produced (DECISIONS #65).
+    assert!(rl_cycles(2000) - rl_cycles(1000) >= 1000 * 4);
+    assert!(lz_cycles(2000) - lz_cycles(1000) >= 1000 * 4);
+}
+
+#[test]
+fn huffman_charges_per_leaf_including_a_malformed_stop() {
+    // Table of 4 bytes: root (index 1) has a leaf on its 0 side and the node at
+    // index 3 on its 1 side; that node points far outside. 1-bit data. The stream
+    // 0, 0, 0, 1, 1 decodes three leaves and then stops at the bad node.
+    let mut b = bus();
+    put(
+        &mut b,
+        EWRAM,
+        &[0x21, 0x10, 0, 0, 0x01, 0x80, 0, 0, 0, 0, 0, 0x18],
+    );
+    let t = b.sched.now();
+    call(&mut b, 0x13, [EWRAM, EWRAM + 0x100, 0, 0]);
+    let cycles = b.sched.now() - t;
+    // 48 call overhead, one header, one table-size byte and the stream word, the
+    // node reads, and 3 cycles of compute for the three leaves.
+    assert!((48 + 3 + 4..400).contains(&cycles), "{cycles}");
+    assert_eq!(b.peek32(EWRAM + 0x100), 0, "no word was completed");
+}

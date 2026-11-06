@@ -108,15 +108,18 @@ struct Sink {
     pos: u32,
     vram: bool,
     pending: u8,
+    /// Compute cycles accrued per byte put, as the byte is put.
+    per_byte: u64,
 }
 
 impl Sink {
-    fn new(dst: u32, vram: bool) -> Self {
+    fn new(dst: u32, vram: bool, per_byte: u64) -> Self {
         Self {
             dst: if vram { dst & !1 } else { dst },
             pos: 0,
             vram,
             pending: 0,
+            per_byte,
         }
     }
     fn put(&mut self, m: &mut Mem, b: u8) {
@@ -132,6 +135,7 @@ impl Sink {
             );
         }
         self.pos += 1;
+        m.work(self.per_byte);
     }
     /// The byte `back` positions behind the write position, read from memory.
     fn back(&self, m: &mut Mem, back: u32) -> u8 {
@@ -322,12 +326,12 @@ pub(super) fn lz77(bus: &mut Bus, r: &[u32; 4], vram: bool) {
     let mut src = r[0];
     let size = m.r32(src) >> 8;
     src = src.wrapping_add(4);
-    let mut out = Sink::new(r[1], vram);
+    let mut out = Sink::new(r[1], vram, DECOMP_PER_BYTE);
     while out.pos < size && !m.exhausted() {
         let flags = m.r8(src);
         src = src.wrapping_add(1);
         for bit in 0..8 {
-            if out.pos >= size {
+            if out.pos >= size || m.exhausted() {
                 break;
             }
             if flags & (0x80 >> bit) == 0 {
@@ -340,7 +344,7 @@ pub(super) fn lz77(bus: &mut Bus, r: &[u32; 4], vram: bool) {
                 src = src.wrapping_add(2);
                 let (len, disp) = ((b1 >> 4) + 3, ((b1 & 0xF) << 8 | b2) + 1);
                 for _ in 0..len {
-                    if out.pos >= size {
+                    if out.pos >= size || m.exhausted() {
                         break;
                     }
                     let v = out.back(&mut m, disp);
@@ -348,7 +352,6 @@ pub(super) fn lz77(bus: &mut Bus, r: &[u32; 4], vram: bool) {
                 }
             }
         }
-        m.extra = u64::from(out.pos) * DECOMP_PER_BYTE;
     }
     m.finish();
 }
@@ -359,7 +362,7 @@ pub(super) fn rl(bus: &mut Bus, r: &[u32; 4], vram: bool) {
     let mut src = r[0];
     let size = m.r32(src) >> 8;
     src = src.wrapping_add(4);
-    let mut out = Sink::new(r[1], vram);
+    let mut out = Sink::new(r[1], vram, DECOMP_PER_BYTE);
     while out.pos < size && !m.exhausted() {
         let flag = m.r8(src);
         src = src.wrapping_add(1);
@@ -367,12 +370,18 @@ pub(super) fn rl(bus: &mut Bus, r: &[u32; 4], vram: bool) {
             let v = m.r8(src);
             src = src.wrapping_add(1);
             for _ in 0..(flag & 0x7F) + 3 {
+                if m.exhausted() {
+                    break;
+                }
                 if out.pos < size {
                     out.put(&mut m, v);
                 }
             }
         } else {
             for _ in 0..(flag & 0x7F) + 1 {
+                if m.exhausted() {
+                    break;
+                }
                 let v = m.r8(src);
                 src = src.wrapping_add(1);
                 if out.pos < size {
@@ -380,7 +389,6 @@ pub(super) fn rl(bus: &mut Bus, r: &[u32; 4], vram: bool) {
                 }
             }
         }
-        m.extra = u64::from(out.pos) * DECOMP_PER_BYTE;
     }
     m.finish();
 }
@@ -435,19 +443,21 @@ pub(super) fn huff(bus: &mut Bus, r: &[u32; 4]) {
                 let data = u32::from(m.r8(table.wrapping_add(next))) & ((1 << bits) - 1);
                 word = word >> bits | data << (32 - bits);
                 have += bits;
+                // One cycle a bit of output (8 a byte), as the leaf is decoded.
+                m.work(u64::from(bits));
                 if have >= 32 {
                     m.w32(dst, word);
                     dst = dst.wrapping_add(4);
                     written += 4;
                     have = 0;
-                    m.extra = u64::from(written) * DECOMP_PER_BYTE * 2;
                 }
                 continue 'outer;
             }
             at = next;
         }
     }
-    // A completed call pays for the declared size, a stopped one for what it wrote.
+    // A completed call pays for the declared size (the last word may carry bytes
+    // past it), a stopped one for the leaves it decoded.
     m.extra = m.extra.min(u64::from(size) * DECOMP_PER_BYTE * 2);
     m.finish();
 }
@@ -479,7 +489,7 @@ pub(super) fn diff_unfilter(bus: &mut Bus, r: &[u32; 4], wide: bool, vram: bool)
             m.extra = u64::from(size) * 2;
         }
     } else {
-        let mut out = Sink::new(r[1], vram);
+        let mut out = Sink::new(r[1], vram, 2);
         let mut acc = 0u8;
         for i in 0..size {
             if m.exhausted() {
@@ -489,7 +499,6 @@ pub(super) fn diff_unfilter(bus: &mut Bus, r: &[u32; 4], wide: bool, vram: bool)
             src = src.wrapping_add(1);
             acc = if i == 0 { d } else { acc.wrapping_add(d) };
             out.put(&mut m, acc);
-            m.work(2);
         }
     }
     m.finish();
