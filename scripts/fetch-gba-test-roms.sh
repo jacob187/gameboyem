@@ -8,7 +8,7 @@
 # verified against a sha256 before it is installed; a mismatch fails the script. An existing file
 # is kept only if it matches, so a corrupted file is re-downloaded (and fails if upstream changed).
 #
-# --with-sst also fetches the SingleStepTests/ARM7TDMI files into sst/ (about 20 MB each, 44 in the
+# --with-sst also fetches the SingleStepTests/ARM7TDMI files into sst/ (about 20 MB each, 45 in the
 # full set). They are only needed by the gba-core CPU tests, so they are opt-in.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,7 +50,7 @@ fetch() { # url out sha256
 
 # jsmolka/gba-tests (MIT, (c) 2019 Julian Smolka). No tags or releases; pinned to the master commit
 # of 2025-04-19. The prebuilt .gba files are committed in the tree.
-JSMOLKA_REV="${JSMOLKA_REV:-a7113b67e63f83a9b321696ddd7042ccfad6c881}"
+JSMOLKA_REV=a7113b67e63f83a9b321696ddd7042ccfad6c881
 J="https://raw.githubusercontent.com/jsmolka/gba-tests/$JSMOLKA_REV"
 while read -r sum path; do
   fetch "$J/$path" "jsmolka/$path" "$sum"
@@ -72,7 +72,7 @@ EOF
 
 # FuzzARM (DenSinH, GPL-3.0). Fetched only, never committed or redistributed. Pinned to the
 # last commit (2022-06-14). Pass protocol: the EWRAM word at 0x0200_0000 stays 0 (DECISIONS #48).
-FUZZARM_REV="${FUZZARM_REV:-a675329cd57da48e3e406216ba2d79dd7e09ee20}"
+FUZZARM_REV=a675329cd57da48e3e406216ba2d79dd7e09ee20
 F="https://raw.githubusercontent.com/DenSinH/FuzzARM/$FUZZARM_REV"
 while read -r sum name; do
   fetch "$F/$name" "fuzzarm/$name" "$sum"
@@ -86,7 +86,7 @@ EOF
 
 # armwrestler, GBA fork by destoer (licence: none stated upstream; fetch only, never commit).
 # Menu driven and screen-only, so it is not in the manifest: for looking at by eye.
-AW_REV="${AW_REV:-802e55ad61b421f4bbbc6f74f96aa4e5df4d630f}"
+AW_REV=802e55ad61b421f4bbbc6f74f96aa4e5df4d630f
 AW="https://raw.githubusercontent.com/destoer/armwrestler-gba-fixed/$AW_REV"
 fetch "$AW/armwrestler-gba-fixed.gba" armwrestler/armwrestler-gba-fixed.gba \
   9f08d807c03ef296d38ef73e9b827a3d8c77cead9ced44b07d64c10f5f7d0746
@@ -95,7 +95,7 @@ fetch "$AW/armwrestler.gba" armwrestler/armwrestler.gba \
 
 # nba-emu/hw-test (BSD-3-Clause, (c) 2021 fleroviux). The GitHub copy is frozen (development moved
 # to Codeberg); pinned to its last commit.
-NBA_REV="${NBA_REV:-3932a0e54dbb5d94b84798d2d5e462e080b95599}"
+NBA_REV=3932a0e54dbb5d94b84798d2d5e462e080b95599
 fetch "https://raw.githubusercontent.com/nba-emu/hw-test/$NBA_REV/dma/latch/latch.gba" \
   nba-hw-test/latch.gba 4e3a6510d30a67afe1b0e8bc8de4676bbbabeef5c0f0f3e960ff25c4c082373b
 
@@ -167,32 +167,21 @@ if ! tonc_ok; then
 fi
 
 # SingleStepTests/ARM7TDMI (MIT, (c) 2024 SingleStepTests; generated from NanoBoyAdvance, not from
-# hardware). Opt-in because of the size. The file list is read from the manifest the CPU tests use,
-# crates/gba-core/tests/sst-files.txt, when it exists: one file per line, a 64-hex sha256 and a
-# `<name>.json.bin` name separated by whitespace (any leading path is dropped); `#` starts a comment.
-# Without that file, the two hashes below are all that is pinned.
+# hardware). Opt-in because of the size. The file list is the manifest the CPU tests use,
+# crates/gba-core/tests/sst-files.txt: one file per line, a 64-hex sha256 and a `<name>.json.bin`
+# name separated by whitespace (any leading path is dropped); `#` starts a comment.
 if [ "$WITH_SST" -eq 1 ]; then
-  SST_REV="${SST_REV:-e3097d88d428752736b949d94c094d5da50f0db6}"
+  SST_REV=e3097d88d428752736b949d94c094d5da50f0db6
   S="https://raw.githubusercontent.com/SingleStepTests/ARM7TDMI/$SST_REV/v1"
   MANIFEST="$ROOT/crates/gba-core/tests/sst-files.txt"
-  if [ -f "$MANIFEST" ]; then
-    SST_LIST="$(sed 's/#.*//' "$MANIFEST" | grep -v '^[[:space:]]*$' || true)"
-    echo "SST: reading the file list from $MANIFEST"
-  else
-    SST_LIST="$(cat <<'EOF'
-8f2389f06cd794b6c7085b1b87c8df7fa0187791aeba9c5c21b8c934079a10f2  arm_mrs.json.bin
-65b91a6abcf5e916c938f34cdeb700061ac198268d15b6564de45b7ba691c581  thumb_data_proc.json.bin
-EOF
-)"
-    echo "SST: $MANIFEST not found; fetching the built-in list of 2 files"
-  fi
-  while read -r a b; do
-    [ -n "$a" ] || continue
-    # Accept either column order.
-    if [[ "$a" =~ ^[0-9a-f]{64}$ ]]; then sum="$a"; name="$b"; else sum="$b"; name="$a"; fi
+  [ -f "$MANIFEST" ] || { echo "error: $MANIFEST not found" >&2; exit 1; }
+  SST_LIST="$(sed 's/#.*//' "$MANIFEST" | grep -v '^[[:space:]]*$' || true)"
+  echo "SST: reading the file list from $MANIFEST"
+  while read -r sum name; do
+    [ -n "$sum" ] || continue
     name="${name##*/}"
     if ! [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || [[ "$name" != *.json.bin ]] || [[ "$name" =~ [^A-Za-z0-9_.] ]]; then
-      echo "bad line in the SST manifest: $a $b" >&2; exit 1
+      echo "bad line in the SST manifest: $sum $name" >&2; exit 1
     fi
     fetch "$S/$name" "sst/$name" "$sum"
   done <<<"$SST_LIST"
