@@ -268,4 +268,13 @@ pass smoke-gba 120 test/gba/tonc/bin/bm_modes.gba
 pass smoke-gba 120 test/gba/tonc/bin/sbb_reg.gba
 pass smoke-gba 120 test/gba/tonc/bin/obj_demo.gba
 pass smoke-gba 120 test/gba/tonc/bin/key_demo.gba
-fail smoke-gba 120 test/gba/tonc/bin/irq_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/irq_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/swi_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/swi_vsync.gba
+pass smoke-gba 120 test/gba/tonc/bin/bld_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/m7_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/dma_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/tmr_demo.gba
+# The HLE BIOS (DECISIONS #64): both agb games use the BIOS IRQ path and VBlankIntrWait.
+pass smoke-gba 700 homebrew/grains.gba
+pass smoke-gba 700 homebrew/moth.gba
