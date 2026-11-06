@@ -1,6 +1,6 @@
 //! Noise channel 4 (GBATEK "GBA Sound Channel 4 - Noise", SOUND4CNT_L/H).
 //!
-//! Adapted from `gb-core`'s `apu/noise.rs` (DECISIONS #60). The LFSR is
+//! Adapted from `gb-core`'s `apu/noise.rs` (DECISIONS #61). The LFSR is
 //! GBATEK's, not the DMG's XNOR form: shift right, and if the bit shifted out
 //! was 1 output HIGH and XOR the register with 0x60 (7-bit) or 0x6000 (15-bit);
 //! the seed on restart is 0x40 / 0x4000.

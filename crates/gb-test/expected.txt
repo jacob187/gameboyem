@@ -232,8 +232,8 @@ fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/11-regs after power.gb
 fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/12-wave.gb
 
 # --- Game Boy Advance (kinds with a `-gba` suffix run on gba-core; DECISIONS #48, #57) ---
-# The GBA cores land in phase P1 and these lines flip to `pass` then; until then the CPU is a stub, so
-# every case fails. Fetched by scripts/fetch-gba-test-roms.sh into roms/test/gba/ (a missing ROM is
+# Run against the full core (CPU, bus, PPU, APU, HLE BIOS). Smoke lines were added only after their
+# frames were checked by eye. Fetched by scripts/fetch-gba-test-roms.sh into roms/test/gba/ (a missing ROM is
 # skipped locally and fails in CI, like the GB ones). Left out on purpose (DECISIONS #48): jsmolka
 # bios.gba (needs the official BIOS) and unsafe.gba (fails on hardware); armwrestler, nba-hw-test and
 # the other tonc demos are screen-only and not wired up yet.

@@ -1,7 +1,7 @@
 //! Wave channel 3: two 32-digit banks, 32- or 64-digit playback (GBATEK "GBA
 //! Sound Channel 3 - Wave Output", SOUND3CNT_L/H/X and wave RAM).
 //!
-//! Adapted from `gb-core`'s `apu/wave.rs` (DECISIONS #60). Dropped: the DMG
+//! Adapted from `gb-core`'s `apu/wave.rs` (DECISIONS #61). Dropped: the DMG
 //! retrigger wave-RAM corruption, the "only the byte being fetched is
 //! reachable while playing" access window and the trigger delay (GBATEK
 //! documents none of them for the GBA; wave RAM is plain memory here). Added:

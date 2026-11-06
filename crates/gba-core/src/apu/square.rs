@@ -2,7 +2,7 @@
 //! halfword registers are made of (GBATEK "GBA Sound Channel 1 - Tone & Sweep",
 //! "Channel 2 - Tone").
 //!
-//! Adapted from `gb-core`'s `apu/square.rs` (DECISIONS #60). Time is in CPU
+//! Adapted from `gb-core`'s `apu/square.rs` (DECISIONS #61). Time is in CPU
 //! cycles, not M-cycles. Dropped: save states, the NR10 negate-clear quirk and
 //! the DMG zombie-mode envelope write.
 

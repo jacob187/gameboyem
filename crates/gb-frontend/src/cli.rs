@@ -31,7 +31,6 @@ options:
 controls:
   arrows or WASD = D-pad    X or E = A    Z = B    Enter = Start    Backspace / Right Shift = Select
   Q / R = GBA L / R shoulders (no effect on a Game Boy)
-  (GBA games have no save states yet: K and L say so)
   P = pause    Tab (hold) = fast-forward    C = screenshot (marks the frame when recording)
   K = save state    L = load state    1-9 = state slot (default 1)
   Esc = quit";

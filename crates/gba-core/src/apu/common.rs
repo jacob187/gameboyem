@@ -1,7 +1,7 @@
 //! Building blocks shared by the PSG channels: length counter and volume
 //! envelope.
 //!
-//! Adapted from `gb-core`'s `apu/common.rs` (DECISIONS #60). Dropped: save-state
+//! Adapted from `gb-core`'s `apu/common.rs` (DECISIONS #61). Dropped: save-state
 //! code, the envelope "zombie mode" volume glitch on NRx2 writes and the
 //! "trigger just before the envelope step" timer bonus (DMG-specific, Pan Docs
 //! "Obscure Behavior"). GBATEK "GBA Sound Channel 1" only specifies the plain
