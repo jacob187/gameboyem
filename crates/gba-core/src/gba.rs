@@ -165,8 +165,9 @@ impl Gba {
         self.bus.cart.battery_generation()
     }
 
-    /// The `.sav` image: [`Gba::battery_ram`] followed, when the cartridge's clock
-    /// is in use (or was restored from a save), by the 24-byte RTC footer
+    /// The `.sav` image: [`Gba::battery_ram`] followed, once the game has used the
+    /// cartridge's clock (a valid command reached it) or a save with a footer
+    /// was loaded, by the 24-byte RTC footer
     /// (DECISIONS #67). The clock in it is the emulated time now; no host time
     /// is stored.
     pub fn battery_save(&self) -> Option<Vec<u8>> {
@@ -186,7 +187,8 @@ impl Gba {
     /// Set the cartridge clock to `t`, a time the host read from its own clock
     /// (the one place real time enters; the core never reads it, DECISIONS #66).
     /// Call it before loading a save: a save's own footer replaces it. Also
-    /// clears the clock's power-loss flag.
+    /// clears the clock's power-loss flag. It does not add a footer to the save
+    /// by itself; that waits for the game to use the clock.
     pub fn set_rtc(&mut self, t: RtcTime) {
         self.bus.cart.set_rtc(t, self.bus.sched.now());
     }

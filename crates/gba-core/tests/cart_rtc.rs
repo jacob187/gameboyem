@@ -2,107 +2,12 @@
 //! way a game's driver does it: 16-bit stores to 0x0800_00C4/C6/C8, command byte
 //! MSB first, data bytes LSB first, bits sampled when SCK rises.
 
+mod cart_common;
 mod sys_common;
-use gba_core::bios::Bios;
-use gba_core::bus::{Bus, CpuBus};
-use gba_core::cart::{Cart, CartOptions, RtcMode};
+use cart_common::*;
+use gba_core::bus::CpuBus;
+use gba_core::cart::RtcMode;
 use sys_common::*;
-
-const DATA: u32 = 0x0800_00C4;
-const DIR: u32 = 0x0800_00C6;
-const CTRL: u32 = 0x0800_00C8;
-const SCK: u16 = 1;
-const SIO: u16 = 2;
-const CS: u16 = 4;
-const CPS: u64 = 16_777_216;
-
-/// A ROM whose bytes at 0xC4..0xCA are recognisable.
-fn rom() -> Vec<u8> {
-    let mut r = rom_with(&[]);
-    r[0xC4..0xCA].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
-    r
-}
-
-fn bus_in(mode: RtcMode) -> Bus {
-    let cart = Cart::with_options(
-        rom(),
-        CartOptions {
-            rtc: mode,
-            ..CartOptions::default()
-        },
-    )
-    .unwrap();
-    Bus::new(cart, Bios::Hle)
-}
-
-/// The driver's init: data 1, then 5 (CS up while SCK is high), all pins out,
-/// reads enabled.
-fn init(b: &mut Bus) {
-    b.write16(DATA, 1, N);
-    b.write16(DATA, 5, N);
-    b.write16(DIR, 7, N);
-    b.write16(CTRL, 1, N);
-}
-
-fn bit_out(b: &mut Bus, bit: u16) {
-    b.write16(DATA, bit << 1 | CS, N);
-    b.write16(DATA, bit << 1 | CS | SCK, N);
-}
-
-fn send_command(b: &mut Bus, reg: u8, read: bool) {
-    b.write16(DIR, 7, N);
-    let byte = 0x60 | reg << 1 | u8::from(read);
-    for i in (0..8).rev() {
-        bit_out(b, u16::from(byte >> i & 1));
-    }
-}
-
-fn write_data(b: &mut Bus, bytes: &[u8]) {
-    for byte in bytes {
-        for i in 0..8 {
-            bit_out(b, u16::from(byte >> i & 1));
-        }
-    }
-}
-
-fn read_data(b: &mut Bus, n: usize) -> Vec<u8> {
-    b.write16(DIR, 5, N); // SIO becomes an input
-    (0..n)
-        .map(|_| {
-            (0..8).fold(0u8, |v, i| {
-                b.write16(DATA, CS, N);
-                b.write16(DATA, CS | SCK, N);
-                v | ((((b.read16(DATA, N) & SIO) >> 1) as u8) << i)
-            })
-        })
-        .collect()
-}
-
-/// A whole transfer: CS up, command, then `body`, CS down.
-fn transfer(b: &mut Bus, reg: u8, read: bool, body: impl FnOnce(&mut Bus) -> Vec<u8>) -> Vec<u8> {
-    b.write16(DATA, SCK, N);
-    b.write16(DATA, SCK | CS, N);
-    send_command(b, reg, read);
-    let out = body(b);
-    b.write16(DATA, SCK, N);
-    b.write16(DIR, 7, N);
-    out
-}
-
-fn read_reg(b: &mut Bus, reg: u8, n: usize) -> Vec<u8> {
-    transfer(b, reg, true, |b| read_data(b, n))
-}
-
-fn write_reg(b: &mut Bus, reg: u8, bytes: &[u8]) {
-    transfer(b, reg, false, |b| {
-        write_data(b, bytes);
-        vec![]
-    });
-}
-
-fn reset(b: &mut Bus) {
-    transfer(b, 0, false, |_| vec![]);
-}
 
 #[test]
 fn registers_read_as_rom_until_the_game_enables_reads() {

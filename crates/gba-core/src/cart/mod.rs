@@ -345,7 +345,8 @@ impl Cart {
     }
 
     /// The `.sav` image at master-clock cycle `now`: [`Cart::battery_ram`] plus,
-    /// when the clock is in use or was loaded from a save, its footer. `None`
+    /// once the game has used the clock or a save with a footer was loaded, the
+    /// footer. `None`
     /// exactly when `battery_ram` is.
     pub fn battery_save(&self, now: u64) -> Option<Vec<u8>> {
         let mut image = self.battery_ram()?.to_vec();
@@ -356,13 +357,10 @@ impl Cart {
     }
 
     /// Start the clock at `t` at master-clock cycle `now` (the host's one entry
-    /// point for real time; DECISIONS #66). From now on the save image carries the
-    /// clock even if the game never touches the port.
+    /// point for real time; DECISIONS #66). It only sets the time: the save
+    /// image gains no footer until the game uses the clock.
     pub fn set_rtc(&mut self, t: RtcTime, now: u64) {
         self.gpio.rtc_mut().set_time(t, now);
-        // The image now carries the clock (and so a recording's start does too).
-        self.gpio.keep_clock();
-        self.generation += 1;
     }
 
     /// The clock's date and time at cycle `now`, whether or not the game has

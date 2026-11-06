@@ -27,7 +27,10 @@ use super::rtc::{CTRL_POWER, FOOTER_LEN, Rtc};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RtcMode {
     /// The port stays inert (all reads are ROM) until the game writes a value
-    /// that looks like GPIO setup to 0x0800_00C4..=C9 (DECISIONS #66).
+    /// that looks like GPIO setup to 0x0800_00C4..=C9 (DECISIONS #66). Waking it
+    /// is harmless for a game that is not using a clock: reads still return ROM
+    /// until the control register enables them, and the save image gains a
+    /// footer only once a valid RTC command arrives.
     #[default]
     Auto,
     /// Present from power-on.
@@ -92,9 +95,11 @@ pub(super) struct Gpio {
     /// The level the RTC drives on SIO while it is being read.
     sio: bool,
     rtc: Rtc,
-    /// The clock's state came from a save footer or from the host's `set_rtc`,
-    /// so it is persisted even if the game never touches the port this session.
-    persist: bool,
+    /// The clock has been used: the chip received a valid command byte (CS high
+    /// and a full `0110 ccc r`), or its state was loaded from a save footer. Only
+    /// then does the save image carry the footer, so a game that never talks to a
+    /// clock keeps a chip-sized `.sav` (code-review K#2, K#3).
+    used: bool,
 }
 
 impl Gpio {
@@ -109,7 +114,7 @@ impl Gpio {
             phase: Phase::Idle,
             sio: false,
             rtc: Rtc::power_on(),
-            persist: false,
+            used: false,
         }
     }
 
@@ -128,19 +133,14 @@ impl Gpio {
     /// Install a clock restored from a save footer.
     pub fn load_rtc(&mut self, rtc: Rtc) {
         self.rtc = rtc;
-        self.persist = true;
+        self.used = true;
         self.phase = Phase::Idle;
     }
 
-    /// Persist the clock from now on (the host set it).
-    pub fn keep_clock(&mut self) {
-        self.persist = true;
-    }
-
-    /// The footer to append to the save image at cycle `now`, if the clock is in
-    /// use or was loaded or set by the host. With `--rtc off` it is carried over frozen.
+    /// The footer to append to the save image at cycle `now`, once the clock has
+    /// been used or was loaded from a save. With `--rtc off` it is carried over frozen.
     pub fn footer(&self, now: u64) -> Option<[u8; FOOTER_LEN]> {
-        if !(self.live || self.persist) {
+        if !self.used {
             return None;
         }
         Some(if self.mode == RtcMode::Off {
@@ -295,6 +295,11 @@ impl Gpio {
         }
         let reg = value >> 1 & 7;
         let read = value & 1 != 0;
+        if !self.used {
+            // The first real use: the image gains its footer, so it is saved now.
+            self.used = true;
+            fx.rtc_changed = true;
+        }
         self.rtc.advance_to(now);
         let len = match reg {
             0 | 6 => 0,

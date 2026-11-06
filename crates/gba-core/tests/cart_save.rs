@@ -1,7 +1,9 @@
 //! P3-CART save handling: the `--save-type` override, an EEPROM driven by CPU
 //! stores, and the battery image with its RTC footer.
 
+mod cart_common;
 mod sys_common;
+use cart_common::{bus_for, init, read_reg};
 use emu_common::Core;
 use gba_core::bus::CpuBus;
 use gba_core::cart::{CartOptions, RtcMode, RtcTime, SaveChoice, SaveKind};
@@ -200,37 +202,48 @@ fn a_cpu_driven_eeprom_is_sized_from_the_request_length() {
     assert!(b.cart.battery_ram().is_none());
 }
 
+/// A save image from a game that has used the clock: the host set `t`, the game
+/// set the port up and read the time register (a valid RTC command).
+fn used_image(id: &[u8], t: RtcTime) -> Vec<u8> {
+    let mut b = bus_for(id, RtcMode::On);
+    b.cart.set_rtc(t, 0);
+    init(&mut b);
+    read_reg(&mut b, 3, 3);
+    b.cart.battery_save(b.sched.now()).unwrap()
+}
+
 #[test]
-fn the_battery_image_has_a_footer_only_when_the_clock_is_in_use() {
-    // Auto, never touched: the image is the bare chip, as before P3-CART.
-    let g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Auto);
-    assert_eq!(g.battery_save().unwrap().len(), 32768);
-    assert_eq!(Core::battery_ram(&g).unwrap().len(), 32768);
-    // On: the footer follows the data.
-    let g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::On);
-    let img = g.battery_save().unwrap();
+fn the_battery_image_has_a_footer_only_once_the_clock_is_used() {
+    // Never touched, in any mode: the image is the bare chip, as before P3-CART.
+    for mode in [RtcMode::Auto, RtcMode::On, RtcMode::Off] {
+        let g = gba_with(b"SRAM_V113", SaveChoice::Auto, mode);
+        assert_eq!(g.battery_save().unwrap().len(), 32768, "{mode:?}");
+        assert_eq!(Core::battery_ram(&g).unwrap().len(), 32768);
+    }
+    // Used: the footer follows the data.
+    let img = used_image(b"SRAM_V113", time(2024, 3, 3, 3, 3, 3));
     assert_eq!(img.len(), 32768 + FOOTER);
     assert_eq!(&img[32768..32768 + 8], b"AGBRTC01");
-    assert_eq!(
-        Core::battery_ram(&g).unwrap(),
-        img,
-        "the Core view is the image"
-    );
+    // A machine that loaded it reports the same image through both views.
+    let mut g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Auto);
+    g.load_battery_ram(&img).unwrap();
+    assert_eq!(Core::battery_ram(&g).unwrap().len(), img.len());
     assert_eq!(g.battery_ram().unwrap().len(), 32768, "the raw chip is not");
-    // Off with nothing loaded: none. No chip: no image at all.
-    let g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Off);
-    assert_eq!(g.battery_save().unwrap().len(), 32768);
-    let g = gba_with(b"", SaveChoice::Auto, RtcMode::On);
-    assert!(g.battery_save().is_none());
-    // An EEPROM of unknown size has no image yet, footer or not.
+    // No chip: no image at all. An EEPROM of unknown size has none yet either.
+    assert!(
+        gba_with(b"", SaveChoice::Auto, RtcMode::On)
+            .battery_save()
+            .is_none()
+    );
     let g = gba_with(b"EEPROM_V124", SaveChoice::Auto, RtcMode::On);
     assert!(g.battery_save().is_none());
 }
 
 #[test]
 fn the_footer_round_trips_the_clock_through_a_new_machine() {
+    let img = used_image(b"FLASH1M_V103", time(2024, 12, 31, 23, 59, 58));
     let mut a = gba_with(b"FLASH1M_V103", SaveChoice::Auto, RtcMode::On);
-    a.set_rtc(time(2024, 12, 31, 23, 59, 58));
+    a.load_battery_ram(&img).unwrap();
     for _ in 0..30 {
         a.step_frame(); // about half a second
     }
@@ -254,16 +267,13 @@ fn the_footer_round_trips_the_clock_through_a_new_machine() {
 }
 
 #[test]
-fn a_footer_loads_even_where_the_clock_is_not_yet_in_use() {
-    let mut a = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::On);
-    a.set_rtc(time(2010, 5, 5, 5, 5, 5));
-    let img = a.battery_save().unwrap();
+fn a_loaded_footer_is_kept_and_written_back_in_every_mode() {
+    let img = used_image(b"SRAM_V113", time(2010, 5, 5, 5, 5, 5));
     // Auto, the game has not touched the port: the saved clock is kept and
-    // written back unchanged in form (still a valid footer).
+    // written back (still a valid footer).
     let mut b = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Auto);
     b.load_battery_ram(&img).unwrap();
-    let again = b.battery_save().unwrap();
-    assert_eq!(again.len(), img.len());
+    assert_eq!(b.battery_save().unwrap().len(), img.len());
     assert_eq!(b.rtc_time(), time(2010, 5, 5, 5, 5, 5));
     // --rtc off carries it across frozen: time does not pass.
     let mut off = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Off);
@@ -286,9 +296,13 @@ fn saves_without_a_footer_still_load() {
         time(2024, 6, 1, 12, 0, 0),
         "the clock is left alone"
     );
-    assert_eq!(g.battery_save().unwrap().len(), 65536 + FOOTER);
+    assert_eq!(
+        g.battery_save().unwrap().len(),
+        65536,
+        "and still no footer"
+    );
     // Every chip accepts its bare size and its size plus a footer.
-    let footer = g.battery_save().unwrap()[65536..].to_vec();
+    let footer = used_image(b"SRAM_V113", time(2024, 6, 1, 12, 0, 0))[32768..].to_vec();
     for (id, size) in [
         (&b"SRAM_V113"[..], 32768),
         (b"FLASH_V126", 65536),
@@ -298,19 +312,19 @@ fn saves_without_a_footer_still_load() {
     ] {
         let mut g = gba_with(id, SaveChoice::Auto, RtcMode::Auto);
         g.load_battery_ram(&vec![1; size]).unwrap();
+        assert_eq!(g.battery_save().unwrap().len(), size, "{id:?} {size}");
         let mut g = gba_with(id, SaveChoice::Auto, RtcMode::Auto);
         let mut with = vec![1; size];
         with.extend_from_slice(&footer);
         g.load_battery_ram(&with).unwrap();
         assert_eq!(g.battery_ram().unwrap().len(), size, "{id:?} {size}");
+        assert_eq!(g.battery_save().unwrap().len(), size + FOOTER);
     }
 }
 
 #[test]
 fn a_corrupt_footer_or_size_is_rejected_and_changes_nothing() {
-    let mut a = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::On);
-    a.set_rtc(time(2024, 2, 29, 1, 2, 3));
-    let good = a.battery_save().unwrap();
+    let good = used_image(b"SRAM_V113", time(2024, 2, 29, 1, 2, 3));
 
     let mut g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::On);
     g.set_rtc(time(2001, 1, 1, 0, 0, 0));
@@ -359,9 +373,10 @@ fn a_corrupt_footer_or_size_is_rejected_and_changes_nothing() {
 }
 
 #[test]
-fn the_game_writing_the_clock_marks_the_save_changed_but_time_passing_does_not() {
+fn time_passing_does_not_mark_the_save_changed() {
     let mut g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::On);
-    g.set_rtc(time(2024, 1, 1, 0, 0, 0));
+    g.load_battery_ram(&used_image(b"SRAM_V113", time(2024, 1, 1, 0, 0, 0)))
+        .unwrap();
     let generation = g.battery_generation();
     let img = g.battery_save().unwrap();
     for _ in 0..70 {
@@ -377,12 +392,15 @@ fn the_game_writing_the_clock_marks_the_save_changed_but_time_passing_does_not()
 }
 
 #[test]
-fn set_rtc_clears_the_power_loss_flag_and_rejects_nothing_valid() {
-    let mut g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::On);
-    let fresh = g.battery_save().unwrap();
-    assert_eq!(fresh[32768 + 8], 0x82, "a fresh clock says power was lost");
-    g.set_rtc(time(2000, 1, 1, 0, 0, 0));
-    assert_eq!(g.battery_save().unwrap()[32768 + 8], 0x02);
+fn set_rtc_clears_the_power_loss_flag_and_bad_times_are_refused() {
+    // A fresh clock reports power loss; a host-set one does not.
+    let mut fresh = bus_for(b"SRAM_V113", RtcMode::On);
+    init(&mut fresh);
+    assert_eq!(read_reg(&mut fresh, 1, 1), [0x82]);
+    let mut set = bus_for(b"SRAM_V113", RtcMode::On);
+    set.cart.set_rtc(time(2000, 1, 1, 0, 0, 0), 0);
+    init(&mut set);
+    assert_eq!(read_reg(&mut set, 1, 1), [0x02]);
     assert_eq!(
         RtcTime::new(2100, 1, 1, 0, 0, 0),
         Err(CartError::BadRtcTime)
@@ -393,16 +411,51 @@ fn set_rtc_clears_the_power_loss_flag_and_rejects_nothing_valid() {
     );
 }
 
+/// Code-review K#2/K#3: a game that never talks to a clock keeps a chip-sized
+/// `.sav`, however the port was poked and whatever the host did.
 #[test]
-fn a_host_set_clock_is_saved_even_before_the_game_uses_the_port() {
+fn a_host_set_clock_and_a_stray_gpio_store_add_no_footer() {
+    let mut b = bus_for(b"SRAM_V113", RtcMode::Auto);
+    b.cart.set_rtc(time(2024, 7, 4, 9, 30, 0), 0);
+    b.write16(0x0800_00C4, 0, N); // plausible: wakes the port
+    assert!(b.cart.gpio_live());
+    assert_eq!(b.cart.battery_save(b.sched.now()).unwrap().len(), 32768);
+    // Even with reads enabled and the pins driven, no valid command: no footer.
+    b.write16(0x0800_00C8, 1, N);
+    b.write16(0x0800_00C6, 7, N);
+    b.write16(0x0800_00C4, 5, N);
+    b.write16(0x0800_00C4, 0, N);
+    assert_eq!(b.cart.battery_save(b.sched.now()).unwrap().len(), 32768);
+    assert_eq!(
+        b.cart.battery_generation(),
+        0,
+        "set_rtc is not a save event"
+    );
+    // The same through the facade: set_rtc alone.
     let mut g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Auto);
-    assert_eq!(g.battery_save().unwrap().len(), 32768);
-    let generation = g.battery_generation();
     g.set_rtc(time(2024, 7, 4, 9, 30, 0));
-    assert_ne!(g.battery_generation(), generation);
-    let img = g.battery_save().unwrap();
-    assert_eq!(img.len(), 32768 + FOOTER);
-    let mut b = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Auto);
-    b.load_battery_ram(&img).unwrap();
-    assert_eq!(b.rtc_time(), time(2024, 7, 4, 9, 30, 0));
+    assert_eq!(g.battery_generation(), 0);
+    assert_eq!(g.battery_save().unwrap().len(), 32768);
+}
+
+/// Code-review K#8: the footer reaches disk promptly. The first valid command
+/// bumps the generation once; later reads that change nothing do not.
+#[test]
+fn the_first_clock_command_adds_the_footer_and_bumps_the_generation() {
+    let mut b = bus_for(b"SRAM_V113", RtcMode::Auto);
+    init(&mut b);
+    let g0 = b.cart.battery_generation();
+    assert_eq!(b.cart.battery_save(b.sched.now()).unwrap().len(), 32768);
+    read_reg(&mut b, 3, 3);
+    assert_eq!(b.cart.battery_generation(), g0 + 1);
+    assert_eq!(
+        b.cart.battery_save(b.sched.now()).unwrap().len(),
+        32768 + FOOTER
+    );
+    read_reg(&mut b, 3, 3);
+    assert_eq!(
+        b.cart.battery_generation(),
+        g0 + 1,
+        "a plain read changes nothing"
+    );
 }
