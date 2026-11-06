@@ -35,20 +35,51 @@ const FOOTER_MAGIC: [u8; 8] = *b"AGBRTC01";
 const CPS: u64 = CYCLES_PER_SECOND as u64;
 
 /// A calendar date and time, as the host supplies it to start the clock. The
-/// RTC has a two-digit year, so only 2000..=2099 exists.
+/// RTC has a two-digit year, so only 2000..=2099 exists. The fields are private:
+/// [`RtcTime::new`] is the only way to make one, so every value is a real date
+/// (day valid for its month and year, time of day in range) with the weekday
+/// computed from it (code-review K#4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtcTime {
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
-    /// 0 = Sunday. Computed by [`RtcTime::new`] from the date.
-    pub weekday: u8,
-    pub hour: u8,
-    pub minute: u8,
-    pub second: u8,
+    year: u16,
+    month: u8,
+    day: u8,
+    weekday: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
 }
 
 impl RtcTime {
+    pub fn year(&self) -> u16 {
+        self.year
+    }
+
+    pub fn month(&self) -> u8 {
+        self.month
+    }
+
+    pub fn day(&self) -> u8 {
+        self.day
+    }
+
+    /// 0 = Sunday.
+    pub fn weekday(&self) -> u8 {
+        self.weekday
+    }
+
+    pub fn hour(&self) -> u8 {
+        self.hour
+    }
+
+    pub fn minute(&self) -> u8 {
+        self.minute
+    }
+
+    pub fn second(&self) -> u8 {
+        self.second
+    }
+
     /// A validated time. The weekday follows from the date.
     pub fn new(
         year: u16,
@@ -507,6 +538,47 @@ mod tests {
         assert_eq!(weekday_of(24, 3, 9), 6, "2024-03-09 was a Saturday");
         assert_eq!(weekday_of(26, 11, 6), 5, "2026-11-06 is a Friday");
         assert_eq!(RtcTime::new(2001, 9, 9, 0, 0, 0).unwrap().weekday, 0);
+    }
+
+    #[test]
+    fn every_rtc_time_is_a_real_date_and_the_clock_only_produces_them() {
+        // Exhaustive over years and months, every day 0..=32: new() accepts
+        // exactly the real days.
+        for year in 1995..=2105u16 {
+            for month in 0..=13u8 {
+                for day in 0..=32u8 {
+                    let real = (2000..=2099).contains(&year)
+                        && (1..=12).contains(&month)
+                        && (1..=days_in_month((year - 2000) as u8, month)).contains(&day);
+                    assert_eq!(
+                        RtcTime::new(year, month, day, 0, 0, 0).is_ok(),
+                        real,
+                        "{year}-{month}-{day}"
+                    );
+                }
+            }
+        }
+        // Every accepted time sets the clock, which reads it back unchanged,
+        // and the clock running on never leaves the valid set.
+        let t = RtcTime::new(2099, 12, 31, 23, 59, 59).unwrap();
+        let mut r = Rtc::power_on();
+        r.set_time(t, 0);
+        assert_eq!(r.time(), t);
+        for day in 1..=40_000u64 {
+            r.advance_to(day * 86_400 * CPS + day);
+            let now = r.time();
+            assert_eq!(
+                RtcTime::new(
+                    now.year(),
+                    now.month(),
+                    now.day(),
+                    now.hour(),
+                    now.minute(),
+                    now.second()
+                ),
+                Ok(now)
+            );
+        }
     }
 
     #[test]

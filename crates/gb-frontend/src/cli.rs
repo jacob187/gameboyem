@@ -499,7 +499,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             (
-                t.year, t.month, t.day, t.weekday, t.hour, t.minute, t.second
+                t.year(),
+                t.month(),
+                t.day(),
+                t.weekday(),
+                t.hour(),
+                t.minute(),
+                t.second()
             ),
             (2024, 2, 29, 4, 13, 45, 9)
         );
@@ -507,7 +513,7 @@ mod tests {
             run(&["--rtc-start=2000-01-01T00:00:00", "g.gba"])
                 .rtc_start
                 .unwrap()
-                .weekday,
+                .weekday(),
             6
         );
         for bad in [

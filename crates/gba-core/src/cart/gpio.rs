@@ -519,7 +519,14 @@ mod tests {
         end(&mut g);
         let t = g.rtc().time();
         assert_eq!(
-            (t.year, t.month, t.day, t.weekday, t.hour, t.minute),
+            (
+                t.year(),
+                t.month(),
+                t.day(),
+                t.weekday(),
+                t.hour(),
+                t.minute()
+            ),
             (2025, 12, 31, 3, 23, 59)
         );
 
@@ -528,7 +535,7 @@ mod tests {
         write_bytes(&mut g, &[0x01, 0x02, 0x03], 0);
         end(&mut g);
         let t = g.rtc().time();
-        assert_eq!((t.day, t.hour, t.minute, t.second), (31, 1, 2, 3));
+        assert_eq!((t.day(), t.hour(), t.minute(), t.second()), (31, 1, 2, 3));
     }
 
     #[test]
@@ -539,12 +546,12 @@ mod tests {
         command(&mut g, 3, false, 0);
         write_bytes(&mut g, &[0x11, 0x22], 0);
         end(&mut g);
-        assert_eq!(g.rtc().time().hour, 0);
+        assert_eq!(g.rtc().time().hour(), 0);
         // The next transfer starts clean.
         start(&mut g, 0);
         command(&mut g, 3, false, 0);
         write_bytes(&mut g, &[0x05, 0x06, 0x07], 0);
-        assert_eq!(g.rtc().time().second, 7);
+        assert_eq!(g.rtc().time().second(), 7);
     }
 
     #[test]
@@ -557,7 +564,13 @@ mod tests {
         let t = g.rtc().time();
         assert_eq!(
             (
-                t.year, t.month, t.day, t.weekday, t.hour, t.minute, t.second
+                t.year(),
+                t.month(),
+                t.day(),
+                t.weekday(),
+                t.hour(),
+                t.minute(),
+                t.second()
             ),
             (2000, 1, 1, 0, 0, 0, 0)
         );
@@ -597,7 +610,7 @@ mod tests {
         }
         // Whatever follows is not interpreted.
         write_bytes(&mut g, &[0x99, 0x99, 0x99], 0);
-        assert_eq!(g.rtc().time().hour, 5);
+        assert_eq!(g.rtc().time().hour(), 5);
     }
 
     #[test]
