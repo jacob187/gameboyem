@@ -23,3 +23,7 @@
 3600 d8d2320126d0f27b 6a762d8a8fea1178 4743036af4432c25 homebrew/breakout.gb
 3600 e00f807ed1acf443 c2a47483116515e3 4bdbd267a4d22425 test/cgb-acid2/cgb-acid2.gbc
 3600 ae06a476c55f4bf0 cefa66f706c109ab 2142cae7e5d63509 corpus/ucity.gb
+3600 0c6f136ad77a5f15 16856c4faa128ea5 5b63d2b52a3c31a5 test/gba/fuzzarm/ARM_Any.gba
+3600 7a02d68c7c2d51b9 175888a5bb05c299 3b468a4777c9560a homebrew/moth.gba
+3600 4e3f3997a3283399 a40e5a1fdc4e4d27 2777e529145ddf05 homebrew/grains.gba
+3600 b5156819333509cd 140d1ca6e6a15bf0 5b63d2b52a3c31a5 test/gba/tonc/bin/m7_demo.gba
