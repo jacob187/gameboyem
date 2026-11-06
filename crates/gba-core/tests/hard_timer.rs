@@ -236,3 +236,66 @@ fn a_fifo_timer_stops_being_observed_once_the_sound_dma_is_off_and_the_fifo_is_d
     b.write32(0x0400_00A0, 0x0101_0101, N);
     assert!(pending(&b, 0));
 }
+
+/// Timer 0 (reload 0xFFF0, IRQ) overflows 16 cycles after its start; the clock
+/// is then taken past that without the bus dispatching (a long instruction), so
+/// the program's register write arrives with the overflow due but undispatched.
+fn started_and_past_its_first_overflow(ctl: u32) -> Bus {
+    let mut b = bus();
+    start(&mut b, 0, 0xFFF0, ctl);
+    let first = b.sched.when(Event::TimerOverflow(0)).unwrap();
+    let late = first + 3 - b.sched.now();
+    b.idle(late as u32 - 1); // the store's own access takes the last cycle
+    assert!(b.sched.now() < first + 3 && b.irq.if_ == 0);
+    b
+}
+
+#[test]
+fn stopping_a_timer_does_not_drop_an_overflow_that_already_happened() {
+    let mut b = started_and_past_its_first_overflow(IRQ);
+    b.write16(TM + 2, 0, N);
+    run(&mut b, 0);
+    assert_ne!(b.irq.if_ & 1 << 3, 0, "timer 0 IRQ (deep-review #13)");
+}
+
+#[test]
+fn clearing_the_irq_or_changing_the_prescaler_does_not_drop_a_due_overflow() {
+    for (new, what) in [(ENABLE, "IRQ off"), (IRQ | ENABLE | 1, "prescaler 64")] {
+        let mut b = started_and_past_its_first_overflow(IRQ);
+        b.write16(TM + 2, new as u16, N);
+        run(&mut b, 0);
+        assert_ne!(b.irq.if_ & 1 << 3, 0, "{what}");
+    }
+}
+
+#[test]
+fn a_due_overflow_still_ticks_a_count_up_follower_when_its_source_is_stopped() {
+    let mut b = bus();
+    start(&mut b, 0, 0xFFF0, 0);
+    start(&mut b, 1, 0x0000, COUNT_UP);
+    let first = b.sched.when(Event::TimerOverflow(0)).unwrap();
+    b.idle((first + 3 - b.sched.now()) as u32 - 1);
+    b.write16(TM + 2, 0, N);
+    run(&mut b, 0);
+    assert_eq!(counter(&b, 1), 1, "timer 1 saw timer 0's overflow");
+}
+
+#[test]
+fn a_reload_write_after_a_due_overflow_takes_effect_from_the_next_one() {
+    let mut b = bus();
+    start(&mut b, 0, 0xFF00, IRQ);
+    let first = b.sched.when(Event::TimerOverflow(0)).unwrap();
+    b.idle((first + 2 - b.sched.now()) as u32 - 1);
+    b.write16(TM, 0xFFC0, N);
+    run(&mut b, 0);
+    assert_eq!(b.timers.t[0].reload, 0xFFC0);
+    assert_eq!(
+        b.timers.t[0].counter, 0xFF00,
+        "the overflow that came first loaded the old reload (deep-review #15)"
+    );
+    assert_eq!(
+        b.sched.when(Event::TimerOverflow(0)),
+        Some(first + 0x100),
+        "and its period was the old one"
+    );
+}
