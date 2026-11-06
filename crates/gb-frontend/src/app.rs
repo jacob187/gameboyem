@@ -1218,7 +1218,7 @@ mod tests {
             "screenshot == replayed frame"
         );
         let tool = dir.path().join("gb-test.png");
-        gb_test::gba::save_gba_png(&gba.framebuffer()[..], &tool).unwrap();
+        gb_test::gba::save_gba_png(gba.framebuffer(), &tool).unwrap();
         assert_eq!(
             fs::read(&tool).unwrap(),
             shot,

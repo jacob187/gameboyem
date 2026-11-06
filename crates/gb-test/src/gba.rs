@@ -140,16 +140,10 @@ fn run_jsmolka_capped(
     }
 }
 
-fn ewram_word(gba: &Gba, offset: u32) -> u32 {
-    (0..4).fold(0, |w, i| {
-        w | u32::from(gba.peek8(EWRAM_BASE + offset + i)) << (8 * i)
-    })
-}
-
 fn run_fuzzarm(gba: &mut Gba, idle: u32, max_frames: u32) -> Outcome {
     for _ in 0..max_frames {
         gba.step_frame();
-        if ewram_word(gba, 0) != 0 {
+        if gba.peek32(EWRAM_BASE) != 0 {
             for _ in 0..FUZZ_SETTLE_FRAMES {
                 gba.step_frame();
             }
@@ -223,16 +217,23 @@ fn run_smoke(gba: &mut Gba, case: &Case) -> Outcome {
     ))
 }
 
+/// A GBA frame widened to RGB888 (three bytes a pixel), the form the PNGs and the
+/// replay frame hash are made from.
+pub fn gba_rgb(fb: &gba_core::Framebuffer) -> Vec<u8> {
+    fb.iter().flat_map(|&c| rgb555_to_rgb888(c)).collect()
+}
+
 /// Write a GBA frame (`SCREEN_WIDTH` x `SCREEN_HEIGHT` RGB555) as an RGB PNG.
-pub fn save_gba_png(fb: &[u16], path: &Path) -> Result<(), String> {
-    if fb.len() != SCREEN_WIDTH * SCREEN_HEIGHT {
-        return Err(format!("framebuffer has {} pixels", fb.len()));
-    }
-    let rgb: Vec<u8> = fb.iter().flat_map(|&c| rgb555_to_rgb888(c)).collect();
+pub fn save_gba_png(fb: &gba_core::Framebuffer, path: &Path) -> Result<(), String> {
+    save_gba_rgb_png(&gba_rgb(fb), path)
+}
+
+/// Write a frame already widened by [`gba_rgb`] as an RGB PNG.
+pub fn save_gba_rgb_png(rgb: &[u8], path: &Path) -> Result<(), String> {
     save_sized_png(
         SCREEN_WIDTH as u32,
         SCREEN_HEIGHT as u32,
-        &rgb,
+        rgb,
         png::ColorType::Rgb,
         path,
     )
@@ -586,7 +587,7 @@ mod tests {
 
     #[test]
     fn gba_png_is_240x160_rgb_with_the_readme_widening() {
-        let mut fb = vec![0u16; SCREEN_WIDTH * SCREEN_HEIGHT];
+        let mut fb: gba_core::Framebuffer = [0u16; SCREEN_WIDTH * SCREEN_HEIGHT];
         fb[0] = 0x001F; // pure red
         fb[SCREEN_WIDTH * SCREEN_HEIGHT - 1] = 0b01111_00001_10000;
         let dir = std::env::temp_dir().join(format!("gb-test-gba-png-{}", std::process::id()));
@@ -603,6 +604,5 @@ mod tests {
         assert_eq!(buf[..3], [255, 0, 0]);
         assert_eq!(buf[buf.len() - 3..], [0x84, 0x08, 0x7B]);
         std::fs::remove_dir_all(dir).unwrap();
-        assert!(save_gba_png(&fb[1..], &path).is_err());
     }
 }
