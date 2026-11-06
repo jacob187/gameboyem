@@ -320,7 +320,8 @@ fn intr_wait_protocol_discard_wait_and_consume() {
     b.write16(BIOS_IF, 0x0003, N);
     let (res, r) = call(&mut b, 0x04, [1, 1, 0, 0]);
     assert_eq!(res, SwiResult::WaitThenRetry);
-    assert_ne!(r[2], 0);
+    assert_eq!(r[2], 0, "r2 keeps the caller's value");
+    assert_eq!(b.intr_wait, Some(1));
     assert_eq!(
         b.peek16(BIOS_IF),
         0x0002,
@@ -374,4 +375,36 @@ fn memory_calls_charge_the_bus_per_access() {
     call(&mut b, 0x0C, [EWRAM, EWRAM + 0x100, 64, 0]);
     let large = b.sched.now() - t;
     assert!(large > small * 4, "{small} vs {large}");
+}
+
+#[test]
+fn intr_wait_ignores_a_caller_r2_that_looks_like_a_marker() {
+    // code-review B#1: r2 used to carry the retry marker; it is the caller's now.
+    let mut b = bus();
+    b.write16(BIOS_IF, 0x0001, N);
+    let regs = [1, 1, 0x4957_4954, 0x1234];
+    let (res, r) = call(&mut b, 0x04, regs);
+    assert_eq!(res, SwiResult::WaitThenRetry, "the discard still happened");
+    assert_eq!(b.peek16(BIOS_IF), 0);
+    assert_eq!((r[2], r[3]), (0x4957_4954, 0x1234));
+}
+
+#[test]
+fn intr_wait_returns_once_for_a_flag_set_mid_wait() {
+    // code-review B#2: a flag the IRQ handler sets while the call waits is
+    // never discarded by a retry, and satisfies exactly one call.
+    let mut b = bus();
+    let (res, r) = call(&mut b, 0x04, [1, 1, 0, 0]);
+    assert_eq!(res, SwiResult::WaitThenRetry);
+    b.write16(BIOS_IF, 0x0001, N); // the handler ORs it in during the halt
+    assert_eq!(call(&mut b, 0x04, r).0, SwiResult::Done);
+    assert_eq!((b.peek16(BIOS_IF), b.intr_wait), (0, None));
+    // The next call starts fresh: it discards and waits again.
+    assert_eq!(call(&mut b, 0x04, r).0, SwiResult::WaitThenRetry);
+    // A different wait abandons a stale one instead of inheriting its state.
+    let (res, _) = call(&mut b, 0x04, [1, 0x0008, 0, 0]);
+    assert_eq!((res, b.intr_wait), (SwiResult::WaitThenRetry, Some(8)));
+    // SoftReset forgets a wait in progress.
+    call(&mut b, 0x00, [0; 4]);
+    assert_eq!(b.intr_wait, None);
 }

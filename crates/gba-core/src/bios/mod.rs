@@ -100,7 +100,10 @@ fn hle(bus: &mut Bus, number: u8, r: &mut [u32; 4]) -> SwiResult {
     bus.sched.advance(SWI_OVERHEAD);
     match number {
         // SoftReset: the image's code resets the CPU and jumps (see module docs).
-        0x00 => return SwiResult::Unhandled,
+        0x00 => {
+            bus.intr_wait = None;
+            return SwiResult::Unhandled;
+        }
         0x01 => register_ram_reset(bus, r[0]),
         0x02 => halt(bus, 0x00),
         0x03 => halt(bus, 0x80),
@@ -176,6 +179,7 @@ fn hle(bus: &mut Bus, number: u8, r: &mut [u32; 4]) -> SwiResult {
             // the image reboot the cartridge (no logo, no 2 second wait).
             register_ram_reset(bus, 0xFF);
             bus.write_value(RESET_FLAG, 0, Width::B);
+            bus.intr_wait = None;
             return SwiResult::Unhandled;
         }
         0x27 => halt(bus, r[2] as u8),
@@ -198,32 +202,33 @@ fn hang(bus: &mut Bus) -> SwiResult {
     SwiResult::WaitThenRetry
 }
 
-/// Marker the first attempt of IntrWait leaves in r2 (unused on the GBA) so a
-/// retry knows the one-time work is done. The CPU re-runs the SWI with the
-/// registers handed back, and an IRQ taken during the wait also returns to the
-/// SWI with them restored from the stack, so the marker survives both. It keeps
-/// the wait's state in registers, not in the bus (nothing extra to save).
-const INTR_WAIT_MARK: u32 = 0x4957_4954; // "IWIT"
-
 /// SWI 0x04 IntrWait (GBATEK "BIOS Halt Functions"): IME = 1, optionally discard
 /// old flags (r0 = 1), then wait in halt until a flag in r1 is set in the BIOS
 /// interrupt flags, and consume it. Returns `WaitThenRetry` while waiting.
-fn intr_wait(bus: &mut Bus, r: &mut [u32; 4]) -> SwiResult {
+///
+/// The CPU re-runs the SWI after every wake-up, and an IRQ taken during the wait
+/// also returns to it, so the one-time work (IME, the discard) must happen once:
+/// `bus.intr_wait` holds the flags being waited for from the first attempt until
+/// the call returns. A wait whose flags differ from the recorded ones is a new
+/// call (the old one was abandoned, for example by a handler that never returned).
+/// GBATEK lets the SWIs destroy r0-r3; this one leaves r2 and r3 alone and r0, r1
+/// as the caller (or VBlankIntrWait) set them.
+fn intr_wait(bus: &mut Bus, r: &[u32; 4]) -> SwiResult {
     let wanted = r[1] as u16;
-    if r[2] != INTR_WAIT_MARK {
+    if bus.intr_wait != Some(wanted) {
         bus.irq.ime = true;
         if r[0] != 0 {
             let flags = bus.read16(BIOS_IF, Access::NonSeq);
             bus.write16(BIOS_IF, flags & !wanted, Access::NonSeq);
         }
-        r[2] = INTR_WAIT_MARK;
+        bus.intr_wait = Some(wanted);
     }
     let flags = bus.read16(BIOS_IF, Access::NonSeq);
     let hit = flags & wanted;
     if hit != 0 {
         // The matched flags are consumed.
         bus.write16(BIOS_IF, flags & !hit, Access::NonSeq);
-        r[2] = 0;
+        bus.intr_wait = None;
         return SwiResult::Done;
     }
     bus.halted = true;
