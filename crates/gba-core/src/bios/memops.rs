@@ -242,6 +242,11 @@ pub(super) fn bit_unpack(bus: &mut Bus, r: &[u32; 4]) {
             if v != 0 || zero {
                 v = v.wrapping_add(offset);
             }
+            // The sum is cut to the destination unit, so an overflow cannot spill
+            // into the next unit (DECISIONS #65).
+            if dw < 32 {
+                v &= (1 << dw) - 1;
+            }
             out |= v << used;
             used += dw;
             if used >= 32 {

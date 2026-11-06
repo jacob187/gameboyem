@@ -441,3 +441,23 @@ fn huffman_rejects_unsupported_bit_widths() {
     call(&mut b, 0x13, [EWRAM + 0x40, EWRAM + 0x140, 0, 0]);
     assert_eq!(b.peek32(EWRAM + 0x140), 0x2121_2121);
 }
+
+#[test]
+fn bit_unpack_masks_the_sum_to_the_destination_width() {
+    // code-review B#5: 0xF + 1 overflows a 4-bit unit and must not spill into the next.
+    let mut b = bus();
+    put(&mut b, EWRAM, &[0xFF; 4]);
+    put32(&mut b, EWRAM + 0x100, &[0xFFFF_FFFF]);
+    // 4-bit source units to 4-bit destination units, offset 1, 4 source bytes.
+    put(&mut b, EWRAM + 0x10, &[4, 0, 4, 4, 1, 0, 0, 0]);
+    call(&mut b, 0x10, [EWRAM, EWRAM + 0x100, EWRAM + 0x10, 0]);
+    assert_eq!(
+        b.peek32(EWRAM + 0x100),
+        0,
+        "every nibble wrapped, nothing leaked"
+    );
+    // 1-bit source units to 4-bit destination units, offset 1: every unit is 2.
+    put(&mut b, EWRAM + 0x20, &[1, 0, 1, 4, 1, 0, 0, 0]);
+    call(&mut b, 0x10, [EWRAM, EWRAM + 0x200, EWRAM + 0x20, 0]);
+    assert_eq!(b.peek32(EWRAM + 0x200), 0x2222_2222);
+}
