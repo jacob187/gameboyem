@@ -687,19 +687,26 @@ mod tests {
 
     #[test]
     fn a_128_kib_flash_save_with_an_rtc_footer_fits_the_cap_and_loads() {
-        let opts = gba_core::CartOptions {
-            rtc: gba_core::RtcMode::On,
-            ..Default::default()
-        };
-        let mut g = gba_core::Gba::with_options(gba_rom(b"FLASH1M_V"), None, opts).unwrap();
-        let ram = Core::battery_ram(&g).expect("flash");
+        // 128 KiB of chip plus a hand-built footer (DECISIONS #67): magic, control,
+        // 2024-01-01 00:00:00 with weekday 1 (BCD), zero sub-second, reserved.
+        let mut ram = vec![0xFF; 128 * 1024];
+        ram.extend_from_slice(b"AGBRTC01");
+        ram.extend_from_slice(&[0x42, 0x24, 0x01, 0x01, 1, 0, 0, 0]);
+        ram.extend_from_slice(&[0; 8]);
         assert_eq!(ram.len(), 128 * 1024 + gba_core::cart::RTC_FOOTER_LEN);
         assert!(ram.len() as u64 <= MAX_SAVE_BYTES);
+        let opts = gba_core::CartOptions::default();
+        let mut g = gba_core::Gba::with_options(gba_rom(b"FLASH1M_V"), None, opts).unwrap();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("g.sav"), &ram).unwrap();
         let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
         m.load(&mut g);
         assert!(!m.write_blocked, "a save with a footer is accepted");
+        assert_eq!(
+            Core::battery_ram(&g).unwrap(),
+            ram,
+            "and written back as it was"
+        );
         // A corrupt footer is refused like any bad save: the file is backed up and ignored.
         let mut bad = ram.clone();
         let n = bad.len();
