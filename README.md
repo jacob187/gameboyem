@@ -40,6 +40,9 @@ usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
   --palette NAME   green (default) or grey (Game Boy only; colour games use their own colours)
   --model NAME     auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb (Game Boy only)
   --bios FILE      boot through a real 16 KiB GBA BIOS dump (GBA only; default: built-in HLE BIOS)
+  --save-type NAME auto (default: from the ROM), none, sram, flash64, flash128, eeprom512 or eeprom8k (GBA only)
+  --rtc NAME       auto (default: on when the game sets up the cartridge clock), on or off (GBA only)
+  --rtc-start TIME start the GBA cartridge clock at YYYY-MM-DDTHH:MM:SS if the save has none (GBA only; default 2000-01-01, power-loss flag set)
   --test-pattern   show a synthetic test pattern and tone instead of running the core
   --record FILE    record every input to FILE (must not exist) for `gb-test --replay`
   -h, --help       show this help

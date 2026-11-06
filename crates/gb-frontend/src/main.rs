@@ -49,8 +49,16 @@ fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<Box<dyn Core>, String>
         Some(path) => Some(rom::read_bios(path)?),
         None => None,
     };
-    let gba =
-        Gba::new(rom, bios).map_err(|e| rom::gba_cartridge_message(&opts.rom, &e, archive))?;
+    let options = gba_core::CartOptions {
+        save: opts.save_type,
+        rtc: opts.rtc,
+    };
+    let mut gba = Gba::with_options(rom, bios, options)
+        .map_err(|e| rom::gba_cartridge_message(&opts.rom, &e, archive))?;
+    // The save is loaded after this and replaces the clock if it carries one.
+    if let Some(start) = opts.rtc_start {
+        gba.set_rtc(start);
+    }
     Ok(Box::new(gba))
 }
 
