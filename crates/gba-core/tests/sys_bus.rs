@@ -309,6 +309,8 @@ fn write_only_and_sound_register_read_masks() {
     b.write32(0x0400_00D4, 0x0300_0000, N);
     assert_eq!(b.read32(0x0400_00D4, N), 0, "DMA SAD is write-only");
     assert_eq!(b.read16(0x0400_00D8, N), 0);
+    // P2-APU: PSG registers are held at zero until SOUNDCNT_X bit 7 enables sound.
+    b.write16(0x0400_0084, 0x80, N);
     b.write16(0x0400_0080, 0xFFFF, N);
     assert_eq!(b.read16(0x0400_0080, N), 0xFF77);
     b.write16(0x0400_0064, 0xFFFF, N);

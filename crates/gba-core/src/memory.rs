@@ -56,6 +56,11 @@ impl Bus {
         if w == Width::H && self.cart.eeprom_at(addr) {
             return u32::from(self.cart.eeprom_read());
         }
+        // P2-APU (code-review A2#1): a sound register or wave RAM read sees the
+        // APU at the current cycle, not at the last sync. `peek*` stays pure.
+        if addr >> 24 == 4 && (0x60..0xA0).contains(&(addr & 0x00FF_FFFF)) {
+            self.apu.advance_to(self.sched.now());
+        }
         self.read_region(addr, w, false)
     }
 

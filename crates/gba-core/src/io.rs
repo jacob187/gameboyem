@@ -10,15 +10,6 @@ use crate::bus::{Bus, Width};
 use crate::irq::Interrupt;
 use crate::scheduler::Event;
 
-/// Readable bits of the sound registers 0x060..0x0A0 (GBATEK "GBA Sound
-/// Controller" register tables: length/initial-frequency bits are write-only).
-const SOUND_READ_MASK: [u16; 0x20] = [
-    0x007F, 0xFFC0, 0x4000, 0, 0xFFC0, 0, 0x4000, 0, // 0x60..0x70: PSG 1, 2
-    0x00E0, 0xE000, 0x4000, 0, 0xFF00, 0, 0x40FF, 0, // 0x70..0x80: PSG 3, 4
-    0xFF77, 0x770F, 0x008F, 0, 0xC3FE, 0, 0, 0, // 0x80..0x90: SOUNDCNT, BIAS
-    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, // wave RAM
-];
-
 /// WAITCNT's writable bits (bit 15, the cart type, is read-only).
 const WAITCNT_MASK: u16 = 0x7FFF;
 
@@ -68,10 +59,8 @@ impl Bus {
     pub fn read_io16(&self, off: u32) -> u16 {
         match off {
             0x000..=0x05F => self.ppu.read_io(off),
-            0x060..=0x09F => {
-                let i = (off as usize - 0x60) >> 1;
-                self.sound_regs[i] & SOUND_READ_MASK[i]
-            }
+            // P2-APU: the sound registers live in the APU (it applies the read masks).
+            0x060..=0x09F => self.apu.read_reg(off),
             0x0A0..=0x0A7 => 0, // FIFOs are write-only
             0x0B0..=0x0DF => self.dma.read_reg(off - 0xB0),
             0x100..=0x10F => {
@@ -99,9 +88,10 @@ impl Bus {
     pub fn write_io16(&mut self, off: u32, v: u16, mask: u16) {
         match off {
             0x000..=0x05F => self.ppu.write_io(off, v, mask),
+            // P2-APU: sync the APU to the clock, then write.
             0x060..=0x09F => {
-                let r = &mut self.sound_regs[(off as usize - 0x60) >> 1];
-                *r = merge(*r, v, mask);
+                self.apu.advance_to(self.sched.now());
+                self.apu.write_reg(off, v, mask);
             }
             0x0A0..=0x0A7 => self.write_fifo_half(off, v, mask),
             0x0B0..=0x0DF => self.dma.write_reg(off - 0xB0, v, mask),
@@ -186,6 +176,8 @@ impl Bus {
                 self.irq.raise(Interrupt::timer(n));
             }
             if n < 2 {
+                // P2-APU: the FIFO pop lands at the overflow's own time.
+                self.apu.advance_to(at);
                 let req = self.apu.on_timer_overflow(n);
                 if req.a {
                     self.dma.trigger(crate::dma::DmaTrigger::FifoA);

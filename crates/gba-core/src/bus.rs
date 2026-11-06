@@ -158,8 +158,6 @@ pub struct Bus {
     pub fetching_bios: bool,
     /// POSTFLG (0x0400_0300, low byte).
     pub postflg: u8,
-    /// Sound registers 0x060..0x0A0 as the APU (P2) will see them.
-    pub sound_regs: [u16; 0x20],
     /// FIFO A/B words being assembled from halfword/byte writes.
     pub fifo_latch: [u32; 2],
     /// Serial/JOY registers 0x120..0x160: stored, not emulated.
@@ -191,11 +189,13 @@ impl Bus {
             bios_latch: 0xE129_F000,
             fetching_bios: false,
             postflg: 0,
-            sound_regs: [0; 0x20],
             fifo_latch: [0; 2],
             sio_regs: [0; 0x20],
         };
         bus.ppu.start(&mut bus.sched);
+        // P2-APU: the sound clock pump (see `Apu::advance_to`).
+        bus.sched
+            .schedule(Event::ApuSample, crate::apu::PUMP_CYCLES);
         bus
     }
 
@@ -228,9 +228,18 @@ impl Bus {
                     }
                 }
                 Event::TimerOverflow(n) => self.timer_overflow(usize::from(n), at),
-                // P2-APU's sample clock; DMA and IRQ delays are folded into the
-                // run loop, so these never fire yet.
-                Event::ApuSample | Event::DmaStart(_) => {}
+                // P2-APU: bring the APU up to date and re-arm the pump from its
+                // own timestamp. The APU is exact without it (it also syncs on
+                // register writes, FIFO timer overflows and drains); the pump just
+                // bounds how stale its flags and buffered samples can get.
+                Event::ApuSample => {
+                    self.apu.advance_to(at);
+                    self.sched
+                        .schedule_at(Event::ApuSample, at + crate::apu::PUMP_CYCLES);
+                }
+                // DMA and IRQ delays are folded into the run loop, so this never
+                // fires yet.
+                Event::DmaStart(_) => {}
                 Event::IrqLine => {}
             }
         }
