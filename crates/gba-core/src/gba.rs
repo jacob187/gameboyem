@@ -245,6 +245,9 @@ mod tests {
         // HALTCNT (high byte of 0x300): every step now advances to an event.
         gba.bus.write_io16(0x300, 0, 0xFF00);
         assert!(gba.bus.halted);
+        // The power-on line-start event is due at cycle 0: the first step only
+        // dispatches it.
+        gba.step_instruction();
         let t = gba.cycles();
         gba.step_instruction();
         assert!(gba.cycles() > t, "halt skipped the clock");
@@ -263,5 +266,60 @@ mod tests {
         assert_eq!(gba.cycles() - t, 2 + 4);
         gba.step_instruction();
         assert!(gba.bus.dma.active_channel().is_none());
+    }
+
+    /// `step_once(false)` without the dispatch gate: events are processed after
+    /// every step, as the run loop did before P3-TIMING.
+    fn step_ungated(g: &mut Gba) {
+        if g.bus.dma.active_channel().is_some() {
+            g.bus.run_dma();
+        } else if g.bus.halted {
+            if !g.bus.sched.skip_to_next() {
+                return;
+            }
+        } else {
+            g.cpu.step(&mut g.bus);
+        }
+        g.bus.process_events();
+    }
+
+    /// A ROM that starts timer 0 (reload 0xFFF0, 16 cycles per overflow) and then
+    /// reads its counter in a loop, so timer, PPU and APU events are all crossed.
+    fn timer_rom() -> Vec<u8> {
+        let mut rom = vec![0; 0x100];
+        let words: [(usize, u32); 7] = [
+            (0x00, 0xEA00_002E), // b 0xC0
+            (0xC0, 0xE3A0_0301), // mov r0, #0x04000000
+            (0xC4, 0xE3A0_1880), // mov r1, #0x00800000 (enable)
+            (0xC8, 0xE381_1CF0), // orr r1, r1, #0xF000
+            (0xCC, 0xE381_10F0), // orr r1, r1, #0xF0 (reload 0xFFF0)
+            (0xD0, 0xE580_1100), // str r1, [r0, #0x100]
+            (0xD4, 0xE590_2100), // loop: ldr r2, [r0, #0x100]
+        ];
+        for (at, w) in words {
+            rom[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        rom[0xD8..0xDC].copy_from_slice(&0xEAFF_FFFDu32.to_le_bytes()); // b loop
+        rom
+    }
+
+    #[test]
+    fn gating_process_events_does_not_change_results() {
+        let mut gated = Gba::new(timer_rom(), None).unwrap();
+        let mut plain = Gba::new(timer_rom(), None).unwrap();
+        for i in 0..300_000 {
+            gated.step_once(false);
+            step_ungated(&mut plain);
+            if i % 1000 == 0 {
+                assert_eq!(gated.cycles(), plain.cycles());
+                assert_eq!(gated.cpu_registers(), plain.cpu_registers());
+            }
+        }
+        assert_eq!(gated.cycles(), plain.cycles());
+        assert_eq!(gated.frames(), plain.frames());
+        assert!(gated.frames() >= 1, "crossed frame events");
+        assert_eq!(gated.cpu_registers(), plain.cpu_registers());
+        assert_eq!(gated.peek16(0x0400_0006), plain.peek16(0x0400_0006));
+        assert_eq!(gated.peek16(0x0400_0202), plain.peek16(0x0400_0202));
     }
 }

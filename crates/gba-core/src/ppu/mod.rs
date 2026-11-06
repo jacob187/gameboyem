@@ -7,8 +7,9 @@
 //! [`Ppu::read_io`] / [`Ppu::write_io`] at 16-bit granularity with a byte-lane mask.
 //!
 //! Timing contract: [`Ppu::start`] schedules the first events; the bus hands every
-//! `PpuHBlank`/`PpuLineEnd` event to [`Ppu::on_event`], which reschedules the next
-//! one and returns the [`PpuSignals`] for the bus to apply.
+//! PPU event (`PpuFirstLine`, `PpuRender`, `PpuHBlank`, `PpuLineEnd`) to
+//! [`Ppu::on_event`], which reschedules the next ones and returns the
+//! [`PpuSignals`] for the bus to apply.
 
 use crate::scheduler::{Event, Scheduler};
 use crate::{CYCLES_PER_LINE, Framebuffer, LINES_PER_FRAME, SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -21,12 +22,15 @@ mod render;
 mod tests;
 mod window;
 
-/// Cycles from the start of a line to the HBlank event: the line is rendered and
-/// the DISPSTAT HBlank flag rises here. 240 dots x 4 cycles = 960 is where the
-/// last visible pixel is drawn, but the flag (and the HBlank IRQ / DMA trigger)
-/// rises later, at cycle 1006 (GBATEK "LCD Status", measured by mGBA/NBA). See
-/// DECISIONS #55.
+/// Cycles from the start of a line to the HBlank event: the DISPSTAT HBlank flag,
+/// the HBlank IRQ and the HBlank DMA trigger happen here, at cycle 1006 (GBATEK
+/// "LCD Status", measured by mGBA/NBA). DECISIONS #55.
 pub const HDRAW_CYCLES: u32 = 1006;
+
+/// Cycles from the start of a line to the render event: 240 dots x 4 = 960, where
+/// the last visible pixel is drawn. The line is drawn from the state at this
+/// point, so a write between 960 and 1006 shows on the next line (DECISIONS #71).
+pub const RENDER_CYCLES: u32 = 960;
 
 /// DISPSTAT bits.
 const STAT_VBLANK_IRQ: u16 = 1 << 3;
@@ -115,6 +119,8 @@ impl Ppu {
 
     /// Schedule the first line's events. **Contract.**
     pub fn start(&mut self, sched: &mut Scheduler) {
+        sched.schedule_at(Event::PpuFirstLine, 0);
+        sched.schedule(Event::PpuRender, u64::from(RENDER_CYCLES));
         sched.schedule(Event::PpuHBlank, u64::from(HDRAW_CYCLES));
         sched.schedule(Event::PpuLineEnd, u64::from(CYCLES_PER_LINE));
     }
@@ -124,13 +130,19 @@ impl Ppu {
         let mut sig = PpuSignals::default();
         let stat = self.io[STAT_INDEX];
         match event {
-            Event::PpuHBlank => {
+            Event::PpuFirstLine => sig.irq |= vcount_match_irq(stat, self.vcount),
+            Event::PpuRender => {
+                // The visible dots are done: draw the line from the registers and
+                // memory as they are now. A write the CPU or an HBlank DMA makes after
+                // this point shows on the next line.
                 let line = u32::from(self.vcount);
                 if line < crate::VISIBLE_LINES {
-                    // The line is drawn from the state at HBlank; writes the CPU or
-                    // an HBlank DMA makes after this point show on the next line.
                     self.render_line(line);
                     self.advance_affine_latches();
+                }
+            }
+            Event::PpuHBlank => {
+                if u32::from(self.vcount) < crate::VISIBLE_LINES {
                     sig.hblank_dma = true;
                 }
                 self.hblank = true;
@@ -151,13 +163,13 @@ impl Ppu {
                     }
                 }
                 // The VCount IRQ is requested as the line starts, not when DISPSTAT
-                // is written (DECISIONS #56).
-                if stat & STAT_VCOUNT_IRQ != 0 && self.vcount == stat >> 8 {
-                    sig.irq |= 1 << 2;
+                // is written (DECISIONS #56, #71).
+                sig.irq |= vcount_match_irq(stat, self.vcount);
+                if u32::from(self.vcount) < crate::VISIBLE_LINES {
+                    sched.schedule_at(Event::PpuRender, at + u64::from(RENDER_CYCLES));
                 }
-                let next_line = at + u64::from(CYCLES_PER_LINE);
                 sched.schedule_at(Event::PpuHBlank, at + u64::from(HDRAW_CYCLES));
-                sched.schedule_at(Event::PpuLineEnd, next_line);
+                sched.schedule_at(Event::PpuLineEnd, at + u64::from(CYCLES_PER_LINE));
             }
             _ => {}
         }
@@ -264,6 +276,16 @@ impl Ppu {
     /// Current scanline (VCOUNT).
     pub fn vcount(&self) -> u16 {
         self.vcount
+    }
+}
+
+/// The IF bit 2 for a VCount match at the start of line `vcount`: the match flag
+/// rises as VCOUNT reaches LYC, and raises the IRQ if DISPSTAT enables it.
+fn vcount_match_irq(stat: u16, vcount: u16) -> u16 {
+    if stat & STAT_VCOUNT_IRQ != 0 && vcount == stat >> 8 {
+        1 << 2
+    } else {
+        0
     }
 }
 

@@ -12,8 +12,14 @@
 /// (scheduling a variant that is already pending replaces it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// The PPU reaches dot 240 of the current line (HBlank begins).
+    /// The PPU's visible dots end (cycle 960 of a visible line): the line is
+    /// drawn from the state as it is now (DECISIONS #71).
+    PpuRender,
+    /// The HBlank flag, IRQ and DMA trigger of the current line (cycle 1006).
     PpuHBlank,
+    /// Line 0 of the first frame starts (power-on, cycle 0): the one line start
+    /// no line-end event announces, so the VCount match is checked here.
+    PpuFirstLine,
     /// The PPU finishes the current line (VCOUNT advances).
     PpuLineEnd,
     /// Timer `n` (0..=3) overflows.

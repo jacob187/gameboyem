@@ -225,7 +225,10 @@ impl Bus {
     pub fn process_events(&mut self) {
         while let Some((event, at)) = self.sched.pop_due() {
             match event {
-                Event::PpuHBlank | Event::PpuLineEnd => {
+                Event::PpuFirstLine
+                | Event::PpuRender
+                | Event::PpuHBlank
+                | Event::PpuLineEnd => {
                     let sig = self.ppu.on_event(event, at, &mut self.sched);
                     self.irq.if_ |= sig.irq;
                     if sig.frame_done {
@@ -265,6 +268,39 @@ impl Bus {
             }
         }
         self.check_wake();
+    }
+
+    /// Dispatch the events that are due before the CPU touches video state, so a
+    /// store lands on the right side of the PPU's render (cycle 960) and line end,
+    /// and a status read sees the current line, instead of being up to an
+    /// instruction early or late. Only the CPU's own accesses do this; a DMA unit
+    /// is never interrupted by event dispatch.
+    #[inline]
+    fn sync_ppu_write(&mut self, addr: u32) {
+        let video = match addr >> 24 {
+            0x04 => addr & 0x00FF_FFFF < 0x60,
+            0x05..=0x07 => true,
+            _ => false,
+        };
+        if video {
+            self.catch_up_events();
+        }
+    }
+
+    /// See [`Bus::sync_ppu_write`]; reads matter for DISPSTAT and VCOUNT only.
+    #[inline]
+    fn sync_ppu_read(&mut self, addr: u32) {
+        if addr >> 24 == 0x04 && addr & 0x00FF_FFFF < 0x60 {
+            self.catch_up_events();
+        }
+    }
+
+    #[inline]
+    fn catch_up_events(&mut self) {
+        let now = self.sched.now();
+        if self.sched.next_at().is_some_and(|t| t <= now) {
+            self.process_events();
+        }
     }
 
     /// End a halt (or stop) if its wake condition holds. Called after events and
@@ -394,36 +430,42 @@ impl CpuBus for Bus {
     fn read8(&mut self, addr: u32, access: Access) -> u8 {
         let c = self.access_cost(addr, Width::B, access);
         self.sched.advance(c);
+        self.sync_ppu_read(addr);
         self.read_value(addr, Width::B) as u8
     }
     #[inline]
     fn read16(&mut self, addr: u32, access: Access) -> u16 {
         let c = self.access_cost(addr, Width::H, access);
         self.sched.advance(c);
+        self.sync_ppu_read(addr);
         self.read_value(addr, Width::H) as u16
     }
     #[inline]
     fn read32(&mut self, addr: u32, access: Access) -> u32 {
         let c = self.access_cost(addr, Width::W, access);
         self.sched.advance(c);
+        self.sync_ppu_read(addr);
         self.read_value(addr, Width::W)
     }
     #[inline]
     fn write8(&mut self, addr: u32, value: u8, access: Access) {
         let c = self.access_cost(addr, Width::B, access);
         self.sched.advance(c);
+        self.sync_ppu_write(addr);
         self.write_value(addr, u32::from(value), Width::B);
     }
     #[inline]
     fn write16(&mut self, addr: u32, value: u16, access: Access) {
         let c = self.access_cost(addr, Width::H, access);
         self.sched.advance(c);
+        self.sync_ppu_write(addr);
         self.write_value(addr, u32::from(value), Width::H);
     }
     #[inline]
     fn write32(&mut self, addr: u32, value: u32, access: Access) {
         let c = self.access_cost(addr, Width::W, access);
         self.sched.advance(c);
+        self.sync_ppu_write(addr);
         self.write_value(addr, value, Width::W);
     }
     #[inline]
@@ -505,5 +547,40 @@ impl CpuBus for Bus {
     }
     fn swi(&mut self, number: u8, r: &mut [u32; 4]) -> SwiResult {
         crate::bios::swi(self, number, r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cpu_store_after_the_render_point_lands_on_the_next_line() {
+        // The store's own access crosses cycle 960, so the line is drawn first
+        // even though the run loop would only dispatch the event after the
+        // instruction (DECISIONS #71).
+        const PAL: u32 = 0x0500_0000;
+        let mut bus = Bus::new(Cart::from_rom(vec![0; 0x400]).unwrap(), Bios::Hle);
+        bus.write16(PAL, 0x001F, Access::NonSeq); // cycle 1
+        bus.idle(957); // cycle 958
+        bus.write16(PAL, 0x03E0, Access::NonSeq); // completes at 959: line 0
+        bus.write16(PAL, 0x7C00, Access::NonSeq); // completes at 960: line 1
+        while bus.frames == 0 {
+            bus.idle(100);
+            bus.process_events();
+        }
+        let fb = bus.ppu.framebuffer();
+        assert_eq!(fb[0], 0x03E0);
+        assert_eq!(fb[crate::SCREEN_WIDTH], 0x7C00);
+    }
+
+    #[test]
+    fn dispstat_and_vcount_reads_see_events_that_are_due() {
+        let mut bus = Bus::new(Cart::from_rom(vec![0; 0x400]).unwrap(), Bios::Hle);
+        bus.idle(crate::CYCLES_PER_LINE - 2);
+        // This read ends one cycle short of line 1: no event due yet.
+        assert_eq!(bus.read16(0x0400_0006, Access::NonSeq), 0);
+        // The read itself costs a cycle and crosses the line end.
+        assert_eq!(bus.read16(0x0400_0006, Access::NonSeq), 1);
     }
 }
