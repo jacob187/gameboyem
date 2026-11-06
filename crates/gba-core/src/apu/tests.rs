@@ -195,6 +195,9 @@ fn length_quirks_follow_the_sequencer_step() {
     assert_eq!(a.ch1.length.counter, 2);
 }
 
+/// A named corruption of an `Apu`.
+type Case = (&'static str, fn(&mut Apu));
+
 /// The APU-level `load_state` refusals, each on its own field (deep-review #74);
 /// the square channels' own are tested in their module.
 #[test]
@@ -209,7 +212,7 @@ fn a_state_with_an_impossible_apu_field_is_refused() {
         Apu::default().load_state(&mut StateReader::new(&bytes), a.now())
     };
     assert!(load(&ok).is_ok());
-    let cases: [(&str, fn(&mut Apu)); 8] = [
+    let cases: [Case; 8] = [
         ("frame sequencer step", |a| a.seq_step = 8),
         ("frame sequencer timer", |a| a.seq_timer = 0),
         ("mix level", |a| a.cur_l = -1),

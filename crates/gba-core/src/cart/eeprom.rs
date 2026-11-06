@@ -343,11 +343,12 @@ mod tests {
             );
         }
         // Unknown size: addressed as 8 KiB until told otherwise.
-        let mut e = Eeprom::default();
-        e.rx_len = 81;
-        assert!(load(&e).is_err());
-        e.rx_len = 80;
-        assert!(load(&e).is_ok());
+        let unknown = |rx_len| Eeprom {
+            rx_len,
+            ..Eeprom::default()
+        };
+        assert!(load(&unknown(81)).is_err());
+        assert!(load(&unknown(80)).is_ok());
     }
 
     #[test]

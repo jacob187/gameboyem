@@ -417,6 +417,8 @@ mod tests {
         assert_eq!(s.env.nr2, 0);
     }
 
+    type Case = (&'static str, fn(&mut Square));
+
     /// Each `load_state` refusal fires on its own field: a duty or position past
     /// the table would index out of bounds, a frequency or shadow past 11 bits
     /// would overflow, a zero or oversized timer breaks the segment length
@@ -433,7 +435,7 @@ mod tests {
         ok.write_envelope(0xF0);
         ok.write_freq_hi_ctrl(0x80, false);
         assert!(load(&ok).is_ok());
-        let cases: [(&str, fn(&mut Square)); 8] = [
+        let cases: [Case; 8] = [
             ("square duty", |s| s.duty = 4),
             ("square duty", |s| s.pos = 8),
             ("square frequency", |s| s.freq = 2048),

@@ -817,9 +817,15 @@ fn specific_impossible_fields_are_refused() {
 fn a_timer_start_that_disagrees_with_its_pending_overflow_is_refused() {
     let mut a = busy_machine(b"FLASH_V");
     a.step_frame();
-    assert!(a.bus.sched.when(crate::scheduler::Event::TimerOverflow(0)).is_some());
+    assert!(
+        a.bus
+            .sched
+            .when(crate::scheduler::Event::TimerOverflow(0))
+            .is_some()
+    );
     let mut g = busy_fresh(b"FLASH_V");
-    g.load_state(&a.save_state()).expect("the machine itself loads");
+    g.load_state(&a.save_state())
+        .expect("the machine itself loads");
     a.bus.timers.t[0].reload = 0xFFFF;
     a.bus.timers.t[0].counter = 0;
     a.bus.timers.t[0].start = 0;

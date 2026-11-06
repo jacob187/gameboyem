@@ -542,7 +542,10 @@ mod tests {
         let floating = u16::from(c.read_rom8(0x201));
         assert_eq!(c.read_rom8(0x200), 0xAB);
         assert_eq!(c.read_rom16(0x200), 0xAB | floating << 8);
-        assert_eq!(c.read_rom32(0x200) & 0xFFFF, 0xAB | u32::from(floating) << 8);
+        assert_eq!(
+            c.read_rom32(0x200) & 0xFFFF,
+            0xAB | u32::from(floating) << 8
+        );
         // Three bytes past a word boundary: the halfword before it is whole.
         let mut rom = vec![0x11; 0x203];
         rom[0x202] = 0xCD;

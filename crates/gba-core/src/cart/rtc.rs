@@ -781,6 +781,8 @@ mod tests {
         load_back(&r);
     }
 
+    type Case = (&'static str, fn(&mut Rtc));
+
     /// Every field `load_state` range-checks is refused when out of range, by name.
     #[test]
     fn a_state_with_an_impossible_clock_field_is_refused() {
@@ -793,7 +795,7 @@ mod tests {
             Rtc::power_on().load_state(&mut StateReader::new(&bytes))
         };
         assert!(load(&ok).is_ok());
-        let cases: [(&str, fn(&mut Rtc)); 11] = [
+        let cases: [Case; 11] = [
             ("RTC control", |r| r.control = 0x01),
             ("RTC control", |r| r.control = 0x04),
             ("RTC year", |r| r.year = 100),

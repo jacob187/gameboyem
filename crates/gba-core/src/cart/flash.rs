@@ -297,11 +297,13 @@ mod tests {
         assert_eq!(f.read(0), 0);
     }
 
+    type Abort = (&'static str, fn(&mut Flash));
+
     /// `AA 55 80` arms an erase for the very next unlock sequence only: a reset, a
     /// stray write or an aborted unlock cancels it (deep-review #10).
     #[test]
     fn an_aborted_erase_sequence_does_not_stay_armed() {
-        let aborts: [(&str, fn(&mut Flash)); 3] = [
+        let aborts: [Abort; 3] = [
             ("reset", |f| {
                 f.write(0x5555, 0xF0);
             }),

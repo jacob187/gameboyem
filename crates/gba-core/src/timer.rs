@@ -459,7 +459,10 @@ mod tests {
         assert!(t.check_events(s.now(), &s).is_err(), "stale start");
         t = ok.clone();
         t.t[0].control &= !0x80;
-        assert!(t.check_events(s.now(), &s).is_err(), "event of a stopped timer");
+        assert!(
+            t.check_events(s.now(), &s).is_err(),
+            "event of a stopped timer"
+        );
         t = ok;
         t.t[0].start = s.now() + START_DELAY + 1;
         assert!(t.check_events(s.now(), &s).is_err(), "start in the future");
