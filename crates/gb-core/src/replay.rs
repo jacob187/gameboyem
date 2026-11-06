@@ -51,6 +51,8 @@ pub enum ReplayError {
     /// The shared format rejected the file (bad magic, version, record, ...).
     Decode(DecodeError),
     BadModel(u8),
+    /// A version 4 header with system data; a Game Boy has none.
+    UnexpectedExtension,
     /// A well-formed recording of a console this core does not emulate.
     WrongSystem(System),
     WrongRom {
@@ -71,6 +73,9 @@ impl std::fmt::Display for ReplayError {
         match self {
             Self::Decode(e) => write!(f, "{e}"),
             Self::BadModel(m) => write!(f, "recording has an unknown hardware model byte {m:#04X}"),
+            Self::UnexpectedExtension => {
+                write!(f, "recording has system data a Game Boy does not use")
+            }
             Self::WrongSystem(s) => write!(f, "recording is for a {s:?} machine, not a Game Boy"),
             Self::WrongRom { expected, actual } => write!(
                 f,
@@ -98,6 +103,9 @@ impl Recording {
         let (header, rest) = common::decode_header(bytes)?;
         if header.system != System::Gb {
             return Err(ReplayError::WrongSystem(header.system));
+        }
+        if !header.ext.is_empty() {
+            return Err(ReplayError::UnexpectedExtension);
         }
         common::check_battery(&header, MAX_BATTERY_LEN)?;
         let model = Model::from_id(header.variant).ok_or(ReplayError::BadModel(header.variant))?;
@@ -341,6 +349,21 @@ mod tests {
         assert_eq!(
             Recording::decode(&hand_built(3, &[0, 2])),
             Err(ReplayError::Decode(DecodeError::UnknownSystem(2)))
+        );
+    }
+
+    #[test]
+    fn a_game_boy_recording_with_system_data_is_refused() {
+        let bytes = common::encode_header_ext(System::Gb, 1, None, 0, &[1, 2]);
+        assert_eq!(
+            Recording::decode(&bytes),
+            Err(ReplayError::UnexpectedExtension)
+        );
+        // A GBA recording is reported as that first.
+        let bytes = common::encode_header_ext(System::Gba, 1, None, 0, &[1, 2]);
+        assert_eq!(
+            Recording::decode(&bytes),
+            Err(ReplayError::WrongSystem(System::Gba))
         );
     }
 
