@@ -420,3 +420,24 @@ fn unhandled_swis_are_not_charged_the_hle_overhead() {
     call(&mut b, 0x08, [4, 0, 0, 0]);
     assert!(b.sched.now() > t);
 }
+
+#[test]
+fn huffman_rejects_unsupported_bit_widths() {
+    // code-review B#4: only 1, 2, 4 and 8 are valid; 3 is a no-op, not a misaligned write.
+    let mut b = bus();
+    put(
+        &mut b,
+        EWRAM,
+        &[0x23, 0x04, 0, 0, 0x01, 0xC0, 1, 2, 0, 0, 0, 0x60],
+    );
+    call(&mut b, 0x13, [EWRAM, EWRAM + 0x100, 0, 0]);
+    assert_eq!(b.peek32(EWRAM + 0x100), 0);
+    // 4-bit data does work: leaves 1 and 2, stream bits 0,1,0,1... -> nibbles 1,2,1,2...
+    put(
+        &mut b,
+        EWRAM + 0x40,
+        &[0x24, 0x04, 0, 0, 0x01, 0xC0, 1, 2, 0x55, 0x55, 0x55, 0x55],
+    );
+    call(&mut b, 0x13, [EWRAM + 0x40, EWRAM + 0x140, 0, 0]);
+    assert_eq!(b.peek32(EWRAM + 0x140), 0x2121_2121);
+}

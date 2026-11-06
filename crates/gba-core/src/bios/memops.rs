@@ -327,7 +327,9 @@ pub(super) fn huff(bus: &mut Bus, r: &[u32; 4]) {
     let src = r[0] & !3;
     let hdr = m.r32(src);
     let (bits, size) = (hdr & 0xF, hdr >> 8);
-    if !(1..=8).contains(&bits) {
+    // GBATEK: data size in bit units, normally 4 or 8; only 1, 2, 4 and 8 pack
+    // evenly into the output words. Anything else is a no-op (DECISIONS #65).
+    if !matches!(bits, 1 | 2 | 4 | 8) {
         return;
     }
     let tree_size = u32::from(m.r8(src.wrapping_add(4)));
