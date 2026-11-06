@@ -173,6 +173,59 @@ fn length_clocks_at_256_hz() {
     assert_eq!(2 * STEP, CPS / 256);
 }
 
+/// The APU hands each PSG control write the parity of the sequencer step that
+/// runs next, so the length quirks fire on an odd one (deep-review #73).
+#[test]
+fn length_quirks_follow_the_sequencer_step() {
+    let mut a = on();
+    a.advance_to(STEP + 10);
+    assert_eq!(a.seq_step, 1, "the next step is odd");
+    w(&mut a, 0x62, 0xF000 | 62); // length counter 2
+    w(&mut a, 0x64, 0x4000); // length on, no restart
+    assert_eq!(a.ch1.length.counter, 1, "the enable clocked once");
+    // Channel 4 gets the same parity.
+    w(&mut a, 0x78, 62);
+    w(&mut a, 0x7C, 0x4000);
+    assert_eq!(a.ch4.length.counter, 1);
+    // On an even step the same writes add nothing.
+    let mut a = on();
+    assert_eq!(a.seq_step, 0);
+    w(&mut a, 0x62, 0xF000 | 62);
+    w(&mut a, 0x64, 0x4000);
+    assert_eq!(a.ch1.length.counter, 2);
+}
+
+/// The APU-level `load_state` refusals, each on its own field (deep-review #74);
+/// the square channels' own are tested in their module.
+#[test]
+fn a_state_with_an_impossible_apu_field_is_refused() {
+    let mut ok = on();
+    start_ch1(&mut ok);
+    ok.advance_to(2 * STEP + 5);
+    let load = |a: &Apu| {
+        let mut w = StateWriter::new();
+        a.save_state(&mut w);
+        let bytes = w.into_bytes();
+        Apu::default().load_state(&mut StateReader::new(&bytes), a.now())
+    };
+    assert!(load(&ok).is_ok());
+    let cases: [(&str, fn(&mut Apu)); 8] = [
+        ("frame sequencer step", |a| a.seq_step = 8),
+        ("frame sequencer timer", |a| a.seq_timer = 0),
+        ("mix level", |a| a.cur_l = -1),
+        ("mix level", |a| a.cur_r = MIX_MAX + 1),
+        ("resampler cycle count", |a| a.mix_n = u32::MAX),
+        ("resampler sums", |a| a.mix_l = -1),
+        ("resampler sums", |a| a.mix_r = i64::MAX),
+        ("resampler phase", |a| a.sample_acc = u64::MAX),
+    ];
+    for (name, break_it) in cases {
+        let mut bad = ok.clone();
+        break_it(&mut bad);
+        assert_eq!(load(&bad), Err(StateError::Invalid(name)), "{name}");
+    }
+}
+
 #[test]
 fn envelope_steps_at_64_hz() {
     let mut a = on();

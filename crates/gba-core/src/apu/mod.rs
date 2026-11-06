@@ -465,7 +465,7 @@ impl Apu {
     }
 
     /// Read the sound register at the even I/O offset `off` (0x060..=0x09F).
-    /// Only the readable bits show (the old `SOUND_READ_MASK`).
+    /// Only the readable bits show (`READ_MASK`).
     pub fn read_reg(&self, off: u32) -> u16 {
         match off {
             SOUNDCNT_X => {

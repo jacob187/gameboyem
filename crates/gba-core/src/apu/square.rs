@@ -3,8 +3,8 @@
 //! "Channel 2 - Tone").
 //!
 //! Adapted from `gb-core`'s `apu/square.rs` (DECISIONS #61). Time is in CPU
-//! cycles, not M-cycles. Dropped: save states, the NR10 negate-clear quirk and
-//! the DMG zombie-mode envelope write.
+//! cycles, not M-cycles. Added: save states, with range checks on load. Dropped:
+//! the NR10 negate-clear quirk and the DMG zombie-mode envelope write.
 
 use super::common::{Envelope, Length, period_or_8};
 use crate::state::{StateError, check};
@@ -415,5 +415,38 @@ mod tests {
         assert!(!s.enabled);
         assert_eq!(s.freq, 0);
         assert_eq!(s.env.nr2, 0);
+    }
+
+    /// Each `load_state` refusal fires on its own field: a duty or position past
+    /// the table would index out of bounds, a frequency or shadow past 11 bits
+    /// would overflow, a zero or oversized timer breaks the segment length
+    /// (deep-review #74).
+    #[test]
+    fn a_state_with_an_impossible_square_field_is_refused() {
+        let load = |s: &Square| {
+            let mut w = StateWriter::new();
+            s.save_state(&mut w);
+            let bytes = w.into_bytes();
+            Square::new(true).load_state(&mut StateReader::new(&bytes))
+        };
+        let mut ok = Square::new(true);
+        ok.write_envelope(0xF0);
+        ok.write_freq_hi_ctrl(0x80, false);
+        assert!(load(&ok).is_ok());
+        let cases: [(&str, fn(&mut Square)); 8] = [
+            ("square duty", |s| s.duty = 4),
+            ("square duty", |s| s.pos = 8),
+            ("square frequency", |s| s.freq = 2048),
+            ("square frequency", |s| s.sweep.shadow = 2048),
+            ("square timer", |s| s.timer = 0),
+            ("square timer", |s| s.timer = STEP_CYCLES * 2048 + 1),
+            ("sweep timer", |s| s.sweep.timer = 9),
+            ("length counter", |s| s.length.counter = 65),
+        ];
+        for (name, break_it) in cases {
+            let mut bad = ok.clone();
+            break_it(&mut bad);
+            assert_eq!(load(&bad), Err(StateError::Invalid(name)), "{name}");
+        }
     }
 }

@@ -1,8 +1,9 @@
 //! Building blocks shared by the PSG channels: length counter and volume
 //! envelope.
 //!
-//! Adapted from `gb-core`'s `apu/common.rs` (DECISIONS #61). Dropped: save-state
-//! code, the envelope "zombie mode" volume glitch on NRx2 writes and the
+//! Adapted from `gb-core`'s `apu/common.rs` (DECISIONS #61). Added: save-state
+//! code, with range checks on load. Dropped: the envelope "zombie mode" volume
+//! glitch on NRx2 writes and the
 //! "trigger just before the envelope step" timer bonus (DMG-specific, Pan Docs
 //! "Obscure Behavior"). GBATEK "GBA Sound Channel 1" only specifies the plain
 //! decay/grow behaviour below.
@@ -249,5 +250,56 @@ mod tests {
         assert!(!dac(0x07), "step time alone does not power the DAC");
         assert!(dac(0x08), "volume 0 but increasing");
         assert!(dac(0x10));
+    }
+
+    /// Length enable on a step whose successor does not clock length adds one
+    /// clock, and only on a rising edge of the flag (deep-review #73).
+    #[test]
+    fn enabling_length_before_an_odd_step_clocks_it_once() {
+        let loaded = || {
+            let mut l = Length::new(64);
+            l.load(62);
+            l
+        };
+        let mut l = loaded();
+        assert!(!l.set_enabled(true, true));
+        assert_eq!(l.counter, 1, "extra clock");
+        // Already enabled: no edge, no extra clock.
+        assert!(!l.set_enabled(true, true));
+        assert_eq!(l.counter, 1);
+        // The extra clock can expire the channel.
+        let mut l = Length::new(64);
+        l.load(63);
+        assert!(l.set_enabled(true, true));
+        // On an even step, or leaving the flag off, nothing extra happens.
+        let mut l = loaded();
+        assert!(!l.set_enabled(true, false));
+        assert_eq!(l.counter, 2);
+        let mut l = loaded();
+        assert!(!l.set_enabled(false, true));
+        assert_eq!(l.counter, 2);
+    }
+
+    /// A trigger on an expired counter reloads it to `max`, one less when length
+    /// is enabled and the next step is odd (deep-review #73).
+    #[test]
+    fn triggering_an_expired_length_before_an_odd_step_loses_one() {
+        for (enabled, odd, want) in [
+            (true, true, 63),
+            (true, false, 64),
+            (false, true, 64),
+            (false, false, 64),
+        ] {
+            let mut l = Length::new(64);
+            l.enabled = enabled;
+            l.trigger(odd);
+            assert_eq!(l.counter, want, "enabled {enabled}, odd {odd}");
+        }
+        // A running counter is left alone.
+        let mut l = Length::new(64);
+        l.load(10);
+        l.enabled = true;
+        l.trigger(true);
+        assert_eq!(l.counter, 54);
     }
 }
