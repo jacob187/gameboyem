@@ -79,7 +79,7 @@ A game with a cartridge clock adds a 24-byte footer to the chip's bytes. The foo
 
 ## Save states
 
-Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **K** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr. GBA games work the same way (a state is 0.55–0.68 MB). A GBA state is tied to the ROM and to how the session was started: it only loads with the same `--bios` dump (or none) and the same `--save-type` and `--rtc` options, and otherwise the load is refused with a message saying so and nothing changes.
+Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **K** to save to the current slot and **L** to load it. **Moved from S:** in earlier versions save state was **S**. S is now D-pad Down (with the arrow keys and W / A / S / D), so on a Game Boy an S press goes to the game as a Down press, and under `--record` it is recorded as one, instead of saving a state. The startup notice and `gb --help` both say K saves. Load is still **L** and the slots are still **1**-**9**. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr. GBA games work the same way (a state is 0.55–0.68 MB). A GBA state is tied to the ROM and to how the session was started: it only loads with the same `--bios` dump (or none) and the same `--save-type` and `--rtc` options, and otherwise the load is refused with a message saying so and nothing changes.
 
 A state is tied to the exact ROM and the console model (DMG or Game Boy Color) it was taken with. A state from another ROM or model, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched. States from before CGB support (format version 1) are DMG states and still load on a DMG. Because `--model auto` now starts CGB-flagged ROMs (header 0x143 = 0x80 or 0xC0) as a Game Boy Color, such a ROM refuses an old state with a message pointing to `--model dmg`; start it with that flag to load the state.
 
@@ -95,7 +95,7 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 | Select | Backspace or Right Shift |
 | Pause | P |
 | Fast-forward (hold) | Tab |
-| Save state / load state | K / L |
+| Save state / load state | K / L (save state was **S** before the GBA work; S is now D-pad Down) |
 | Select state slot | 1-9 |
 | Screenshot (and mark the frame) | C |
 | L / R shoulders (GBA games only; ignored on a Game Boy) | Q / R |
@@ -168,7 +168,7 @@ These are the results at the head of `feat/gba` (`bd6ce54`), from `cargo run -p 
 | Our GBA homebrew `grains` and `moth`: smoke | 2 / 2 |
 | **Total** | **192 / 202** |
 
-The GBA rows are 30 of the 202. Four things about them. First, the visual ROMs only prove that the PPU draws something, not that the picture is right (`gb-test --dump-gba ROM FRAMES OUT_DIR` writes PNGs for looking at them). Second, SingleStepTests/ARM7TDMI, which checks the CPU per instruction down to the bus transactions, runs under `cargo test -p gba-core` and isn't in this table. It needs `--with-sst` and is skipped locally without the files. Third, jsmolka `bios.gba` (the official BIOS's open-bus values) runs only when `GBA_BIOS` points at a real dump, so it is skipped in CI, and `unsafe.gba` fails on real hardware and is left out. Last, the mGBA test suite isn't run (see Known gaps).
+The GBA rows are 30 of the 202. Four things about them. First, the visual ROMs only prove that the PPU draws something, not that the picture is right (`gb-test --dump-gba ROM FRAMES OUT_DIR` writes PNGs for looking at them). Second, SingleStepTests/ARM7TDMI, which checks the CPU per instruction down to the bus transactions, runs under `cargo test -p gba-core` and isn't in this table. It needs `--with-sst` (about 900 MB) and is skipped without the files, in CI as well as locally, because CI never fetches the set (see Known gaps). Third, jsmolka `bios.gba` (the official BIOS's open-bus values) runs only when `GBA_BIOS` points at a real dump, so it is skipped in CI, and `unsafe.gba` fails on real hardware and is left out. Last, the mGBA test suite isn't run (see Known gaps).
 
 The Mooneye CGB cases (`boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C`, `boot_div-cgbABCDE`, `ppu/vblank_stat_intr-C`) all pass. The ten failing cases are expected failures in `expected.txt`, each with a note: four AGE speed-switch ROMs (DIV-reset edges of the fast timers, LCD / APU phase across a switch; DECISIONS #38), and six `cgb_sound` ROMs (CGB APU differences). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
 
@@ -264,6 +264,7 @@ Everything here is a deliberate approximation or an unimplemented feature. The d
 
 - **Commercial games are untested by CI.** No commercial ROM is committed or fetched, so the emulator is checked only against test ROMs and our own homebrew. Whether a given game runs well is for you to find out. Open-bus values, odd DMA corners, and games that depend on exact timing are where problems are most likely to show.
 - **The mGBA test suite isn't run.** It has no prebuilt ROM and needs devkitARM to build, which means Docker, and Docker is off by default here (DECISIONS #48). The visual test ROMs are smoke checks only, and `armwrestler` and the nba-emu `hw-test` ROMs aren't wired up.
+- **CI doesn't run the CPU SingleStepTests (DECISIONS #57).** The ARM7TDMI SingleStepTests set is about 900 MB and only `./scripts/fetch-gba-test-roms.sh --with-sst` fetches it, which CI doesn't run. So all 45 SST tests skip and pass on every CI leg without checking anything. CI still runs jsmolka `arm`, `thumb` and `memory` and FuzzARM, but a CPU bug only SST would catch (the N/S kind of a load/store-multiple bus transaction, say) shows up only when you run `cargo test -p gba-core` with the set fetched. A populated set with a missing file does fail under `CI`.
 - **HLE BIOS (DECISIONS #64, #65, #68).**
   - The sound-driver calls (`SoundDriverInit`, `Mode`, `Main`, `VSync`, `VSyncOff`, `VSyncOn`, `SoundChannelClear`, the undocumented 0x20-0x24 and `SoundGetJumpList`) do nothing and return. Most commercial games link their own driver, but one that calls the BIOS's gets no sound from it.
   - `ArcTan`, `ArcTan2` and the sine table behind `BgAffineSet` and `ObjAffineSet` are written from the documented algorithm, not from a real BIOS, and nothing checks them against one. Only tan(1.0) = 0x2000 is pinned. `BgAffineSet` / `ObjAffineSet` rounding may differ by one LSB, and `MidiKey2Freq` and some `RegisterRamReset` resets are approximated.
