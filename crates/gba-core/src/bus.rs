@@ -19,10 +19,10 @@ use crate::bios::Bios;
 use crate::cart::Cart;
 use crate::dma::{Dma, DmaTrigger};
 use crate::irq::Irq;
-use crate::memory::rd;
-use crate::prefetch::Prefetch;
 use crate::keypad::Keypad;
+use crate::memory::rd;
 use crate::ppu::Ppu;
+use crate::prefetch::Prefetch;
 use crate::scheduler::{Event, Scheduler};
 use crate::timer::Timers;
 
@@ -225,10 +225,7 @@ impl Bus {
     pub fn process_events(&mut self) {
         while let Some((event, at)) = self.sched.pop_due() {
             match event {
-                Event::PpuFirstLine
-                | Event::PpuRender
-                | Event::PpuHBlank
-                | Event::PpuLineEnd => {
+                Event::PpuFirstLine | Event::PpuRender | Event::PpuHBlank | Event::PpuLineEnd => {
                     let sig = self.ppu.on_event(event, at, &mut self.sched);
                     self.irq.if_ |= sig.irq;
                     if sig.frame_done {
@@ -335,7 +332,7 @@ impl Bus {
                 }
             }
             // Palette and VRAM: 16-bit bus, no waits (the PPU contention penalty
-            // is P3-TIMING); a word is two accesses.
+            // is not modelled, DECISIONS #71); a word is two accesses.
             0x05 | 0x06 => {
                 if w == Width::W {
                     2

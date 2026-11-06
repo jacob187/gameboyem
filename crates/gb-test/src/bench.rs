@@ -52,7 +52,9 @@ use gb_test::{roms_dir, workspace_root};
 enum Target {
     Gb(Model),
     /// A GBA ROM; `start` presses START for [`START_FRAMES`] frames from that frame.
-    Gba { start: Option<u32> },
+    Gba {
+        start: Option<u32>,
+    },
 }
 
 impl Target {
@@ -80,7 +82,10 @@ const START_FRAMES: u32 = 4;
 /// runs on.
 const ROMS: [(&str, Target); 10] = [
     ("test/dmg-acid2/dmg-acid2.gb", Target::Gb(Model::Dmg)),
-    ("test/blargg/cpu_instrs/cpu_instrs.gb", Target::Gb(Model::Dmg)),
+    (
+        "test/blargg/cpu_instrs/cpu_instrs.gb",
+        Target::Gb(Model::Dmg),
+    ),
     ("homebrew/snake.gb", Target::Gb(Model::Dmg)),
     ("homebrew/breakout.gb", Target::Gb(Model::Dmg)),
     ("test/cgb-acid2/cgb-acid2.gbc", Target::Gb(Model::Cgb)),

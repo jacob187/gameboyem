@@ -368,7 +368,10 @@ fn affine_reference_points_advance_with_the_render_event() {
     rig.write(0x028, 0x0200); // BG2X: reload now
     assert_eq!(rig.ppu.affine_latch[0][0], 0x0200);
     rig.run_to_line(3, 1231);
-    assert_eq!(rig.ppu.affine_latch[0][0], 0x0200, "no second step in HBlank");
+    assert_eq!(
+        rig.ppu.affine_latch[0][0], 0x0200,
+        "no second step in HBlank"
+    );
 }
 
 #[test]

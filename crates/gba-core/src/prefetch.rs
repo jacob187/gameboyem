@@ -194,7 +194,10 @@ mod tests {
         b.idle(50);
         assert_eq!(took(&mut b, |b| _ = b.fetch16(ROM + 4, Access::Seq)), 2);
         // A word is N+S, or S+S.
-        assert_eq!(took(&mut b, |b| _ = b.fetch32(ROM + 0x100, Access::NonSeq)), 6);
+        assert_eq!(
+            took(&mut b, |b| _ = b.fetch32(ROM + 0x100, Access::NonSeq)),
+            6
+        );
         assert_eq!(took(&mut b, |b| _ = b.fetch32(ROM + 0x104, Access::Seq)), 4);
     }
 
@@ -254,7 +257,10 @@ mod tests {
         let mut b = bus(WS0_FAST | PREFETCH);
         b.fetch16(ROM, Access::NonSeq);
         b.idle(20);
-        assert_eq!(took(&mut b, |b| _ = b.fetch16(ROM + 0x80, Access::NonSeq)), 4);
+        assert_eq!(
+            took(&mut b, |b| _ = b.fetch16(ROM + 0x80, Access::NonSeq)),
+            4
+        );
         // Prefetching restarted after the target.
         assert_eq!(took(&mut b, |b| _ = b.fetch16(ROM + 0x82, Access::Seq)), 2);
         b.idle(10);
@@ -317,7 +323,10 @@ mod tests {
         b.fetch16(last, Access::NonSeq); // t = 4
         b.fetch16(last + 2, Access::Seq); // reads 0x1FFFE: t = 6; next is the page start
         // Reading the first halfword of the next page takes N (4), not S (2).
-        assert_eq!(took(&mut b, |b| _ = b.fetch16(ROM + 0x2_0000, Access::Seq)), 4);
+        assert_eq!(
+            took(&mut b, |b| _ = b.fetch16(ROM + 0x2_0000, Access::Seq)),
+            4
+        );
     }
 
     #[test]
@@ -340,8 +349,14 @@ mod tests {
         assert_eq!(b.rom_cost(ROM, crate::bus::Width::W, Access::NonSeq), 5 + 3);
         assert_eq!(b.rom_cost(ROM + 4, crate::bus::Width::W, Access::Seq), 6);
         // A "sequential" access at the start of a 128 KiB page is charged N.
-        assert_eq!(b.rom_cost(ROM + 0x2_0000, crate::bus::Width::W, Access::Seq), 8);
-        assert_eq!(b.rom_cost(ROM + 0x2_0000, crate::bus::Width::H, Access::Seq), 5);
+        assert_eq!(
+            b.rom_cost(ROM + 0x2_0000, crate::bus::Width::W, Access::Seq),
+            8
+        );
+        assert_eq!(
+            b.rom_cost(ROM + 0x2_0000, crate::bus::Width::H, Access::Seq),
+            5
+        );
     }
 
     #[test]
@@ -353,7 +368,11 @@ mod tests {
                 if i % 7 == 6 {
                     b.idle(i % 5);
                 }
-                let a = if i % 11 == 10 { ROM + 0x40 } else { ROM + 2 * i };
+                let a = if i % 11 == 10 {
+                    ROM + 0x40
+                } else {
+                    ROM + 2 * i
+                };
                 v.push(took(&mut b, |b| _ = b.fetch16(a, Access::Seq)));
             }
             v
