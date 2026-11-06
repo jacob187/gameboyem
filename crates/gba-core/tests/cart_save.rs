@@ -392,3 +392,17 @@ fn set_rtc_clears_the_power_loss_flag_and_rejects_nothing_valid() {
         Err(CartError::BadRtcTime)
     );
 }
+
+#[test]
+fn a_host_set_clock_is_saved_even_before_the_game_uses_the_port() {
+    let mut g = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Auto);
+    assert_eq!(g.battery_save().unwrap().len(), 32768);
+    let generation = g.battery_generation();
+    g.set_rtc(time(2024, 7, 4, 9, 30, 0));
+    assert_ne!(g.battery_generation(), generation);
+    let img = g.battery_save().unwrap();
+    assert_eq!(img.len(), 32768 + FOOTER);
+    let mut b = gba_with(b"SRAM_V113", SaveChoice::Auto, RtcMode::Auto);
+    b.load_battery_ram(&img).unwrap();
+    assert_eq!(b.rtc_time(), time(2024, 7, 4, 9, 30, 0));
+}

@@ -308,3 +308,21 @@ fn a_cart_that_never_touches_the_port_is_untouched() {
     }
     assert!(b.cart.battery_save(0).is_none(), "no chip, no save");
 }
+
+/// The sequence of the standard Sii driver (pokeemerald `SiiRtcGetStatus`): read
+/// enable, DATA = SCK, DATA = SCK|CS, and only then DIRECTION = all-out, which
+/// raises CS and SCK in one update. That SCK edge is not a data clock.
+#[test]
+fn the_standard_drivers_first_transfer_works_from_a_fresh_auto_cart() {
+    let mut b = bus_in(RtcMode::Auto);
+    b.write16(CTRL, 1, N);
+    b.write16(DATA, SCK, N);
+    b.write16(DATA, SCK | CS, N);
+    b.write16(DIR, 7, N);
+    send_command(&mut b, 1, true);
+    assert_eq!(
+        read_data(&mut b, 1),
+        [0x82],
+        "power-loss flag on a fresh clock"
+    );
+}

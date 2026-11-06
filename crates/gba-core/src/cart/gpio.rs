@@ -92,9 +92,9 @@ pub(super) struct Gpio {
     /// The level the RTC drives on SIO while it is being read.
     sio: bool,
     rtc: Rtc,
-    /// The clock's state came from a save footer, so it is persisted even if the
-    /// game never touches the port this session.
-    from_save: bool,
+    /// The clock's state came from a save footer or from the host's `set_rtc`,
+    /// so it is persisted even if the game never touches the port this session.
+    persist: bool,
 }
 
 impl Gpio {
@@ -109,7 +109,7 @@ impl Gpio {
             phase: Phase::Idle,
             sio: false,
             rtc: Rtc::power_on(),
-            from_save: false,
+            persist: false,
         }
     }
 
@@ -128,14 +128,19 @@ impl Gpio {
     /// Install a clock restored from a save footer.
     pub fn load_rtc(&mut self, rtc: Rtc) {
         self.rtc = rtc;
-        self.from_save = true;
+        self.persist = true;
         self.phase = Phase::Idle;
     }
 
+    /// Persist the clock from now on (the host set it).
+    pub fn keep_clock(&mut self) {
+        self.persist = true;
+    }
+
     /// The footer to append to the save image at cycle `now`, if the clock is in
-    /// use or came from a save. With `--rtc off` it is carried over frozen.
+    /// use or was loaded or set by the host. With `--rtc off` it is carried over frozen.
     pub fn footer(&self, now: u64) -> Option<[u8; FOOTER_LEN]> {
-        if !(self.live || self.from_save) {
+        if !(self.live || self.persist) {
             return None;
         }
         Some(if self.mode == RtcMode::Off {
@@ -207,8 +212,12 @@ impl Gpio {
         let (cs, sck) = (self.driven & CS != 0, self.driven & SCK != 0);
         let (was_cs, was_sck) = (was & CS != 0, was & SCK != 0);
         if cs && !was_cs {
+            // CS rising opens the transfer. An SCK edge in the same update (the
+            // standard driver sets DATA = SCK|CS first and only then switches the
+            // direction register to all-output) is not a data clock.
             self.phase = Phase::Command { value: 0, bits: 0 };
             self.sio = false;
+            return;
         } else if !cs && was_cs {
             self.phase = Phase::Idle;
             self.sio = false;

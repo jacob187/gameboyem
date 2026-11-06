@@ -356,10 +356,13 @@ impl Cart {
     }
 
     /// Start the clock at `t` at master-clock cycle `now` (the host's one entry
-    /// point for real time; DECISIONS #66). Harmless without an RTC.
+    /// point for real time; DECISIONS #66). From now on the save image carries the
+    /// clock even if the game never touches the port.
     pub fn set_rtc(&mut self, t: RtcTime, now: u64) {
         self.gpio.rtc_mut().set_time(t, now);
-        self.generation += u64::from(self.gpio.live());
+        // The image now carries the clock (and so a recording's start does too).
+        self.gpio.keep_clock();
+        self.generation += 1;
     }
 
     /// The clock's date and time at cycle `now`, whether or not the game has
