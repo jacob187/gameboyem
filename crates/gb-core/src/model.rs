@@ -32,8 +32,9 @@ impl Model {
         }
     }
 
-    /// The inverse of [`Model::id`]; `None` for a byte no model writes.
-    pub(crate) fn from_id(id: u8) -> Option<Self> {
+    /// The inverse of [`Model::id`]; `None` for a byte no model writes. Public so a
+    /// host can match on the model behind `Core::hw_variant` and stay exhaustive.
+    pub fn from_id(id: u8) -> Option<Self> {
         match id {
             0 => Some(Self::Dmg),
             1 => Some(Self::Cgb),
