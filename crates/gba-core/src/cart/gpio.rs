@@ -19,7 +19,9 @@
 //! unfinished write.
 //!
 //! The port is edge-driven from register writes; nothing here ticks. The clock
-//! is caught up to the master clock only when a command starts.
+//! is caught up to the master clock when a command starts and again when a
+//! write's last data byte arrives, so the cycles spent clocking the data in are
+//! not added to the time just written.
 
 use super::rtc::{CTRL_POWER, FOOTER_LEN, Rtc};
 use crate::state::{StateError, check};
@@ -111,9 +113,6 @@ pub(super) struct Gpio {
     data: u8,
     dir: u8,
     control: u8,
-    /// The pin levels the GBA drives (`data & dir`) at the last write, for edge
-    /// detection.
-    driven: u8,
     phase: Phase,
     /// The level the RTC drives on SIO while it is being read.
     sio: bool,
@@ -133,7 +132,6 @@ impl Gpio {
             data: 0,
             dir: 0,
             control: 0,
-            driven: 0,
             phase: Phase::Idle,
             sio: false,
             rtc: Rtc::power_on(),
@@ -158,7 +156,6 @@ impl Gpio {
         w.u8(self.data);
         w.u8(self.dir);
         w.u8(self.control);
-        w.u8(self.driven);
         match &self.phase {
             Phase::Idle => w.u8(0),
             Phase::Command { value, bits } => {
@@ -204,8 +201,8 @@ impl Gpio {
     /// takes one (1, 2, 3 or an alarm/free one) with the length that register has.
     pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
         let live = r.bool()?;
-        let (data, dir, control, driven) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
-        check(data <= 0xF && dir <= 0xF && driven <= 0xF, "GPIO pins")?;
+        let (data, dir, control) = (r.u8()?, r.u8()?, r.u8()?);
+        check(data <= 0xF && dir <= 0xF, "GPIO pins")?;
         check(control <= 1, "GPIO control")?;
         let phase = match r.u8()? {
             0 => Phase::Idle,
@@ -266,7 +263,6 @@ impl Gpio {
             data,
             dir,
             control,
-            driven,
             phase,
             sio,
             rtc,
@@ -351,12 +347,14 @@ impl Gpio {
         }
         match reg {
             REG_DATA => {
+                let was = self.driven();
                 self.data = (v & 0xF) as u8;
-                self.pins_changed(now, &mut fx);
+                self.pins_changed(was, now, &mut fx);
             }
             REG_DIR => {
+                let was = self.driven();
                 self.dir = (v & 0xF) as u8;
-                self.pins_changed(now, &mut fx);
+                self.pins_changed(was, now, &mut fx);
             }
             REG_CTRL => self.control = (v & 1) as u8,
             _ => {}
@@ -384,17 +382,23 @@ impl Gpio {
             }
             self.live = true;
         }
+        let was = self.driven();
         self.data = (data & 0xF) as u8;
         self.dir = (dir & 0xF) as u8;
-        self.pins_changed(now, &mut fx);
+        self.pins_changed(was, now, &mut fx);
         fx
     }
 
-    /// Re-evaluate the pins after `data` or `dir` changed.
-    fn pins_changed(&mut self, now: u64, fx: &mut GpioEffect) {
-        let was = self.driven;
-        self.driven = self.data & self.dir;
-        let (cs, sck) = (self.driven & CS != 0, self.driven & SCK != 0);
+    /// The pin levels the GBA drives, for edge detection.
+    fn driven(&self) -> u8 {
+        self.data & self.dir
+    }
+
+    /// Re-evaluate the pins after `data` or `dir` changed; `was` is what
+    /// [`Gpio::driven`] returned before.
+    fn pins_changed(&mut self, was: u8, now: u64, fx: &mut GpioEffect) {
+        let driven = self.driven();
+        let (cs, sck) = (driven & CS != 0, driven & SCK != 0);
         let (was_cs, was_sck) = (was & CS != 0, was & SCK != 0);
         if cs && !was_cs {
             // CS rising opens the transfer. An SCK edge in the same update (the
@@ -411,7 +415,7 @@ impl Gpio {
             return;
         }
         if sck && !was_sck {
-            let bit = self.driven & SIO != 0;
+            let bit = driven & SIO != 0;
             self.rising(bit, now, fx);
         } else if !sck && was_sck {
             self.falling();
