@@ -89,6 +89,10 @@ pub fn swi(bus: &mut Bus, number: u8, r: &mut [u32; 4]) -> SwiResult {
         return SwiResult::Unhandled;
     }
     let res = hle(bus, number, r);
+    if res != SwiResult::Unhandled {
+        // Unhandled calls run the image's code, which the bus charges itself.
+        bus.sched.advance(SWI_OVERHEAD);
+    }
     if res == SwiResult::Done {
         // The last BIOS opcode fetched was the SWI return path's (image.rs).
         bus.bios_latch = image::LATCH_AFTER_SWI;
@@ -97,7 +101,6 @@ pub fn swi(bus: &mut Bus, number: u8, r: &mut [u32; 4]) -> SwiResult {
 }
 
 fn hle(bus: &mut Bus, number: u8, r: &mut [u32; 4]) -> SwiResult {
-    bus.sched.advance(SWI_OVERHEAD);
     match number {
         // SoftReset: the image's code resets the CPU and jumps (see module docs).
         0x00 => {

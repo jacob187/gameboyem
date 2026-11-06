@@ -408,3 +408,15 @@ fn intr_wait_returns_once_for_a_flag_set_mid_wait() {
     call(&mut b, 0x00, [0; 4]);
     assert_eq!(b.intr_wait, None);
 }
+
+#[test]
+fn unhandled_swis_are_not_charged_the_hle_overhead() {
+    // code-review B#3: the image's own code is charged by the bus.
+    let mut b = bus();
+    let t = b.sched.now();
+    call(&mut b, 0x00, [0; 4]);
+    call(&mut b, 0x2B, [0; 4]);
+    assert_eq!(b.sched.now(), t);
+    call(&mut b, 0x08, [4, 0, 0, 0]);
+    assert!(b.sched.now() > t);
+}
