@@ -398,4 +398,33 @@ mod tests {
         assert_eq!(c.prefetch.count, b.prefetch.count);
         assert_eq!(c.prefetch.done_at, b.prefetch.done_at);
     }
+
+    #[test]
+    fn hle_bios_reads_of_rom_use_the_cartridge_bus() {
+        // code-review T#2: a CpuSet from ROM is cartridge-bus traffic, so the buffer
+        // does not fill "for free" while it runs. ws2 is slow enough (S = 9 cycles)
+        // that the SWI's 48-cycle overhead does not fill the buffer on its own. Same
+        // elapsed time, once as a CpuSet and once as idle: the CpuSet's reads keep
+        // restarting the prefetcher, so fewer halfwords are buffered afterwards.
+        const WS2: u32 = 0x0C00_0000;
+        let mut a = bus(PREFETCH);
+        a.fetch16(WS2, Access::NonSeq);
+        let t = a.sched.now();
+        let mut r = [WS2 + 0x100, 0x0300_0000, 4, 0]; // four halfwords
+        crate::bios::swi(&mut a, 0x0B, &mut r);
+        let elapsed = a.sched.now() - t;
+        let mut idle = bus(PREFETCH);
+        idle.fetch16(WS2, Access::NonSeq);
+        idle.idle(u32::try_from(elapsed).unwrap());
+        for b in [&mut a, &mut idle] {
+            let now = b.sched.now();
+            b.prefetch.sync(now, &b.waits);
+        }
+        assert!(
+            a.prefetch.count < idle.prefetch.count,
+            "{} vs {}",
+            a.prefetch.count,
+            idle.prefetch.count
+        );
+    }
 }
