@@ -195,9 +195,10 @@ impl Apu {
     /// number of cycles in one host sample at the lowest rate (8 kHz).
     ///
     /// `now` is the restored master clock. The APU is synced lazily and its pump
-    /// runs after every step, so it trails the clock by well under a frame; a state
-    /// that has it further behind would make the next drain run the channels for
-    /// all that time.
+    /// runs after every step, so it trails the clock by under a pump interval
+    /// (an HLE call can charge up to 16 frames inside one step, which the pump
+    /// then catches up). A state with it more than 16 frames behind would make
+    /// the next drain run the channels for all that time.
     pub(crate) fn load_state(&mut self, r: &mut StateReader, now: u64) -> Result<(), StateError> {
         let mut next = Self {
             sample_rate: self.sample_rate,
@@ -221,7 +222,7 @@ impl Apu {
         next.mix_n = r.u32()?;
         next.sample_acc = r.u64()?;
         check(
-            next.now <= now && now - next.now <= u64::from(crate::CYCLES_PER_FRAME),
+            next.now <= now && now - next.now <= crate::bios::SWI_CYCLE_CAP,
             "APU clock is ahead of, or far behind, the master clock",
         )?;
         check(next.seq_step < 8, "frame sequencer step")?;
@@ -233,7 +234,8 @@ impl Apu {
             (0..=MIX_MAX).contains(&next.cur_l) && (0..=MIX_MAX).contains(&next.cur_r),
             "mix level",
         )?;
-        let max_n = CYCLES_PER_SECOND / 8_000 + 1;
+        // One host sample at the lowest rate, plus slack for the rate changing mid-sample.
+        let max_n = CYCLES_PER_SECOND / 8_000 + 16;
         check(next.mix_n <= max_n, "resampler cycle count")?;
         let max_sum = i64::from(MIX_MAX) * i64::from(max_n);
         check(

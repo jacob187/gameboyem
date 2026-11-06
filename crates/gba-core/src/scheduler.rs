@@ -11,6 +11,12 @@
 use crate::state::{MAX_CLOCK, StateError, check};
 use emu_common::state::{StateReader, StateWriter};
 
+/// How far behind the clock an undispatched event can be: events are dispatched
+/// after every step, so only at power-on (and after tests that drive the bus
+/// directly), but one HLE call may charge up to 16 frames inside a step, so allow
+/// that much (a few thousand events to catch up).
+const MAX_EVENT_LATE: u64 = crate::bios::SWI_CYCLE_CAP;
+
 /// How far ahead of the clock a timer event (or one nothing schedules yet) can
 /// be: a timer on the slowest prescaler (1024 cycles per tick) counting all 65 536
 /// ticks, plus its start delay, is 2^26 + 2 cycles. 2^27 leaves room without
@@ -198,8 +204,8 @@ impl Scheduler {
 
     /// Restore what [`Scheduler::save_state`] wrote. Entries must be in strict
     /// `(at, seq)` order with distinct events (one pending instance per variant),
-    /// each `seq` below the counter, each time within a frame behind the clock
-    /// (events due but not yet dispatched at power-on) or no further ahead than
+    /// each `seq` below the counter, each time within [`MAX_EVENT_LATE`] behind the clock
+    /// (events due but not yet dispatched) or no further ahead than
     /// the event can be scheduled ([`Event::max_ahead`]); the line end and the APU pump must be pending, or the
     /// machine would never advance a frame.
     pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
@@ -215,8 +221,7 @@ impl Scheduler {
             let (at, entry_seq) = (r.u64()?, r.u64()?);
             check(entry_seq < seq, "scheduler entry sequence")?;
             check(
-                at.saturating_add(u64::from(crate::CYCLES_PER_FRAME)) >= now
-                    && at <= now + event.max_ahead(),
+                at.saturating_add(MAX_EVENT_LATE) >= now && at <= now + event.max_ahead(),
                 "scheduler entry time",
             )?;
             check(
