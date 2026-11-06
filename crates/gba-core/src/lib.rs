@@ -71,7 +71,7 @@ pub const BIOS_SIZE: usize = 16 * 1024;
 /// Upper bound on a save state, which a frontend uses to refuse an oversized file
 /// unread. The state is fixed-size apart from a scheduler queue of at most 14
 /// entries: EWRAM 256 KiB, IWRAM 32 KiB, VRAM 96 KiB, palette and OAM 2 KiB, two
-/// 75 KiB frames and the save chip (at most 128 KiB of Flash) come to 681 166
+/// 75 KiB frames and the save chip (at most 128 KiB of Flash) come to 681 175
 /// bytes at worst (a full queue); the cap is that plus a little. A test builds
 /// each chip's state and fails if the layout outgrows the cap or the cap drifts
 /// well above the real size (DECISIONS #73).
