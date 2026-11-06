@@ -19,21 +19,6 @@ pub enum Button {
     L = 9,
 }
 
-impl Button {
-    pub const ALL: [Button; 10] = [
-        Button::A,
-        Button::B,
-        Button::Select,
-        Button::Start,
-        Button::Right,
-        Button::Left,
-        Button::Up,
-        Button::Down,
-        Button::R,
-        Button::L,
-    ];
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Keypad {
     /// Bit n set = button n held.

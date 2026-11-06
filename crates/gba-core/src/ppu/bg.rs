@@ -88,12 +88,10 @@ fn render_affine_map(bg: usize, regs: &Regs, mem: &Mem, back: u32, out: &mut Lin
         let tile =
             usize::from(mem.vram[screen_base + (v >> 3) as usize * tiles_wide + (u >> 3) as usize]);
         let addr = char_base + tile * 64 + (v & 7) as usize * 8 + (u & 7) as usize;
-        // Tile data past 64 KiB is OBJ memory: the BG shows nothing there.
-        let idx = if addr < BG_TILE_LIMIT {
-            mem.vram[addr]
-        } else {
-            0
-        };
+        // 8-bit tile numbers: at most 0xC000 + 255 * 64 + 63, below the 64 KiB
+        // where OBJ tile memory starts, so (unlike text BGs) no bounds guard.
+        debug_assert!(addr < BG_TILE_LIMIT);
+        let idx = mem.vram[addr];
         *px = if idx == 0 {
             TRANSPARENT
         } else {
