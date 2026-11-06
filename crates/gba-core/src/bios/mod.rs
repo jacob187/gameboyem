@@ -296,8 +296,10 @@ fn register_ram_reset(bus: &mut Bus, flags: u32) {
         bus.sched.advance(c);
     }
     if flags & 0x20 != 0 {
-        // SIO: general purpose mode (RCNT bit 15), everything else zero.
-        for off in (0x120..0x160).step_by(2) {
+        // SIO: general purpose mode (RCNT bit 15), everything else zero. KEYINPUT
+        // and KEYCNT (0x130..0x134) sit inside the range but are the keypad's,
+        // reset by flag 0x80 (deep-review #8).
+        for off in (0x120..0x130).step_by(2).chain((0x134..0x160).step_by(2)) {
             bus.write_io16(off, 0, 0xFFFF);
         }
         bus.write_io16(0x134, 0x8000, 0xFFFF);
