@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn the_writer_emits_version_3_and_a_v2_reader_layout_still_matches() {
+    fn the_writer_emits_version_3_with_a_system_byte() {
         let (header, records) = sample();
         let v = encode(&header, &records, Some(12));
         assert_eq!(v[8], 3);

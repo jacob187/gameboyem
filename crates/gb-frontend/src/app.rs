@@ -418,9 +418,10 @@ impl<C: Core> App<C> {
                 // Always drain so the core's buffer cannot grow unbounded.
                 self.core.drain_audio_into(&mut self.audio_buf);
                 let seconds = audio_seconds(self.audio_buf.len(), self.core.audio_sample_rate());
-                // A step that made no audio (a core whose APU produces none yet)
-                // still covered a frame: without this the pacer would see zero
-                // time pass and run flat out. A Game Boy step always has samples.
+                // A step that drained no samples still covered a frame: without
+                // this the pacer would see zero time pass and run flat out. Both
+                // shipped cores always emit samples, so this only guards a core
+                // that stops doing so.
                 if seconds > 0.0 {
                     seconds
                 } else {
@@ -514,10 +515,10 @@ impl<C: Core> ApplicationHandler for App<C> {
         self.update_title();
         self.upload();
         self.reset_clock();
-        if let Some(w) = &self.window {
         if self.test.is_none() && self.core.system() == emu_common::System::Gb {
             eprintln!("{}", crate::keymap::SAVE_KEY_NOTICE);
         }
+        if let Some(w) = &self.window {
             w.request_redraw();
         }
     }
