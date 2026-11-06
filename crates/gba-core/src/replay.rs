@@ -68,21 +68,31 @@ impl Header {
 
     /// The extension bytes (what `Core::recording_ext` returns).
     pub fn ext(&self) -> Vec<u8> {
-        let mut e = Vec::with_capacity(EXT_LEN_WITH_RTC);
-        e.push(self.options.save.id());
-        e.push(self.options.rtc.id());
-        e.push(u8::from(self.bios_hash.is_some()));
-        e.extend_from_slice(&self.bios_hash.unwrap_or(0).to_le_bytes());
-        match self.rtc_start {
-            None => e.push(0),
-            Some(t) => {
-                e.push(1);
-                e.extend_from_slice(&t.year().to_le_bytes());
-                e.extend_from_slice(&[t.month(), t.day(), t.hour(), t.minute(), t.second()]);
-            }
-        }
-        e
+        encode_ext(self.options, self.bios_hash, self.rtc_start)
     }
+}
+
+/// The header extension for a session started with these options, BIOS and clock
+/// start (see the module docs for the layout).
+pub fn encode_ext(
+    options: CartOptions,
+    bios_hash: Option<u64>,
+    rtc_start: Option<RtcTime>,
+) -> Vec<u8> {
+    let mut e = Vec::with_capacity(EXT_LEN_WITH_RTC);
+    e.push(options.save.id());
+    e.push(options.rtc.id());
+    e.push(u8::from(bios_hash.is_some()));
+    e.extend_from_slice(&bios_hash.unwrap_or(0).to_le_bytes());
+    match rtc_start {
+        None => e.push(0),
+        Some(t) => {
+            e.push(1);
+            e.extend_from_slice(&t.year().to_le_bytes());
+            e.extend_from_slice(&[t.month(), t.day(), t.hour(), t.minute(), t.second()]);
+        }
+    }
+    e
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -93,7 +93,7 @@ impl Core for Gba {
     /// The cartridge options, BIOS identity and clock start (see
     /// [`crate::replay`]).
     fn recording_ext(&self) -> Vec<u8> {
-        crate::replay::Header::of(self).ext()
+        crate::replay::encode_ext(self.options(), self.bios_hash(), self.rtc_start())
     }
 
     fn save_state(&self) -> Vec<u8> {
