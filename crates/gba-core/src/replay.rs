@@ -458,7 +458,7 @@ mod tests {
     /// appended, minus the chip.
     fn footer_of(g: &Gba) -> Vec<u8> {
         let t = g.rtc_time();
-        let bcd = |v: u8| (v / 10) << 4 | v % 10;
+        let bcd = |v: u8| ((v / 10) << 4) | (v % 10);
         let mut f = b"AGBRTC01".to_vec();
         f.extend_from_slice(&[
             0x40,

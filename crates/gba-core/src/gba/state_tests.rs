@@ -533,7 +533,8 @@ fn sections(g: &Gba) -> Vec<(&'static str, usize, usize)> {
 fn bulk(g: &Gba, sections: &[(&str, usize, usize)]) -> Vec<std::ops::Range<usize>> {
     let start = |name| sections.iter().find(|s| s.0 == name).unwrap().1;
     let len = |name| sections.iter().find(|s| s.0 == name).unwrap().2;
-    let mut v = vec![start("bus") + 1..start("bus") + 1 + 256 * 1024 + 32 * 1024];
+    let mut v = Vec::new();
+    v.push(start("bus") + 1..start("bus") + 1 + 256 * 1024 + 32 * 1024);
     let ppu = start("ppu");
     v.push(ppu + 1 + 0x400..ppu + 1 + 0x400 + 0x1_8000);
     v.push(ppu + len("ppu") - 2 * 76_800..ppu + len("ppu"));
