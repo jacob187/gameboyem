@@ -67,7 +67,6 @@ impl Eeprom {
         }
     }
 
-    /// Whether a save of `len` bytes fits this chip.
     /// The whole 8 KiB array (a chip of 512 bytes keeps the rest erased), the
     /// size state and the request and response shift registers, so a state taken
     /// between two bits of a DMA still completes the request.
@@ -117,6 +116,7 @@ impl Eeprom {
         Ok(())
     }
 
+    /// Whether a save of `len` bytes fits this chip.
     pub fn accepts(&self, len: usize) -> bool {
         match (self.forced, self.size) {
             (true, Some(size)) => len == size,

@@ -57,7 +57,6 @@ impl Wave {
         }
     }
 
-    /// SOUNDCNT_X bit 7 cleared: the registers reset, wave RAM is kept.
     pub fn save_state(&self, w: &mut StateWriter) {
         w.bool(self.enabled);
         w.bool(self.dac);
@@ -103,6 +102,7 @@ impl Wave {
         Ok(())
     }
 
+    /// SOUNDCNT_X bit 7 cleared: the registers reset, wave RAM is kept.
     pub fn reset(&mut self) {
         let ram = self.ram;
         *self = Self::new();
