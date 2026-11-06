@@ -117,9 +117,10 @@ impl Ppu {
         }
     }
 
-    /// Schedule the first line's events. **Contract.**
+    /// Schedule the first line's events, relative to the current clock (line 0
+    /// starts now). **Contract.**
     pub fn start(&mut self, sched: &mut Scheduler) {
-        sched.schedule_at(Event::PpuFirstLine, 0);
+        sched.schedule(Event::PpuFirstLine, 0);
         sched.schedule(Event::PpuRender, u64::from(RENDER_CYCLES));
         sched.schedule(Event::PpuHBlank, u64::from(HDRAW_CYCLES));
         sched.schedule(Event::PpuLineEnd, u64::from(CYCLES_PER_LINE));
