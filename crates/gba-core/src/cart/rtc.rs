@@ -567,7 +567,9 @@ mod tests {
         for day in 1..=40_000u64 {
             r.advance_to(day * 86_400 * CPS + day);
             let now = r.time();
-            assert_eq!(
+            // The weekday free-runs (a game may have written any), so only the
+            // date and time of day are checked.
+            assert!(
                 RtcTime::new(
                     now.year(),
                     now.month(),
@@ -575,8 +577,9 @@ mod tests {
                     now.hour(),
                     now.minute(),
                     now.second()
-                ),
-                Ok(now)
+                )
+                .is_ok(),
+                "{now:?}"
             );
         }
     }
