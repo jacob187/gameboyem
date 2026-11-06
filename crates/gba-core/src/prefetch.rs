@@ -68,9 +68,9 @@ impl Prefetch {
         self.count = 0;
     }
 
-    /// Complete every halfword read that finished by `now`.
+    /// Complete every halfword read that finished by `now`, at `waits`' costs.
     #[inline]
-    fn sync(&mut self, now: u64, waits: &WaitTable) {
+    pub fn sync(&mut self, now: u64, waits: &WaitTable) {
         while self.count < CAPACITY && self.done_at <= now {
             self.count += 1;
             self.seq = true;
@@ -378,5 +378,24 @@ mod tests {
             v
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn a_waitcnt_write_syncs_the_buffer_under_the_old_timings() {
+        // code-review T#1: halfwords read before the write were read at the old S
+        // time (2 cycles), not the new one (3).
+        let mut b = bus(WS0_FAST | PREFETCH);
+        b.fetch16(ROM, Access::NonSeq); // t = 4, reading ROM+2 until 6
+        b.idle(10); // t = 14: reads finished at 6, 8, 10, 12, 14
+        b.write_io16(0x204, (WS0_FAST & !0x10) | PREFETCH, 0xFFFF); // ws0 S: 1 wait -> 2
+        assert_eq!(b.prefetch.count, 5);
+        // The same state as syncing explicitly first, then changing the table.
+        let mut c = bus(WS0_FAST | PREFETCH);
+        c.fetch16(ROM, Access::NonSeq);
+        c.idle(10);
+        c.prefetch.sync(c.sched.now(), &c.waits);
+        c.write_io16(0x204, (WS0_FAST & !0x10) | PREFETCH, 0xFFFF);
+        assert_eq!(c.prefetch.count, b.prefetch.count);
+        assert_eq!(c.prefetch.done_at, b.prefetch.done_at);
     }
 }

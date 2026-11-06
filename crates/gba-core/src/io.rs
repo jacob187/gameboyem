@@ -117,6 +117,10 @@ impl Bus {
             0x200 => self.irq.ie = merge(self.irq.ie, v, mask) & 0x3FFF,
             0x202 => self.irq.write_if(v & mask),
             0x204 => {
+                // Halfwords read so far were read at the old timings (code-review T#1).
+                if self.prefetch.enabled {
+                    self.prefetch.sync(self.sched.now(), &self.waits);
+                }
                 self.waitcnt = merge(self.waitcnt, v, mask) & WAITCNT_MASK;
                 self.waits = crate::bus::WaitTable::from_waitcnt(self.waitcnt);
                 // Bit 14: the prefetch buffer. Only a change resets it.
