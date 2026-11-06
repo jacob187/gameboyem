@@ -1,5 +1,6 @@
-//! Audio from real homebrew. Needs the CPU (P1-CPU), so it is `#[ignore]`d on
-//! this branch; run with `cargo test -p gba-core --test apu_roms -- --ignored`.
+//! Audio from real homebrew: CPU, HLE BIOS (agb's IRQ path), timers, Direct
+//! Sound DMA and the APU together. Skips if the ROM hasn't been built
+//! (`make -C homebrew gba`); CI builds it.
 
 use gba_core::{Button, Gba};
 use std::path::Path;
@@ -23,8 +24,6 @@ fn deviation(samples: &[f32], base: (f32, f32)) -> (f32, f32) {
 /// begins a round and a rising jingle of about 0.34 s must make the output
 /// non-silent on both channels.
 #[test]
-// The CPU is on `feat/gba` now; the coordinator enables this after merging it.
-#[ignore = "needs P1-CPU"]
 fn moth_plays_its_jingle_after_start() {
     let Ok(rom) = std::fs::read(Path::new(MOTH)) else {
         eprintln!("skipping: {MOTH} not found");

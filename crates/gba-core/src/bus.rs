@@ -161,8 +161,6 @@ pub struct Bus {
     /// P2-BIOS: an HLE IntrWait/VBlankIntrWait is waiting, with the interrupt
     /// flags it waits for. Save-state data (DECISIONS #65).
     pub intr_wait: Option<u16>,
-    /// Sound registers 0x060..0x0A0 as the APU (P2) will see them.
-    pub sound_regs: [u16; 0x20],
     /// FIFO A/B words being assembled from halfword/byte writes.
     pub fifo_latch: [u32; 2],
     /// Serial/JOY registers 0x120..0x160: stored, not emulated.
@@ -195,7 +193,6 @@ impl Bus {
             fetching_bios: false,
             postflg: 0,
             intr_wait: None,
-            sound_regs: [0; 0x20],
             fifo_latch: [0; 2],
             sio_regs: [0; 0x20],
         };
