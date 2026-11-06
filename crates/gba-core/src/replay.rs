@@ -16,9 +16,13 @@
 //!                                       (the last six only when the clock start is given)
 //! ```
 //!
-//! A version 3 GBA recording (made before the extension existed) has none and
-//! decodes as the defaults: `--save-type auto`, `--rtc auto`, the built-in BIOS
-//! and no clock start. It replays as the frontend ran it then.
+//! A version 3 GBA recording (made before the extension existed) has none. It
+//! decodes as the defaults (`--save-type auto`, `--rtc auto`, the built-in BIOS,
+//! no clock start) and is flagged [`Recording::legacy`]: it replays faithfully
+//! only if the session used those defaults, and the file cannot say. Because it
+//! does not say which BIOS it used either, [`Recording::power_on`] takes a BIOS
+//! dump for it without being able to check it. Callers should warn when
+//! `legacy` is set (deep-review #14).
 //!
 //! A real-BIOS recording stores the dump's hash, never the dump (it cannot be
 //! shipped); replaying it needs the user's own dump, and says so otherwise.
@@ -104,6 +108,9 @@ pub struct Recording {
     pub end_frame: Option<u64>,
     /// The file ended inside a record (the partial record was dropped).
     pub truncated: bool,
+    /// A version 3 file: no extension, so `header` holds the defaults rather
+    /// than what the session used (see the module docs).
+    pub legacy: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -243,6 +250,7 @@ impl Recording {
             records: records.records,
             end_frame: records.end_frame,
             truncated: records.truncated,
+            legacy: header.ext.is_empty(),
         })
     }
 
@@ -268,7 +276,8 @@ impl Recording {
     /// Power on a machine in the state the recorded session started from: the
     /// same cartridge options, BIOS, clock start and battery image, applied in
     /// the order the frontend applied them. `bios` is the user's dump, needed
-    /// exactly when the session used one.
+    /// exactly when the session used one. A [`legacy`](Recording::legacy)
+    /// recording does not say, so a dump is accepted for it unchecked.
     pub fn power_on(&self, rom: Vec<u8>, bios: Option<Box<[u8]>>) -> Result<Gba, ReplayError> {
         let actual = rom_hash(&rom);
         if actual != self.header.rom_hash {
@@ -279,6 +288,11 @@ impl Recording {
         }
         match (self.header.bios_hash, &bios) {
             (None, None) => {}
+            (None, Some(data)) if self.legacy => {
+                if data.len() != BIOS_SIZE {
+                    return Err(ReplayError::BadBiosSize(data.len()));
+                }
+            }
             (None, Some(_)) => return Err(ReplayError::UnexpectedBios),
             (Some(hash), None) => return Err(ReplayError::NeedsBios { hash }),
             (Some(expected), Some(data)) => {
@@ -416,6 +430,33 @@ mod tests {
         let gba = rec.power_on(rom, None).unwrap();
         assert_eq!(gba.options(), CartOptions::default());
         assert_eq!(gba.bios_hash(), None);
+    }
+
+    /// A version 3 file cannot say which BIOS or options its session used: it is
+    /// flagged so a caller can warn, and (unlike a version 4 file of a built-in
+    /// BIOS session) it takes a BIOS dump, unchecked, so a session made with
+    /// `--bios` can still be replayed (deep-review #14).
+    #[test]
+    fn a_version_3_recording_is_flagged_and_takes_a_bios_unchecked() {
+        let rom = rom(b"");
+        let v3 = emu_common::replay::encode_header(System::Gba, rom_hash(&rom), None, 0);
+        let legacy = Recording::decode(&v3).unwrap();
+        assert!(legacy.legacy);
+        let gba = legacy.power_on(rom.clone(), Some(bios(7))).unwrap();
+        assert_eq!(gba.bios_hash(), Some(rom_hash(&bios(7))));
+        assert_eq!(
+            legacy
+                .power_on(rom.clone(), Some(vec![0; 100].into_boxed_slice()))
+                .err(),
+            Some(ReplayError::BadBiosSize(100))
+        );
+        // A version 4 file says what it used, and is held to it.
+        let current = Recording::decode(&bytes(&header(&rom), &[])).unwrap();
+        assert!(!current.legacy);
+        assert_eq!(
+            current.power_on(rom, Some(bios(7))).err(),
+            Some(ReplayError::UnexpectedBios)
+        );
     }
 
     #[test]
