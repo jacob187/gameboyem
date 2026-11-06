@@ -8,6 +8,14 @@
 //! so lateness never accumulates. Count-up (cascade) timers have no event: the
 //! previous timer's overflow increments them. On an overflow of timer 0 or 1 the
 //! bus also tells the APU (`Apu::on_timer_overflow`), which may request a FIFO DMA.
+//!
+//! Overflow events exist only for timers something observes (DECISIONS #69). A
+//! timer is observed when its IRQ is enabled, a running count-up timer follows it,
+//! or it clocks a Direct Sound FIFO that is in use ([`Timers::sound`]). An
+//! unobserved timer has no event: `read_counter` folds the elapsed time, and
+//! [`Timers::sync`] catches `counter`/`start` up (keeping the prescaler phase)
+//! when it becomes observed or its reload changes. An observed timer has exactly
+//! one event per overflow, at the overflow's own cycle.
 
 use crate::scheduler::{Event, Scheduler};
 
@@ -40,16 +48,41 @@ impl Timer {
     fn shift(&self) -> u32 {
         PRESCALER_SHIFT[usize::from(self.control & 3)]
     }
+
+    /// Prescaled ticks from a reload to the next overflow.
+    fn reload_ticks(&self) -> u64 {
+        0x1_0000 - u64::from(self.reload)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Timers {
     pub t: [Timer; 4],
+    /// Timers 0 and 1: the timer clocks a Direct Sound FIFO that is in use, so
+    /// each of its overflows pops a sample. Derived by the bus from SOUNDCNT_H,
+    /// the FIFO writes and the DMA channels; set through [`Timers::set_sound`].
+    pub sound: [bool; 2],
+    /// Bytes in FIFO A / B, mirrored from the bus: +4 per word written (to a
+    /// maximum of 32, as the APU), -1 per pop, 0 on a reset. A FIFO with none
+    /// and no sound DMA is not in use. The APU's own FIFO is private; this stays
+    /// equal to it as long as every write and every pop goes through the bus.
+    pub fifo_len: [u8; 2],
 }
 
 impl Timers {
     fn countup(&self, n: usize) -> bool {
         n > 0 && self.t[n].control & 4 != 0
+    }
+
+    /// A running count-up timer follows timer `n`.
+    fn cascades_into(&self, n: usize) -> bool {
+        n < 3 && self.t[n + 1].enabled() && self.countup(n + 1)
+    }
+
+    /// Something needs timer `n`'s overflows: its IRQ, a count-up follower, or a
+    /// FIFO it clocks.
+    fn observed(&self, n: usize) -> bool {
+        self.t[n].irq_enabled() || (n < 2 && self.sound[n]) || self.cascades_into(n)
     }
 
     /// TMxCNT_L: the live counter.
@@ -63,10 +96,32 @@ impl Timers {
         if total <= 0xFFFF {
             return total as u16;
         }
-        // An overflow is due but not dispatched yet (events run between
-        // instructions): fold into the reload period so we never exceed 0xFFFF.
-        let period = 0x1_0000 - u64::from(t.reload);
+        // An overflow is due but not dispatched (events run between instructions)
+        // or has no event at all: fold into the reload period so we never exceed
+        // 0xFFFF.
+        let period = t.reload_ticks();
         (u64::from(t.reload) + (total - 0x1_0000) % period) as u16
+    }
+
+    /// Move a running prescaled timer's `counter`/`start` forward to the last
+    /// prescaler tick at or before `now`, folding any overflows (reload applied)
+    /// without delivering them. The phase is kept, so the trajectory is unchanged.
+    pub fn sync(&mut self, n: usize, now: u64) {
+        if !self.t[n].enabled() || self.countup(n) {
+            return;
+        }
+        let t = &mut self.t[n];
+        let ticks = now.saturating_sub(t.start) >> t.shift();
+        if ticks == 0 {
+            return;
+        }
+        let total = u64::from(t.counter) + ticks;
+        t.counter = if total <= 0xFFFF {
+            total as u16
+        } else {
+            (u64::from(t.reload) + (total - 0x1_0000) % t.reload_ticks()) as u16
+        };
+        t.start += ticks << t.shift();
     }
 
     /// TMxCNT_H.
@@ -74,10 +129,18 @@ impl Timers {
         self.t[n].control
     }
 
-    /// Write TMxCNT_L (the reload value) through a byte-lane `mask`.
-    pub fn write_reload(&mut self, n: usize, v: u16, mask: u16) {
+    /// Write TMxCNT_L (the reload value) through a byte-lane `mask`. A running
+    /// timer without an event is caught up first, so the elapsed periods keep the
+    /// old reload. One with an event needs no catch-up (its first overflow does not
+    /// depend on the reload and `overflow` restarts it), and folding would swallow
+    /// an overflow that is due but not yet dispatched.
+    pub fn write_reload(&mut self, n: usize, v: u16, mask: u16, now: u64, sched: &mut Scheduler) {
+        if sched.when(Event::TimerOverflow(n as u8)).is_none() {
+            self.sync(n, now);
+        }
         let t = &mut self.t[n];
         t.reload = (t.reload & !mask) | (v & mask);
+        self.reschedule_all(now, sched);
     }
 
     /// Write TMxCNT_H through a byte-lane `mask`.
@@ -95,20 +158,19 @@ impl Timers {
             self.rebase(n, now);
         }
         self.t[n].control = new;
-        if !timing_changed {
-            return;
+        if timing_changed {
+            if was && is && (old ^ new) & 4 != 0 {
+                // Count-up -> prescaled: the prescaler starts now.
+                self.t[n].start = now;
+            }
+            if is && !was {
+                // Starting reloads the counter; counting begins after the delay.
+                let t = &mut self.t[n];
+                t.counter = t.reload;
+                t.start = now + START_DELAY;
+            }
         }
-        if was && is && (old ^ new) & 4 != 0 {
-            // Count-up -> prescaled: the prescaler starts now.
-            self.t[n].start = now;
-        }
-        if is && !was {
-            // Starting reloads the counter; counting begins after the delay.
-            let t = &mut self.t[n];
-            t.counter = t.reload;
-            t.start = now + START_DELAY;
-        }
-        self.reschedule(n, sched);
+        self.reschedule_all(now, sched);
     }
 
     /// Bring `counter` up to `now` and restart the prescaler there (the
@@ -123,28 +185,52 @@ impl Timers {
         t.start = now;
     }
 
-    /// (Re)schedule timer `n`'s overflow event from its current state.
-    fn reschedule(&mut self, n: usize, sched: &mut Scheduler) {
-        let ev = Event::TimerOverflow(n as u8);
-        let t = &self.t[n];
-        if t.enabled() && !self.countup(n) {
-            let ticks = 0x1_0000 - u64::from(t.counter);
-            sched.schedule_at(ev, t.start + (ticks << t.shift()));
-        } else {
-            sched.cancel(ev);
+    /// Record which timers clock a FIFO in use and reschedule.
+    pub fn set_sound(&mut self, sound: [bool; 2], now: u64, sched: &mut Scheduler) {
+        self.sound = sound;
+        self.reschedule_all(now, sched);
+    }
+
+    /// Bring every timer's event in line with what is observed now.
+    pub fn reschedule_all(&mut self, now: u64, sched: &mut Scheduler) {
+        for n in 0..4 {
+            self.reschedule(n, now, sched);
         }
     }
 
-    /// Timer `n` overflowed at time `at`: reload it, schedule the next overflow
-    /// and report whether its IRQ is enabled. The cascade into timer `n + 1` is
-    /// the caller's job (see [`Timers::cascade`]).
-    pub fn overflow(&mut self, n: usize, at: u64, sched: &mut Scheduler) -> bool {
+    /// (Re)schedule timer `n`'s overflow event from its current state, or cancel
+    /// it if nothing observes the timer.
+    fn reschedule(&mut self, n: usize, now: u64, sched: &mut Scheduler) {
+        let ev = Event::TimerOverflow(n as u8);
+        if !self.t[n].enabled() || self.countup(n) || !self.observed(n) {
+            sched.cancel(ev);
+            return;
+        }
+        if sched.when(ev).is_none() {
+            // Not tracked until now: its counter/start may be far behind.
+            self.sync(n, now);
+        }
+        self.schedule(n, sched);
+    }
+
+    /// Schedule the event for timer `n`'s next overflow, leaving an already
+    /// correct event (and its place in the tie order) alone.
+    fn schedule(&self, n: usize, sched: &mut Scheduler) {
+        let ev = Event::TimerOverflow(n as u8);
+        let t = &self.t[n];
+        let at = t.start + ((0x1_0000 - u64::from(t.counter)) << t.shift());
+        if sched.when(ev) != Some(at) {
+            sched.schedule_at(ev, at);
+        }
+    }
+
+    /// Timer `n`'s event fired at `at`: reload it and schedule the next. The IRQ
+    /// and the cascade are the caller's job (see [`Timers::cascade`]).
+    pub fn overflow(&mut self, n: usize, at: u64, sched: &mut Scheduler) {
         let t = &mut self.t[n];
         t.counter = t.reload;
         t.start = at;
-        let irq = t.irq_enabled();
-        self.reschedule(n, sched);
-        irq
+        self.schedule(n, sched);
     }
 
     /// Timer `n - 1` overflowed: tick timer `n` if it counts up. Returns true if
@@ -155,7 +241,7 @@ impl Timers {
         }
         let t = &mut self.t[n];
         let (c, wrapped) = t.counter.overflowing_add(1);
-        t.counter = c;
+        t.counter = if wrapped { t.reload } else { c };
         wrapped
     }
 }
@@ -165,7 +251,7 @@ mod tests {
     use super::*;
 
     fn start(timers: &mut Timers, sched: &mut Scheduler, n: usize, reload: u16, ctl: u16) {
-        timers.write_reload(n, reload, 0xFFFF);
+        timers.write_reload(n, reload, 0xFFFF, sched.now(), sched);
         timers.write_control(n, ctl | 0x80, 0xFFFF, sched.now(), sched);
     }
 
@@ -173,7 +259,7 @@ mod tests {
     fn counter_counts_after_the_start_delay() {
         let mut t = Timers::default();
         let mut s = Scheduler::new();
-        start(&mut t, &mut s, 0, 0xFFF0, 0);
+        start(&mut t, &mut s, 0, 0xFFF0, 0x40);
         assert_eq!(t.read_counter(0, 0), 0xFFF0);
         assert_eq!(t.read_counter(0, START_DELAY), 0xFFF0);
         assert_eq!(t.read_counter(0, START_DELAY + 5), 0xFFF5);
@@ -185,7 +271,7 @@ mod tests {
         for (sel, shift) in [(1u16, 6u32), (2, 8), (3, 10)] {
             let mut t = Timers::default();
             let mut s = Scheduler::new();
-            start(&mut t, &mut s, 1, 0, sel);
+            start(&mut t, &mut s, 1, 0, sel | 0x40);
             let at = START_DELAY + (0x1_0000u64 << shift);
             assert_eq!(s.when(Event::TimerOverflow(1)), Some(at));
             assert_eq!(t.read_counter(1, START_DELAY + (5 << shift) + 3), 5);
@@ -203,7 +289,7 @@ mod tests {
         s.advance(at + 40);
         let (ev, when) = s.pop_due().unwrap();
         assert_eq!(ev, Event::TimerOverflow(0));
-        assert!(t.overflow(0, when, &mut s), "IRQ bit set");
+        t.overflow(0, when, &mut s);
         assert_eq!(s.when(Event::TimerOverflow(0)), Some(at + 0x100));
         assert_eq!(t.read_counter(0, at + 40), 0xFF00 + 40);
     }
@@ -221,7 +307,8 @@ mod tests {
     fn stopping_freezes_and_restarting_reloads() {
         let mut t = Timers::default();
         let mut s = Scheduler::new();
-        start(&mut t, &mut s, 2, 100, 0);
+        start(&mut t, &mut s, 2, 100, 0x40);
+        assert!(s.when(Event::TimerOverflow(2)).is_some());
         t.write_control(2, 0, 0xFFFF, START_DELAY + 7, &mut s);
         assert_eq!(t.read_counter(2, 10_000), 107);
         assert_eq!(s.when(Event::TimerOverflow(2)), None);
@@ -233,9 +320,14 @@ mod tests {
     fn irq_bit_change_keeps_the_phase() {
         let mut t = Timers::default();
         let mut s = Scheduler::new();
-        start(&mut t, &mut s, 1, 0, 1);
+        start(&mut t, &mut s, 1, 0, 0x41);
         let ev = s.when(Event::TimerOverflow(1));
-        t.write_control(1, 0xC1, 0xFFFF, 1000, &mut s);
+        assert!(ev.is_some());
+        // The IRQ goes off: nothing observes the timer, so no event. It comes
+        // back at the same time when the IRQ is enabled again.
+        t.write_control(1, 0x81, 0xFFFF, 1000, &mut s);
+        assert_eq!(s.when(Event::TimerOverflow(1)), None);
+        t.write_control(1, 0xC1, 0xFFFF, 2000, &mut s);
         assert_eq!(s.when(Event::TimerOverflow(1)), ev);
         assert!(t.t[1].irq_enabled());
     }
@@ -245,6 +337,7 @@ mod tests {
         let mut t = Timers::default();
         let mut s = Scheduler::new();
         start(&mut t, &mut s, 0, 0, 1);
+        assert_eq!(s.when(Event::TimerOverflow(0)), None, "unobserved");
         let now = START_DELAY + (3 << 6) + 10;
         t.write_control(0, 0x80, 0xFFFF, now, &mut s);
         assert_eq!(t.read_counter(0, now), 3);
@@ -260,7 +353,8 @@ mod tests {
         assert!(!t.cascade(1));
         assert_eq!(t.read_counter(1, 12345), 0xFFFF);
         assert!(t.cascade(1), "wraps");
-        // Timer 0 ignores the count-up bit.
+        // Timer 0 ignores the count-up bit; the running count-up timer 1 makes
+        // it observed.
         t.write_control(0, 0x84, 0xFFFF, 0, &mut s);
         assert!(s.when(Event::TimerOverflow(0)).is_some());
         // A stopped or non-count-up timer does not cascade.
@@ -272,7 +366,7 @@ mod tests {
         let mut t = Timers::default();
         let mut s = Scheduler::new();
         // A 32-bit write is the reload halfword, then the control halfword.
-        t.write_reload(3, 0x1234, 0xFFFF);
+        t.write_reload(3, 0x1234, 0xFFFF, 0, &mut s);
         t.write_control(3, 0x80, 0xFFFF, 0, &mut s);
         assert_eq!(t.read_counter(3, 0), 0x1234);
     }

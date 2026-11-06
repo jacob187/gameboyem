@@ -150,13 +150,14 @@ pub(super) fn render_text(bg: usize, regs: &Regs, mem: &Mem, y: u32, out: &mut L
     let tile_bytes = if is8 { 64 } else { 32 };
     let row_bytes = if is8 { 8 } else { 4 };
 
-    out.fill(TRANSPARENT);
     let py = (y + u32::from(regs.vofs[bg])) & height_mask;
     let ty = (py >> 3) as usize;
     let fine_y = (py & 7) as usize;
     let px0 = u32::from(regs.hofs[bg]) & width_mask;
     let mut tx = (px0 >> 3) as usize;
-    // Screen x of the left edge of the first (partially visible) tile.
+    // Screen x of the left edge of the first (partially visible) tile. The tiles
+    // cover the line exactly once, so every column is written here, with
+    // TRANSPARENT where a tile has no pixel: no pre-fill of the line.
     let mut x = -((px0 & 7) as i32);
     while x < SCREEN_WIDTH as i32 {
         let col = tx & if wide { 63 } else { 31 };
@@ -175,23 +176,35 @@ pub(super) fn render_text(bg: usize, regs: &Regs, mem: &Mem, y: u32, out: &mut L
         let bank = usize::from(entry >> 12) * 16;
         let row = if vflip { 7 - fine_y } else { fine_y };
         let addr = char_base + tile * tile_bytes + row * row_bytes;
-        // Tile data past 64 KiB is OBJ memory: the BG shows nothing there.
-        if addr + row_bytes <= BG_TILE_LIMIT {
+        let lo = (-x).max(0) as usize;
+        let hi = (SCREEN_WIDTH as i32 - x).min(8) as usize;
+        let dst = &mut out[(x + lo as i32) as usize..(x + hi as i32) as usize];
+        // Tile data past 64 KiB is OBJ memory: the BG shows nothing there. A tile
+        // row of all zero texels shows nothing either, so skip decoding it.
+        if addr + row_bytes > BG_TILE_LIMIT || row_is_empty(&mem.vram[addr..addr + row_bytes]) {
+            dst.fill(TRANSPARENT);
+        } else {
             let texels = mem.tile_row(addr, is8, hflip);
-            let lo = (-x).max(0) as usize;
-            let hi = (SCREEN_WIDTH as i32 - x).min(8) as usize;
-            for (i, &idx) in texels.iter().enumerate().take(hi).skip(lo) {
-                if idx != 0 {
-                    let pal = if is8 {
-                        usize::from(idx)
-                    } else {
-                        bank + usize::from(idx)
-                    };
-                    out[(x + i as i32) as usize] = mem.colour(pal);
-                }
+            for (px, &idx) in dst.iter_mut().zip(&texels[lo..hi]) {
+                *px = if idx == 0 {
+                    TRANSPARENT
+                } else if is8 {
+                    mem.colour(usize::from(idx))
+                } else {
+                    mem.colour(bank + usize::from(idx))
+                };
             }
         }
         x += 8;
         tx += 1;
+    }
+}
+
+/// Whether a tile row (4 or 8 bytes) has no non-zero texel.
+#[inline]
+fn row_is_empty(row: &[u8]) -> bool {
+    match <[u8; 4]>::try_from(row) {
+        Ok(four) => u32::from_le_bytes(four) == 0,
+        Err(_) => row.iter().all(|&b| b == 0),
     }
 }
