@@ -1100,6 +1100,142 @@ mod tests {
         assert_eq!(app.core.save_state(), before);
     }
 
+    /// A GBA ROM that copies KEYINPUT into palette entry 0 forever: with no layer
+    /// enabled the backdrop shows it, so the picture follows the buttons.
+    fn gba_keypad_rom() -> Vec<u8> {
+        const AL: u32 = 0xE000_0000;
+        let imm = |v: u32| -> u32 {
+            (0..16)
+                .find_map(|rot| {
+                    let r = v.rotate_left(rot * 2);
+                    (r <= 0xFF).then_some(rot << 8 | r)
+                })
+                .expect("encodable immediate")
+        };
+        let mov = |rd: u32, v: u32| AL | 1 << 25 | 13 << 21 | rd << 12 | imm(v);
+        let add = |rd: u32, rn: u32, v: u32| AL | 1 << 25 | 4 << 21 | rn << 16 | rd << 12 | imm(v);
+        let half = |load: u32, rd: u32, rn: u32| {
+            AL | 1 << 24 | 1 << 23 | 1 << 22 | load << 20 | rn << 16 | rd << 12 | 0xB0
+        };
+        let words = [
+            mov(0, 0x0400_0000),
+            add(0, 0, 0x130), // KEYINPUT
+            mov(1, 0x0500_0000),
+            half(1, 2, 0),                // loop: ldrh r2, [r0]
+            half(0, 2, 1),                //       strh r2, [r1]
+            AL | 0x0A00_0000 | 0xFF_FFFC, //       b loop (-4 words + 8)
+        ];
+        let mut rom = vec![0u8; 0x400];
+        for (i, w) in words.iter().enumerate() {
+            rom[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        rom
+    }
+
+    /// The whole loop for a GBA: play with `--record` (cartridge options, a clock
+    /// start and a screenshot included), then replay with `gba_core::replay` and
+    /// get the identical machine, the identical screenshot bytes, and the same PNG
+    /// `gb-test --replay` writes for that frame.
+    #[test]
+    fn a_gba_recording_replays_to_the_identical_state_and_screenshot() {
+        use emu_common::replay::rom_hash;
+        use gba_core::replay::{Recording, Replayer};
+        use gba_core::{CartOptions, RtcMode, RtcTime, SaveChoice};
+        use winit::keyboard::KeyCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom_path = dir.path().join("g.gba");
+        let rom = gba_keypad_rom();
+        let options = CartOptions {
+            save: SaveChoice::Sram,
+            rtc: RtcMode::On,
+        };
+        let start = RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap();
+        let mut gba = Gba::with_options(rom.clone(), None, options).unwrap();
+        gba.set_rtc(start);
+        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        saves.load(&mut gba);
+        let rec_path = dir.path().join("s.gbinput");
+        let header = record::header_for(&gba, rom_hash(&rom));
+        assert!(!header.ext.is_empty(), "a GBA header carries its options");
+        let mut app = App::new(
+            gba,
+            Storage {
+                saves,
+                states: StateSlots::new(&rom_path),
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(rom_path.clone())
+        .with_recorder(Some(Recorder::create(&rec_path, &header).unwrap()));
+
+        let frames = |app: &mut App<Gba>, n: u32| (0..n).for_each(|_| _ = app.step_once());
+        frames(&mut app, 2);
+        app.on_key_input(KeyCode::ArrowRight, true);
+        frames(&mut app, 3);
+        app.on_key_input(KeyCode::ArrowLeft, true); // press and release in one frame
+        app.on_key_input(KeyCode::ArrowLeft, false);
+        frames(&mut app, 2);
+        app.on_key_input(KeyCode::KeyR, true); // the R shoulder
+        frames(&mut app, 1);
+        app.release_all_buttons();
+        app.on_key_input(KeyCode::ArrowRight, true);
+        frames(&mut app, 1);
+        app.on_key_input(KeyCode::KeyC, true); // screenshot + marker
+        let marker = app.frame;
+        frames(&mut app, 4);
+        let total = app.frame;
+        app.recorder.as_mut().unwrap().finish(total);
+
+        let rec = Recording::decode(&fs::read(&rec_path).unwrap()).unwrap();
+        assert_eq!(rec.end_frame, Some(total));
+        assert_eq!(rec.markers(), vec![marker]);
+        assert_eq!(rec.header.options, options);
+        assert_eq!(rec.header.rtc_start, Some(start));
+        assert_eq!(rec.header.bios_hash, None);
+
+        let mut gba = rec.power_on(rom, None).unwrap();
+        let mut player = Replayer::new(&rec);
+        let mut audio = Vec::new();
+        let mut step = |gba: &mut Gba, to: u64| {
+            while player.frame() < to {
+                player.step_frame(gba);
+                audio.clear();
+                gba.drain_audio_into(&mut audio);
+            }
+        };
+        step(&mut gba, marker);
+        let shot = fs::read(record::screenshot_path(&rom_path, marker)).unwrap();
+        let replayed = dir.path().join("replayed.png");
+        record::write_png(Core::frame(&gba), &replayed).unwrap();
+        assert_eq!(
+            fs::read(&replayed).unwrap(),
+            shot,
+            "screenshot == replayed frame"
+        );
+        let tool = dir.path().join("gb-test.png");
+        gb_test::gba::save_gba_png(&gba.framebuffer()[..], &tool).unwrap();
+        assert_eq!(
+            fs::read(&tool).unwrap(),
+            shot,
+            "gb-test's PNG == the frontend's screenshot, byte for byte"
+        );
+        step(&mut gba, total);
+        assert_eq!(gba.cycles(), app.core.cycles());
+        assert_eq!(gba.cpu_registers(), app.core.cpu_registers());
+        assert_eq!(gba.framebuffer()[..], app.core.framebuffer()[..]);
+        assert_eq!(gba.save_state(), app.core.save_state(), "the whole machine");
+        assert_eq!(
+            gba.framebuffer()[0] & 0x3FF,
+            0x3FF & !0x010,
+            "Right held: the palette followed KEYINPUT"
+        );
+    }
+
     /// L and R (Q and R on the keyboard) reach a GBA and its recording, which
     /// its 10-button decoder reads back, with a 128 KiB flash save in the header.
     #[test]

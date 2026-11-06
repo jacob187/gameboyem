@@ -14,6 +14,8 @@ png = "0.18"
 
 [dev-dependencies]
 libtest-mimic = "0.8"
+tempfile.workspace = true
+emu-common.workspace = true
 
 [[test]]
 name = "roms"

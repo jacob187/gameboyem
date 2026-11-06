@@ -312,3 +312,343 @@ impl<'a> Replayer<'a> {
         self.0.step_frame(gba);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emu_common::Button;
+
+    fn rom(id: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x400];
+        rom[..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // b .
+        rom[0x100..0x100 + id.len()].copy_from_slice(id);
+        rom
+    }
+
+    fn bios(fill: u8) -> Box<[u8]> {
+        vec![fill; BIOS_SIZE].into_boxed_slice()
+    }
+
+    fn start(button: Button, pressed: bool, frame: u64) -> Record {
+        Record {
+            frame,
+            event: Event::Button { button, pressed },
+        }
+    }
+
+    fn bytes(header: &Header, records: &[Record]) -> Vec<u8> {
+        let mut out = encode_header(header);
+        for r in records {
+            out.extend_from_slice(&encode_record(*r));
+        }
+        out
+    }
+
+    fn header(rom: &[u8]) -> Header {
+        Header {
+            rom_hash: rom_hash(rom),
+            battery: None,
+            options: CartOptions::default(),
+            bios_hash: None,
+            rtc_start: None,
+        }
+    }
+
+    #[test]
+    fn the_header_extension_round_trips_every_option() {
+        let t = RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap();
+        for save in [
+            SaveChoice::Auto,
+            SaveChoice::None,
+            SaveChoice::Sram,
+            SaveChoice::Flash64,
+            SaveChoice::Flash128,
+            SaveChoice::Eeprom512,
+            SaveChoice::Eeprom8k,
+        ] {
+            for rtc in [RtcMode::Auto, RtcMode::On, RtcMode::Off] {
+                for bios_hash in [None, Some(0xDEAD_BEEF_0123_4567)] {
+                    for rtc_start in [None, Some(t)] {
+                        for battery in [None, Some(vec![1, 2, 3])] {
+                            let h = Header {
+                                rom_hash: 77,
+                                battery,
+                                options: CartOptions { save, rtc },
+                                bios_hash,
+                                rtc_start,
+                            };
+                            let records = [start(Button::L, true, 0), start(Button::L, false, 4)];
+                            let rec = Recording::decode(&bytes(&h, &records)).unwrap();
+                            assert_eq!(rec.header, h);
+                            assert_eq!(rec.records, records);
+                            assert_eq!(h.ext().len(), if rtc_start.is_some() { 19 } else { 12 });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_version_3_gba_recording_decodes_as_the_defaults() {
+        let rom = rom(b"FLASH1M_V");
+        // Exactly what the frontend wrote before the extension existed.
+        let v3 = emu_common::replay::encode_header(System::Gba, rom_hash(&rom), None, 0);
+        assert_eq!(v3[8], 3);
+        let rec = Recording::decode(&v3).unwrap();
+        assert_eq!(
+            rec.header,
+            Header {
+                battery: None,
+                ..header(&rom)
+            }
+        );
+        let gba = rec.power_on(rom, None).unwrap();
+        assert_eq!(gba.options(), CartOptions::default());
+        assert_eq!(gba.bios_hash(), None);
+    }
+
+    #[test]
+    fn a_session_header_is_what_powers_the_replay_on() {
+        // A session with a forced save type, the clock on and started at a time.
+        let rom = rom(b"");
+        let options = CartOptions {
+            save: SaveChoice::Flash128,
+            rtc: RtcMode::On,
+        };
+        let t = RtcTime::new(2031, 12, 31, 23, 59, 58).unwrap();
+        let mut live = Gba::with_options(rom.clone(), Some(bios(7)), options).unwrap();
+        live.set_rtc(t);
+        let h = Header::of(&live);
+        assert_eq!(h.options, options);
+        assert_eq!(h.bios_hash, Some(rom_hash(&bios(7))));
+        assert_eq!(h.rtc_start, Some(t));
+        assert_eq!(h.battery.as_ref().map(Vec::len), Some(128 * 1024));
+        let rec = Recording::decode(&bytes(&h, &[])).unwrap();
+        let replayed = rec.power_on(rom, Some(bios(7))).unwrap();
+        assert_eq!(replayed.options(), options);
+        assert_eq!(replayed.rtc_time(), live.rtc_time());
+        assert_eq!(replayed.battery_save(), live.battery_save());
+        assert_eq!(replayed.save_state(), live.save_state());
+    }
+
+    #[test]
+    fn the_battery_loads_after_the_clock_start_as_the_frontend_does() {
+        // A save with a footer replaces the clock start, as `--rtc-start` then
+        // the `.sav` load do in the frontend.
+        let rom = rom(b"FLASH1M_V");
+        let mut first = Gba::new(rom.clone(), None).unwrap();
+        first.set_rtc(RtcTime::new(2020, 1, 2, 3, 4, 5).unwrap());
+        let footer_save = {
+            let mut g = Gba::new(rom.clone(), None).unwrap();
+            g.set_rtc(RtcTime::new(2030, 6, 7, 8, 9, 10).unwrap());
+            let mut image = g.battery_ram().unwrap().to_vec();
+            image.extend_from_slice(&footer_of(&g));
+            image
+        };
+        first.load_battery_ram(&footer_save).unwrap();
+        let h = Header::of(&first);
+        let rec = Recording::decode(&bytes(&h, &[])).unwrap();
+        let replayed = rec.power_on(rom, None).unwrap();
+        assert_eq!(replayed.rtc_time(), first.rtc_time());
+        assert_eq!(replayed.rtc_time().year(), 2030, "the save's clock won");
+    }
+
+    /// A valid RTC footer for `g`'s clock: the save image with the footer
+    /// appended, minus the chip.
+    fn footer_of(g: &Gba) -> Vec<u8> {
+        let t = g.rtc_time();
+        let bcd = |v: u8| (v / 10) << 4 | v % 10;
+        let mut f = b"AGBRTC01".to_vec();
+        f.extend_from_slice(&[
+            0x40,
+            bcd((t.year() - 2000) as u8),
+            bcd(t.month()),
+            bcd(t.day()),
+            t.weekday(),
+            bcd(t.hour()),
+            bcd(t.minute()),
+            bcd(t.second()),
+        ]);
+        f.extend_from_slice(&[0; 8]);
+        f
+    }
+
+    #[test]
+    fn power_on_says_what_is_wrong() {
+        let rom = rom(b"");
+        let mut h = header(&rom);
+        let rec = |h: &Header| Recording::decode(&bytes(h, &[])).unwrap();
+        // Another ROM.
+        let mut other = rom.clone();
+        other[0x300] = 1;
+        assert!(matches!(
+            rec(&h).power_on(other, None),
+            Err(ReplayError::WrongRom { .. })
+        ));
+        // Built-in BIOS recording, BIOS supplied.
+        assert_eq!(
+            rec(&h).power_on(rom.clone(), Some(bios(1))).err(),
+            Some(ReplayError::UnexpectedBios)
+        );
+        // Real BIOS recording: none, the wrong size, the wrong dump, the right one.
+        h.bios_hash = Some(rom_hash(&bios(1)));
+        let r = rec(&h);
+        assert_eq!(
+            r.power_on(rom.clone(), None).err(),
+            Some(ReplayError::NeedsBios {
+                hash: rom_hash(&bios(1))
+            })
+        );
+        assert_eq!(
+            r.power_on(rom.clone(), Some(vec![0; 100].into_boxed_slice()))
+                .err(),
+            Some(ReplayError::BadBiosSize(100))
+        );
+        assert!(matches!(
+            r.power_on(rom.clone(), Some(bios(2))),
+            Err(ReplayError::WrongBios { .. })
+        ));
+        assert!(r.power_on(rom, Some(bios(1))).is_ok());
+        for e in [
+            ReplayError::NeedsBios { hash: 1 },
+            ReplayError::UnexpectedBios,
+            ReplayError::BadBiosSize(3),
+            ReplayError::WrongBios {
+                expected: 1,
+                actual: 2,
+            },
+        ] {
+            assert!(!e.to_string().is_empty());
+        }
+        assert!(
+            ReplayError::NeedsBios { hash: 1 }
+                .to_string()
+                .contains("--bios")
+        );
+    }
+
+    #[test]
+    fn a_damaged_extension_is_refused() {
+        let rom = rom(b"");
+        let good = emu_common::replay::encode_header_ext(
+            System::Gba,
+            rom_hash(&rom),
+            None,
+            0,
+            &header(&rom).ext(),
+        );
+        assert!(Recording::decode(&good).is_ok());
+        let ext_at = good.len() - EXT_LEN;
+        let bad = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut v = good.clone();
+            edit(&mut v);
+            Recording::decode(&v)
+        };
+        for (what, at, value) in [
+            ("save type", 0, 99),
+            ("clock option", 1, 99),
+            ("BIOS kind", 2, 5),
+            ("a BIOS hash on the built-in BIOS", 3, 1),
+            ("clock flag", 11, 2),
+        ] {
+            assert!(
+                matches!(
+                    bad(&|v| v[ext_at + at] = value),
+                    Err(ReplayError::BadExtension(_))
+                ),
+                "{what}"
+            );
+        }
+        // A clock start flag without the time, and a time that is not a date.
+        let t = RtcTime::new(2024, 2, 29, 0, 0, 0).unwrap();
+        let with_time = Header {
+            rtc_start: Some(t),
+            ..header(&rom)
+        };
+        let good_time = bytes(&with_time, &[]);
+        assert!(Recording::decode(&good_time).is_ok());
+        let mut v = good_time.clone();
+        let n = v.len();
+        v[n - 4] = 31; // day 31 of month 2
+        assert!(matches!(
+            Recording::decode(&v),
+            Err(ReplayError::BadExtension(_))
+        ));
+        let mut v = good.clone();
+        v[ext_at + 11] = 1; // flag set, no time follows
+        assert!(matches!(
+            Recording::decode(&v),
+            Err(ReplayError::BadExtension(_))
+        ));
+        // A variant other than 0, and an extension that is not ours at all.
+        let mut v = good.clone();
+        v[good.len() - EXT_LEN - 3] = 1; // the variant byte
+        assert_eq!(Recording::decode(&v), Err(ReplayError::BadVariant(1)));
+        let short =
+            emu_common::replay::encode_header_ext(System::Gba, rom_hash(&rom), None, 0, &[1, 2, 3]);
+        assert!(matches!(
+            Recording::decode(&short),
+            Err(ReplayError::BadExtension(_))
+        ));
+        // Cut anywhere in the header: always an error, never a panic.
+        for cut in 0..good.len() {
+            assert!(Recording::decode(&good[..cut]).is_err(), "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn other_systems_and_the_battery_cap() {
+        let gb = emu_common::replay::encode_header(System::Gb, 1, None, 0);
+        assert_eq!(
+            Recording::decode(&gb),
+            Err(ReplayError::WrongSystem(System::Gb))
+        );
+        let big =
+            emu_common::replay::encode_header(System::Gba, 1, Some(&vec![0; MAX_BATTERY_LEN]), 0);
+        assert!(Recording::decode(&big).is_ok());
+        let bigger = emu_common::replay::encode_header(
+            System::Gba,
+            1,
+            Some(&vec![0; MAX_BATTERY_LEN + 1]),
+            0,
+        );
+        assert!(matches!(
+            Recording::decode(&bigger),
+            Err(ReplayError::Decode(DecodeError::BatteryTooLarge { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_replay_feeds_the_recorded_buttons_to_the_machine() {
+        let rom = rom(b"");
+        let records = [
+            start(Button::L, true, 1),
+            start(Button::A, true, 2),
+            Record {
+                frame: 2,
+                event: Event::Marker,
+            },
+            start(Button::L, false, 3),
+            Record {
+                frame: 4,
+                event: Event::End,
+            },
+        ];
+        let rec = Recording::decode(&bytes(&header(&rom), &records)).unwrap();
+        assert_eq!((rec.markers(), rec.frame_count()), (vec![2], 4));
+        let mut gba = rec.power_on(rom, None).unwrap();
+        let mut player = Replayer::new(&rec);
+        let mut keys = Vec::new();
+        while player.frame() < rec.frame_count() {
+            player.step_frame(&mut gba);
+            keys.push(gba.peek16(0x0400_0130) & 0x3FF);
+        }
+        // Active low: L is bit 9, A bit 0. A change recorded at frame f takes
+        // effect before the (f+1)-th frame.
+        assert_eq!(
+            keys,
+            [0x3FF, 0x3FF & !0x200, 0x3FF & !0x201, 0x3FF & !0x001]
+        );
+    }
+}

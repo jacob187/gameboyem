@@ -22,3 +22,4 @@ png = "0.18"
 
 [dev-dependencies]
 tempfile.workspace = true
+gb-test = { path = "../gb-test" }

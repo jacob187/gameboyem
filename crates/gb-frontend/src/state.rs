@@ -24,7 +24,7 @@ const GB_MAX_STATE_BYTES: u64 = 512 * 1024;
 pub fn max_state_bytes(system: System) -> u64 {
     match system {
         System::Gb => GB_MAX_STATE_BYTES,
-        // From the core; P3 tightens it once a GBA state exists.
+        // From the core: the real worst case (128 KiB flash) plus a little.
         System::Gba => gba_core::MAX_STATE_BYTES as u64,
     }
 }
