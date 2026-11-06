@@ -2,8 +2,8 @@
 //! and gather drifting glints before the 30 second round ends.
 //!
 //! Hardware used: four regular backgrounds (a slow star/moon layer, a faster
-//! hill layer that both scroll, a fixed HUD, a text overlay), seven hardware
-//! sprites with two animation frames each, the VBlank interrupt (agb's frame
+//! hill layer that both scroll, a fixed HUD, a text overlay), six hardware
+//! sprites (the moth, five glints; two frames each), the VBlank interrupt (agb's frame
 //! commit waits on it and an explicit handler counts frames) and the software
 //! mixer for sound effects. All art and sound is generated in code.
 #![no_std]
