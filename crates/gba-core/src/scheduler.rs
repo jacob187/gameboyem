@@ -14,7 +14,10 @@ use emu_common::state::{StateReader, StateWriter};
 /// How far behind the clock an undispatched event can be: events are dispatched
 /// after every step, so only at power-on (and after tests that drive the bus
 /// directly), but one HLE call may charge up to 16 frames inside a step, so allow
-/// that much (a few thousand events to catch up).
+/// that much. Catching up is a few thousand PPU and APU events, plus one event
+/// per period of each observed timer: up to one per cycle for a timer on reload
+/// 0xFFFF at prescaler 1, so about 4.5 million. That is bounded work, and the
+/// same work the timer costs over those cycles when running normally.
 const MAX_EVENT_LATE: u64 = crate::bios::SWI_CYCLE_CAP;
 
 /// How far ahead of the clock a timer event (or one nothing schedules yet) can

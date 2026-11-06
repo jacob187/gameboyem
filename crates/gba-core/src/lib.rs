@@ -11,10 +11,13 @@
 //! rather than ticked every cycle. Events that fall due during an instruction are
 //! dispatched after it.
 //!
-//! Ownership of the modules (see the GBA plan): `cpu/` is the CPU agent's; `ppu/`
-//! the PPU agent's; `bus`, `memory`, `dma`, `timer`, `irq`, `keypad`, `cart/` and
-//! `gba` the system agent's; `apu/` and `bios/` come in phase P2. The types and
-//! functions marked **Contract** are frozen; changing one is a contract change.
+//! The modules: `cpu/` (ARM7TDMI), `ppu/`, `apu/` (PSG channels and the two
+//! Direct Sound FIFOs), `bios/` (the high-level BIOS), `cart/` (ROM, backup
+//! chips, the GPIO port and its clock); the system pieces `bus`, `memory`, `io`,
+//! `dma`, `timer`, `irq`, `keypad`, `prefetch` and `scheduler`; and `gba` (the
+//! whole machine) with its `replay` and save-state (`state`) support. The types
+//! and functions marked **Contract** are frozen; changing one is a contract
+//! change.
 #![forbid(unsafe_code)]
 
 pub mod apu;

@@ -428,8 +428,9 @@ impl Ppu {
 
 #[cfg(test)]
 mod fast_path_tests {
-    //! The plain composite and the new `render_text` against the general path and
-    //! the old tile loop, on seeded random registers and memory.
+    //! The plain composite and `render_text` against the general path and a
+    //! straightforward pre-fill, per-pixel text renderer (`reference_text`), on
+    //! seeded random registers and memory.
 
     use super::*;
 
@@ -547,8 +548,8 @@ mod fast_path_tests {
         assert!(fast < lines, "{fast} of {lines}");
     }
 
-    /// The text renderer as it was before the fast path (full pre-fill, per-pixel
-    /// writes), kept as the reference.
+    /// The text renderer written the plain way (full pre-fill, per-pixel writes),
+    /// kept as the oracle for the fast path.
     fn reference_text(bg: usize, regs: &Regs, mem: &Mem, y: u32, out: &mut Line) {
         let cnt = regs.bgcnt[bg];
         let char_base = usize::from((cnt >> 2) & 3) * 0x4000;
@@ -604,7 +605,7 @@ mod fast_path_tests {
     }
 
     #[test]
-    fn text_renderer_matches_the_old_tile_loop() {
+    fn text_renderer_matches_the_reference() {
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
             let ppu = random_ppu(&mut rng);

@@ -79,7 +79,8 @@ pub struct Ppu {
     hblank: bool,
     /// Per-layer line buffers (scratch; see `render.rs`).
     layers: Box<render::Layers>,
-    /// The frame being drawn, one line per HBlank.
+    /// The frame being drawn, one line per `PpuRender` event (cycle 960 of a
+    /// visible line, before the HBlank flag at 1006; DECISIONS #71).
     back: Box<Framebuffer>,
     /// The last complete frame (swapped in at VBlank start).
     front: Box<Framebuffer>,
@@ -121,7 +122,8 @@ impl Ppu {
 
     /// Palette, VRAM, OAM, the I/O registers, the affine reference points, the
     /// line counter, the HBlank flag and both framebuffers (DECISIONS #73). The
-    /// back buffer is mid-frame (lines above `vcount` are drawn), so it cannot be
+    /// back buffer is mid-frame (lines above `vcount` are drawn, and `vcount`
+    /// itself once the clock is past cycle 960 of it), so it cannot be
     /// re-rendered from the registers; the per-line layer buffers are scratch that
     /// every line fills before reading, and are not saved.
     pub(crate) fn save_state(&self, w: &mut StateWriter) {

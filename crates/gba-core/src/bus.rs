@@ -462,10 +462,10 @@ impl Bus {
     }
 
     /// Cost of a cartridge ROM access without the prefetch buffer: the
-    /// [`WaitTable`] entry (see [`WaitTable::rom_access`]). Pure, so the HLE BIOS
-    /// can use it for its bookkeeping; the CPU and DMA go through
-    /// [`Bus::access_cost`] and [`Bus::rom_fetch_cost`], which also keep the prefetch
-    /// buffer's state.
+    /// [`WaitTable`] entry (see [`WaitTable::rom_access`]). Pure; [`Bus::cost`]
+    /// and [`Bus::rom_fetch_cost`] (with the prefetch buffer off) call it. The CPU
+    /// and DMA go through [`Bus::access_cost`] and [`Bus::rom_fetch_cost`], which
+    /// also keep the prefetch buffer's state.
     #[inline]
     pub fn rom_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
         self.waits.rom_access(addr, w == Width::W, access)

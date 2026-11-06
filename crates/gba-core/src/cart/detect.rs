@@ -74,7 +74,8 @@ const IDS: [(&[u8], SaveKind); 6] = [
 pub fn detect_save(rom: &[u8]) -> SaveKind {
     for word in rom.chunks(4).enumerate().map(|(i, _)| i * 4) {
         let tail = &rom[word..];
-        // Every ID starts with one of these two bytes; skip the rest cheaply.
+        // Every ID starts with one of these three bytes (EEPROM, SRAM, FLASH); skip
+        // the rest cheaply.
         if !matches!(tail[0], b'E' | b'S' | b'F') {
             continue;
         }
