@@ -10,6 +10,7 @@
 //! ```text
 //! header:  magic "GBINPUT\0" | version u8 | ROM FNV-1a u64 | battery length u32 | battery bytes
 //!          | variant u8 (version 2 and later) | system u8 (version 3 and later)
+//!          | extension length u8 | extension bytes (version 4 and later)
 //!          (battery length 0xFFFF_FFFF means "no battery RAM")
 //! records: frame u64 | kind u8, repeated; 9 bytes each, append-only
 //! ```
@@ -20,6 +21,13 @@
 //! (variant 0 DMG, 1 CGB). The variant is the hardware byte of the system's
 //! save states (Game Boy: `Model::id`). The decoder keeps it as a raw byte;
 //! the core's wrapper decides which values are valid.
+//!
+//! Version 4 appends an opaque, system-defined extension (at most 255 bytes):
+//! what a console needs besides the ROM and the battery to power on the way the
+//! session did (the GBA: cartridge options, BIOS identity, clock start). The
+//! decoder returns it raw, like the variant; an empty extension is written as
+//! a version 3 header, so a Game Boy recording is byte for byte what it always
+//! was and older tools still read it.
 //!
 //! A record's `kind` is a button index plus `0x80` for a press, or `0x40`
 //! (marker) or `0x41` (end). The index is the button's position in
@@ -37,9 +45,13 @@ use crate::interface::{Button, Core, System};
 use crate::state::fnv1a;
 
 pub const MAGIC: [u8; 8] = *b"GBINPUT\0";
-/// Version 2 added the hardware variant, version 3 the system. Older files
-/// still decode.
-pub const VERSION: u8 = 3;
+/// Version 2 added the hardware variant, version 3 the system, version 4 the
+/// per-system extension. Older files still decode.
+pub const VERSION: u8 = 4;
+/// The last version without an extension; what an empty extension is written as.
+const VERSION_NO_EXT: u8 = 3;
+/// The longest extension: its length is one byte.
+pub const MAX_EXT_LEN: usize = u8::MAX as usize;
 pub const RECORD_LEN: usize = 9;
 
 /// The most battery bytes [`decode_header`] accepts from any system. It is only
@@ -83,15 +95,19 @@ pub struct Header {
     pub battery: Option<Vec<u8>>,
     /// `Core::hw_variant()`, as a raw byte.
     pub variant: u8,
+    /// `Core::recording_ext()`: system-defined bytes, empty for versions 1 to 3.
+    pub ext: Vec<u8>,
 }
 
 impl Header {
+    /// The current-version header. Panics if `ext` is over [`MAX_EXT_LEN`].
     pub fn encode(&self) -> Vec<u8> {
-        encode_header(
+        encode_header_ext(
             self.system,
             self.rom_hash,
             self.battery.as_deref(),
             self.variant,
+            &self.ext,
         )
     }
 }
@@ -133,16 +149,33 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// The current-version header for a session on `system`.
+/// The header for a session on `system` with no extension (version 3).
 pub fn encode_header(
     system: System,
     rom_hash: u64,
     battery: Option<&[u8]>,
     variant: u8,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(23 + battery.map_or(0, <[u8]>::len));
+    encode_header_ext(system, rom_hash, battery, variant, &[])
+}
+
+/// The header for a session on `system`: version 3 if `ext` is empty, else
+/// version 4 with the extension appended. Panics if `ext` is over
+/// [`MAX_EXT_LEN`] bytes (a core's extension is a few bytes).
+pub fn encode_header_ext(
+    system: System,
+    rom_hash: u64,
+    battery: Option<&[u8]>,
+    variant: u8,
+    ext: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 + battery.map_or(0, <[u8]>::len) + ext.len());
     out.extend_from_slice(&MAGIC);
-    out.push(VERSION);
+    out.push(if ext.is_empty() {
+        VERSION_NO_EXT
+    } else {
+        VERSION
+    });
     out.extend_from_slice(&rom_hash.to_le_bytes());
     match battery {
         Some(b) => {
@@ -154,6 +187,10 @@ pub fn encode_header(
     }
     out.push(variant);
     out.push(system.id());
+    if !ext.is_empty() {
+        out.push(u8::try_from(ext.len()).expect("recording extension fits in a byte"));
+        out.extend_from_slice(ext);
+    }
     out
 }
 
@@ -221,11 +258,22 @@ pub fn decode_header(bytes: &[u8]) -> Result<(Header, &[u8]), DecodeError> {
     } else {
         (System::Gb, rest)
     };
+    let (ext, rest) = if version >= 4 {
+        let (&len, rest) = rest.split_first().ok_or(DecodeError::TruncatedHeader)?;
+        let len = usize::from(len);
+        if rest.len() < len {
+            return Err(DecodeError::TruncatedHeader);
+        }
+        (rest[..len].to_vec(), &rest[len..])
+    } else {
+        (Vec::new(), rest)
+    };
     let header = Header {
         system,
         rom_hash,
         battery,
         variant,
+        ext,
     };
     Ok((header, rest))
 }
@@ -420,6 +468,48 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_built_version_4_file_carries_its_extension() {
+        let mut v = prefix(4);
+        v.extend_from_slice(&[0, 1, 3, 7, 8, 9]); // variant 0, GBA, ext [7, 8, 9]
+        v.extend_from_slice(&RECORDS);
+        let (h, r) = decode(&v, 10).unwrap();
+        assert_eq!((h.system, h.variant), (System::Gba, 0));
+        assert_eq!(h.ext, vec![7, 8, 9]);
+        assert_eq!(r.records, expected_records());
+        // Versions 1 to 3 have no extension.
+        let mut v = prefix(3);
+        v.extend_from_slice(&[0, 1]);
+        assert!(decode_header(&v).unwrap().0.ext.is_empty());
+    }
+
+    #[test]
+    fn an_empty_extension_is_a_version_3_header_and_a_real_one_is_version_4() {
+        let plain = encode_header_ext(System::Gba, HASH, Some(&[1, 2, 3]), 0, &[]);
+        assert_eq!(plain, encode_header(System::Gba, HASH, Some(&[1, 2, 3]), 0));
+        assert_eq!(plain[8], 3);
+        let with = encode_header_ext(System::Gba, HASH, Some(&[1, 2, 3]), 0, &[7, 8]);
+        assert_eq!(with[8], 4);
+        assert_eq!(&with[..8], &plain[..8], "same magic");
+        assert_eq!(&with[9..plain.len()], &plain[9..], "every earlier offset");
+        assert_eq!(&with[plain.len()..], &[2, 7, 8]);
+        let (h, rest) = decode_header(&with).unwrap();
+        assert_eq!(h.ext, vec![7, 8]);
+        assert!(rest.is_empty());
+        // A version 4 header cut inside the extension is truncated.
+        for cut in plain.len()..with.len() {
+            assert_eq!(
+                decode_header(&with[..cut]),
+                Err(DecodeError::TruncatedHeader),
+                "cut at {cut}"
+            );
+        }
+        // The longest extension round-trips.
+        let big = vec![5; MAX_EXT_LEN];
+        let bytes = encode_header_ext(System::Gba, HASH, None, 0, &big);
+        assert_eq!(decode_header(&bytes).unwrap().0.ext, big);
+    }
+
+    #[test]
     fn the_encoder_writes_version_3_with_every_earlier_offset_unchanged() {
         let bytes = encode_header(System::Gba, HASH, Some(&[1, 2, 3]), 0);
         let mut want = prefix(3);
@@ -439,6 +529,11 @@ mod tests {
                     rom_hash: 5,
                     battery,
                     variant: 1,
+                    ext: if system == System::Gba {
+                        vec![1, 2, 3]
+                    } else {
+                        Vec::new()
+                    },
                 };
                 let bytes = h.encode();
                 let (back, rest) = decode_header(&bytes).unwrap();
@@ -455,6 +550,7 @@ mod tests {
             rom_hash: HASH,
             battery: Some(vec![1, 2, 3]),
             variant: 0,
+            ext: Vec::new(),
         }
         .encode();
         assert_eq!(decode_header(b"nope"), Err(DecodeError::NotARecording));

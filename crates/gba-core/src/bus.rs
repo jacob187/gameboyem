@@ -18,13 +18,16 @@ use crate::apu::Apu;
 use crate::bios::Bios;
 use crate::cart::Cart;
 use crate::dma::{Dma, DmaTrigger};
+use crate::io::WAITCNT_PREFETCH;
 use crate::irq::Irq;
 use crate::keypad::Keypad;
 use crate::memory::rd;
 use crate::ppu::Ppu;
 use crate::prefetch::Prefetch;
 use crate::scheduler::{Event, Scheduler};
+use crate::state::{StateError, check, get_u16s, get_u32s, put_u16s, put_u32s, tag};
 use crate::timer::Timers;
+use emu_common::state::{StateReader, StateWriter};
 
 /// Width of a bus access, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +221,114 @@ impl Bus {
         bus.sched
             .schedule(Event::ApuSample, crate::apu::PUMP_CYCLES);
         bus
+    }
+
+    /// Every component but the CPU, in the section order of DECISIONS #73. The
+    /// scheduler goes first and is restored verbatim; nothing is re-derived from
+    /// the registers afterwards except the wait-state table (a pure function of
+    /// WAITCNT) and the timers' FIFO-length mirror (a copy of the APU's lengths).
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u8(tag::SCHEDULER);
+        self.sched.save_state(w);
+        w.u8(tag::BUS);
+        self.save_misc(w);
+        w.u8(tag::IRQ);
+        self.irq.save_state(w);
+        w.u8(tag::TIMERS);
+        self.timers.save_state(w);
+        w.u8(tag::DMA);
+        self.dma.save_state(w);
+        w.u8(tag::PPU);
+        self.ppu.save_state(w);
+        w.u8(tag::APU);
+        self.apu.save_state(w);
+        w.u8(tag::KEYPAD);
+        self.keypad.save_state(w);
+        w.u8(tag::PREFETCH);
+        self.prefetch.save_state(w);
+        w.u8(tag::CART);
+        self.cart.save_state(w);
+    }
+
+    /// The bus's own fields: both work RAMs and the flags and latches.
+    pub(crate) fn save_misc(&self, w: &mut StateWriter) {
+        w.bytes(&self.ewram);
+        w.bytes(&self.iwram);
+        w.bool(self.halted);
+        w.bool(self.stopped);
+        w.u64(self.frames);
+        w.u16(self.waitcnt);
+        w.u32(self.open_bus);
+        w.u32(self.bios_latch);
+        w.bool(self.fetching_bios);
+        w.u8(self.postflg);
+        w.bool(self.intr_wait.is_some());
+        w.u16(self.intr_wait.unwrap_or(0));
+        put_u32s(w, &self.fifo_latch);
+        put_u16s(w, &self.sio_regs);
+    }
+
+    /// Restore what [`Bus::save_state`] wrote. Components validate their own
+    /// fields; the checks here are the ones that relate two components, which is
+    /// why they run after every section is in.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        r.tag(tag::SCHEDULER)?;
+        self.sched.load_state(r)?;
+        r.tag(tag::BUS)?;
+        r.bytes_into(&mut self.ewram)?;
+        r.bytes_into(&mut self.iwram)?;
+        let (halted, stopped) = (r.bool()?, r.bool()?);
+        let frames = r.u64()?;
+        let waitcnt = r.u16()?;
+        let (open_bus, bios_latch) = (r.u32()?, r.u32()?);
+        let fetching_bios = r.bool()?;
+        let postflg = r.u8()?;
+        let (waiting, wanted) = (r.bool()?, r.u16()?);
+        let fifo_latch = get_u32s::<2>(r)?;
+        let mut sio_regs = [0; 0x20];
+        get_u16s(r, &mut sio_regs)?;
+        check(!stopped || halted, "stopped without halting")?;
+        check(waitcnt & 0x8000 == 0, "WAITCNT")?;
+        check(postflg <= 1, "POSTFLG")?;
+        check(waiting || wanted == 0, "IntrWait flags without a wait")?;
+        check(frames < crate::state::MAX_CLOCK, "frame count")?;
+        self.halted = halted;
+        self.stopped = stopped;
+        self.frames = frames;
+        self.waitcnt = waitcnt;
+        self.waits = WaitTable::from_waitcnt(waitcnt);
+        self.open_bus = open_bus;
+        self.bios_latch = bios_latch;
+        self.fetching_bios = fetching_bios;
+        self.postflg = postflg;
+        self.intr_wait = waiting.then_some(wanted);
+        self.fifo_latch = fifo_latch;
+        self.sio_regs = sio_regs;
+        r.tag(tag::IRQ)?;
+        self.irq.load_state(r)?;
+        r.tag(tag::TIMERS)?;
+        self.timers.load_state(r)?;
+        r.tag(tag::DMA)?;
+        self.dma.load_state(r)?;
+        r.tag(tag::PPU)?;
+        self.ppu.load_state(r)?;
+        let now = self.sched.now();
+        r.tag(tag::APU)?;
+        self.apu.load_state(r, now)?;
+        r.tag(tag::KEYPAD)?;
+        self.keypad.load_state(r)?;
+        r.tag(tag::PREFETCH)?;
+        self.prefetch.load_state(r, now)?;
+        r.tag(tag::CART)?;
+        self.cart.load_state(r, now)?;
+
+        // Relations between components.
+        self.timers.fifo_len = self.apu.fifo_lens();
+        self.timers.check_clock(now)?;
+        check(
+            self.prefetch.enabled == (waitcnt & WAITCNT_PREFETCH != 0),
+            "prefetch enable disagrees with WAITCNT",
+        )
     }
 
     /// Dispatch every event that is due. Called by the run loop after each CPU

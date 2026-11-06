@@ -90,19 +90,18 @@ impl Core for Gba {
         0
     }
 
-    /// GBA save states come in P3 (DECISIONS #62).
-    fn supports_save_state(&self) -> bool {
-        false
+    /// The cartridge options, BIOS identity and clock start (see
+    /// [`crate::replay`]).
+    fn recording_ext(&self) -> Vec<u8> {
+        crate::replay::encode_ext(self.options(), self.bios_hash(), self.rtc_start())
     }
 
-    /// Empty: there is no state format yet. A host checks
-    /// [`Core::supports_save_state`] first.
     fn save_state(&self) -> Vec<u8> {
-        Vec::new()
+        Gba::save_state(self)
     }
 
-    fn load_state(&mut self, _data: &[u8]) -> Result<(), StateError> {
-        Err(StateError::Invalid("GBA save states are not supported yet"))
+    fn load_state(&mut self, data: &[u8]) -> Result<(), StateError> {
+        Gba::load_state(self, data)
     }
 }
 
@@ -173,15 +172,23 @@ mod tests {
     }
 
     #[test]
-    fn save_states_are_not_supported_and_do_not_panic() {
+    fn save_states_work_through_the_trait_and_a_box() {
         let mut g = gba(None);
         let core: &mut dyn Core = &mut g;
-        assert!(!core.supports_save_state());
-        assert!(core.save_state().is_empty());
+        assert!(core.supports_save_state());
+        core.step_frame();
+        let snap = core.save_state();
+        assert!(!snap.is_empty());
+        core.step_frame();
+        assert_ne!(core.save_state(), snap);
+        core.load_state(&snap).unwrap();
+        assert_eq!(core.save_state(), snap);
         assert!(core.load_state(b"anything").is_err());
-        // Boxed, as the frontend holds it: the default must not leak through.
-        let boxed: Box<dyn Core> = Box::new(gba(None));
-        assert!(!boxed.supports_save_state());
+        // Boxed, as the frontend holds it: the defaults must not leak through.
+        let mut boxed: Box<dyn Core> = Box::new(gba(None));
+        assert!(boxed.supports_save_state());
+        boxed.load_state(&snap).unwrap();
+        assert_eq!(boxed.save_state(), snap);
     }
 
     #[test]

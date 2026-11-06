@@ -17,6 +17,8 @@
 
 use super::CartError;
 use crate::CYCLES_PER_SECOND;
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// Control register: bit 7 is the power-off flag (read-only; set when the clock
 /// lost power, cleared by reading the register or by a reset).
@@ -181,6 +183,61 @@ impl Rtc {
         r
     }
 
+    /// Every register, the sub-second count and the cycle they are valid for.
+    /// The fields are binary here (BCD only exists on the wire), so the save
+    /// stores them as they are.
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.control);
+        w.u8(self.year);
+        w.u8(self.month);
+        w.u8(self.day);
+        w.u8(self.weekday);
+        w.u8(self.hour);
+        w.u8(self.minute);
+        w.u8(self.second);
+        w.u32(self.subsecond);
+        w.u64(self.synced_at);
+    }
+
+    /// The clock never holds an impossible time (`write_datetime` and
+    /// `write_time` ignore a field that is not valid BCD in range), so every
+    /// field is range-checked, the day against its month and year. `synced_at`
+    /// is checked against the restored clock by the cart ([`Rtc::synced_at`]).
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let next = Self {
+            control: r.u8()?,
+            year: r.u8()?,
+            month: r.u8()?,
+            day: r.u8()?,
+            weekday: r.u8()?,
+            hour: r.u8()?,
+            minute: r.u8()?,
+            second: r.u8()?,
+            subsecond: r.u32()?,
+            synced_at: r.u64()?,
+        };
+        check(next.year <= 99, "RTC year")?;
+        check((1..=12).contains(&next.month), "RTC month")?;
+        check(
+            (1..=days_in_month(next.year, next.month)).contains(&next.day),
+            "RTC day",
+        )?;
+        check(next.weekday <= 6, "RTC weekday")?;
+        check(
+            next.hour <= 23 && next.minute <= 59 && next.second <= 59,
+            "RTC time of day",
+        )?;
+        check(u64::from(next.subsecond) < CPS, "RTC sub-second count")?;
+        check(next.synced_at < crate::state::MAX_CLOCK, "RTC sync time")?;
+        *self = next;
+        Ok(())
+    }
+
+    /// The master-clock cycle the fields are valid for.
+    pub fn synced_at(&self) -> u64 {
+        self.synced_at
+    }
+
     /// Force reset: every register to 0, except day and month which become 1.
     pub fn reset(&mut self) {
         *self = Self {
@@ -343,6 +400,11 @@ impl Rtc {
         if b[3] <= 6 {
             self.weekday = b[3];
         }
+        // A new month or year can leave the old day past its end (day 31, then
+        // month 2; 29 February, then a non-leap year). The S-3511 is not
+        // documented here; the clock never holds an impossible date, so the day
+        // is clamped to the last day of the month it is now in.
+        self.day = self.day.min(days_in_month(self.year, self.month));
         self.write_time([b[4], b[5], b[6]]);
     }
 
@@ -675,5 +737,37 @@ mod tests {
         assert!(broken(23, 1), "reserved");
         assert!(Rtc::from_footer(&f[..23], 0).is_err());
         assert!(Rtc::from_footer(&[f.as_slice(), &[0]].concat(), 0).is_err());
+    }
+
+    /// Writing the month or year alone must not leave the old day past the end of
+    /// the new month (code-review ST#2): the day is clamped, so the clock holds a
+    /// real date and a state taken from it loads.
+    #[test]
+    fn a_datetime_write_never_leaves_an_impossible_date() {
+        let load_back = |r: &Rtc| {
+            let mut w = StateWriter::new();
+            r.save_state(&mut w);
+            let bytes = w.into_bytes();
+            let mut back = Rtc::power_on();
+            back.load_state(&mut StateReader::new(&bytes))
+                .expect("a reachable clock state loads");
+            assert_eq!(&back, r);
+        };
+        // 31 January 2024 (leap year), then month = 02 with an unusable day byte.
+        let mut r = Rtc::power_on();
+        r.set_time(RtcTime::new(2024, 1, 31, 1, 2, 3).unwrap(), 0);
+        r.write_datetime([0x24, 0x02, 0xFF, 9, 0x01, 0x02, 0x03]);
+        assert_eq!((r.month, r.day), (2, 29));
+        load_back(&r);
+        // 29 February 2024, then the year becomes 2023.
+        let mut r = Rtc::power_on();
+        r.set_time(RtcTime::new(2024, 2, 29, 1, 2, 3).unwrap(), 0);
+        r.write_datetime([0x23, 0x02, 0xFF, 9, 0x01, 0x02, 0x03]);
+        assert_eq!((r.year, r.month, r.day), (23, 2, 28));
+        load_back(&r);
+        // A valid day in the same write is kept as written.
+        r.write_datetime([0x23, 0x04, 0x30, 9, 0x01, 0x02, 0x03]);
+        assert_eq!((r.month, r.day), (4, 30));
+        load_back(&r);
     }
 }

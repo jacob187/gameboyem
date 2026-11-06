@@ -56,7 +56,7 @@ If an existing `<rom>.sav` can't be read, isn't a regular file, is larger than a
 
 ## Save states
 
-Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **K** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr.
+Save states snapshot the whole machine, so you can save and resume anywhere, not just at a game's own save point. Press **K** to save to the current slot and **L** to load it. **1**–**9** pick the slot (default 1). Slot *n* is stored as `<rom>.ss<n>` next to the ROM and written atomically. The window title briefly shows the result, which is also printed to stderr. GBA games work the same way (a state is 0.55–0.68 MB). A GBA state is tied to the ROM and to how the session was started: it only loads with the same `--bios` dump (or none) and the same `--save-type` and `--rtc` options, and otherwise the load is refused with a message saying so and nothing changes.
 
 A state is tied to the exact ROM and the console model (DMG or Game Boy Color) it was taken with. A state from another ROM or model, a damaged file, or one from an incompatible version is rejected, and the running game is left untouched. States from before CGB support (format version 1) are DMG states and still load on a DMG. Because `--model auto` now starts CGB-flagged ROMs (header 0x143 = 0x80 or 0xC0) as a Game Boy Color, such a ROM refuses an old state with a message pointing to `--model dmg`; start it with that flag to load the state.
 
@@ -72,7 +72,7 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 | Select | Backspace or Right Shift |
 | Pause | P |
 | Fast-forward (hold) | Tab |
-| Save state / load state (not yet for GBA games) | K / L |
+| Save state / load state | K / L |
 | Select state slot | 1-9 |
 | Screenshot (and mark the frame) | C |
 | GBA L / R shoulders (GBA games only; ignored on a Game Boy) | Q / R |
@@ -80,9 +80,11 @@ Loading a state also rewinds battery RAM, and the next autosave writes that RAM 
 
 ## Recording, replay and screenshots
 
-Press **C** to save the exact 160×144 picture as a PNG next to the ROM, named `<rom>-f<frame>.png`. It is greyscale for a DMG, and RGB (RGB555 widened with no colour correction) for a Game Boy Color game in colour mode.
+Press **C** to save the exact 160×144 picture (240×160 for a GBA game) as a PNG next to the ROM, named `<rom>-f<frame>.png`. It is greyscale for a DMG, and RGB (RGB555 widened with no colour correction) for a Game Boy Color game in colour mode and for every GBA game.
 
 `gb --record session.gbinput game.gb` also records every button change, keyed by frame, plus the battery RAM and the console model (DMG or Game Boy Color, as `--model` resolved it) the session started from. The file grows by about 9 bytes per button change, which is roughly 20–100 KB per hour of play. Screenshots taken while recording mark their frame in the file. The window title shows `[rec]`.
+
+A GBA recording also stores what powers the machine on the way the session did: `--save-type`, `--rtc`, `--rtc-start` and, for `--bios`, the dump's hash (never the dump). `gb-test --replay` reads it back; a recording made with a real BIOS replays only with the same dump, `--replay session.gbinput game.gba --bios bios.bin`, and says so if it is missing or different.
 
 The core is deterministic, so a recording reproduces the session exactly without a window:
 

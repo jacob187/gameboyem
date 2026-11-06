@@ -192,9 +192,17 @@ pub trait Core {
     /// Boy: 0 DMG, 1 CGB); 0 where a system has only one.
     fn hw_variant(&self) -> u8;
 
+    /// System-specific bytes a recording stores after the variant, so that a
+    /// replay powers the machine on the way the session did (the GBA: cartridge
+    /// options, BIOS identity and clock start). At most 255 bytes; empty (the
+    /// default) writes a version 3 header.
+    fn recording_ext(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
     /// Whether [`Core::save_state`] and [`Core::load_state`] work. A core
-    /// that returns false has no state format yet (the GBA until P3); a host
-    /// must not call them, and says so instead. Defaults to true.
+    /// that returns false has no state format; a host must not call them, and
+    /// says so instead. Defaults to true.
     fn supports_save_state(&self) -> bool {
         true
     }
@@ -249,6 +257,9 @@ impl<T: Core + ?Sized> Core for Box<T> {
     }
     fn hw_variant(&self) -> u8 {
         (**self).hw_variant()
+    }
+    fn recording_ext(&self) -> Vec<u8> {
+        (**self).recording_ext()
     }
     fn supports_save_state(&self) -> bool {
         (**self).supports_save_state()

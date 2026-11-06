@@ -703,6 +703,7 @@ dependencies = [
  "ctrlc",
  "emu-common",
  "gb-core",
+ "gb-test",
  "gba-core",
  "pixels",
  "png",
@@ -714,10 +715,12 @@ dependencies = [
 name = "gb-test"
 version = "0.1.0"
 dependencies = [
+ "emu-common",
  "gb-core",
  "gba-core",
  "libtest-mimic",
  "png",
+ "tempfile",
 ]
 
 [[package]]

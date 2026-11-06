@@ -2,10 +2,45 @@
 
 use crate::bios::Bios;
 use crate::bus::Bus;
-use crate::cart::{Cart, CartError, CartOptions, RtcTime, SaveKind};
+use crate::cart::{Cart, CartError, CartOptions, RtcMode, RtcTime, SaveChoice, SaveKind};
 use crate::cpu::{Cpu, Registers};
 use crate::keypad::Button;
-use crate::{CYCLES_PER_FRAME, Framebuffer};
+use crate::state::{self, StateError, check, tag};
+use crate::{CYCLES_PER_FRAME, Framebuffer, MAX_STATE_BYTES};
+use emu_common::state::{StateReader, StateWriter};
+
+/// The clock start the host gave [`Gba::set_rtc`], as a state stores it: a flag
+/// and six fixed-width fields (zero when absent). It is host configuration that a
+/// recording's header reads back, so a loaded machine must agree with the state
+/// about it (code-review ST#8).
+fn save_rtc_start(w: &mut StateWriter, t: Option<RtcTime>) {
+    w.bool(t.is_some());
+    w.u16(t.map_or(0, |t| t.year()));
+    for v in t.map_or([0; 5], |t| {
+        [t.month(), t.day(), t.hour(), t.minute(), t.second()]
+    }) {
+        w.u8(v);
+    }
+}
+
+fn load_rtc_start(r: &mut StateReader) -> Result<Option<RtcTime>, StateError> {
+    let given = r.bool()?;
+    let year = r.u16()?;
+    let mut f = [0u8; 5];
+    for v in &mut f {
+        *v = r.u8()?;
+    }
+    if !given {
+        check(
+            year == 0 && f == [0; 5],
+            "clock start fields without a clock start",
+        )?;
+        return Ok(None);
+    }
+    RtcTime::new(year, f[0], f[1], f[2], f[3], f[4])
+        .map(Some)
+        .map_err(|_| StateError::Invalid("clock start"))
+}
 
 /// A complete Game Boy Advance: CPU + bus (which owns every other component).
 pub struct Gba {
@@ -13,6 +48,14 @@ pub struct Gba {
     bus: Bus,
     /// FNV-1a of the ROM image; ties save states and recordings to their ROM.
     rom_hash: u64,
+    /// What the host chose besides the ROM (`--save-type`, `--rtc`). Part of a
+    /// state's and a recording's header: they pick the backup chip and the clock.
+    options: CartOptions,
+    /// FNV-1a of the real BIOS dump, or 0 for the built-in HLE BIOS.
+    bios_hash: u64,
+    /// The time the host started the cartridge clock at ([`Gba::set_rtc`]); a
+    /// recording stores it so a replay starts the clock the same way.
+    rtc_start: Option<RtcTime>,
 }
 
 impl Gba {
@@ -37,13 +80,24 @@ impl Gba {
             Some(data) => (Cpu::reset(), Bios::Real(data)),
             None => (Cpu::post_bios(), Bios::Hle),
         };
+        let bios_hash = match &bios {
+            Bios::Hle => 0,
+            Bios::Real(data) => crate::fnv1a(data),
+        };
         let hle = matches!(bios, Bios::Hle);
         let mut bus = Bus::new(cart, bios);
         if hle {
             // P2-BIOS: the I/O and IWRAM state the BIOS leaves (DECISIONS #64).
             crate::bios::post_boot(&mut bus);
         }
-        Ok(Self { cpu, bus, rom_hash })
+        Ok(Self {
+            cpu,
+            bus,
+            rom_hash,
+            options,
+            bios_hash,
+            rtc_start: None,
+        })
     }
 
     /// Run until the next VBlank starts (one frame), with a two-frame safety cap.
@@ -198,7 +252,127 @@ impl Gba {
     /// clears the clock's power-loss flag. It does not add a footer to the save
     /// by itself; that waits for the game to use the clock.
     pub fn set_rtc(&mut self, t: RtcTime) {
+        self.rtc_start = Some(t);
         self.bus.cart.set_rtc(t, self.bus.sched.now());
+    }
+
+    /// The options the machine was built with.
+    pub fn options(&self) -> CartOptions {
+        self.options
+    }
+
+    /// FNV-1a of the real BIOS dump the machine boots through, `None` for the
+    /// built-in HLE BIOS.
+    pub fn bios_hash(&self) -> Option<u64> {
+        matches!(self.bus.bios, Bios::Real(_)).then_some(self.bios_hash)
+    }
+
+    /// The start time given to [`Gba::set_rtc`], if any.
+    pub fn rtc_start(&self) -> Option<RtcTime> {
+        self.rtc_start
+    }
+
+    /// Snapshot the whole machine (see [`crate::state`] for the format).
+    ///
+    /// Host configuration and buffers are not included: the audio sample rate,
+    /// undrained audio samples and the battery-save generation counter.
+    pub fn save_state(&self) -> Vec<u8> {
+        let mut w = StateWriter::with_capacity(MAX_STATE_BYTES);
+        w.bytes(&state::MAGIC);
+        w.u16(state::VERSION);
+        w.u64(self.rom_hash);
+        w.u8(self.bios_kind());
+        w.u64(self.bios_hash);
+        w.u8(self.options.save.id());
+        w.u8(self.options.rtc.id());
+        w.u8(tag::CPU);
+        self.cpu.save_state(&mut w);
+        self.bus.save_state(&mut w);
+        w.u8(tag::RTC_START);
+        save_rtc_start(&mut w, self.rtc_start);
+        w.into_bytes()
+    }
+
+    /// 0 for the built-in BIOS, 1 for a real dump.
+    fn bios_kind(&self) -> u8 {
+        u8::from(matches!(self.bus.bios, Bios::Real(_)))
+    }
+
+    /// Restore a snapshot from [`Gba::save_state`] taken with the same ROM, BIOS
+    /// and cartridge options.
+    ///
+    /// All-or-nothing: on error the machine is left exactly as it was. On
+    /// success buffered audio is discarded (it belongs to the old timeline), the
+    /// keypad holds whatever buttons were held when the state was saved (the host
+    /// should re-apply its current input), and [`Gba::battery_generation`]
+    /// advances so the host writes the restored save data.
+    ///
+    /// A different ROM is [`StateError::RomMismatch`]; a different BIOS kind or
+    /// dump, save type or clock option is [`StateError::ModelMismatch`].
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), StateError> {
+        let mut r = StateReader::new(data);
+        let mut magic = [0; 4];
+        r.bytes_into(&mut magic).map_err(|_| StateError::BadMagic)?;
+        if magic != state::MAGIC {
+            return Err(StateError::BadMagic);
+        }
+        let version = r.u16()?;
+        if version != state::VERSION {
+            return Err(StateError::UnsupportedVersion(version));
+        }
+        if r.u64()? != self.rom_hash {
+            return Err(StateError::RomMismatch);
+        }
+        let kind = r.u8()?;
+        let bios_hash = r.u64()?;
+        check(kind <= 1, "BIOS kind")?;
+        check(
+            kind == 1 || bios_hash == 0,
+            "BIOS hash of the built-in BIOS",
+        )?;
+        let save = SaveChoice::from_id(r.u8()?).ok_or(StateError::Invalid("save type"))?;
+        let rtc = RtcMode::from_id(r.u8()?).ok_or(StateError::Invalid("clock option"))?;
+        if kind != self.bios_kind()
+            || bios_hash != self.bios_hash
+            || save != self.options.save
+            || rtc != self.options.rtc
+        {
+            return Err(StateError::ModelMismatch);
+        }
+        // Load into a scratch machine and swap it in only on success, so a state
+        // that fails anywhere leaves this one untouched and nothing depends on
+        // this machine's own state passing the validators (code-review ST#1).
+        let mut next = self.scratch();
+        next.load_sections(r)?;
+        next.bus.cart.exchange_rom(&mut self.bus.cart);
+        next.bus.cart.bump_generation();
+        *self = next;
+        Ok(())
+    }
+
+    /// A powered-off machine of the same ROM, BIOS and options with the host's
+    /// audio rate and the cartridge's save generation, to load a state into. The
+    /// ROM stays with `self` until the load succeeded ([`Cart::exchange_rom`]).
+    fn scratch(&self) -> Self {
+        let mut bus = Bus::new(self.bus.cart.blank_like(), self.bus.bios.clone());
+        bus.apu.set_sample_rate(self.bus.apu.sample_rate());
+        Self {
+            cpu: Cpu::reset(),
+            bus,
+            rom_hash: self.rom_hash,
+            options: self.options,
+            bios_hash: self.bios_hash,
+            rtc_start: None,
+        }
+    }
+
+    fn load_sections(&mut self, mut r: StateReader) -> Result<(), StateError> {
+        r.tag(tag::CPU)?;
+        self.cpu.load_state(&mut r)?;
+        self.bus.load_state(&mut r)?;
+        r.tag(tag::RTC_START)?;
+        self.rtc_start = load_rtc_start(&mut r)?;
+        r.finish()
     }
 
     /// The cartridge clock's date and time now, in emulated time.
@@ -216,6 +390,9 @@ impl Gba {
         self.bus.frames
     }
 }
+
+#[cfg(test)]
+mod state_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,9 @@
 //! Keypad: KEYINPUT (0x0400_0130, active-low) and KEYCNT (0x0400_0132). Owned by
 //! P1-SYS; [`Button`] is a **Contract**.
 
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
 /// The ten GBA buttons, in KEYINPUT bit order (bit 0 = A ... bit 9 = L).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Button {
@@ -46,6 +49,24 @@ pub struct Keypad {
 pub const KEYCNT_MASK: u16 = 0xC3FF;
 
 impl Keypad {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u16(self.held);
+        w.u16(self.keycnt);
+        w.bool(self.irq_level);
+    }
+
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let (held, keycnt, irq_level) = (r.u16()?, r.u16()?, r.bool()?);
+        check(held <= 0x3FF, "held keys")?;
+        check(keycnt & !KEYCNT_MASK == 0, "KEYCNT")?;
+        *self = Self {
+            held,
+            keycnt,
+            irq_level,
+        };
+        Ok(())
+    }
+
     pub fn set(&mut self, b: Button, pressed: bool) {
         let bit = 1u16 << b as u16;
         if pressed {

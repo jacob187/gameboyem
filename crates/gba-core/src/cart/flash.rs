@@ -10,6 +10,9 @@
 ///
 /// 64 KiB: Panasonic MN63F805MNP (ID 0x1B32). 128 KiB: Sanyo LE26FV10N1TS (ID
 /// 0x1362). Both are on the list of commonly emulated chips (DECISIONS #53).
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
 const ID_64K: [u8; 2] = [0x32, 0x1B];
 const ID_128K: [u8; 2] = [0x62, 0x13];
 
@@ -51,8 +54,58 @@ impl Flash {
         }
     }
 
+    /// An erased chip of the same size.
+    pub fn blank_like(&self) -> Self {
+        Self::new(self.data.len())
+    }
+
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// The whole array, the command state machine (so a write sequence can be
+    /// interrupted between its bytes), ID mode, the armed erase and the bank.
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bytes(&self.data);
+        w.u8(match self.state {
+            State::Idle => 0,
+            State::Unlocked1 => 1,
+            State::Unlocked2 => 2,
+            State::Program => 3,
+            State::BankSelect => 4,
+        });
+        w.bool(self.id_mode);
+        w.bool(self.erase_armed);
+        w.u8(self.bank as u8);
+    }
+
+    /// The chip's size comes from the cartridge (the save type), not the file.
+    /// A 64 KiB chip has one bank and no bank-select command: a bank of 1 would
+    /// index past its array.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut data = vec![0; self.data.len()].into_boxed_slice();
+        r.bytes_into(&mut data)?;
+        let state = match r.u8()? {
+            0 => State::Idle,
+            1 => State::Unlocked1,
+            2 => State::Unlocked2,
+            3 => State::Program,
+            4 => State::BankSelect,
+            _ => return Err(StateError::Invalid("flash state")),
+        };
+        let (id_mode, erase_armed) = (r.bool()?, r.bool()?);
+        let bank = usize::from(r.u8()?);
+        let two_banks = data.len() == SIZE_128K;
+        check(bank <= usize::from(two_banks), "flash bank")?;
+        check(two_banks || state != State::BankSelect, "flash bank select")?;
+        *self = Self {
+            data,
+            state,
+            id_mode,
+            erase_armed,
+            bank,
+        };
+        Ok(())
     }
 
     /// Replace the contents (size already validated) and reset the command state.

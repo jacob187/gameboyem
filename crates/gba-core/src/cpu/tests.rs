@@ -166,6 +166,52 @@ fn msr_in_user_mode_only_changes_the_flags() {
     assert_eq!(cpu.registers().cpsr & 0x1F, 0x10);
 }
 
+/// MSR can set the state bit (as the SingleStepTests reference does; ARMv4T
+/// calls it UNPREDICTABLE) and nothing refills the pipeline, so the next step
+/// runs the ARM words already fetched as Thumb. That used to panic in
+/// `THUMB[op >> 6]` (code-review ST#9, correcting P1-CPU C#3); the opcode is
+/// now masked to 16 bits. Guest code must never be able to panic the host.
+#[test]
+fn msr_setting_the_thumb_bit_does_not_panic() {
+    let (mut cpu, mut ram) = setup(
+        &[
+            MSR_CPSR_C | 0x3F, // System | T
+            0xE3A0_1001,       // mov r1, #1 (executes as a Thumb halfword now)
+            0xE3A0_2002,
+            0xE3A0_3003,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF,
+        ],
+        |_| {},
+    );
+    run(&mut cpu, &mut ram, 6);
+    assert_eq!(cpu.registers().cpsr & 0x20, 0x20, "T was set, as written");
+    // Through a register source from a privileged mode.
+    let (mut cpu, mut ram) = setup(
+        &[
+            0xE3A0_001F, // mov r0, #0x1F
+            0xE380_0020, // orr r0, r0, #0x20
+            0xE129_F000, // msr cpsr_fc, r0
+            0xE3A0_1005,
+            0xE3A0_2006,
+        ],
+        |_| {},
+    );
+    run(&mut cpu, &mut ram, 8);
+    assert_eq!(cpu.registers().cpsr & 0x20, 0x20);
+}
+
+/// The Thumb decode cannot index past its table whatever the pipeline holds (a
+/// loaded state, or any future path that lets the two disagree).
+#[test]
+fn thumb_state_with_a_wide_pipeline_opcode_does_not_panic() {
+    let (mut cpu, mut ram) = setup(&[0; 4], |s| {
+        s.cpsr = 0x3F; // System, Thumb
+        s.pipeline = [0xE3A0_0001, 0xFFFF_FFFF];
+    });
+    run(&mut cpu, &mut ram, 3);
+}
+
 #[test]
 fn ldm_with_empty_list_loads_pc_and_moves_base_by_0x40() {
     // ldmia r0!, {}

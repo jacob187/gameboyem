@@ -18,6 +18,8 @@
 //! one event per overflow, at the overflow's own cycle.
 
 use crate::scheduler::{Event, Scheduler};
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// Cycles between enabling a timer and its first counted tick. GBATEK doesn't
 /// give the figure; two cycles is the commonly measured value (DECISIONS #54).
@@ -70,6 +72,53 @@ pub struct Timers {
 }
 
 impl Timers {
+    /// The four timers and `sound`. `fifo_len` is not written: it mirrors the
+    /// APU's FIFOs, so the bus sets it from them after loading
+    /// ([`crate::bus::Bus::load_state`]), and the two cannot disagree. The overflow
+    /// events live in the scheduler's section and are restored verbatim, not
+    /// re-derived (DECISIONS #73).
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        for t in &self.t {
+            w.u16(t.reload);
+            w.u16(t.control);
+            w.u16(t.counter);
+            w.u64(t.start);
+        }
+        for s in self.sound {
+            w.bool(s);
+        }
+    }
+
+    /// `control` is stored through `& 0xC7` (timer 0 also without count-up), and
+    /// `start` is never past the clock plus the start delay (the bus checks that
+    /// against the restored clock, [`Timers::check_clock`]).
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut t = [Timer::default(); 4];
+        for (n, timer) in t.iter_mut().enumerate() {
+            *timer = Timer {
+                reload: r.u16()?,
+                control: r.u16()?,
+                counter: r.u16()?,
+                start: r.u64()?,
+            };
+            check(timer.control & !0xC7 == 0, "timer control")?;
+            check(n > 0 || timer.control & 4 == 0, "timer 0 count-up")?;
+        }
+        let sound = [r.bool()?, r.bool()?];
+        self.t = t;
+        self.sound = sound;
+        Ok(())
+    }
+
+    /// Reject a `start` that is ahead of what the clock allows: prescaled
+    /// timers compute `start + (ticks << shift)`.
+    pub(crate) fn check_clock(&self, now: u64) -> Result<(), StateError> {
+        check(
+            self.t.iter().all(|t| t.start <= now + START_DELAY),
+            "timer start is in the future",
+        )
+    }
+
     fn countup(&self, n: usize) -> bool {
         n > 0 && self.t[n].control & 4 != 0
     }

@@ -236,17 +236,3 @@ fn a_fifo_timer_stops_being_observed_once_the_sound_dma_is_off_and_the_fifo_is_d
     b.write32(0x0400_00A0, 0x0101_0101, N);
     assert!(pending(&b, 0));
 }
-
-#[test]
-fn rederiving_after_a_load_rebuilds_the_events() {
-    let mut b = bus();
-    b.write16(0x0400_0082, 0x0304, N);
-    b.write32(0x0400_00A0, 0x0101_0101, N);
-    start(&mut b, 0, 0xFFF0, 0);
-    start(&mut b, 1, 0xFFF0, IRQ);
-    // Forget the derived state, as a loaded snapshot of the scheduler might.
-    b.timers.sound = [false, false];
-    b.sched.cancel(Event::TimerOverflow(0));
-    b.rederive_timer_events();
-    assert!(b.timers.sound[0] && pending(&b, 0) && pending(&b, 1));
-}

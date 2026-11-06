@@ -12,7 +12,9 @@
 //! [`PpuSignals`] for the bus to apply.
 
 use crate::scheduler::{Event, Scheduler};
+use crate::state::{StateError, check, get_u16s, put_u16s};
 use crate::{CYCLES_PER_LINE, Framebuffer, LINES_PER_FRAME, SCREEN_HEIGHT, SCREEN_WIDTH};
+use emu_common::state::{StateReader, StateWriter};
 
 mod bg;
 mod effects;
@@ -115,6 +117,50 @@ impl Ppu {
             back: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             front: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
         }
+    }
+
+    /// Palette, VRAM, OAM, the I/O registers, the affine reference points, the
+    /// line counter, the HBlank flag and both framebuffers (DECISIONS #73). The
+    /// back buffer is mid-frame (lines above `vcount` are drawn), so it cannot be
+    /// re-rendered from the registers; the per-line layer buffers are scratch that
+    /// every line fills before reading, and are not saved.
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.bytes(&self.palette[..]);
+        w.bytes(&self.vram[..]);
+        w.bytes(&self.oam[..]);
+        put_u16s(w, &self.io);
+        for axis in self.affine_latch {
+            for v in axis {
+                w.i32(v);
+            }
+        }
+        w.u16(self.vcount);
+        w.bool(self.hblank);
+        put_u16s(w, &self.back[..]);
+        put_u16s(w, &self.front[..]);
+    }
+
+    /// `vcount` is a line of the frame, and each reference point is a 28-bit
+    /// value sign-extended to 32 (the renderer's arithmetic assumes it).
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut next = Self::new();
+        r.bytes_into(&mut next.palette[..])?;
+        r.bytes_into(&mut next.vram[..])?;
+        r.bytes_into(&mut next.oam[..])?;
+        get_u16s(r, &mut next.io)?;
+        for axis in &mut next.affine_latch {
+            for v in axis {
+                *v = r.i32()?;
+                check(sign_extend_28(*v) == *v, "affine reference point")?;
+            }
+        }
+        next.vcount = r.u16()?;
+        check(next.vcount < LINES_PER_FRAME as u16, "VCOUNT")?;
+        next.hblank = r.bool()?;
+        get_u16s(r, &mut next.back[..])?;
+        get_u16s(r, &mut next.front[..])?;
+        *self = next;
+        Ok(())
     }
 
     /// Schedule the first line's events, relative to the current clock (line 0

@@ -20,6 +20,7 @@ mod memops;
 
 use crate::bus::{Access, Bus, CpuBus, SwiResult, Width};
 
+#[derive(Clone)]
 pub enum Bios {
     /// HLE: SWIs are emulated in Rust; the BIOS region holds the built-in image
     /// ([`image::IMAGE`]) instead of Nintendo's code.

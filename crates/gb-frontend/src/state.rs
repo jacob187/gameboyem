@@ -24,7 +24,7 @@ const GB_MAX_STATE_BYTES: u64 = 512 * 1024;
 pub fn max_state_bytes(system: System) -> u64 {
     match system {
         System::Gb => GB_MAX_STATE_BYTES,
-        // From the core; P3 tightens it once a GBA state exists.
+        // From the core: the real worst case (128 KiB flash) plus a little.
         System::Gba => gba_core::MAX_STATE_BYTES as u64,
     }
 }
@@ -41,8 +41,8 @@ pub fn state_path(rom: &Path, slot: u8) -> PathBuf {
     }
 }
 
-/// The text for a failed `load_state`. A Game Boy model mismatch names the way
-/// out: a pre-CGB (v1) state is a DMG one, and `--model auto` now starts
+/// The text for a failed `load_state`. A GBA mismatch names the options a state
+/// is tied to. A Game Boy model mismatch names the way out: a pre-CGB (v1) state is a DMG one, and `--model auto` now starts
 /// CGB-flagged ROMs as a Game Boy Color, so they need `--model dmg` to load it.
 /// `variant` is [`Core::hw_variant`] (Game Boy: 0 DMG, 1 CGB).
 fn load_error(e: &StateError, system: System, variant: u8) -> String {
@@ -52,6 +52,10 @@ fn load_error(e: &StateError, system: System, variant: u8) -> String {
         }
         (StateError::ModelMismatch, System::Gb, _) => {
             format!("{e}; this session is a DMG, for a Game Boy Color state start with --model cgb")
+        }
+        // A GBA state is tied to the BIOS and the cartridge options it ran with.
+        (StateError::ModelMismatch, System::Gba, _) => {
+            format!("{e}; start with the same --bios, --save-type and --rtc as when it was saved")
         }
         _ => e.to_string(),
     }

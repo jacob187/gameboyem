@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use emu_common::replay::{Event, Record};
-use emu_common::{Button, Core, FrameRef, Pixels as FramePixels, System};
+use emu_common::{Button, Core, FrameRef, Pixels as FramePixels};
 use gb_core::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
@@ -65,14 +65,6 @@ fn window_title(game: &str) -> String {
         "gb".to_owned()
     } else {
         format!("gb - {game}")
-    }
-}
-
-/// How the console is named in a message to the user.
-fn system_label(system: System) -> &'static str {
-    match system {
-        System::Gb => "Game Boy",
-        System::Gba => "GBA",
     }
 }
 
@@ -275,29 +267,12 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// Say so, instead of touching a slot file, if the core has no state format
-    /// (the GBA until P3). True when states are available.
-    fn states_available(&mut self) -> bool {
-        if self.core.supports_save_state() {
-            return true;
-        }
-        let label = system_label(self.core.system());
-        self.show_status(format!("save states are not supported for {label} yet"));
-        false
-    }
-
     fn save_state(&mut self) {
-        if !self.states_available() {
-            return;
-        }
         let msg = self.states.save(&self.core).unwrap_or_else(|e| e);
         self.show_status(msg);
     }
 
     fn load_state(&mut self) {
-        if !self.states_available() {
-            return;
-        }
         match self.states.load(&mut self.core) {
             Ok(msg) => {
                 // The state replaces the machine (and the frame it is on), so
@@ -635,6 +610,7 @@ impl<C: Core> ApplicationHandler for App<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use emu_common::System;
     use gb_core::{FRAMES_PER_SECOND, GameBoy, M_CYCLES_PER_FRAME, Model};
     use gba_core::Gba;
     use std::fs;
@@ -1066,32 +1042,198 @@ mod tests {
         present(&f, &app.palette, &mut rgba);
     }
 
-    /// K and L on a GBA say so and touch nothing: no slot file, the recording
-    /// goes on, and the answer comes through `Box<dyn Core>` (a defaulted trait
-    /// method that was not forwarded would say "supported").
+    /// K and L on a GBA, held as the `Box<dyn Core>` `main` builds, write a slot
+    /// file and restore from it: a state taken at one frame comes back after the
+    /// machine has run on.
     #[test]
-    fn save_state_keys_on_a_gba_say_so_and_write_nothing() {
+    fn save_state_keys_on_a_gba_round_trip_through_a_slot() {
         let dir = tempfile::tempdir().unwrap();
         let core: Box<dyn Core> = Box::new(Gba::new(gba_rom(), None).unwrap());
         let mut app = gba_app(dir.path(), core);
         app.step_once();
+        let snap = app.core.save_state();
         app.save_state();
-        assert_eq!(
-            app.status.as_ref().unwrap().0,
-            "save states are not supported for GBA yet"
-        );
-        app.status = None;
-        app.load_state();
-        assert!(
-            app.status
-                .as_ref()
-                .unwrap()
-                .0
-                .contains("not supported for GBA")
-        );
-        for n in 1..=9 {
-            assert!(!dir.path().join(format!("g.ss{n}")).exists());
+        assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
+        let slot = fs::read(dir.path().join("g.ss1")).unwrap();
+        assert_eq!(slot, snap);
+        assert!(slot.len() <= gba_core::MAX_STATE_BYTES);
+        for _ in 0..4 {
+            app.step_once();
         }
+        assert_ne!(app.core.save_state(), snap);
+        app.load_state();
+        assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
+        assert_eq!(app.core.save_state(), snap);
+    }
+
+    /// A state of a GBA session started with other options or another BIOS says
+    /// what to match, and a corrupt slot leaves the machine as it was.
+    #[test]
+    fn a_gba_state_load_failure_names_the_cause_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = Gba::with_options(
+            gba_rom(),
+            None,
+            gba_core::CartOptions {
+                save: gba_core::SaveChoice::Sram,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::write(dir.path().join("g.ss1"), other.save_state()).unwrap();
+        let mut app = gba_app(dir.path(), Gba::new(gba_rom(), None).unwrap());
+        app.step_once();
+        let before = app.core.save_state();
+        app.load_state();
+        let msg = app.status.as_ref().unwrap().0.clone();
+        assert!(
+            msg.contains("--bios") && msg.contains("--save-type"),
+            "{msg}"
+        );
+        assert_eq!(app.core.save_state(), before);
+
+        let mut bad = before.clone();
+        bad.truncate(bad.len() / 2);
+        fs::write(dir.path().join("g.ss1"), bad).unwrap();
+        app.load_state();
+        assert!(app.status.as_ref().unwrap().0.contains("truncated"));
+        assert_eq!(app.core.save_state(), before);
+    }
+
+    /// A GBA ROM that copies KEYINPUT into palette entry 0 forever: with no layer
+    /// enabled the backdrop shows it, so the picture follows the buttons.
+    fn gba_keypad_rom() -> Vec<u8> {
+        const AL: u32 = 0xE000_0000;
+        let imm = |v: u32| -> u32 {
+            (0..16)
+                .find_map(|rot| {
+                    let r = v.rotate_left(rot * 2);
+                    (r <= 0xFF).then_some(rot << 8 | r)
+                })
+                .expect("encodable immediate")
+        };
+        let mov = |rd: u32, v: u32| AL | 1 << 25 | 13 << 21 | rd << 12 | imm(v);
+        let add = |rd: u32, rn: u32, v: u32| AL | 1 << 25 | 4 << 21 | rn << 16 | rd << 12 | imm(v);
+        let half = |load: u32, rd: u32, rn: u32| {
+            AL | 1 << 24 | 1 << 23 | 1 << 22 | load << 20 | rn << 16 | rd << 12 | 0xB0
+        };
+        let words = [
+            mov(0, 0x0400_0000),
+            add(0, 0, 0x130), // KEYINPUT
+            mov(1, 0x0500_0000),
+            half(1, 2, 0),                // loop: ldrh r2, [r0]
+            half(0, 2, 1),                //       strh r2, [r1]
+            AL | 0x0A00_0000 | 0xFF_FFFC, //       b loop (-4 words + 8)
+        ];
+        let mut rom = vec![0u8; 0x400];
+        for (i, w) in words.iter().enumerate() {
+            rom[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        rom
+    }
+
+    /// The whole loop for a GBA: play with `--record` (cartridge options, a clock
+    /// start and a screenshot included), then replay with `gba_core::replay` and
+    /// get the identical machine, the identical screenshot bytes, and the same PNG
+    /// `gb-test --replay` writes for that frame.
+    #[test]
+    fn a_gba_recording_replays_to_the_identical_state_and_screenshot() {
+        use emu_common::replay::rom_hash;
+        use gba_core::replay::{Recording, Replayer};
+        use gba_core::{CartOptions, RtcMode, RtcTime, SaveChoice};
+        use winit::keyboard::KeyCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom_path = dir.path().join("g.gba");
+        let rom = gba_keypad_rom();
+        let options = CartOptions {
+            save: SaveChoice::Sram,
+            rtc: RtcMode::On,
+        };
+        let start = RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap();
+        let mut gba = Gba::with_options(rom.clone(), None, options).unwrap();
+        gba.set_rtc(start);
+        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        saves.load(&mut gba);
+        let rec_path = dir.path().join("s.gbinput");
+        let header = record::header_for(&gba, rom_hash(&rom));
+        assert!(!header.ext.is_empty(), "a GBA header carries its options");
+        let mut app = App::new(
+            gba,
+            Storage {
+                saves,
+                states: StateSlots::new(&rom_path),
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(rom_path.clone())
+        .with_recorder(Some(Recorder::create(&rec_path, &header).unwrap()));
+
+        let frames = |app: &mut App<Gba>, n: u32| (0..n).for_each(|_| _ = app.step_once());
+        frames(&mut app, 2);
+        app.on_key_input(KeyCode::ArrowRight, true);
+        frames(&mut app, 3);
+        app.on_key_input(KeyCode::ArrowLeft, true); // press and release in one frame
+        app.on_key_input(KeyCode::ArrowLeft, false);
+        frames(&mut app, 2);
+        app.on_key_input(KeyCode::KeyR, true); // the R shoulder
+        frames(&mut app, 1);
+        app.release_all_buttons();
+        app.on_key_input(KeyCode::ArrowRight, true);
+        frames(&mut app, 1);
+        app.on_key_input(KeyCode::KeyC, true); // screenshot + marker
+        let marker = app.frame;
+        frames(&mut app, 4);
+        let total = app.frame;
+        app.recorder.as_mut().unwrap().finish(total);
+
+        let rec = Recording::decode(&fs::read(&rec_path).unwrap()).unwrap();
+        assert_eq!(rec.end_frame, Some(total));
+        assert_eq!(rec.markers(), vec![marker]);
+        assert_eq!(rec.header.options, options);
+        assert_eq!(rec.header.rtc_start, Some(start));
+        assert_eq!(rec.header.bios_hash, None);
+
+        let mut gba = rec.power_on(rom, None).unwrap();
+        let mut player = Replayer::new(&rec);
+        let mut audio = Vec::new();
+        let mut step = |gba: &mut Gba, to: u64| {
+            while player.frame() < to {
+                player.step_frame(gba);
+                audio.clear();
+                gba.drain_audio_into(&mut audio);
+            }
+        };
+        step(&mut gba, marker);
+        let shot = fs::read(record::screenshot_path(&rom_path, marker)).unwrap();
+        let replayed = dir.path().join("replayed.png");
+        record::write_png(Core::frame(&gba), &replayed).unwrap();
+        assert_eq!(
+            fs::read(&replayed).unwrap(),
+            shot,
+            "screenshot == replayed frame"
+        );
+        let tool = dir.path().join("gb-test.png");
+        gb_test::gba::save_gba_png(&gba.framebuffer()[..], &tool).unwrap();
+        assert_eq!(
+            fs::read(&tool).unwrap(),
+            shot,
+            "gb-test's PNG == the frontend's screenshot, byte for byte"
+        );
+        step(&mut gba, total);
+        assert_eq!(gba.cycles(), app.core.cycles());
+        assert_eq!(gba.cpu_registers(), app.core.cpu_registers());
+        assert_eq!(gba.framebuffer()[..], app.core.framebuffer()[..]);
+        assert_eq!(gba.save_state(), app.core.save_state(), "the whole machine");
+        assert_eq!(
+            gba.framebuffer()[0] & 0x3FF,
+            0x3FF & !0x010,
+            "Right held: the palette followed KEYINPUT"
+        );
     }
 
     /// L and R (Q and R on the keyboard) reach a GBA and its recording, which

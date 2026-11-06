@@ -6,6 +6,11 @@
 //! the seed on restart is 0x40 / 0x4000.
 
 use super::common::{Envelope, Length};
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
+/// The longest LFSR period: ratio 7 (448 cycles) at shift clock 15.
+const MAX_PERIOD: u32 = 448 << 15;
 
 #[derive(Clone, Debug)]
 pub(super) struct Noise {
@@ -33,6 +38,31 @@ impl Noise {
             length: Length::new(64),
             env: Envelope::default(),
         }
+    }
+
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.u8(self.nr43);
+        w.u16(self.lfsr);
+        w.bool(self.high);
+        w.u32(self.timer);
+        self.length.save_state(w);
+        self.env.save_state(w);
+    }
+
+    /// The timer counts down from at most the longest period and is never zero.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut next = Self::new();
+        next.enabled = r.bool()?;
+        next.nr43 = r.u8()?;
+        next.lfsr = r.u16()?;
+        next.high = r.bool()?;
+        next.timer = r.u32()?;
+        next.length.load_state(r)?;
+        next.env.load_state(r)?;
+        check((1..=MAX_PERIOD).contains(&next.timer), "noise timer")?;
+        *self = next;
+        Ok(())
     }
 
     pub fn reset(&mut self) {

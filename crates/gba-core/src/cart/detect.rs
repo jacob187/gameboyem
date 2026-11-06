@@ -29,6 +29,35 @@ pub enum SaveChoice {
     Eeprom8k,
 }
 
+impl SaveChoice {
+    /// The byte a save state or a recording stores.
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::None => 1,
+            Self::Sram => 2,
+            Self::Flash64 => 3,
+            Self::Flash128 => 4,
+            Self::Eeprom512 => 5,
+            Self::Eeprom8k => 6,
+        }
+    }
+
+    /// The inverse of [`SaveChoice::id`]; `None` for a byte no choice writes.
+    pub const fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            0 => Self::Auto,
+            1 => Self::None,
+            2 => Self::Sram,
+            3 => Self::Flash64,
+            4 => Self::Flash128,
+            5 => Self::Eeprom512,
+            6 => Self::Eeprom8k,
+            _ => return Option::None,
+        })
+    }
+}
+
 /// ID strings (the version digits after `_V` are ignored), in no particular order.
 const IDS: [(&[u8], SaveKind); 6] = [
     (b"EEPROM_V", SaveKind::Eeprom),

@@ -8,6 +8,8 @@
 //! the second bank, the dimension bit and the forced 75% volume.
 
 use super::common::Length;
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// CPU cycles per wave digit: the sample rate is `2097152 / (2048 - n)` Hz
 /// (GBATEK SOUND3CNT_X), i.e. `8 * (2048 - n)` cycles at 16.78 MHz.
@@ -53,6 +55,53 @@ impl Wave {
             length: Length::new(256),
             ram: [[0; 16]; 2],
         }
+    }
+
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.bool(self.dac);
+        w.bool(self.two_banks);
+        w.u8(self.bank);
+        w.u8(self.level);
+        w.bool(self.force_75);
+        w.u16(self.freq);
+        w.u32(self.timer);
+        w.u8(self.pos);
+        w.u8(self.sample);
+        self.length.save_state(w);
+        w.bytes(&self.ram[0]);
+        w.bytes(&self.ram[1]);
+    }
+
+    /// `bank` picks one of two RAM banks, `pos` is a digit of the 64-digit
+    /// pattern, `sample` a 4-bit digit, and the timer a countdown from one
+    /// period (never zero). `pos` may be 32 or more with one bank selected:
+    /// clearing the dimension bit (NR30) mid-play leaves it where it was (see the
+    /// test `pos_past_32_with_one_bank_is_reachable`), so it is not refused.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut next = Self::new();
+        next.enabled = r.bool()?;
+        next.dac = r.bool()?;
+        next.two_banks = r.bool()?;
+        next.bank = r.u8()?;
+        next.level = r.u8()?;
+        next.force_75 = r.bool()?;
+        next.freq = r.u16()?;
+        next.timer = r.u32()?;
+        next.pos = r.u8()?;
+        next.sample = r.u8()?;
+        next.length.load_state(r)?;
+        r.bytes_into(&mut next.ram[0])?;
+        r.bytes_into(&mut next.ram[1])?;
+        check(next.bank <= 1 && next.level <= 3, "wave bank or level")?;
+        check(next.freq <= 2047, "wave frequency")?;
+        check(
+            (1..=DIGIT_CYCLES * 2048).contains(&next.timer),
+            "wave timer",
+        )?;
+        check(next.pos < 64 && next.sample <= 15, "wave position")?;
+        *self = next;
+        Ok(())
     }
 
     /// SOUNDCNT_X bit 7 cleared: the registers reset, wave RAM is kept.
@@ -176,6 +225,27 @@ impl Wave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clearing the dimension bit while the pattern is in its second half leaves
+    /// `pos` at 32..=63 with one bank selected, so a state with that must load.
+    #[test]
+    fn pos_past_32_with_one_bank_is_reachable() {
+        let mut w = Wave::new();
+        w.write_nr30(0xA0); // DAC on, two banks
+        w.write_freq_hi_ctrl(0x80 | 7, false);
+        for _ in 0..40 {
+            w.advance(w.next_step().unwrap());
+        }
+        assert_eq!(w.pos, 40);
+        w.write_nr30(0x80); // one bank
+        assert!(w.pos >= 32 && !w.two_banks);
+        let mut out = StateWriter::new();
+        w.save_state(&mut out);
+        let bytes = out.into_bytes();
+        let mut back = Wave::new();
+        back.load_state(&mut StateReader::new(&bytes)).unwrap();
+        assert_eq!(back.pos, 40);
+    }
 
     fn playing(nr30: u8, level: u8, force: bool) -> Wave {
         let mut w = Wave::new();

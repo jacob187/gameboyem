@@ -10,6 +10,8 @@
 
 use crate::bus::{Access, Bus, Width};
 use crate::irq::Interrupt;
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// Why a DMA might start. **Contract.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,63 @@ pub struct Dma {
 }
 
 impl Dma {
+    /// All four channels with both the visible registers and the internal latched
+    /// ones, the active set and the bus latch (DECISIONS #73).
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        for c in &self.ch {
+            w.u32(c.sad);
+            w.u32(c.dad);
+            w.u16(c.count);
+            w.u16(c.control);
+            w.u32(c.src);
+            w.u32(c.dst);
+            w.u32(c.remaining);
+            w.bool(c.first);
+            w.bool(c.fresh);
+        }
+        w.u8(self.active);
+        w.u32(self.latch);
+    }
+
+    /// An enabled channel has between 1 and its maximum units left (`remaining`
+    /// is decremented per unit, and latched from the count on enabling, on every
+    /// repeat and as 4 for a sound FIFO), and an active channel is enabled
+    /// (disabling clears the active bit). `control` holds only the stored bits.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut dma = Self::default();
+        for (n, c) in dma.ch.iter_mut().enumerate() {
+            *c = Channel {
+                sad: r.u32()?,
+                dad: r.u32()?,
+                count: r.u16()?,
+                control: r.u16()?,
+                src: r.u32()?,
+                dst: r.u32()?,
+                remaining: r.u32()?,
+                first: r.bool()?,
+                fresh: r.bool()?,
+            };
+            check(c.control & !control_mask(n) == 0, "DMA control")?;
+            let max = if n == 3 { 0x1_0000 } else { 0x4000 };
+            check(c.remaining <= max, "DMA remaining units")?;
+            check(
+                !c.enabled() || c.remaining >= 1,
+                "enabled DMA with no units",
+            )?;
+        }
+        dma.active = r.u8()?;
+        dma.latch = r.u32()?;
+        check(dma.active <= 0xF, "DMA active set")?;
+        for (n, c) in dma.ch.iter().enumerate() {
+            check(
+                dma.active & (1 << n) == 0 || c.enabled(),
+                "active DMA channel is not enabled",
+            )?;
+        }
+        *self = dma;
+        Ok(())
+    }
+
     /// Start every enabled channel whose start timing matches `t`. **Contract.**
     pub fn trigger(&mut self, t: DmaTrigger) {
         for n in 0..4 {
