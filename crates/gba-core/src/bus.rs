@@ -10,9 +10,9 @@
 //! Every `CpuBus` access first advances the master clock by [`Bus::cost`] (1 cycle
 //! plus the region's wait states for that width and [`Access`] kind), then does its
 //! effect, so a timer read sees the clock at the end of its own access. Events
-//! that fall due are dispatched by the run loop after the instruction. All
-//! cartridge-ROM costs go through [`Bus::rom_cost`]; that is where the P3-TIMING
-//! prefetch buffer hooks in (see its doc).
+//! that fall due are dispatched by the run loop after the instruction. Cartridge-ROM
+//! costs come from [`WaitTable::rom_access`]; opcode fetches from ROM go through the
+//! prefetch buffer ([`crate::prefetch`]) when WAITCNT bit 14 is set.
 
 use crate::apu::Apu;
 use crate::bios::Bios;
@@ -20,6 +20,7 @@ use crate::cart::Cart;
 use crate::dma::{Dma, DmaTrigger};
 use crate::irq::Irq;
 use crate::memory::rd;
+use crate::prefetch::Prefetch;
 use crate::keypad::Keypad;
 use crate::ppu::Ppu;
 use crate::scheduler::{Event, Scheduler};
@@ -108,6 +109,18 @@ pub struct WaitTable {
 }
 
 impl WaitTable {
+    /// Cycles for a cartridge-ROM access at `addr`, 16-bit or (`wide`) 32-bit. A
+    /// sequential access is only sequential if the CPU/DMA says so *and* it
+    /// doesn't start a new 128 KiB page (the cart's address latch rolls over;
+    /// GBATEK "GBA Cart ROM" / nba hw-test `128kb-boundary`). A word is two
+    /// halfword accesses: N+S, or S+S.
+    #[inline]
+    pub fn rom_access(&self, addr: u32, wide: bool, access: Access) -> u64 {
+        let ws = ((addr >> 25) & 3) as usize;
+        let seq = access == Access::Seq && addr & 0x1_FFFF != 0;
+        u64::from(self.rom[ws][usize::from(seq)][usize::from(wide)])
+    }
+
     pub fn from_waitcnt(w: u16) -> Self {
         const N: [u8; 4] = [4, 3, 2, 8];
         const S: [[u8; 2]; 3] = [[2, 1], [4, 1], [8, 1]];
@@ -149,6 +162,8 @@ pub struct Bus {
     /// WAITCNT (0x0400_0204) and the costs derived from it.
     pub waitcnt: u16,
     pub waits: WaitTable,
+    /// The GamePak prefetch buffer (WAITCNT bit 14, DECISIONS #70).
+    pub prefetch: Prefetch,
     /// The last value the CPU fetched, replicated to 32 bits for a halfword
     /// fetch: what unmapped regions read as (open bus, DECISIONS #52).
     pub open_bus: u32,
@@ -187,6 +202,7 @@ impl Bus {
             frames: 0,
             waitcnt: 0,
             waits: WaitTable::from_waitcnt(0),
+            prefetch: Prefetch::default(),
             open_bus: 0,
             // What the BIOS leaves behind after startup (GBATEK "BIOS Memory
             // Protection"); P2-BIOS refines it.
@@ -298,21 +314,25 @@ impl Bus {
         }
     }
 
-    /// Cost of a cartridge ROM access.
-    ///
-    /// A sequential access is only sequential if the CPU/DMA says so *and* it
-    /// doesn't start a new 128 KiB page (the cart's address latch rolls over;
-    /// GBATEK "GBA Cart ROM" / nba hw-test `128kb-boundary`).
-    ///
-    /// P3-TIMING: the prefetch buffer hooks in here. `fetch` is true for opcode
-    /// fetches (the only accesses the buffer serves); a buffered opcode would
-    /// cost 1 cycle, and every other ROM access would first have to account for
-    /// the prefetch in flight. The caller already passes everything needed.
+    /// Cost of a cartridge ROM access without the prefetch buffer: the
+    /// [`WaitTable`] entry (see [`WaitTable::rom_access`]). Pure, so the HLE BIOS
+    /// can use it for its bookkeeping; the CPU and DMA go through
+    /// [`Bus::access_cost`] and [`Bus::rom_fetch_cost`], which also keep the prefetch
+    /// buffer's state.
     #[inline]
     pub fn rom_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
-        let ws = ((addr >> 25) & 3) as usize;
-        let seq = access == Access::Seq && addr & 0x1_FFFF != 0;
-        u64::from(self.waits.rom[ws][usize::from(seq)][usize::from(w == Width::W)])
+        self.waits.rom_access(addr, w == Width::W, access)
+    }
+
+    /// Cost of a (non-fetch) access, updating the prefetch buffer when the access
+    /// uses the cartridge bus. Used by the CPU and DMA.
+    #[inline]
+    pub fn access_cost(&mut self, addr: u32, w: Width, access: Access) -> u64 {
+        let c = self.cost(addr, w, access);
+        if self.prefetch.enabled && (0x08..=0x0D).contains(&(addr >> 24)) {
+            self.prefetch.data_access(self.sched.now(), &self.waits, c);
+        }
+        c
     }
 
     /// Open-bus value for an access of `w` at `addr` (the CPU's last fetch).
@@ -334,10 +354,15 @@ impl Bus {
     }
 
     /// Cost of a cartridge-ROM opcode fetch: the only access the prefetch buffer
-    /// serves (P3-TIMING hooks in here).
+    /// serves (`Prefetch::fetch`, DECISIONS #70).
     #[inline]
-    fn rom_fetch_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
-        self.rom_cost(addr, w, access)
+    fn rom_fetch_cost(&mut self, addr: u32, w: Width, access: Access) -> u64 {
+        if self.prefetch.enabled {
+            self.prefetch
+                .fetch(self.sched.now(), &self.waits, addr, w == Width::W, access)
+        } else {
+            self.rom_cost(addr, w, access)
+        }
     }
 
     /// Record an opcode fetch for open bus and BIOS read protection.
@@ -367,32 +392,38 @@ const STOP_WAKE_MASK: u16 = 1 << 7 | 1 << 12 | 1 << 13;
 impl CpuBus for Bus {
     #[inline]
     fn read8(&mut self, addr: u32, access: Access) -> u8 {
-        self.sched.advance(self.cost(addr, Width::B, access));
+        let c = self.access_cost(addr, Width::B, access);
+        self.sched.advance(c);
         self.read_value(addr, Width::B) as u8
     }
     #[inline]
     fn read16(&mut self, addr: u32, access: Access) -> u16 {
-        self.sched.advance(self.cost(addr, Width::H, access));
+        let c = self.access_cost(addr, Width::H, access);
+        self.sched.advance(c);
         self.read_value(addr, Width::H) as u16
     }
     #[inline]
     fn read32(&mut self, addr: u32, access: Access) -> u32 {
-        self.sched.advance(self.cost(addr, Width::W, access));
+        let c = self.access_cost(addr, Width::W, access);
+        self.sched.advance(c);
         self.read_value(addr, Width::W)
     }
     #[inline]
     fn write8(&mut self, addr: u32, value: u8, access: Access) {
-        self.sched.advance(self.cost(addr, Width::B, access));
+        let c = self.access_cost(addr, Width::B, access);
+        self.sched.advance(c);
         self.write_value(addr, u32::from(value), Width::B);
     }
     #[inline]
     fn write16(&mut self, addr: u32, value: u16, access: Access) {
-        self.sched.advance(self.cost(addr, Width::H, access));
+        let c = self.access_cost(addr, Width::H, access);
+        self.sched.advance(c);
         self.write_value(addr, u32::from(value), Width::H);
     }
     #[inline]
     fn write32(&mut self, addr: u32, value: u32, access: Access) {
-        self.sched.advance(self.cost(addr, Width::W, access));
+        let c = self.access_cost(addr, Width::W, access);
+        self.sched.advance(c);
         self.write_value(addr, value, Width::W);
     }
     #[inline]
