@@ -257,6 +257,18 @@ fn pin_mismatch(pin: Option<&Pin>, actual: &Pin) -> Option<&'static str> {
     }
 }
 
+/// Why a system's overall line and floor check cannot be trusted: not every one of
+/// its ROMs completed (a missing ROM or a load error), including none at all.
+fn incomplete_system(system: &str, expected: usize, completed: u32) -> Option<String> {
+    if completed as usize == expected {
+        None
+    } else {
+        Some(format!(
+            "overall ({system}): only {completed} of {expected} ROMs ran, so no speed (or floor) result"
+        ))
+    }
+}
+
 /// Entry point for `--bench`. `args` are all command-line arguments.
 pub fn run(args: &[String]) -> std::process::ExitCode {
     let check = args.iter().any(|a| a == "--check");
@@ -380,7 +392,12 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         ));
     }
     for (&system, &(roms, total)) in SYSTEMS.iter().zip(&totals) {
-        if roms == 0 {
+        let expected = ROMS.iter().filter(|(_, t)| t.system() == system).count();
+        if let Some(why) = incomplete_system(system, expected, roms) {
+            // A ROM that was missing or failed already failed the run; say what that
+            // means for this system's speed line, and never skip its floor check.
+            println!("FAIL: {why}");
+            ok = false;
             continue;
         }
         let native = ROMS
@@ -437,6 +454,13 @@ mod tests {
         assert!(parse_pins("1200 zz 2 3 a.gb").is_err());
         assert!(parse_pins("1200 1 2 3").is_err());
         assert!(parse_pins("x 1 2 3 a.gb").is_err());
+    }
+
+    #[test]
+    fn a_system_with_a_missing_rom_or_none_fails_instead_of_skipping() {
+        assert_eq!(incomplete_system("gba", 4, 4), None);
+        assert!(incomplete_system("gba", 4, 3).unwrap().contains("3 of 4"));
+        assert!(incomplete_system("gba", 4, 0).unwrap().contains("0 of 4"));
     }
 
     #[test]
