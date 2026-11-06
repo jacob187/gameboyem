@@ -158,7 +158,14 @@ fn gba_drain_returns_exactly_the_samples_for_the_elapsed_time() {
         total += sink.len() / 2;
     }
     let cycles = gba.cycles() - t0;
-    assert_eq!(cycles, 60 * u64::from(CYCLES_PER_FRAME));
+    // step_frame stops after the instruction that crosses VBlank, so a real
+    // CPU overshoots each frame end by a few cycles (DECISIONS #45). The
+    // sample count below is checked against the cycles that really elapsed.
+    let frames = 60 * u64::from(CYCLES_PER_FRAME);
+    assert!(
+        (frames..frames + 64).contains(&cycles),
+        "{cycles} cycles for 60 frames"
+    );
     // 60 frames of 48 kHz audio: 48 000 x 60 / 59.7275 = 48 218.9 samples.
     assert!((48_218..=48_219).contains(&total), "{total}");
     let cps = u64::from(CYCLES_PER_SECOND);
