@@ -33,7 +33,7 @@ pub mod ppu;
 pub mod scheduler;
 pub mod timer;
 
-pub use cart::CartError;
+pub use cart::{CartError, CartOptions, RtcMode, RtcTime, SaveChoice};
 pub use gba::Gba;
 pub use keypad::Button;
 

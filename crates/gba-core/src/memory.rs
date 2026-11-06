@@ -101,6 +101,10 @@ impl Bus {
             0x07 => rd(&*self.ppu.oam, addr as usize & 0x3FF, w),
             0x08..=0x0D => {
                 let off = addr & 0x01FF_FFFF;
+                // P3-CART: the GPIO port overlays ROM at 0xC4..0xC9 once enabled.
+                if let Some(v) = self.cart.gpio_read(off, w) {
+                    return v;
+                }
                 match w {
                     Width::B => u32::from(self.cart.read_rom8(off)),
                     Width::H => u32::from(self.cart.read_rom16(off & !1)),
@@ -162,6 +166,13 @@ impl Bus {
             }
             0x0D if w == Width::H && self.cart.eeprom_at(addr) => {
                 self.cart.eeprom_write(v as u16);
+            }
+            // P3-CART: stores to the GPIO registers (0xC4..0xC9 of ROM space).
+            0x08..=0x0D if (0xC4..0xCA).contains(&(addr & 0x01FF_FFFF)) => {
+                let now = self.sched.now();
+                if self.cart.gpio_write(addr & 0x01FF_FFFF, v, w, now) {
+                    self.irq.raise(crate::irq::Interrupt::GamePak);
+                }
             }
             0x0E | 0x0F => {
                 // One byte, from the lane the address selects, at the exact address.

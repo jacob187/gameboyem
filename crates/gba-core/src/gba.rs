@@ -2,7 +2,7 @@
 
 use crate::bios::Bios;
 use crate::bus::Bus;
-use crate::cart::{Cart, CartError, SaveKind};
+use crate::cart::{Cart, CartError, CartOptions, RtcTime, SaveKind};
 use crate::cpu::{Cpu, Registers};
 use crate::keypad::Button;
 use crate::{CYCLES_PER_FRAME, Framebuffer};
@@ -21,8 +21,18 @@ impl Gba {
     /// point; with a real 16 KiB dump it boots through the BIOS from address 0.
     /// The host validates the dump's size (and may check its hash).
     pub fn new(rom: Vec<u8>, bios: Option<Box<[u8]>>) -> Result<Self, CartError> {
+        Self::with_options(rom, bios, CartOptions::default())
+    }
+
+    /// [`Gba::new`] with the host's cartridge choices: the save type
+    /// (`--save-type`) and whether the cartridge has a clock (`--rtc`).
+    pub fn with_options(
+        rom: Vec<u8>,
+        bios: Option<Box<[u8]>>,
+        options: CartOptions,
+    ) -> Result<Self, CartError> {
         let rom_hash = crate::fnv1a(&rom);
-        let cart = Cart::from_rom(rom)?;
+        let cart = Cart::with_options(rom, options)?;
         let (cpu, bios) = match bios {
             Some(data) => (Cpu::reset(), Bios::Real(data)),
             None => (Cpu::post_bios(), Bios::Hle),
@@ -135,9 +145,9 @@ impl Gba {
         self.bus.peek32(addr)
     }
 
-    /// The save data to write to a `.sav` file: SRAM, Flash, or EEPROM (`None`
-    /// without a backup chip, or for an EEPROM the game hasn't touched yet, whose
-    /// size is still unknown).
+    /// The backup chip's contents alone: SRAM, Flash, or EEPROM (`None` without a
+    /// backup chip, or for an EEPROM whose size is still unknown). A host writes
+    /// [`Gba::battery_save`] to a `.sav` file, which adds the RTC footer.
     pub fn battery_ram(&self) -> Option<&[u8]> {
         self.bus.cart.battery_ram()
     }
@@ -155,10 +165,35 @@ impl Gba {
         self.bus.cart.battery_generation()
     }
 
-    /// Restore save data from a `.sav` file. The size must match the detected
-    /// backup chip (an EEPROM accepts 512 or 8192 bytes).
+    /// The `.sav` image: [`Gba::battery_ram`] followed, when the cartridge's clock
+    /// is in use (or was restored from a save), by the 24-byte RTC footer
+    /// (DECISIONS #67). The clock in it is the emulated time now; no host time
+    /// is stored.
+    pub fn battery_save(&self) -> Option<Vec<u8>> {
+        self.bus.cart.battery_save(self.bus.sched.now())
+    }
+
+    /// Restore a `.sav` image. The size must match the backup chip (an EEPROM
+    /// accepts 512 or 8192 bytes unless the save type was forced), optionally
+    /// followed by an RTC footer. A footer that is present but invalid rejects
+    /// the file; a file without one loads and leaves the clock alone.
     pub fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartError> {
-        self.bus.cart.load_battery_ram(data)
+        self.bus
+            .cart
+            .load_battery_ram_at(data, self.bus.sched.now())
+    }
+
+    /// Set the cartridge clock to `t`, a time the host read from its own clock
+    /// (the one place real time enters; the core never reads it, DECISIONS #66).
+    /// Call it before loading a save: a save's own footer replaces it. Also
+    /// clears the clock's power-loss flag.
+    pub fn set_rtc(&mut self, t: RtcTime) {
+        self.bus.cart.set_rtc(t, self.bus.sched.now());
+    }
+
+    /// The cartridge clock's date and time now, in emulated time.
+    pub fn rtc_time(&self) -> RtcTime {
+        self.bus.cart.rtc_time(self.bus.sched.now())
     }
 
     /// Master clock in CPU cycles since power-on.

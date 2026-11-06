@@ -67,8 +67,9 @@ impl Core for Gba {
     }
 
     /// `None` without a backup chip, and for an EEPROM until its size is known.
+    /// Includes the RTC footer when the cartridge's clock is in use.
     fn battery_ram(&self) -> Option<Vec<u8>> {
-        Gba::battery_ram(self).map(<[u8]>::to_vec)
+        Gba::battery_save(self)
     }
 
     fn battery_generation(&self) -> u64 {

@@ -12,6 +12,23 @@ pub enum SaveKind {
     Eeprom,
 }
 
+/// `--save-type`: which backup chip to give the cartridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaveChoice {
+    /// Detect from the ROM's library ID string ([`detect_save`]).
+    #[default]
+    Auto,
+    /// No backup chip, whatever the ROM says.
+    None,
+    Sram,
+    Flash64,
+    Flash128,
+    /// 512 bytes (6-bit addresses).
+    Eeprom512,
+    /// 8 KiB (14-bit addresses).
+    Eeprom8k,
+}
+
 /// ID strings (the version digits after `_V` are ignored), in no particular order.
 const IDS: [(&[u8], SaveKind); 6] = [
     (b"EEPROM_V", SaveKind::Eeprom),
