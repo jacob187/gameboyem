@@ -95,7 +95,13 @@ impl Bus {
                 self.apu.advance_to(self.sched.now());
                 self.apu.write_reg(off, v, mask);
                 if off == SOUNDCNT_H {
-                    // The timer select decides which timers clock a FIFO.
+                    // Bits 11 and 15 empty FIFO A and B; the timer select decides
+                    // which timers clock them.
+                    for b in 0..2 {
+                        if v & mask & (0x0800 << (4 * b)) != 0 {
+                            self.timers.fifo_len[b] = 0;
+                        }
+                    }
                     self.refresh_sound_clock();
                 }
             }
@@ -162,10 +168,9 @@ impl Bus {
         self.fifo_latch[b] = (self.fifo_latch[b] & !m) | (u32::from(v) << shift & m);
         if hi && mask & 0xFF00 != 0 {
             self.apu.write_fifo(b == 1, self.fifo_latch[b]);
-            if !self.timers.fifo_written[b] {
-                self.timers.fifo_written[b] = true;
-                self.refresh_sound_clock();
-            }
+            let len = &mut self.timers.fifo_len[b];
+            *len = (*len + 4).min(32);
+            self.refresh_sound_clock();
         }
     }
 
@@ -183,15 +188,14 @@ impl Bus {
         self.keypad_irq();
     }
 
-    /// Work out which of timers 0 and 1 clock a Direct Sound FIFO that is in use
-    /// and tell the timers (they schedule overflow events only for observed
-    /// timers, DECISIONS #69). A FIFO is in use once a word was written to it or
-    /// a sound-FIFO DMA channel (DMA1/2, start timing 3) is enabled; until then
-    /// a pop is a no-op and a refill request starts nothing. The timer is the
-    /// SOUNDCNT_H select, whatever the output enables say, because the APU pops
-    /// regardless of them. Call after anything that changes those inputs;
-    /// P3-STATE calls it after loading a state.
-    pub fn refresh_sound_clock(&mut self) {
+    /// Which of timers 0 and 1 clock a Direct Sound FIFO that is in use, from the
+    /// current registers (they schedule overflow events only for observed timers,
+    /// DECISIONS #69). A FIFO is in use while it holds data (`Timers::fifo_len`) or
+    /// a sound-FIFO DMA channel (DMA1/2 enabled, start timing 3) may fill it;
+    /// otherwise a pop is a no-op and a refill request starts nothing. The timer
+    /// is the SOUNDCNT_H select, whatever the output enables say, because the APU
+    /// pops regardless of them.
+    fn sound_clock(&self) -> [bool; 2] {
         let select = self.apu.read_reg(SOUNDCNT_H);
         let dma_fifo = (1..3).any(|c| {
             let ctl = self.dma.ch[c].control;
@@ -199,14 +203,34 @@ impl Bus {
         });
         let mut clock = [false; 2];
         for b in 0..2 {
-            if self.timers.fifo_written[b] || dma_fifo {
+            if self.timers.fifo_len[b] > 0 || dma_fifo {
                 clock[usize::from(select >> (10 + 4 * b) & 1)] = true;
             }
         }
+        clock
+    }
+
+    /// Re-derive which timers clock a FIFO and reschedule if that changed. Runs
+    /// after anything that changes its inputs: SOUNDCNT_H, a FIFO write, a DMA
+    /// control write, and every FIFO pop (which is where a FIFO that has run dry
+    /// after its DMA was switched off, by a write or by the DMA itself, stops
+    /// being in use).
+    pub fn refresh_sound_clock(&mut self) {
+        let clock = self.sound_clock();
         if clock != self.timers.sound {
             let now = self.sched.now();
             self.timers.set_sound(clock, now, &mut self.sched);
         }
+    }
+
+    /// Recompute all timer elision state from the registers and reschedule every
+    /// timer event: the one call P3-STATE makes after loading a state. It needs
+    /// `Timers::fifo_len` to be right (saved with the state, or set to `[32, 32]`,
+    /// which only keeps the FIFO timers observed until they have popped 32 times).
+    pub fn rederive_timer_events(&mut self) {
+        let clock = self.sound_clock();
+        let now = self.sched.now();
+        self.timers.set_sound(clock, now, &mut self.sched);
     }
 
     /// Timer `n` overflowed at `at`: reload, schedule the next event, then the
@@ -228,6 +252,15 @@ impl Bus {
                 if req.b {
                     self.dma.trigger(crate::dma::DmaTrigger::FifoB);
                 }
+                // Mirror the pops (a FIFO pops when its select is this timer).
+                let select = self.apu.read_reg(SOUNDCNT_H);
+                for b in 0..2 {
+                    if usize::from(select >> (10 + 4 * b) & 1) == n {
+                        let len = &mut self.timers.fifo_len[b];
+                        *len = len.saturating_sub(1);
+                    }
+                }
+                self.refresh_sound_clock();
             }
             if n < 3 && self.timers.cascade(n + 1) {
                 // The cascaded timer overflowed too: handle it at the same

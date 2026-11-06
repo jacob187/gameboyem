@@ -62,8 +62,11 @@ pub struct Timers {
     /// each of its overflows pops a sample. Derived by the bus from SOUNDCNT_H,
     /// the FIFO writes and the DMA channels; set through [`Timers::set_sound`].
     pub sound: [bool; 2],
-    /// A word has been written to FIFO A / B (sticky): the FIFO may hold data.
-    pub fifo_written: [bool; 2],
+    /// Bytes in FIFO A / B, mirrored from the bus: +4 per word written (to a
+    /// maximum of 32, as the APU), -1 per pop, 0 on a reset. A FIFO with none
+    /// and no sound DMA is not in use. The APU's own FIFO is private; this stays
+    /// equal to it as long as every write and every pop goes through the bus.
+    pub fifo_len: [u8; 2],
 }
 
 impl Timers {

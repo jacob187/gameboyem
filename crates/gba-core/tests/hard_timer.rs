@@ -145,8 +145,13 @@ fn fifo_clock_timers_stay_exact() {
     b.write32(0x0400_00A0, 0x0102_0304, N);
     assert!(b.timers.sound[1] && !b.timers.sound[0]);
     assert!(pending(&b, 1) && !pending(&b, 0));
+    run(&mut b, 2);
+    assert!(pending(&b, 1), "still exact while it holds data");
     run(&mut b, 10_000);
+    assert!(!pending(&b, 1), "four pops emptied the FIFO");
     // Moving the select to timer 0 moves the events.
+    b.write32(0x0400_00A0, 0x0506_0708, N);
+    assert!(pending(&b, 1));
     b.write16(0x0400_0082, 0x0304, N);
     assert!(pending(&b, 0) && !pending(&b, 1));
 }
@@ -191,4 +196,57 @@ fn a_reload_write_does_not_swallow_an_overflow_that_is_due_but_not_dispatched() 
     b.write16(TM, 0xFF00, N);
     run(&mut b, 0);
     assert_ne!(b.irq.if_ & 1 << 3, 0, "the overflow still fires");
+}
+
+#[test]
+fn a_fifo_timer_stops_being_observed_once_the_sound_dma_is_off_and_the_fifo_is_dry() {
+    let mut b = bus();
+    b.write16(0x0400_0082, 0x0304, N); // A on timer 0
+    b.write32(0x0400_00BC, 0x0300_0000, N);
+    b.write32(0x0400_00C0, 0x0400_00A0, N);
+    b.write32(
+        0x0400_00C4,
+        4 | u32::from(0x8000u16 | 3 << 12 | 2 << 5 | 1 << 10) << 16,
+        N,
+    );
+    start(&mut b, 0, 0xFFF0, 0);
+    assert!(b.timers.sound[0] && pending(&b, 0));
+    let mut cycles = 0;
+    let mut stopped = None;
+    while cycles < 20_000 {
+        if b.dma.active_channel().is_some() {
+            b.run_dma();
+        }
+        run(&mut b, 4);
+        cycles += 4;
+        if cycles == 400 {
+            // The DMA switches itself off internally (no register write, so no
+            // hook runs): the next pops must notice.
+            b.dma.ch[1].control &= !0x8000;
+        }
+        if stopped.is_none() && !pending(&b, 0) {
+            stopped = Some(cycles);
+        }
+    }
+    let at = stopped.expect("the events stop");
+    assert!(at > 400, "not before the DMA went off: {at}");
+    assert_eq!(b.timers.fifo_len, [0, 0]);
+    assert!(!b.timers.sound[0]);
+    // A new word brings it back, and the counter kept its phase meanwhile.
+    b.write32(0x0400_00A0, 0x0101_0101, N);
+    assert!(pending(&b, 0));
+}
+
+#[test]
+fn rederiving_after_a_load_rebuilds_the_events() {
+    let mut b = bus();
+    b.write16(0x0400_0082, 0x0304, N);
+    b.write32(0x0400_00A0, 0x0101_0101, N);
+    start(&mut b, 0, 0xFFF0, 0);
+    start(&mut b, 1, 0xFFF0, IRQ);
+    // Forget the derived state, as a loaded snapshot of the scheduler might.
+    b.timers.sound = [false, false];
+    b.sched.cancel(Event::TimerOverflow(0));
+    b.rederive_timer_events();
+    assert!(b.timers.sound[0] && pending(&b, 0) && pending(&b, 1));
 }
