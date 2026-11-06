@@ -103,7 +103,7 @@ fn elided_timers_read_the_same_counters_as_observed_ones() {
                 // Stopped while the reload changes, so no overflow is in flight.
                 b.write16(TM + 4 * n + 2, 0, N);
                 b.write16(TM + 4 * n, reload, N);
-                b.write16(TM + 4 * n + 2, ((round + n) % 4 | irq | ENABLE) as u16, N);
+                b.write16(TM + 4 * n + 2, (((round + n) % 4) | irq | ENABLE) as u16, N);
             }
         }
         for _ in 0..300 {
@@ -176,7 +176,7 @@ fn a_sound_dma_channel_makes_the_fifo_timer_observed() {
 
 #[test]
 fn a_counted_timer_is_exact_when_its_follower_clocks_a_fifo() {
-    // Timer 1 counts timer 0 and clocks FIFO B: timer 0 must not coalesce.
+    // Timer 1 counts timer 0 and clocks FIFO B: timer 0 keeps its event.
     let mut b = bus();
     b.write16(0x0400_0082, 0x4000, N); // B on timer 1
     b.write32(0x0400_00A4, 0x0101_0101, N);
