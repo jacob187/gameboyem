@@ -55,6 +55,11 @@ impl Timer {
     fn reload_ticks(&self) -> u64 {
         0x1_0000 - u64::from(self.reload)
     }
+
+    /// The cycle of the next overflow, from `counter` at `start`.
+    fn next_overflow(&self) -> u64 {
+        self.start + ((0x1_0000 - u64::from(self.counter)) << self.shift())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,8 +95,9 @@ impl Timers {
     }
 
     /// `control` is stored through `& 0xC7` (timer 0 also without count-up), and
-    /// `start` is never past the clock plus the start delay (the bus checks that
-    /// against the restored clock, [`Timers::check_clock`]).
+    /// `start` is never past the clock plus the start delay, and a pending
+    /// overflow event sits where the timer says (the bus checks both against the
+    /// restored clock and scheduler, [`Timers::check_events`]).
     pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
         let mut t = [Timer::default(); 4];
         for (n, timer) in t.iter_mut().enumerate() {
@@ -110,13 +116,27 @@ impl Timers {
         Ok(())
     }
 
-    /// Reject a `start` that is ahead of what the clock allows: prescaled
-    /// timers compute `start + (ticks << shift)`.
-    pub(crate) fn check_clock(&self, now: u64) -> Result<(), StateError> {
+    /// Reject timer state the clock and the scheduler cannot agree with: a
+    /// `start` ahead of what the clock allows (prescaled timers compute
+    /// `start + (ticks << shift)`), and a pending overflow event that is not at
+    /// the cycle the timer's own `counter`/`start` give. `schedule` recomputes
+    /// the event from those fields, so a stale `start` would make every later
+    /// overflow replay from the past, one dispatch per period, in a single
+    /// `process_events` call (deep-review #2).
+    pub(crate) fn check_events(&self, now: u64, sched: &Scheduler) -> Result<(), StateError> {
         check(
             self.t.iter().all(|t| t.start <= now + START_DELAY),
             "timer start is in the future",
-        )
+        )?;
+        for (n, t) in self.t.iter().enumerate() {
+            if let Some(at) = sched.when(Event::TimerOverflow(n as u8)) {
+                check(
+                    t.enabled() && !self.countup(n) && at == t.next_overflow(),
+                    "timer overflow event disagrees with the timer",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn countup(&self, n: usize) -> bool {
@@ -182,7 +202,10 @@ impl Timers {
     /// timer without an event is caught up first, so the elapsed periods keep the
     /// old reload. One with an event needs no catch-up (its first overflow does not
     /// depend on the reload and `overflow` restarts it), and folding would swallow
-    /// an overflow that is due but not yet dispatched.
+    /// an overflow that is due but not yet dispatched. The CPU's stores dispatch
+    /// what is due before they get here (`Bus::sync_ppu_write`), so an overflow
+    /// that fell earlier in the instruction loads the old reload; a DMA unit's
+    /// write does not, and relies on this.
     pub fn write_reload(&mut self, n: usize, v: u16, mask: u16, now: u64, sched: &mut Scheduler) {
         if sched.when(Event::TimerOverflow(n as u8)).is_none() {
             self.sync(n, now);
@@ -267,7 +290,7 @@ impl Timers {
     fn schedule(&self, n: usize, sched: &mut Scheduler) {
         let ev = Event::TimerOverflow(n as u8);
         let t = &self.t[n];
-        let at = t.start + ((0x1_0000 - u64::from(t.counter)) << t.shift());
+        let at = t.next_overflow();
         if sched.when(ev) != Some(at) {
             sched.schedule_at(ev, at);
         }
@@ -418,5 +441,30 @@ mod tests {
         t.write_reload(3, 0x1234, 0xFFFF, 0, &mut s);
         t.write_control(3, 0x80, 0xFFFF, 0, &mut s);
         assert_eq!(t.read_counter(3, 0), 0x1234);
+    }
+
+    /// A pending overflow event must sit where its timer's `counter`/`start` say:
+    /// `schedule` recomputes it from them, so a stale `start` would replay every
+    /// period since then in one `process_events` call (deep-review #2).
+    #[test]
+    fn a_pending_overflow_that_disagrees_with_its_timer_is_refused() {
+        let mut t = Timers::default();
+        let mut s = Scheduler::new();
+        start(&mut t, &mut s, 0, 0xFFFF, 0x40);
+        s.advance(1_000_000);
+        assert!(t.check_events(s.now(), &s).is_ok());
+        let ok = t.clone();
+        t.t[0].start = 0;
+        t.t[0].counter = 0;
+        assert!(t.check_events(s.now(), &s).is_err(), "stale start");
+        t = ok.clone();
+        t.t[0].control &= !0x80;
+        assert!(
+            t.check_events(s.now(), &s).is_err(),
+            "event of a stopped timer"
+        );
+        t = ok;
+        t.t[0].start = s.now() + START_DELAY + 1;
+        assert!(t.check_events(s.now(), &s).is_err(), "start in the future");
     }
 }

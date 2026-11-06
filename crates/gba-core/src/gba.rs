@@ -158,7 +158,6 @@ impl Gba {
         self.bus.set_button(b, pressed);
     }
 
-    /// The cartridge title from the header.
     /// Append the audio produced since the last call (interleaved stereo f32,
     /// see `Apu::drain_samples`).
     pub fn drain_audio_into(&mut self, out: &mut Vec<f32>) {
@@ -179,6 +178,7 @@ impl Gba {
         self.bus.apu.set_sample_rate(hz);
     }
 
+    /// The cartridge title from the header.
     pub fn title(&self) -> String {
         self.bus.cart.title()
     }

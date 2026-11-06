@@ -274,6 +274,51 @@ fn register_ram_reset_honours_each_flag() {
 }
 
 #[test]
+fn register_ram_reset_clears_palette_oam_sio_and_sound_by_their_flags() {
+    const PALETTE: u32 = 0x0500_0000;
+    const OAM: u32 = 0x0700_0000;
+    let mut b = bus();
+    b.write16(PALETTE, 0x7FFF, N);
+    b.write16(OAM, 0x1234, N);
+    b.write_io16(0x128, 0x5555, 0xFFFF); // SIOCNT
+    b.write_io16(0x134, 0x1234, 0xFFFF); // RCNT
+    b.write_io16(0x132, 0xC00F, 0xFFFF); // KEYCNT
+    b.write_io16(0x84, 0x80, 0xFFFF); // sound on, so the PSG registers take writes
+    b.write_io16(0x80, 0x7777, 0xFFFF); // SOUNDCNT_L
+    b.write_io16(0x88, 0x0100, 0xFFFF); // SOUNDBIAS
+    assert_ne!(b.read_io16(0x80), 0);
+
+    // Flag 2 (palette) touches nothing else.
+    call(&mut b, 0x01, [0x04, 0, 0, 0]);
+    assert_eq!(b.peek16(PALETTE), 0);
+    assert_eq!(b.peek16(OAM), 0x1234);
+    assert_eq!(b.read_io16(0x128), 0x5555);
+    assert_ne!(b.read_io16(0x80), 0);
+
+    call(&mut b, 0x01, [0x10, 0, 0, 0]);
+    assert_eq!(b.peek16(OAM), 0);
+    assert_eq!(b.read_io16(0x128), 0x5555);
+
+    // SIO: general-purpose mode; the keypad registers beside it are not SIO
+    // (deep-review #8).
+    call(&mut b, 0x01, [0x20, 0, 0, 0]);
+    assert_eq!(b.read_io16(0x128), 0);
+    assert_eq!(b.read_io16(0x134), 0x8000, "RCNT: general purpose");
+    assert_eq!(b.read_io16(0x132), 0xC00F, "KEYCNT survives flag 0x20");
+    assert_ne!(b.read_io16(0x80), 0);
+
+    call(&mut b, 0x01, [0x40, 0, 0, 0]);
+    assert_eq!(b.read_io16(0x80), 0);
+    assert_eq!(b.read_io16(0x84) & 0x80, 0, "sound off");
+    assert_eq!(b.read_io16(0x88) & 0x3FF, 0x200);
+    assert_eq!(b.read_io16(0x132), 0xC00F, "KEYCNT survives flag 0x40");
+
+    // KEYCNT belongs to flag 0x80.
+    call(&mut b, 0x01, [0x80, 0, 0, 0]);
+    assert_eq!(b.read_io16(0x132), 0);
+}
+
+#[test]
 fn sound_bias_sets_the_level_and_keeps_upper_bits() {
     let mut b = bus();
     b.write_io16(0x88, 0xC200, 0xFFFF);

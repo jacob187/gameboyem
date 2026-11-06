@@ -6,8 +6,8 @@
 //! polynomial nor the sine table, so those come from the documented BIOS
 //! algorithms (the table is `trunc(0x4000 * sin(2 pi i / 256))`, the first
 //! sixteen entries match the values quoted in homebrew documentation, and the
-//! ArcTan coefficients telescope so that tan = 1.0 gives exactly 0x2000; both
-//! facts are tests below).
+//! ArcTan coefficients telescope so that tan = 1.0 gives exactly 0x2000; all
+//! three facts are tests below).
 
 /// Quarter wave of the BIOS sine table: `trunc(0x4000 * sin(2 pi i / 256))` for
 /// `i = 0..=64`, generated once offline with exact arithmetic.
@@ -144,6 +144,7 @@ const SEMITONE: [u64; 13] = [
 /// low bits can differ.
 pub fn midi_key_to_freq(freq: u32, mk: u8, fp: u8) -> u32 {
     let e = (180 - i64::from(mk)) * 256 - i64::from(fp);
+    // `mk` and `fp` are bytes, so `e` is in -19455..=46080 and `octave` in -7..=15.
     let octave = e.div_euclid(3072);
     let rem = e.rem_euclid(3072);
     let (k, frac) = ((rem / 256) as usize, (rem % 256) as u64);
@@ -151,9 +152,9 @@ pub fn midi_key_to_freq(freq: u32, mk: u8, fp: u8) -> u32 {
     let factor = hi - (hi - lo) * frac / 256;
     let v = (u64::from(freq) * factor) >> 32;
     let v = if octave >= 0 {
-        v >> octave.min(63)
+        v >> octave
     } else {
-        v << (-octave).min(32)
+        v << -octave
     };
     v as u32
 }
@@ -172,6 +173,29 @@ mod tests {
         assert_eq!(SINE[100], SINE[28]);
         assert_eq!(sin_cos(0), (0, 0x4000));
         assert_eq!(sin_cos(0x4000), (0x4000, 0));
+    }
+
+    /// Every quarter-wave entry is the documented formula (deep-review #75). The
+    /// runtime has no floats; the test uses `f64`, which agrees with the exact
+    /// table on all 65 entries (none is within rounding of an integer).
+    #[test]
+    fn every_quarter_wave_entry_is_the_truncated_sine() {
+        for (i, &entry) in QUARTER.iter().enumerate() {
+            let want = (16384.0 * (2.0 * std::f64::consts::PI * i as f64 / 256.0).sin()) as i16;
+            assert_eq!(entry, want, "QUARTER[{i}]");
+        }
+    }
+
+    /// The values the homebrew documentation quotes for the start of the table.
+    #[test]
+    fn the_first_sixteen_entries_match_the_documented_values() {
+        assert_eq!(
+            SINE[..16],
+            [
+                0x0000, 0x0192, 0x0323, 0x04B5, 0x0645, 0x07D5, 0x0964, 0x0AF1, 0x0C7C, 0x0E05,
+                0x0F8C, 0x1111, 0x1294, 0x1413, 0x158F, 0x1708
+            ]
+        );
     }
 
     #[test]

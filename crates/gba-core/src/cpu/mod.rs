@@ -212,16 +212,6 @@ impl Cpu {
         self.retry.is_some()
     }
 
-    /// CPSR (test and debug hook).
-    pub fn cpsr(&self) -> u32 {
-        self.cpsr
-    }
-
-    /// Whether the CPU is in Thumb state.
-    pub fn is_thumb(&self) -> bool {
-        self.cpsr & PSR_T != 0
-    }
-
     /// Load a complete state (test hook for the SingleStepTests harness).
     pub fn set_state(&mut self, s: &CpuState) {
         let mut c = Self::blank(s.cpsr, 0);

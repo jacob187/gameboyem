@@ -568,7 +568,7 @@ fn teqp_returning_into_thumb_refills_in_the_new_state() {
     run(&mut cpu, &mut ram, 1);
     let r = cpu.registers();
     assert_eq!(r.cpsr, 0x3F, "CPSR restored from SPSR");
-    assert!(cpu.is_thumb());
+    assert!(r.cpsr & PSR_T != 0, "Thumb state");
     assert_eq!(r.r[15], 4, "resumes at the next instruction");
     run(&mut cpu, &mut ram, 1);
     assert_eq!(cpu.registers().r[0], 0x55, "ran as Thumb code");

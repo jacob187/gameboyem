@@ -324,7 +324,7 @@ impl Bus {
 
         // Relations between components.
         self.timers.fifo_len = self.apu.fifo_lens();
-        self.timers.check_clock(now)?;
+        self.timers.check_events(now, &self.sched)?;
         check(
             self.prefetch.enabled == (waitcnt & WAITCNT_PREFETCH != 0),
             "prefetch enable disagrees with WAITCNT",
@@ -381,12 +381,15 @@ impl Bus {
     /// Dispatch the events that are due before the CPU touches video state, so a
     /// store lands on the right side of the PPU's render (cycle 960) and line end,
     /// and a status read sees the current line, instead of being up to an
-    /// instruction early or late. Only the CPU's own accesses do this; a DMA unit
-    /// is never interrupted by event dispatch.
+    /// instruction early or late. A store to a timer register does the same: an
+    /// overflow that fell earlier in the instruction must fire (IRQ, cascade, FIFO
+    /// pop) before the write stops, re-prescales or reloads the timer (deep-review
+    /// #13, #15). Only the CPU's own accesses do this; a DMA unit is never
+    /// interrupted by event dispatch.
     #[inline]
     fn sync_ppu_write(&mut self, addr: u32) {
         let video = match addr >> 24 {
-            0x04 => addr & 0x00FF_FFFF < 0x60,
+            0x04 => matches!(addr & 0x00FF_FFFF, 0..=0x5F | 0x100..=0x10F),
             0x05..=0x07 => true,
             _ => false,
         };
@@ -459,10 +462,10 @@ impl Bus {
     }
 
     /// Cost of a cartridge ROM access without the prefetch buffer: the
-    /// [`WaitTable`] entry (see [`WaitTable::rom_access`]). Pure, so the HLE BIOS
-    /// can use it for its bookkeeping; the CPU and DMA go through
-    /// [`Bus::access_cost`] and [`Bus::rom_fetch_cost`], which also keep the prefetch
-    /// buffer's state.
+    /// [`WaitTable`] entry (see [`WaitTable::rom_access`]). Pure; [`Bus::cost`]
+    /// and [`Bus::rom_fetch_cost`] (with the prefetch buffer off) call it. The CPU
+    /// and DMA go through [`Bus::access_cost`] and [`Bus::rom_fetch_cost`], which
+    /// also keep the prefetch buffer's state.
     #[inline]
     pub fn rom_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
         self.waits.rom_access(addr, w == Width::W, access)

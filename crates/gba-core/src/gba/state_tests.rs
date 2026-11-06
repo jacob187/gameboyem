@@ -810,6 +810,35 @@ fn specific_impossible_fields_are_refused() {
     refuse("resampler phase", &bad);
 }
 
+/// A timer whose `start` does not match its pending overflow event would, on the
+/// next timer-register write, replay every period since `start` in one call: a
+/// hang for a state taken late in a session (deep-review #2).
+#[test]
+fn a_timer_start_that_disagrees_with_its_pending_overflow_is_refused() {
+    let mut a = busy_machine(b"FLASH_V");
+    a.step_frame();
+    assert!(
+        a.bus
+            .sched
+            .when(crate::scheduler::Event::TimerOverflow(0))
+            .is_some()
+    );
+    let mut g = busy_fresh(b"FLASH_V");
+    g.load_state(&a.save_state())
+        .expect("the machine itself loads");
+    a.bus.timers.t[0].reload = 0xFFFF;
+    a.bus.timers.t[0].counter = 0;
+    a.bus.timers.t[0].start = 0;
+    let before = g.save_state();
+    assert_eq!(
+        g.load_state(&a.save_state()),
+        Err(StateError::Invalid(
+            "timer overflow event disagrees with the timer"
+        ))
+    );
+    assert!(g.save_state() == before, "unchanged");
+}
+
 #[test]
 fn loading_drops_the_buffered_audio_and_marks_the_save_changed() {
     let rom = flash_rom();

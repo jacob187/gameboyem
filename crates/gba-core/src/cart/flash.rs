@@ -6,14 +6,15 @@
 //! Erase and program complete instantly (the "wait until" polls in software see
 //! the finished state on the first read); real chips take milliseconds.
 
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
 /// Manufacturer / device IDs reported in ID mode, from GBATEK's device table.
 ///
 /// 64 KiB: Panasonic MN63F805MNP (ID 0x1B32). 128 KiB: Sanyo LE26FV10N1TS (ID
 /// 0x1362). Both are on the list of commonly emulated chips (DECISIONS #53).
-use crate::state::{StateError, check};
-use emu_common::state::{StateReader, StateWriter};
-
 const ID_64K: [u8; 2] = [0x32, 0x1B];
+/// The 128 KiB part's ID bytes (see [`ID_64K`]).
 const ID_128K: [u8; 2] = [0x62, 0x13];
 
 pub const SIZE_64K: usize = 64 * 1024;
@@ -157,9 +158,15 @@ impl Flash {
             State::Idle => {
                 if a == 0x5555 && v == 0xAA {
                     self.state = State::Unlocked1;
-                } else if v == 0xF0 {
-                    // Reset / terminate ID mode without the unlock sequence.
-                    self.id_mode = false;
+                } else {
+                    // Anything but the start of an unlock aborts a pending erase:
+                    // it is one six-write sequence (`AA 55 80 AA 55 10/30`)
+                    // (deep-review #10).
+                    self.erase_armed = false;
+                    if v == 0xF0 {
+                        // Reset / terminate ID mode without the unlock sequence.
+                        self.id_mode = false;
+                    }
                 }
                 false
             }
@@ -288,6 +295,44 @@ mod tests {
         program(&mut f, 0, 0);
         cmd(&mut f, 0x10);
         assert_eq!(f.read(0), 0);
+    }
+
+    type Abort = (&'static str, fn(&mut Flash));
+
+    /// `AA 55 80` arms an erase for the very next unlock sequence only: a reset, a
+    /// stray write or an aborted unlock cancels it (deep-review #10).
+    #[test]
+    fn an_aborted_erase_sequence_does_not_stay_armed() {
+        let aborts: [Abort; 3] = [
+            ("reset", |f| {
+                f.write(0x5555, 0xF0);
+            }),
+            ("stray write", |f| {
+                f.write(0x1111, 0x00);
+            }),
+            ("aborted unlock", |f| {
+                f.write(0x5555, 0xAA);
+                f.write(0x1111, 0x00);
+            }),
+        ];
+        for (what, abort) in aborts {
+            for (erase, addr) in [(0x10, 0x5555), (0x30, 0x0000)] {
+                let mut f = Flash::new(SIZE_64K);
+                program(&mut f, 0x0010, 0);
+                cmd(&mut f, 0x80);
+                abort(&mut f);
+                f.write(0x5555, 0xAA);
+                f.write(0x2AAA, 0x55);
+                f.write(addr, erase);
+                assert_eq!(f.read(0x0010), 0, "{what}, erase {erase:#x}");
+            }
+        }
+        // The unlock sequence after the arming command still erases.
+        let mut f = Flash::new(SIZE_64K);
+        program(&mut f, 0x0010, 0);
+        cmd(&mut f, 0x80);
+        cmd(&mut f, 0x10);
+        assert_eq!(f.read(0x0010), 0xFF);
     }
 
     #[test]

@@ -409,7 +409,6 @@ fn single_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32)
             rotate_load(bus.read32(addr, Access::NonSeq), addr)
         };
         cpu.internal(bus, 1);
-        cpu.seq = false;
         if writeback {
             cpu.write_reg(bus, rn_i, moved);
         }
@@ -468,7 +467,6 @@ fn halfword<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
             }
         };
         cpu.internal(bus, 1);
-        cpu.seq = false;
         if writeback {
             cpu.write_reg(bus, rn_i, moved);
         }
@@ -555,7 +553,6 @@ pub(super) fn block_transfer<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B
             }
         }
         cpu.internal(bus, 1);
-        cpu.seq = false;
         if let Some(pc) = pc_value {
             if s_bit {
                 cpu.restore_spsr();
@@ -609,6 +606,5 @@ fn swp<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
         v
     };
     cpu.internal(bus, 1);
-    cpu.seq = false;
     cpu.write_reg(bus, rd_i, value);
 }

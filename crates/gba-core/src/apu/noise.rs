@@ -51,6 +51,8 @@ impl Noise {
     }
 
     /// The timer counts down from at most the longest period and is never zero.
+    /// The LFSR is nonzero and below 2^15: the seed is nonzero, a step shifts
+    /// right and a shifted-out 1 XORs a mask back in.
     pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
         let mut next = Self::new();
         next.enabled = r.bool()?;
@@ -61,6 +63,7 @@ impl Noise {
         next.length.load_state(r)?;
         next.env.load_state(r)?;
         check((1..=MAX_PERIOD).contains(&next.timer), "noise timer")?;
+        check((1..=0x7FFF).contains(&next.lfsr), "noise LFSR")?;
         *self = next;
         Ok(())
     }
@@ -261,5 +264,27 @@ mod tests {
         n.clock_length();
         n.clock_length();
         assert!(!n.enabled);
+    }
+
+    /// The LFSR is seeded nonzero and no step reaches 0 or bit 15, so a state
+    /// holding either is refused (deep-review #7).
+    #[test]
+    fn a_state_with_an_unreachable_lfsr_is_refused() {
+        let load = |n: &Noise| {
+            let mut w = StateWriter::new();
+            n.save_state(&mut w);
+            let bytes = w.into_bytes();
+            Noise::new().load_state(&mut StateReader::new(&bytes))
+        };
+        let mut n = started(0x00);
+        for _ in 0..200 {
+            n.advance(n.next_step().unwrap());
+            assert!((1..=0x7FFF).contains(&n.lfsr), "{:#x} is reachable", n.lfsr);
+            assert!(load(&n).is_ok());
+        }
+        for bad in [0, 0x8000, 0xFFFF] {
+            n.lfsr = bad;
+            assert_eq!(load(&n), Err(StateError::Invalid("noise LFSR")), "{bad:#x}");
+        }
     }
 }

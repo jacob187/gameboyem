@@ -221,7 +221,6 @@ fn ldr_pc<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     let addr = (cpu.r[15] & !2).wrapping_add((op & 0xFF) << 2);
     let v = bus.read32(addr, Access::NonSeq);
     cpu.internal(bus, 1);
-    cpu.seq = false;
     cpu.r[lo(op, 8)] = v.rotate_right((addr & 3) * 8);
 }
 
@@ -229,7 +228,6 @@ fn ldr_pc<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 fn load_word<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
     let v = bus.read32(addr, Access::NonSeq);
     cpu.internal(bus, 1);
-    cpu.seq = false;
     cpu.r[rd] = v.rotate_right((addr & 3) * 8);
 }
 
@@ -237,7 +235,6 @@ fn load_word<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
 fn load_byte<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
     let v = bus.read8(addr, Access::NonSeq);
     cpu.internal(bus, 1);
-    cpu.seq = false;
     cpu.r[rd] = u32::from(v);
 }
 
@@ -245,7 +242,6 @@ fn load_byte<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
 fn load_half<B: CpuBus>(cpu: &mut Cpu, bus: &mut B, addr: u32, rd: usize) {
     let v = bus.read16(addr, Access::NonSeq);
     cpu.internal(bus, 1);
-    cpu.seq = false;
     cpu.r[rd] = u32::from(v).rotate_right((addr & 1) * 8);
 }
 
@@ -269,7 +265,6 @@ fn ls_reg<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
         3 => {
             let v = bus.read8(addr, Access::NonSeq);
             cpu.internal(bus, 1);
-            cpu.seq = false;
             cpu.r[rd] = i32::from(v as i8) as u32;
         }
         4 => load_word(cpu, bus, addr, rd),
@@ -284,7 +279,6 @@ fn ls_reg<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
                 i32::from(h as i16) as u32
             };
             cpu.internal(bus, 1);
-            cpu.seq = false;
             cpu.r[rd] = v;
         }
     }
@@ -376,10 +370,12 @@ fn ldm_stm<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
 }
 
 /// Format 16/17: conditional branch, and SWI (condition 0xF). `F` = condition.
+/// Condition 0xE ("always" in ARM, an undefined Thumb encoding) branches, as the
+/// reference data (`thumb_undefined_bcc`) has it: `COND_PASS[0xE]` is all ones.
 fn bcc<B: CpuBus, const F: u32>(cpu: &mut Cpu, bus: &mut B, op: u32) {
     if F == 0xF {
         cpu.software_interrupt(bus, op);
-    } else if F == 0xE || COND_PASS[F as usize] >> (cpu.cpsr >> 28) & 1 != 0 {
+    } else if COND_PASS[F as usize] >> (cpu.cpsr >> 28) & 1 != 0 {
         let target = cpu.r[15].wrapping_add(((op as u8 as i8 as i32) << 1) as u32);
         cpu.refill(bus, target);
     }

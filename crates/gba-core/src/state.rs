@@ -10,9 +10,11 @@
 //! field that a component later uses as an index, a loop bound, a divisor or a
 //! counter that must not underflow is range-checked against what the emulator
 //! can reach. A check rejects only values the emulator can never produce; decoding
-//! never panics. Each component reads into locals, validates, and only then
-//! assigns, so a bad section leaves that component untouched; the whole load is
-//! all-or-nothing because [`crate::Gba::load_state`] rolls back to a snapshot.
+//! never panics. Components validate what they read before they assign it, but
+//! the bus assigns its parts one after another and checks the relations between
+//! them last, so a failed load can leave a component half written. The load is
+//! all-or-nothing because [`crate::Gba::load_state`] loads into a scratch machine
+//! and replaces `self` only when every section and relation checked out.
 //!
 //! Host-side bookkeeping is not part of a state: the audio sample rate, the
 //! buffered audio samples and the battery-save generation counter.
