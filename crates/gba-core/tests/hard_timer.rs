@@ -244,3 +244,15 @@ fn a_counted_timer_is_exact_when_its_follower_clocks_a_fifo() {
     assert!(pending(&b, 0));
     assert_eq!(b.timers.t[0].batch, 1);
 }
+
+#[test]
+fn a_reload_write_does_not_swallow_an_overflow_that_is_due_but_not_dispatched() {
+    let mut b = bus();
+    start(&mut b, 0, 0xFFF0, IRQ);
+    // Time passes past the first overflow without the bus dispatching events (a
+    // long instruction, an HLE SWI), then the program writes the reload.
+    b.idle(30);
+    b.write16(TM, 0xFF00, N);
+    run(&mut b, 0);
+    assert_ne!(b.irq.if_ & 1 << 3, 0, "the overflow still fires");
+}

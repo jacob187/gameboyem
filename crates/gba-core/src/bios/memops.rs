@@ -461,8 +461,10 @@ pub(super) fn diff_unfilter(bus: &mut Bus, r: &[u32; 4], wide: bool, vram: bool)
     if wide {
         let mut dst = r[1] & !1;
         let mut acc = 0u16;
+        let mut completed = true;
         for i in 0..size / 2 {
             if m.exhausted() {
+                completed = false;
                 break;
             }
             let d = m.r16(src);
@@ -471,6 +473,10 @@ pub(super) fn diff_unfilter(bus: &mut Bus, r: &[u32; 4], wide: bool, vram: bool)
             m.w16(dst, acc);
             dst = dst.wrapping_add(2);
             m.work(2 * 2);
+        }
+        if completed {
+            // The whole call costs two cycles a byte, an odd trailing byte included.
+            m.extra = u64::from(size) * 2;
         }
     } else {
         let mut out = Sink::new(r[1], vram);

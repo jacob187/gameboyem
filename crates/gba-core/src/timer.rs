@@ -179,9 +179,14 @@ impl Timers {
     }
 
     /// Write TMxCNT_L (the reload value) through a byte-lane `mask`. A running
-    /// timer is caught up first, so the elapsed periods keep the old reload.
+    /// timer without an event is caught up first, so the elapsed periods keep the
+    /// old reload. One with an event needs no catch-up (its first overflow does not
+    /// depend on the reload and `overflow` restarts it), and folding would swallow
+    /// an overflow that is due but not yet dispatched.
     pub fn write_reload(&mut self, n: usize, v: u16, mask: u16, now: u64, sched: &mut Scheduler) {
-        self.sync(n, now);
+        if sched.when(Event::TimerOverflow(n as u8)).is_none() {
+            self.sync(n, now);
+        }
         let t = &mut self.t[n];
         t.reload = (t.reload & !mask) | (v & mask);
         self.reschedule_all(now, sched);
