@@ -75,8 +75,25 @@ jobs:
 
       # GBA homebrew (DECISIONS #49): a separate cargo project on a pinned nightly
       # (homebrew/gba/rust-toolchain.toml); the workspace itself stays on stable.
+      # The nightly (with rust-src) and the build-std/agb build output are cached, keyed on what
+      # pins them: the toolchain file and the lockfile. The install step stays: it is a no-op on
+      # a hit and fills in anything the cache did not hold.
+      - name: Cache the GBA homebrew nightly
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/nightly-2026-07-22-*
+            ~/.rustup/update-hashes/nightly-2026-07-22-*
+          key: gba-nightly-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('homebrew/gba/rust-toolchain.toml') }}
+
       - name: Install the GBA homebrew nightly
         run: rustup toolchain install nightly-2026-07-22 --component rust-src,clippy,rustfmt --profile minimal
+
+      - name: Cache the GBA homebrew build
+        uses: actions/cache@v4
+        with:
+          path: homebrew/gba/target
+          key: gba-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('homebrew/gba/rust-toolchain.toml', 'homebrew/gba/Cargo.lock') }}
 
       - name: Cache agb-gbafix
         uses: actions/cache@v4
