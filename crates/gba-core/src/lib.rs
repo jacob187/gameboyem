@@ -30,6 +30,7 @@ pub mod irq;
 pub mod keypad;
 pub mod memory;
 pub mod ppu;
+pub mod prefetch;
 pub mod scheduler;
 pub mod timer;
 

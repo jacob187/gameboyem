@@ -240,7 +240,8 @@ impl Bus {
         let dst = c.dst & !(size - 1);
 
         let value = if (0x02..=0x0F).contains(&(src >> 24)) {
-            self.sched.advance(self.cost(src, w, access));
+            let cycles = self.access_cost(src, w, access);
+            self.sched.advance(cycles);
             let v = self.read_value(src, w);
             self.dma.latch = if w == Width::H {
                 v & 0xFFFF | v << 16
@@ -253,7 +254,8 @@ impl Bus {
             self.sched.advance(1);
             self.dma.latch
         };
-        self.sched.advance(self.cost(dst, w, access));
+        let cycles = self.access_cost(dst, w, access);
+        self.sched.advance(cycles);
         self.write_value(dst, value, w);
 
         let step = |addr: u32, ctl: u16| match ctl {

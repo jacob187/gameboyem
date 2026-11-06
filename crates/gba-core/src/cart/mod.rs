@@ -379,6 +379,13 @@ impl Cart {
         self.gpio.live()
     }
 
+    /// Whether a GPIO register can currently shadow ROM on a read. When false,
+    /// [`Cart::gpio_read`] would return `None` for every address.
+    #[inline]
+    pub fn gpio_reads(&self) -> bool {
+        self.gpio.reads_enabled()
+    }
+
     /// A data read at ROM offset `off` (0..0x0200_0000) of width `w`, if it hits
     /// a GPIO register that is currently readable: `None` means read the ROM.
     /// Registers are 0xC4 data, 0xC6 direction, 0xC8 control; a word covering a

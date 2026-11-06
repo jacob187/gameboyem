@@ -12,6 +12,8 @@ use crate::scheduler::Event;
 
 /// WAITCNT's writable bits (bit 15, the cart type, is read-only).
 const WAITCNT_MASK: u16 = 0x7FFF;
+/// WAITCNT bit 14: GamePak prefetch buffer enable.
+const WAITCNT_PREFETCH: u16 = 1 << 14;
 
 #[inline]
 fn merge(old: u16, v: u16, mask: u16) -> u16 {
@@ -115,8 +117,17 @@ impl Bus {
             0x200 => self.irq.ie = merge(self.irq.ie, v, mask) & 0x3FFF,
             0x202 => self.irq.write_if(v & mask),
             0x204 => {
+                // Halfwords read so far were read at the old timings (code-review T#1).
+                if self.prefetch.enabled {
+                    self.prefetch.sync(self.sched.now(), &self.waits);
+                }
                 self.waitcnt = merge(self.waitcnt, v, mask) & WAITCNT_MASK;
                 self.waits = crate::bus::WaitTable::from_waitcnt(self.waitcnt);
+                // Bit 14: the prefetch buffer. Only a change resets it.
+                let on = self.waitcnt & WAITCNT_PREFETCH != 0;
+                if on != self.prefetch.enabled {
+                    self.prefetch.set_enabled(on);
+                }
             }
             0x208 => {
                 if mask & 1 != 0 {

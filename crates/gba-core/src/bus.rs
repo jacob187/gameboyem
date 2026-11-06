@@ -10,9 +10,9 @@
 //! Every `CpuBus` access first advances the master clock by [`Bus::cost`] (1 cycle
 //! plus the region's wait states for that width and [`Access`] kind), then does its
 //! effect, so a timer read sees the clock at the end of its own access. Events
-//! that fall due are dispatched by the run loop after the instruction. All
-//! cartridge-ROM costs go through [`Bus::rom_cost`]; that is where the P3-TIMING
-//! prefetch buffer hooks in (see its doc).
+//! that fall due are dispatched by the run loop after the instruction. Cartridge-ROM
+//! costs come from [`WaitTable::rom_access`]; opcode fetches from ROM go through the
+//! prefetch buffer ([`crate::prefetch`]) when WAITCNT bit 14 is set.
 
 use crate::apu::Apu;
 use crate::bios::Bios;
@@ -20,7 +20,9 @@ use crate::cart::Cart;
 use crate::dma::{Dma, DmaTrigger};
 use crate::irq::Irq;
 use crate::keypad::Keypad;
+use crate::memory::rd;
 use crate::ppu::Ppu;
+use crate::prefetch::Prefetch;
 use crate::scheduler::{Event, Scheduler};
 use crate::timer::Timers;
 
@@ -107,6 +109,18 @@ pub struct WaitTable {
 }
 
 impl WaitTable {
+    /// Cycles for a cartridge-ROM access at `addr`, 16-bit or (`wide`) 32-bit. A
+    /// sequential access is only sequential if the CPU/DMA says so *and* it
+    /// doesn't start a new 128 KiB page (the cart's address latch rolls over;
+    /// GBATEK "GBA Cart ROM" / nba hw-test `128kb-boundary`). A word is two
+    /// halfword accesses: N+S, or S+S.
+    #[inline]
+    pub fn rom_access(&self, addr: u32, wide: bool, access: Access) -> u64 {
+        let ws = ((addr >> 25) & 3) as usize;
+        let seq = access == Access::Seq && addr & 0x1_FFFF != 0;
+        u64::from(self.rom[ws][usize::from(seq)][usize::from(wide)])
+    }
+
     pub fn from_waitcnt(w: u16) -> Self {
         const N: [u8; 4] = [4, 3, 2, 8];
         const S: [[u8; 2]; 3] = [[2, 1], [4, 1], [8, 1]];
@@ -148,6 +162,8 @@ pub struct Bus {
     /// WAITCNT (0x0400_0204) and the costs derived from it.
     pub waitcnt: u16,
     pub waits: WaitTable,
+    /// The GamePak prefetch buffer (WAITCNT bit 14, DECISIONS #70).
+    pub prefetch: Prefetch,
     /// The last value the CPU fetched, replicated to 32 bits for a halfword
     /// fetch: what unmapped regions read as (open bus, DECISIONS #52).
     pub open_bus: u32,
@@ -186,6 +202,7 @@ impl Bus {
             frames: 0,
             waitcnt: 0,
             waits: WaitTable::from_waitcnt(0),
+            prefetch: Prefetch::default(),
             open_bus: 0,
             // What the BIOS leaves behind after startup (GBATEK "BIOS Memory
             // Protection"); P2-BIOS refines it.
@@ -208,7 +225,7 @@ impl Bus {
     pub fn process_events(&mut self) {
         while let Some((event, at)) = self.sched.pop_due() {
             match event {
-                Event::PpuHBlank | Event::PpuLineEnd => {
+                Event::PpuFirstLine | Event::PpuRender | Event::PpuHBlank | Event::PpuLineEnd => {
                     let sig = self.ppu.on_event(event, at, &mut self.sched);
                     self.irq.if_ |= sig.irq;
                     if sig.frame_done {
@@ -250,6 +267,39 @@ impl Bus {
         self.check_wake();
     }
 
+    /// Dispatch the events that are due before the CPU touches video state, so a
+    /// store lands on the right side of the PPU's render (cycle 960) and line end,
+    /// and a status read sees the current line, instead of being up to an
+    /// instruction early or late. Only the CPU's own accesses do this; a DMA unit
+    /// is never interrupted by event dispatch.
+    #[inline]
+    fn sync_ppu_write(&mut self, addr: u32) {
+        let video = match addr >> 24 {
+            0x04 => addr & 0x00FF_FFFF < 0x60,
+            0x05..=0x07 => true,
+            _ => false,
+        };
+        if video {
+            self.catch_up_events();
+        }
+    }
+
+    /// See [`Bus::sync_ppu_write`]; reads matter for DISPSTAT and VCOUNT only.
+    #[inline]
+    fn sync_ppu_read(&mut self, addr: u32) {
+        if addr >> 24 == 0x04 && addr & 0x00FF_FFFF < 0x60 {
+            self.catch_up_events();
+        }
+    }
+
+    #[inline]
+    fn catch_up_events(&mut self) {
+        let now = self.sched.now();
+        if self.sched.next_at().is_some_and(|t| t <= now) {
+            self.process_events();
+        }
+    }
+
     /// End a halt (or stop) if its wake condition holds. Called after events and
     /// whenever something outside the run loop raises an interrupt.
     pub fn check_wake(&mut self) {
@@ -282,7 +332,7 @@ impl Bus {
                 }
             }
             // Palette and VRAM: 16-bit bus, no waits (the PPU contention penalty
-            // is P3-TIMING); a word is two accesses.
+            // is not modelled, DECISIONS #71); a word is two accesses.
             0x05 | 0x06 => {
                 if w == Width::W {
                     2
@@ -290,29 +340,32 @@ impl Bus {
                     1
                 }
             }
-            0x08..=0x0D => self.rom_cost(addr, w, access, false),
+            0x08..=0x0D => self.rom_cost(addr, w, access),
             0x0E | 0x0F => u64::from(self.waits.sram),
             // BIOS, IWRAM, I/O, OAM (32-bit buses), and open bus.
             _ => 1,
         }
     }
 
-    /// Cost of a cartridge ROM access.
-    ///
-    /// A sequential access is only sequential if the CPU/DMA says so *and* it
-    /// doesn't start a new 128 KiB page (the cart's address latch rolls over;
-    /// GBATEK "GBA Cart ROM" / nba hw-test `128kb-boundary`).
-    ///
-    /// P3-TIMING: the prefetch buffer hooks in here. `fetch` is true for opcode
-    /// fetches (the only accesses the buffer serves); a buffered opcode would
-    /// cost 1 cycle, and every other ROM access would first have to account for
-    /// the prefetch in flight. The caller already passes everything needed.
+    /// Cost of a cartridge ROM access without the prefetch buffer: the
+    /// [`WaitTable`] entry (see [`WaitTable::rom_access`]). Pure, so the HLE BIOS
+    /// can use it for its bookkeeping; the CPU and DMA go through
+    /// [`Bus::access_cost`] and [`Bus::rom_fetch_cost`], which also keep the prefetch
+    /// buffer's state.
     #[inline]
-    pub fn rom_cost(&self, addr: u32, w: Width, access: Access, fetch: bool) -> u64 {
-        let _ = fetch;
-        let ws = ((addr >> 25) & 3) as usize;
-        let seq = access == Access::Seq && addr & 0x1_FFFF != 0;
-        u64::from(self.waits.rom[ws][usize::from(seq)][usize::from(w == Width::W)])
+    pub fn rom_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
+        self.waits.rom_access(addr, w == Width::W, access)
+    }
+
+    /// Cost of a (non-fetch) access, updating the prefetch buffer when the access
+    /// uses the cartridge bus. Used by the CPU and DMA.
+    #[inline]
+    pub fn access_cost(&mut self, addr: u32, w: Width, access: Access) -> u64 {
+        let c = self.cost(addr, w, access);
+        if self.prefetch.enabled && (0x08..=0x0D).contains(&(addr >> 24)) {
+            self.prefetch.data_access(self.sched.now(), &self.waits, c);
+        }
+        c
     }
 
     /// Open-bus value for an access of `w` at `addr` (the CPU's last fetch).
@@ -333,13 +386,15 @@ impl Bus {
         self.fetching_bios = addr < crate::BIOS_SIZE as u32;
     }
 
-    /// Cost of an opcode fetch (ROM fetches go through the prefetch hook).
+    /// Cost of a cartridge-ROM opcode fetch: the only access the prefetch buffer
+    /// serves (`Prefetch::fetch`, DECISIONS #70).
     #[inline]
-    fn fetch_cost(&self, addr: u32, w: Width, access: Access) -> u64 {
-        if (0x08..=0x0D).contains(&(addr >> 24)) {
-            self.rom_cost(addr, w, access, true)
+    fn rom_fetch_cost(&mut self, addr: u32, w: Width, access: Access) -> u64 {
+        if self.prefetch.enabled {
+            self.prefetch
+                .fetch(self.sched.now(), &self.waits, addr, w == Width::W, access)
         } else {
-            self.cost(addr, w, access)
+            self.rom_cost(addr, w, access)
         }
     }
 
@@ -370,49 +425,116 @@ const STOP_WAKE_MASK: u16 = 1 << 7 | 1 << 12 | 1 << 13;
 impl CpuBus for Bus {
     #[inline]
     fn read8(&mut self, addr: u32, access: Access) -> u8 {
-        self.sched.advance(self.cost(addr, Width::B, access));
+        let c = self.access_cost(addr, Width::B, access);
+        self.sched.advance(c);
+        self.sync_ppu_read(addr);
         self.read_value(addr, Width::B) as u8
     }
     #[inline]
     fn read16(&mut self, addr: u32, access: Access) -> u16 {
-        self.sched.advance(self.cost(addr, Width::H, access));
+        let c = self.access_cost(addr, Width::H, access);
+        self.sched.advance(c);
+        self.sync_ppu_read(addr);
         self.read_value(addr, Width::H) as u16
     }
     #[inline]
     fn read32(&mut self, addr: u32, access: Access) -> u32 {
-        self.sched.advance(self.cost(addr, Width::W, access));
+        let c = self.access_cost(addr, Width::W, access);
+        self.sched.advance(c);
+        self.sync_ppu_read(addr);
         self.read_value(addr, Width::W)
     }
     #[inline]
     fn write8(&mut self, addr: u32, value: u8, access: Access) {
-        self.sched.advance(self.cost(addr, Width::B, access));
+        let c = self.access_cost(addr, Width::B, access);
+        self.sched.advance(c);
+        self.sync_ppu_write(addr);
         self.write_value(addr, u32::from(value), Width::B);
     }
     #[inline]
     fn write16(&mut self, addr: u32, value: u16, access: Access) {
-        self.sched.advance(self.cost(addr, Width::H, access));
+        let c = self.access_cost(addr, Width::H, access);
+        self.sched.advance(c);
+        self.sync_ppu_write(addr);
         self.write_value(addr, u32::from(value), Width::H);
     }
     #[inline]
     fn write32(&mut self, addr: u32, value: u32, access: Access) {
-        self.sched.advance(self.cost(addr, Width::W, access));
+        let c = self.access_cost(addr, Width::W, access);
+        self.sched.advance(c);
+        self.sync_ppu_write(addr);
         self.write_value(addr, value, Width::W);
     }
     #[inline]
     fn fetch16(&mut self, addr: u32, access: Access) -> u16 {
-        self.begin_fetch(addr);
-        self.sched.advance(self.fetch_cost(addr, Width::H, access));
-        let v = self.read_region(addr, Width::H, false);
-        self.note_fetch(addr, v, Width::H);
-        v as u16
+        // Per-region fast paths for the regions code runs from. Each does what the
+        // general path does: the BIOS-fetch flag is cleared (no BIOS latch update
+        // is needed), the open-bus value is latched and the clock charged.
+        match addr >> 24 {
+            0x08..=0x0D => {
+                self.fetching_bios = false;
+                let c = self.rom_fetch_cost(addr, Width::H, access);
+                self.sched.advance(c);
+                let v = self.read_rom(addr, Width::H);
+                self.open_bus = v | v << 16;
+                v as u16
+            }
+            0x03 => {
+                self.fetching_bios = false;
+                self.sched.advance(1);
+                let v = rd(&self.iwram, addr as usize & 0x7FFF, Width::H);
+                self.open_bus = v | v << 16;
+                v as u16
+            }
+            0x02 => {
+                self.fetching_bios = false;
+                self.sched.advance(3);
+                let v = rd(&self.ewram, addr as usize & 0x3_FFFF, Width::H);
+                self.open_bus = v | v << 16;
+                v as u16
+            }
+            _ => {
+                self.begin_fetch(addr);
+                self.sched.advance(self.cost(addr, Width::H, access));
+                let v = self.read_region(addr, Width::H, false);
+                self.note_fetch(addr, v, Width::H);
+                v as u16
+            }
+        }
     }
     #[inline]
     fn fetch32(&mut self, addr: u32, access: Access) -> u32 {
-        self.begin_fetch(addr);
-        self.sched.advance(self.fetch_cost(addr, Width::W, access));
-        let v = self.read_region(addr, Width::W, false);
-        self.note_fetch(addr, v, Width::W);
-        v
+        match addr >> 24 {
+            0x08..=0x0D => {
+                self.fetching_bios = false;
+                let c = self.rom_fetch_cost(addr, Width::W, access);
+                self.sched.advance(c);
+                let v = self.read_rom(addr, Width::W);
+                self.open_bus = v;
+                v
+            }
+            0x03 => {
+                self.fetching_bios = false;
+                self.sched.advance(1);
+                let v = rd(&self.iwram, addr as usize & 0x7FFF, Width::W);
+                self.open_bus = v;
+                v
+            }
+            0x02 => {
+                self.fetching_bios = false;
+                self.sched.advance(6);
+                let v = rd(&self.ewram, addr as usize & 0x3_FFFF, Width::W);
+                self.open_bus = v;
+                v
+            }
+            _ => {
+                self.begin_fetch(addr);
+                self.sched.advance(self.cost(addr, Width::W, access));
+                let v = self.read_region(addr, Width::W, false);
+                self.note_fetch(addr, v, Width::W);
+                v
+            }
+        }
     }
     fn idle(&mut self, cycles: u32) {
         self.sched.advance(u64::from(cycles));
@@ -422,5 +544,40 @@ impl CpuBus for Bus {
     }
     fn swi(&mut self, number: u8, r: &mut [u32; 4]) -> SwiResult {
         crate::bios::swi(self, number, r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cpu_store_after_the_render_point_lands_on_the_next_line() {
+        // The store's own access crosses cycle 960, so the line is drawn first
+        // even though the run loop would only dispatch the event after the
+        // instruction (DECISIONS #71).
+        const PAL: u32 = 0x0500_0000;
+        let mut bus = Bus::new(Cart::from_rom(vec![0; 0x400]).unwrap(), Bios::Hle);
+        bus.write16(PAL, 0x001F, Access::NonSeq); // cycle 1
+        bus.idle(957); // cycle 958
+        bus.write16(PAL, 0x03E0, Access::NonSeq); // completes at 959: line 0
+        bus.write16(PAL, 0x7C00, Access::NonSeq); // completes at 960: line 1
+        while bus.frames == 0 {
+            bus.idle(100);
+            bus.process_events();
+        }
+        let fb = bus.ppu.framebuffer();
+        assert_eq!(fb[0], 0x03E0);
+        assert_eq!(fb[crate::SCREEN_WIDTH], 0x7C00);
+    }
+
+    #[test]
+    fn dispstat_and_vcount_reads_see_events_that_are_due() {
+        let mut bus = Bus::new(Cart::from_rom(vec![0; 0x400]).unwrap(), Bios::Hle);
+        bus.idle(crate::CYCLES_PER_LINE - 2);
+        // This read ends one cycle short of line 1: no event due yet.
+        assert_eq!(bus.read16(0x0400_0006, Access::NonSeq), 0);
+        // The read itself costs a cycle and crosses the line end.
+        assert_eq!(bus.read16(0x0400_0006, Access::NonSeq), 1);
     }
 }

@@ -333,3 +333,79 @@ fn io_register_read_masks() {
     assert_eq!(rig.ppu.dispcnt(), 0x1234);
     assert_eq!(rig.ppu.read_io(DISPCNT), 0x1234);
 }
+
+#[test]
+fn a_line_is_drawn_at_cycle_960_and_a_later_write_shows_on_the_next_line() {
+    // DECISIONS #71: the render event is separate from the HBlank event. With no
+    // layer enabled every pixel is the backdrop, palette entry 0.
+    let mut rig = Rig::new();
+    rig.pal(0, 0x001F);
+    rig.run_to_line(5, 959);
+    rig.pal(0, 0x03E0); // before the visible dots end: shows on line 5
+    rig.run_to_line(5, 960);
+    rig.pal(0, 0x7C00); // after: line 5 is already drawn
+    rig.run_to_line(5, 1005);
+    assert_eq!(rig.stat() & 2, 0, "HBlank has not begun");
+    rig.run_to_line(5, 1006);
+    assert_eq!(rig.stat() & 2, 2);
+    let frame = rig.frame();
+    assert_eq!(px(&frame, 3, 4), 0x001F);
+    assert_eq!(px(&frame, 3, 5), 0x03E0);
+    assert_eq!(px(&frame, 3, 6), 0x7C00);
+}
+
+#[test]
+fn affine_reference_points_advance_with_the_render_event() {
+    // The latch step is tied to the render (DECISIONS #58): a BG2X write after cycle
+    // 960 reloads the point after this line's step, so it is the next line's start.
+    let mut rig = Rig::new();
+    rig.write(0x022, 0x0001); // BG2PB = 1 (a nonzero step)
+    rig.run_to_line(3, 959);
+    let before = rig.ppu.affine_latch[0][0];
+    rig.run_to_line(3, 961);
+    assert_eq!(rig.ppu.affine_latch[0][0], before + 1);
+    rig.run_to_line(3, 1100);
+    rig.write(0x028, 0x0200); // BG2X: reload now
+    assert_eq!(rig.ppu.affine_latch[0][0], 0x0200);
+    rig.run_to_line(3, 1231);
+    assert_eq!(
+        rig.ppu.affine_latch[0][0], 0x0200,
+        "no second step in HBlank"
+    );
+}
+
+#[test]
+fn vcount_irq_fires_for_line_0_of_the_first_frame() {
+    // Line 0 after power-on is the one line start no line end announces.
+    let mut rig = Rig::new();
+    rig.write(DISPSTAT, 1 << 5); // VCount IRQ on, LYC = 0
+    rig.run_to(0);
+    assert_eq!(rig.irq, 4);
+    // Only once: the next match is line 0 of the next frame.
+    rig.run_to_line(227, 1231);
+    assert_eq!(rig.irq, 4);
+    rig.irq = 0;
+    rig.run_to(u64::from(CYCLES_PER_FRAME));
+    assert_eq!(rig.irq, 4);
+
+    // A different LYC does not match line 0, nor does a disabled IRQ.
+    let mut rig = Rig::new();
+    rig.write(DISPSTAT, 1 << 5 | 1 << 8);
+    rig.run_to(0);
+    assert_eq!(rig.irq, 0);
+    let mut rig = Rig::new();
+    rig.run_to(0);
+    assert_eq!(rig.irq, 0);
+}
+
+#[test]
+fn a_write_that_makes_the_vcount_match_true_mid_line_raises_nothing() {
+    // GBATEK and nba hw-test status-irq-dma leave this open; the IRQ stays a line-start
+    // event (DECISIONS #71). The flag itself is live.
+    let mut rig = Rig::new();
+    rig.run_to_line(10, 100);
+    rig.write(DISPSTAT, 1 << 5 | 10 << 8);
+    assert_eq!(rig.stat() & 4, 4);
+    rig.run_to_line(10, 1231);
+    assert_eq!(rig.irq, 0);
+}

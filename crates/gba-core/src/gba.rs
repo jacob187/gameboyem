@@ -77,7 +77,13 @@ impl Gba {
         } else {
             self.cpu.step(&mut self.bus);
         }
-        self.bus.process_events();
+        // Dispatch only when something is due, or while halted (the wake check at
+        // the end of `process_events` is what ends a halt). Most instructions
+        // cross no event, and the call is not free (P3-TIMING).
+        let now = self.bus.sched.now();
+        if self.bus.halted || self.bus.sched.next_at().is_some_and(|t| t <= now) {
+            self.bus.process_events();
+        }
         true
     }
 
@@ -239,6 +245,9 @@ mod tests {
         // HALTCNT (high byte of 0x300): every step now advances to an event.
         gba.bus.write_io16(0x300, 0, 0xFF00);
         assert!(gba.bus.halted);
+        // The power-on line-start event is due at cycle 0: the first step only
+        // dispatches it.
+        gba.step_instruction();
         let t = gba.cycles();
         gba.step_instruction();
         assert!(gba.cycles() > t, "halt skipped the clock");
@@ -257,5 +266,184 @@ mod tests {
         assert_eq!(gba.cycles() - t, 2 + 4);
         gba.step_instruction();
         assert!(gba.bus.dma.active_channel().is_none());
+    }
+
+    /// `step_once(false)` without the dispatch gate: events are processed after
+    /// every step, as the run loop did before P3-TIMING.
+    fn step_ungated(g: &mut Gba) {
+        if g.bus.dma.active_channel().is_some() {
+            g.bus.run_dma();
+        } else if g.bus.halted {
+            if !g.bus.sched.skip_to_next() {
+                return;
+            }
+        } else {
+            g.cpu.step(&mut g.bus);
+        }
+        g.bus.process_events();
+    }
+
+    /// A ROM that starts timer 0 (reload 0xFFF0, 16 cycles per overflow) and then
+    /// reads its counter in a loop, so timer, PPU and APU events are all crossed.
+    fn timer_rom() -> Vec<u8> {
+        let mut rom = vec![0; 0x100];
+        let words: [(usize, u32); 7] = [
+            (0x00, 0xEA00_002E), // b 0xC0
+            (0xC0, 0xE3A0_0301), // mov r0, #0x04000000
+            (0xC4, 0xE3A0_1880), // mov r1, #0x00800000 (enable)
+            (0xC8, 0xE381_1CF0), // orr r1, r1, #0xF000
+            (0xCC, 0xE381_10F0), // orr r1, r1, #0xF0 (reload 0xFFF0)
+            (0xD0, 0xE580_1100), // str r1, [r0, #0x100]
+            (0xD4, 0xE590_2100), // loop: ldr r2, [r0, #0x100]
+        ];
+        for (at, w) in words {
+            rom[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        rom[0xD8..0xDC].copy_from_slice(&0xEAFF_FFFDu32.to_le_bytes()); // b loop
+        rom
+    }
+
+    #[test]
+    fn gating_process_events_does_not_change_results() {
+        let mut gated = Gba::new(timer_rom(), None).unwrap();
+        let mut plain = Gba::new(timer_rom(), None).unwrap();
+        for i in 0..300_000 {
+            gated.step_once(false);
+            step_ungated(&mut plain);
+            if i % 1000 == 0 {
+                assert_eq!(gated.cycles(), plain.cycles());
+                assert_eq!(gated.cpu_registers(), plain.cpu_registers());
+            }
+        }
+        assert_eq!(gated.cycles(), plain.cycles());
+        assert_eq!(gated.frames(), plain.frames());
+        assert!(gated.frames() >= 1, "crossed frame events");
+        assert_eq!(gated.cpu_registers(), plain.cpu_registers());
+        assert_eq!(gated.peek16(0x0400_0006), plain.peek16(0x0400_0006));
+        assert_eq!(gated.peek16(0x0400_0202), plain.peek16(0x0400_0202));
+    }
+
+    /// A ROM whose code at 0xC0 is `words`, entered through a branch at 0.
+    fn rom_with(words: &[u32]) -> Vec<u8> {
+        let mut rom = vec![0; 0x100 + 4 * words.len()];
+        rom[0..4].copy_from_slice(&0xEA00_002Eu32.to_le_bytes()); // b 0xC0
+        for (i, w) in words.iter().enumerate() {
+            rom[0xC0 + 4 * i..0xC4 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
+        rom
+    }
+
+    const MODE_IRQ: u32 = 0x12;
+
+    /// Run `steps` steps on a gated and an ungated machine in lockstep, asserting
+    /// they never differ in cycles or registers, and call `each` on the gated one
+    /// after every step.
+    fn lockstep(
+        rom: Vec<u8>,
+        steps: usize,
+        mut setup: impl FnMut(&mut Gba),
+        mut each: impl FnMut(usize, &Gba),
+    ) {
+        let mut gated = Gba::new(rom.clone(), None).unwrap();
+        let mut plain = Gba::new(rom, None).unwrap();
+        setup(&mut gated);
+        setup(&mut plain);
+        for i in 0..steps {
+            gated.step_once(false);
+            step_ungated(&mut plain);
+            assert_eq!(gated.cycles(), plain.cycles(), "step {i}");
+            assert_eq!(gated.cpu_registers(), plain.cpu_registers(), "step {i}");
+            assert_eq!(gated.bus.halted, plain.bus.halted, "step {i}");
+            assert_eq!(gated.bus.irq.if_, plain.bus.irq.if_, "step {i}");
+            each(i, &gated);
+        }
+    }
+
+    #[test]
+    fn an_ie_ime_write_that_makes_an_irq_pending_is_taken_before_the_next_instruction() {
+        // code-review T#6: the IRQ line is level (IME & IE & IF), not an event, so the
+        // gate cannot delay it. VBlank is already flagged; IE then IME open the gate.
+        let rom = rom_with(&[
+            0xE3A0_0301, // mov r0, #0x04000000
+            0xE3A0_1001, // mov r1, #1
+            0xE580_1200, // str r1, [r0, #0x200]   IE = VBlank
+            0xE580_1208, // str r1, [r0, #0x208]   IME = 1
+            0xE1A0_0000, // nop
+            0xEAFF_FFFE, // b .
+        ]);
+        let mut ime_step = None;
+        let mut irq_step = None;
+        lockstep(
+            rom,
+            12,
+            |g| g.bus.irq.if_ = 1,
+            |i, g| {
+                if ime_step.is_none() && g.bus.irq.ime {
+                    ime_step = Some(i);
+                }
+                if irq_step.is_none() && g.cpu_registers().cpsr & 0x1F == MODE_IRQ {
+                    irq_step = Some(i);
+                }
+            },
+        );
+        let ime = ime_step.expect("IME was written");
+        assert_eq!(irq_step, Some(ime + 1), "taken at the very next step");
+    }
+
+    #[test]
+    fn haltcnt_with_a_pending_interrupt_never_halts() {
+        let rom = rom_with(&[
+            0xE3A0_0301, // mov r0, #0x04000000
+            0xE3A0_1001, // mov r1, #1
+            0xE580_1200, // str r1, [r0, #0x200]   IE = VBlank (IME stays 0)
+            0xE3A0_2000, // mov r2, #0
+            0xE5C0_2301, // strb r2, [r0, #0x301]  HALTCNT
+            0xE3A0_3007, // mov r3, #7
+            0xEAFF_FFFE, // b .
+        ]);
+        let mut done = false;
+        lockstep(
+            rom,
+            16,
+            |g| g.bus.irq.if_ = 1,
+            |_, g| {
+                assert!(!g.bus.halted, "halted with an enabled interrupt pending");
+                done |= g.cpu_registers().r[3] == 7;
+            },
+        );
+        assert!(done, "ran on past the HALTCNT write");
+    }
+
+    #[test]
+    fn a_halt_woken_by_a_timer_irq_resumes_at_the_same_cycle_as_without_gating() {
+        let rom = rom_with(&[
+            0xE3A0_0301, // mov r0, #0x04000000
+            0xE3A0_18C0, // mov r1, #0x00C00000   enable + IRQ
+            0xE381_1CF0, // orr r1, r1, #0xF000
+            0xE381_10F0, // orr r1, r1, #0xF0     reload 0xFFF0: overflow after 16 cycles
+            0xE580_1100, // str r1, [r0, #0x100]  TM0CNT
+            0xE3A0_2008, // mov r2, #8
+            0xE580_2200, // str r2, [r0, #0x200]  IE = Timer0 (IME stays 0)
+            0xE3A0_2000, // mov r2, #0
+            0xE5C0_2301, // strb r2, [r0, #0x301] HALTCNT
+            0xE3A0_3007, // mov r3, #7
+            0xEAFF_FFFE, // b .
+        ]);
+        let (mut halted_at, mut woke_at) = (None, None);
+        lockstep(
+            rom,
+            24,
+            |_| {},
+            |_, g| {
+                if g.bus.halted && halted_at.is_none() {
+                    halted_at = Some(g.cycles());
+                }
+                if halted_at.is_some() && !g.bus.halted && woke_at.is_none() {
+                    woke_at = Some(g.cycles());
+                }
+            },
+        );
+        let (h, w) = (halted_at.expect("halted"), woke_at.expect("woken"));
+        assert!(w > h, "the clock skipped to the timer overflow");
     }
 }
