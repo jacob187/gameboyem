@@ -400,6 +400,11 @@ impl Rtc {
         if b[3] <= 6 {
             self.weekday = b[3];
         }
+        // A new month or year can leave the old day past its end (day 31, then
+        // month 2; 29 February, then a non-leap year). The S-3511 is not
+        // documented here; the clock never holds an impossible date, so the day
+        // is clamped to the last day of the month it is now in.
+        self.day = self.day.min(days_in_month(self.year, self.month));
         self.write_time([b[4], b[5], b[6]]);
     }
 
@@ -732,5 +737,37 @@ mod tests {
         assert!(broken(23, 1), "reserved");
         assert!(Rtc::from_footer(&f[..23], 0).is_err());
         assert!(Rtc::from_footer(&[f.as_slice(), &[0]].concat(), 0).is_err());
+    }
+
+    /// Writing the month or year alone must not leave the old day past the end of
+    /// the new month (code-review ST#2): the day is clamped, so the clock holds a
+    /// real date and a state taken from it loads.
+    #[test]
+    fn a_datetime_write_never_leaves_an_impossible_date() {
+        let load_back = |r: &Rtc| {
+            let mut w = StateWriter::new();
+            r.save_state(&mut w);
+            let bytes = w.into_bytes();
+            let mut back = Rtc::power_on();
+            back.load_state(&mut StateReader::new(&bytes))
+                .expect("a reachable clock state loads");
+            assert_eq!(&back, r);
+        };
+        // 31 January 2024 (leap year), then month = 02 with an unusable day byte.
+        let mut r = Rtc::power_on();
+        r.set_time(RtcTime::new(2024, 1, 31, 1, 2, 3).unwrap(), 0);
+        r.write_datetime([0x24, 0x02, 0xFF, 9, 0x01, 0x02, 0x03]);
+        assert_eq!((r.month, r.day), (2, 29));
+        load_back(&r);
+        // 29 February 2024, then the year becomes 2023.
+        let mut r = Rtc::power_on();
+        r.set_time(RtcTime::new(2024, 2, 29, 1, 2, 3).unwrap(), 0);
+        r.write_datetime([0x23, 0x02, 0xFF, 9, 0x01, 0x02, 0x03]);
+        assert_eq!((r.year, r.month, r.day), (23, 2, 28));
+        load_back(&r);
+        // A valid day in the same write is kept as written.
+        r.write_datetime([0x23, 0x04, 0x30, 9, 0x01, 0x02, 0x03]);
+        assert_eq!((r.month, r.day), (4, 30));
+        load_back(&r);
     }
 }
