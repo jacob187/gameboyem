@@ -1,4 +1,4 @@
-//! Headless test-ROM harness for `gb-core`.
+//! Headless test-ROM harness for `gb-core` and `gba-core`.
 //!
 //! Never opens a window: runs on macOS, in Docker and in CI. The list of ROMs and
 //! their expected outcomes lives in `expected.txt` (see its header).

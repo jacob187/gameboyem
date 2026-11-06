@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use gb_core::replay::{Recording, ReplayError, Replayer};
 use gb_core::rgb555_to_rgb888;
-use gb_test::gba::save_gba_png;
+use gb_test::gba::{gba_rgb, save_gba_rgb_png};
 use gb_test::{artifact_dir, save_framebuffer_png, save_rgb_png};
 
 const USAGE: &str = "usage: gb-test --replay REC ROM [--bios FILE] [--dump F,F,...] [--out DIR]";
@@ -249,12 +249,8 @@ fn replay_gba(
             gba.drain_audio_into(&mut audio); // keep the core's buffer bounded
         }
         let path = out.join(format!("f{target:07}.png"));
-        save_gba_png(&gba.framebuffer()[..], &path)?;
-        let rgb: Vec<u8> = gba
-            .framebuffer()
-            .iter()
-            .flat_map(|&c| rgb555_to_rgb888(c))
-            .collect();
+        let rgb = gba_rgb(gba.framebuffer());
+        save_gba_rgb_png(&rgb, &path)?;
         println!(
             "frame {target}: {} (hash {:016x})",
             path.display(),

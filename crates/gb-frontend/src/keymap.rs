@@ -20,6 +20,9 @@ pub enum Action {
     Screenshot,
 }
 
+/// Printed once when the window opens on a Game Boy, where S used to save a state.
+pub const SAVE_KEY_NOTICE: &str = "save state is K, load is L (S is now D-pad Down)";
+
 pub fn map(key: KeyCode) -> Option<Action> {
     Some(match key {
         KeyCode::ArrowUp | KeyCode::KeyW => Action::Button(Button::Up),
@@ -215,6 +218,9 @@ mod tests {
         assert_eq!(map(KeyCode::KeyS), Some(Action::Button(Button::Down)));
         let mut s = InputState::default();
         assert_eq!(s.key(KeyCode::KeyK, true), None, "K moves no button");
+        // The startup notice names the same keys.
+        assert!(SAVE_KEY_NOTICE.contains("K") && SAVE_KEY_NOTICE.contains("L"));
+        assert!(SAVE_KEY_NOTICE.contains("S is now D-pad Down"));
     }
 
     #[test]

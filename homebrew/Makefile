@@ -5,7 +5,8 @@
 #   make -C homebrew gba                    # the GBA games (see below), not part of `all`
 #
 # Objects, maps and linker output go to $(BUILD) (gitignored); only the
-# finished .gb files are copied to $(OUT).
+# finished .gb files (and, for `make gba`, the .gba files) are copied to $(OUT).
+# `clean` removes the .gb files and $(BUILD); `gba-clean` the .gba files and gba/target.
 
 GBDK_HOME ?= ../tools/gbdk/
 OUT       ?= ../roms/homebrew
@@ -95,7 +96,12 @@ clean:
 GBA_DIR    := gba
 # name:header title (<= 12 bytes):game code (4 bytes); the ELF is $(GBA_ELF)/<name>.
 GBA_GAMES  := grains:GRAINS:AGRN moth:MOTH:AMTH
-GBA_ELF    := $(GBA_DIR)/target/thumbv4t-none-eabi/release
+# Cargo's output directory: $CARGO_TARGET_DIR if set (a relative one is relative to
+# $(GBA_DIR), where cargo runs), else $(GBA_DIR)/target. The build below is given this
+# same directory explicitly, so a build.target-dir in some cargo config cannot send
+# the ELFs elsewhere and leave gbafix reading stale ones.
+GBA_TARGET := $(if $(CARGO_TARGET_DIR),$(if $(filter /%,$(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR),$(GBA_DIR)/$(CARGO_TARGET_DIR)),$(GBA_DIR)/target)
+GBA_ELF    := $(GBA_TARGET)/thumbv4t-none-eabi/release
 GBAFIX     ?= $(firstword $(wildcard ../tools/agb/bin/agb-gbafix) agb-gbafix)
 gba_field   = $(word $(2),$(subst :, ,$(1)))
 GBA_ROMS   := $(foreach g,$(GBA_GAMES),$(OUT)/$(call gba_field,$(g),1).gba)
@@ -108,11 +114,12 @@ gba:
 	  echo "error: agb-gbafix not found (looked in ../tools/agb/bin and on PATH)." >&2; \
 	  echo "       install it: cargo install agb-gbafix --version 0.25.0 --locked --root tools/agb" >&2; \
 	  exit 1; }
-	cd $(GBA_DIR) && cargo build --release --locked
+	cd $(GBA_DIR) && CARGO_TARGET_DIR=$(abspath $(GBA_TARGET)) cargo build --release --locked
 	mkdir -p $(OUT)
 	$(foreach g,$(GBA_GAMES),$(GBAFIX) $(GBA_ELF)/$(call gba_field,$(g),1) -t $(call gba_field,$(g),2) -c $(call gba_field,$(g),3) -m 00 -o $(OUT)/$(call gba_field,$(g),1).gba && ) true
 	sh $(GBA_DIR)/check-header.sh $(GBA_ROMS)
 
+# Only the in-tree target: a CARGO_TARGET_DIR may be shared with other projects.
 gba-clean:
 	rm -rf $(GBA_DIR)/target
 	rm -f $(GBA_ROMS)

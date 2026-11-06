@@ -28,23 +28,9 @@ impl Button {
         Button::Start,
     ];
 
-    /// The same button as the cross-console type. Index `i` of
-    /// [`Button::ALL`] is index `i` of `emu_common::Button::ALL`.
-    pub const fn to_common(self) -> emu_common::Button {
-        match self {
-            Button::Right => emu_common::Button::Right,
-            Button::Left => emu_common::Button::Left,
-            Button::Up => emu_common::Button::Up,
-            Button::Down => emu_common::Button::Down,
-            Button::A => emu_common::Button::A,
-            Button::B => emu_common::Button::B,
-            Button::Select => emu_common::Button::Select,
-            Button::Start => emu_common::Button::Start,
-        }
-    }
-
     /// The Game Boy button for a cross-console one; `None` for the GBA-only
-    /// `L` and `R`.
+    /// `L` and `R`. Index `i` of [`Button::ALL`] is index `i` of
+    /// `emu_common::Button::ALL`.
     pub const fn from_common(button: emu_common::Button) -> Option<Self> {
         Some(match button {
             emu_common::Button::Right => Button::Right,
@@ -183,9 +169,7 @@ mod tests {
     #[test]
     fn button_order_matches_the_cross_console_type() {
         for (i, b) in Button::ALL.into_iter().enumerate() {
-            assert_eq!(usize::from(b.to_common().index()), i);
-            assert_eq!(Button::from_common(b.to_common()), Some(b));
-            assert_eq!(emu_common::Button::ALL[i], b.to_common());
+            assert_eq!(Button::from_common(emu_common::Button::ALL[i]), Some(b));
         }
         assert_eq!(Button::from_common(emu_common::Button::L), None);
         assert_eq!(Button::from_common(emu_common::Button::R), None);

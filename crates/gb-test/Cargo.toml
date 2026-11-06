@@ -1,6 +1,6 @@
 [package]
 name = "gb-test"
-description = "Headless test-ROM harness for gb-core"
+description = "Headless test-ROM harness for gb-core and gba-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

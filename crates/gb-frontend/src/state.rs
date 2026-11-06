@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use emu_common::{Core, StateError, System};
+use gb_core::Model;
 
 use crate::save::{append_ext, backup_without_overwrite, read_capped, save_path, write_atomic};
 
@@ -44,22 +45,29 @@ pub fn state_path(rom: &Path, slot: u8) -> PathBuf {
 /// The text for a failed `load_state`. A GBA mismatch names the options a state
 /// is tied to. A Game Boy model mismatch names the way out: a pre-CGB (v1) state is a DMG one, and `--model auto` now starts
 /// CGB-flagged ROMs as a Game Boy Color, so they need `--model dmg` to load it.
-/// `variant` is [`Core::hw_variant`] (Game Boy: 0 DMG, 1 CGB).
+/// `variant` is [`Core::hw_variant`] (Game Boy: 0 DMG, 1 CGB), decoded through
+/// [`Model::from_id`] so that a new model fails to compile here until it has a hint.
 fn load_error(e: &StateError, system: System, variant: u8) -> String {
-    match (e, system, variant) {
-        (StateError::ModelMismatch, System::Gb, 1) => {
-            format!("{e}; this session is a Game Boy Color, for a DMG state start with --model dmg")
-        }
-        (StateError::ModelMismatch, System::Gb, _) => {
-            format!("{e}; this session is a DMG, for a Game Boy Color state start with --model cgb")
-        }
+    match (e, system) {
+        (StateError::ModelMismatch, System::Gb) => match Model::from_id(variant) {
+            Some(Model::Cgb) => format!(
+                "{e}; this session is a Game Boy Color, for a DMG state start with --model dmg"
+            ),
+            Some(Model::Dmg) => format!(
+                "{e}; this session is a DMG, for a Game Boy Color state start with --model cgb"
+            ),
+            None => e.to_string(),
+        },
         // A GBA state is tied to the BIOS and the cartridge options it ran with.
-        (StateError::ModelMismatch, System::Gba, _) => {
+        (StateError::ModelMismatch, System::Gba) => {
             format!("{e}; start with the same --bios, --save-type and --rtc as when it was saved")
         }
         _ => e.to_string(),
     }
 }
+
+/// What K and L report for a core that has no state format ([`Core::supports_save_state`]).
+const NO_STATES: &str = "this core has no save states";
 
 pub struct StateSlots {
     rom: PathBuf,
@@ -93,6 +101,9 @@ impl StateSlots {
 
     /// Write the current slot. Returns a message for the user.
     pub fn save(&self, core: &dyn Core) -> Result<String, String> {
+        if !core.supports_save_state() {
+            return Err(NO_STATES.to_owned());
+        }
         let path = self.path();
         write_atomic(&path, &core.save_state())
             .map(|()| format!("saved state {}", self.slot))
@@ -101,6 +112,9 @@ impl StateSlots {
 
     /// Load the current slot into `core`. On error `core` is unchanged.
     pub fn load(&mut self, core: &mut dyn Core) -> Result<String, String> {
+        if !core.supports_save_state() {
+            return Err(NO_STATES.to_owned());
+        }
         let path = self.path();
         let data = match read_capped(&path, max_state_bytes(core.system()), "save state") {
             Ok(Some(d)) => d,
@@ -151,6 +165,70 @@ mod tests {
         rom[0x147] = 0x1B; // MBC5+RAM+BATTERY
         rom[0x149] = ram_code;
         rom
+    }
+
+    /// A Game Boy that says it cannot save states.
+    struct NoStates(GameBoy);
+
+    impl Core for NoStates {
+        fn system(&self) -> System {
+            Core::system(&self.0)
+        }
+        fn title(&self) -> String {
+            Core::title(&self.0)
+        }
+        fn native_fps(&self) -> f64 {
+            Core::native_fps(&self.0)
+        }
+        fn step_frame(&mut self) {
+            Core::step_frame(&mut self.0);
+        }
+        fn frame(&self) -> emu_common::FrameRef<'_> {
+            Core::frame(&self.0)
+        }
+        fn set_button(&mut self, button: emu_common::Button, pressed: bool) {
+            Core::set_button(&mut self.0, button, pressed);
+        }
+        fn drain_audio_into(&mut self, out: &mut Vec<f32>) {
+            Core::drain_audio_into(&mut self.0, out);
+        }
+        fn audio_sample_rate(&self) -> u32 {
+            Core::audio_sample_rate(&self.0)
+        }
+        fn set_audio_sample_rate(&mut self, hz: u32) {
+            Core::set_audio_sample_rate(&mut self.0, hz);
+        }
+        fn battery_ram(&self) -> Option<Vec<u8>> {
+            Core::battery_ram(&self.0)
+        }
+        fn battery_generation(&self) -> u64 {
+            Core::battery_generation(&self.0)
+        }
+        fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), emu_common::BatteryError> {
+            Core::load_battery_ram(&mut self.0, data)
+        }
+        fn hw_variant(&self) -> u8 {
+            Core::hw_variant(&self.0)
+        }
+        fn supports_save_state(&self) -> bool {
+            false
+        }
+        fn save_state(&self) -> Vec<u8> {
+            unreachable!("the host must not call save_state")
+        }
+        fn load_state(&mut self, _: &[u8]) -> Result<(), StateError> {
+            unreachable!("the host must not call load_state")
+        }
+    }
+
+    #[test]
+    fn a_core_without_states_is_not_asked_for_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slots = StateSlots::new(&dir.path().join("g.gb"));
+        let mut core = NoStates(GameBoy::new(battery_rom(0x02)).unwrap());
+        assert_eq!(slots.save(&core), Err(NO_STATES.to_owned()));
+        assert_eq!(slots.load(&mut core), Err(NO_STATES.to_owned()));
+        assert!(!slots.path().exists(), "nothing was written");
     }
 
     #[test]

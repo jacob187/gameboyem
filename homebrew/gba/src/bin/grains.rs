@@ -3,6 +3,14 @@
 //! palette and VRAM directly; agb is only used for input and VBlank waits.
 //! D-pad moves the brush, A pours, B erases, L/R pick the material, SELECT
 //! toggles the faucet, START clears. Everything is deterministic from input.
+//!
+//! The loop must finish inside one frame or the page flip lands mid-scan and
+//! the game slows down, so a frame redraws only what changed on the page it is
+//! about to show: [`Shown`] remembers, per page, the material drawn in each
+//! cell, the cursor box and the HUD characters (a page is two frames stale).
+//! The two per-cell loops, `Sim::step` and `Sim::render`, are placed in IWRAM
+//! (thumb code from the 32-bit zero-wait bus; from ROM they cost about twice as
+//! much), which `#[inline(never)]` keeps from being folded back into ROM code.
 #![no_std]
 #![no_main]
 
@@ -43,8 +51,10 @@ const C_CURSOR_B: u8 = 4;
 const C_BLINK: u8 = 5;
 const C_STONE: u8 = 8; // 8..=9
 const C_SAND: u8 = 16; // 16..=19
-const C_WATER: u8 = 24; // 24..=31, rotated every frame
+const C_WATER: u8 = 24; // 24..=31, rotated every frame in play
 const C_RAINBOW: u8 = 40; // 40..=47, rotated on the title
+/// "Not drawn yet" in a [`Shown`]: no material or ASCII byte is 0xFF.
+const UNKNOWN: u8 = 0xFF;
 
 const TITLE_TIMEOUT: u32 = 600;
 const FAUCET_CAP: usize = 1200;
@@ -99,16 +109,24 @@ fn fill_rows(page: usize, y0: usize, y1: usize, idx: u8) {
     }
 }
 
-fn text(page: usize, x: usize, y: usize, scale: usize, s: &[u8], idx: u8) {
-    for (n, &c) in s.iter().enumerate() {
-        let cx = x + n * (font::WIDTH + 1) * scale;
-        for (ry, row) in font::rows(c).into_iter().enumerate() {
-            for rx in 0..font::WIDTH {
-                if row & (0b100 >> rx) != 0 {
-                    fill_rect(page, cx + rx * scale, y + ry * scale, scale, scale, idx);
-                }
+fn glyph(page: usize, x: usize, y: usize, scale: usize, c: u8, idx: u8) {
+    for (ry, row) in font::rows(c).into_iter().enumerate() {
+        for rx in 0..font::WIDTH {
+            if row & (0b100 >> rx) != 0 {
+                fill_rect(page, x + rx * scale, y + ry * scale, scale, scale, idx);
             }
         }
+    }
+}
+
+/// Where character `n` of a string starting at `x` goes.
+fn glyph_x(x: usize, n: usize, scale: usize) -> usize {
+    x + n * (font::WIDTH + 1) * scale
+}
+
+fn text(page: usize, x: usize, y: usize, scale: usize, s: &[u8], idx: u8) {
+    for (n, &c) in s.iter().enumerate() {
+        glyph(page, glyph_x(x, n, scale), y, scale, c, idx);
     }
 }
 
@@ -139,8 +157,8 @@ fn init_palette() {
     }
 }
 
-/// Rotate the water blues and the title rainbow by `t` steps.
-fn animate_palette(t: u32) {
+/// Rotate the water blues by `t` steps (play; the title draws no water).
+fn animate_water(t: u32) {
     for i in 0..8u32 {
         let k = ((i + t) & 7) as i32;
         let level = (k - 4).unsigned_abs() as u16; // 4,3,2,1,0,1,2,3
@@ -148,6 +166,12 @@ fn animate_palette(t: u32) {
             C_WATER + i as u8,
             rgb(2 + level, 8 + 2 * level, 20 + level * 2),
         );
+    }
+}
+
+/// Rotate the title rainbow by `t` steps (the title; play draws none of it).
+fn animate_rainbow(t: u32) {
+    for i in 0..8u32 {
         let hue = (i + t / 4) & 7;
         let c = match hue {
             0 => rgb(31, 6, 6),
@@ -160,6 +184,49 @@ fn animate_palette(t: u32) {
             _ => rgb(30, 8, 22),
         };
         set_palette(C_RAINBOW + i as u8, c);
+    }
+}
+
+/// What one of the two pages shows right now.
+struct Shown {
+    /// The material drawn in each grid cell (its colour follows from the cell's
+    /// position), or [`UNKNOWN`].
+    cells: [[u8; GW]; GH],
+    /// The centre cell of the cursor box drawn on top of the grid.
+    cursor: Option<(usize, usize)>,
+    /// The HUD background and the static "T" are drawn.
+    hud_ready: bool,
+    swatch: u8,
+    name: [u8; NAME_LEN],
+    count: [u8; 4],
+    frame: [u8; 5],
+    faucet: [u8; 6],
+}
+
+const NAME_LEN: usize = 5;
+
+impl Shown {
+    const fn new() -> Self {
+        Shown {
+            cells: [[UNKNOWN; GW]; GH],
+            cursor: None,
+            hud_ready: false,
+            swatch: UNKNOWN,
+            name: [UNKNOWN; NAME_LEN],
+            count: [UNKNOWN; 4],
+            frame: [UNKNOWN; 5],
+            faucet: [UNKNOWN; 6],
+        }
+    }
+
+    /// The cursor box painted over the grid, so the cells under it are no longer
+    /// what `cells` says: forget them and let `render` redraw them.
+    fn forget_cursor(&mut self) {
+        if let Some((cx, cy)) = self.cursor.take() {
+            for row in &mut self.cells[cy - 1..=cy + 1] {
+                row[cx - 1..=cx + 1].fill(UNKNOWN);
+            }
+        }
     }
 }
 
@@ -185,14 +252,6 @@ impl Sim {
         x & 0x100 != 0
     }
 
-    fn at(&self, x: isize, y: isize) -> Option<u8> {
-        if (0..GW as isize).contains(&x) && (0..GH as isize).contains(&y) {
-            Some(self.cells[y as usize][x as usize])
-        } else {
-            None
-        }
-    }
-
     /// Move the cell at (x, y) to (nx, ny), putting `swap` back where it was.
     fn relocate(&mut self, x: usize, y: usize, nx: usize, ny: usize, swap: u8) {
         let c = self.cells[y][x];
@@ -200,6 +259,8 @@ impl Sim {
         self.cells[ny][nx] = c | MOVED;
     }
 
+    #[inline(never)]
+    #[unsafe(link_section = ".iwram.grains_step")]
     fn step(&mut self, frame: u32) {
         for y in (0..GH - 1).rev() {
             for i in 0..GW {
@@ -212,28 +273,40 @@ impl Sim {
                 if c == EMPTY || c & MOVED != 0 || c == STONE {
                     continue;
                 }
-                let (xi, yi) = (x as isize, y as isize);
                 // Sand sinks through water; water only fills empty cells.
-                let free = |v: Option<u8>| v == Some(EMPTY) || (c == SAND && v == Some(WATER));
-                if free(self.at(xi, yi + 1)) {
-                    let below = self.cells[y + 1][x];
+                let free = |v: u8| v == EMPTY || (c == SAND && v == WATER);
+                let below = self.cells[y + 1][x];
+                if free(below) {
                     self.relocate(x, y, x, y + 1, below);
                     continue;
                 }
-                let dir = if self.rand_bit() { 1 } else { -1 };
-                let mut moved = false;
-                for d in [dir, -dir] {
-                    if free(self.at(xi + d, yi + 1)) {
-                        let t = self.cells[y + 1][(xi + d) as usize];
-                        self.relocate(x, y, (xi + d) as usize, y + 1, t);
-                        moved = true;
-                        break;
+                // Try the two lower diagonals; the generator is only drawn when
+                // there is a choice to make (most settled grains have none).
+                let left = x > 0 && free(self.cells[y + 1][x - 1]);
+                let right = x + 1 < GW && free(self.cells[y + 1][x + 1]);
+                let dx: isize = match (left, right) {
+                    (true, true) => {
+                        if self.rand_bit() {
+                            1
+                        } else {
+                            -1
+                        }
                     }
-                }
-                if !moved && c == WATER {
+                    (false, true) => 1,
+                    (true, false) => -1,
+                    (false, false) => 0,
+                };
+                if dx != 0 {
+                    let nx = (x as isize + dx) as usize;
+                    let t = self.cells[y + 1][nx];
+                    self.relocate(x, y, nx, y + 1, t);
+                } else if c == WATER {
+                    // Pooled water spreads sideways into an empty cell.
+                    let dir = if self.rand_bit() { 1 } else { -1 };
                     for d in [dir, -dir] {
-                        if self.at(xi + d, yi) == Some(EMPTY) {
-                            self.relocate(x, y, (xi + d) as usize, y, EMPTY);
+                        let nx = x as isize + d;
+                        if (0..GW as isize).contains(&nx) && self.cells[y][nx as usize] == EMPTY {
+                            self.relocate(x, y, nx as usize, y, EMPTY);
                             break;
                         }
                     }
@@ -255,21 +328,28 @@ impl Sim {
         }
     }
 
-    /// Draw the grid into `page` (clearing MOVED flags); returns the number
-    /// of occupied cells. Each cell is four word writes.
-    fn render(&mut self, page: usize) -> usize {
+    /// Draw the cells of the grid that differ from `shown` into `page` (clearing
+    /// MOVED flags); returns the number of occupied cells. A cell is four word
+    /// writes.
+    #[inline(never)]
+    #[unsafe(link_section = ".iwram.grains_render")]
+    fn render(&mut self, page: usize, shown: &mut Shown) -> usize {
         let mut count = 0;
-        for gy in 0..GH {
-            for gx in 0..GW {
-                let v = self.cells[gy][gx] & !MOVED;
-                self.cells[gy][gx] = v;
+        for (gy, (row, drawn)) in self.cells.iter_mut().zip(&mut shown.cells).enumerate() {
+            for (gx, (cell, seen)) in row.iter_mut().zip(drawn).enumerate() {
+                let v = *cell & !MOVED;
+                *cell = v;
+                count += usize::from(v != EMPTY);
+                if *seen == v {
+                    continue;
+                }
+                *seen = v;
                 let idx = match v {
                     SAND => C_SAND + ((gx * 3 + gy * 5) & 3) as u8,
                     WATER => C_WATER + ((gx + gy) & 7) as u8,
                     STONE => C_STONE + ((gx + gy) & 1) as u8,
                     _ => C_BG,
                 };
-                count += usize::from(v != EMPTY);
                 let word = u32::from(idx) * 0x0101_0101;
                 let base = (page_addr(page) + gy * CELL * W + gx * CELL) as *mut u32;
                 for r in 0..CELL {
@@ -304,7 +384,7 @@ fn title(vblank: &VBlank, input: &mut ButtonController) {
             return;
         }
         vblank.wait_for_vblank();
-        animate_palette(t);
+        animate_rainbow(t);
         set_palette(
             C_BLINK,
             if t / 30 % 2 == 0 {
@@ -316,28 +396,44 @@ fn title(vblank: &VBlank, input: &mut ButtonController) {
     }
 }
 
-fn hud(page: usize, mat: usize, count: usize, frame: u32, faucet: bool) {
-    fill_rows(page, HUD_Y, H, C_HUD);
-    fill_rect(page, 4, HUD_Y + 4, 8, 8, mat_colour(MATERIALS[mat]));
-    text(page, 16, HUD_Y + 3, 2, NAMES[mat], C_TEXT);
-    text(
-        page,
-        80,
-        HUD_Y + 3,
-        2,
-        &font::digits::<4>(count as u32),
-        C_TEXT,
-    );
-    text(page, 120, HUD_Y + 3, 2, b"T", C_TEXT);
-    text(page, 130, HUD_Y + 3, 2, &font::digits::<5>(frame), C_TEXT);
-    text(
-        page,
-        186,
-        HUD_Y + 3,
-        2,
-        if faucet { b"FAUCET" } else { b"OFF" },
-        C_TEXT,
-    );
+/// Redraw the characters of one HUD field that differ from what `page` shows.
+fn hud_text(page: usize, x: usize, shown: &mut [u8], now: &[u8]) {
+    for (n, (&c, drawn)) in now.iter().zip(shown.iter_mut()).enumerate() {
+        if *drawn != c {
+            *drawn = c;
+            let gx = glyph_x(x, n, 2);
+            fill_rect(
+                page,
+                gx,
+                HUD_Y + 3,
+                font::WIDTH * 2,
+                font::HEIGHT * 2,
+                C_HUD,
+            );
+            glyph(page, gx, HUD_Y + 3, 2, c, C_TEXT);
+        }
+    }
+}
+
+/// Bring the HUD of `page` up to date; only what changed is drawn.
+fn hud(page: usize, shown: &mut Shown, mat: usize, count: usize, frame: u32, faucet: bool) {
+    if !shown.hud_ready {
+        fill_rows(page, HUD_Y, H, C_HUD);
+        text(page, 120, HUD_Y + 3, 2, b"T", C_TEXT);
+        shown.hud_ready = true;
+    }
+    let colour = mat_colour(MATERIALS[mat]);
+    if shown.swatch != colour {
+        shown.swatch = colour;
+        fill_rect(page, 4, HUD_Y + 4, 8, 8, colour);
+    }
+    let mut name = [b' '; NAME_LEN];
+    name[..NAMES[mat].len()].copy_from_slice(NAMES[mat]);
+    hud_text(page, 16, &mut shown.name, &name);
+    hud_text(page, 80, &mut shown.count, &font::digits::<4>(count as u32));
+    hud_text(page, 130, &mut shown.frame, &font::digits::<5>(frame));
+    let label: &[u8; 6] = if faucet { b"FAUCET" } else { b"OFF   " };
+    hud_text(page, 186, &mut shown.faucet, label);
 }
 
 fn cursor_box(page: usize, cx: usize, cy: usize, colour: u8) {
@@ -357,6 +453,7 @@ fn play(vblank: &VBlank, input: &mut ButtonController) -> ! {
     let (mut mat, mut faucet, mut held) = (0usize, true, 0u32);
     let (mut front, mut count) = (0usize, 0usize);
     let mut frame = 0u32;
+    let mut shown = [Shown::new(), Shown::new()];
     loop {
         input.update();
         // Move on the press, then repeat every other frame after 8 frames.
@@ -409,8 +506,11 @@ fn play(vblank: &VBlank, input: &mut ButtonController) -> ! {
         sim.step(frame);
 
         let back = 1 - front;
-        count = sim.render(back);
-        hud(back, mat, count, frame, faucet);
+        let on_back = &mut shown[back];
+        on_back.forget_cursor();
+        count = sim.render(back, on_back);
+        hud(back, on_back, mat, count, frame, faucet);
+        on_back.cursor = Some((cx, cy));
         cursor_box(
             back,
             cx,
@@ -424,7 +524,7 @@ fn play(vblank: &VBlank, input: &mut ButtonController) -> ! {
         vblank.wait_for_vblank();
         set_page(back);
         front = back;
-        animate_palette(frame);
+        animate_water(frame);
         frame += 1;
     }
 }

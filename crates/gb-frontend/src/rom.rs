@@ -198,7 +198,25 @@ pub fn cartridge_message(path: &Path, e: &CartridgeError, archive: Option<&str>)
     let hint = archive.map_or(String::new(), |kind| {
         format!(" (this looks like a {kind} archive; extract the ROM first)")
     });
-    format!("{} is not a usable ROM: {reason}{hint}", path.display())
+    // Detection falls back to the Game Boy when a GBA header's checksum is wrong
+    // (DECISIONS #46), so a refusal that says "not a Game Boy ROM" names the way out.
+    let gba_hint = if archive.is_none()
+        && matches!(
+            e,
+            CartridgeError::TooSmall(1..)
+                | CartridgeError::TooLarge(_)
+                | CartridgeError::UnsupportedType(_)
+                | CartridgeError::InvalidRomSize(_)
+                | CartridgeError::InvalidRamSize(_)
+        ) {
+        " (if this is a GBA game, run it with --system gba)"
+    } else {
+        ""
+    };
+    format!(
+        "{} is not a usable ROM: {reason}{hint}{gba_hint}",
+        path.display()
+    )
 }
 
 /// Message for a GBA ROM the core refused. `archive` is [`archive_kind`] of the
@@ -427,6 +445,26 @@ mod tests {
             .contains("save file")
         );
         assert!(msg(CartridgeError::TooSmall(0)).starts_with("g.gb is not a usable ROM"));
+    }
+
+    #[test]
+    fn a_refused_game_boy_rom_names_system_gba() {
+        // A GBA ROM with a wrong header checksum falls back to the Game Boy core.
+        for e in [
+            CartridgeError::TooLarge(8 * 1024 * 1024 + 1),
+            CartridgeError::UnsupportedType(0xE1),
+            CartridgeError::TooSmall(200),
+        ] {
+            assert!(msg(e).contains("--system gba"));
+        }
+        assert!(!msg(CartridgeError::TooSmall(0)).contains("--system"));
+        assert!(!msg(CartridgeError::NoBattery).contains("--system"));
+        let zip = cartridge_message(
+            Path::new("g.zip"),
+            &CartridgeError::UnsupportedType(0x50),
+            Some("zip"),
+        );
+        assert!(!zip.contains("--system"), "an archive is not a GBA ROM");
     }
 
     #[test]

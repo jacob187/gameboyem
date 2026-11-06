@@ -6,10 +6,10 @@ generated in code; the code is MIT. (`agb` itself is MPL-2.0.)
 
 | Game | ROM | Hardware |
 |------|-----|----------|
-| GRAINS, a falling-sand toy | `grains.gba` | Raw mode 4 (240x160, 8-bit paletted), page flipping, palette cycling, VBlank wait; D-pad, A, B, L, R, START, SELECT |
-| MOTH, a night-sky collector | `moth.gba` | Mode 0, four backgrounds (two scroll), hardware sprites with animation, VBlank interrupt, software mixer (direct sound DMA) |
+| GRAINS, a falling-sand toy | `grains.gba` | Raw mode 4 (240x160, 8-bit paletted), page flipping with incremental redraw, palette cycling, VBlank wait, the per-cell loops in IWRAM; D-pad, A, B, L, R, START, SELECT |
+| MOTH, a night-sky collector | `moth.gba` | Mode 0, four backgrounds (two scroll), hardware sprites with animation, VBlank interrupt, software mixer (direct sound DMA, timers 0 and 1) |
 
-Both are deterministic from the button input: fixed-seed xorshift RNGs, no hardware RNG, no timers or SRAM.
+Both are deterministic from the button input: fixed-seed xorshift RNGs, no hardware RNG, no SRAM. GRAINS uses no timers; MOTH's mixer runs timer 0 as the sample clock for the sound DMA and timer 1 in cascade mode with an overflow IRQ that swaps the sound buffers.
 
 ## Build
 
@@ -30,7 +30,7 @@ Sizes and sha256 with the pinned toolchain (the same on any machine and any `CAR
 
 | ROM | Bytes | sha256 |
 |-----|-------|--------|
-| `grains.gba` | 14168 | `bc68def9fc254f7e2bec8ae2f4c3ce005b6bf56d8a7f808857f9975356ab3e5e` |
+| `grains.gba` | 18436 | `55885fb566e06e9fcd719ef0a7902ba3bae392dc3f852cebd82379293039daa1` |
 | `moth.gba` | 51112 | `2220d181fddb05ff4d133bd8b66f7e3ca897746e07f02d95a8d7dff3a1d905bf` |
 
 `agb` is built with `default-features = false, features = ["testing"]`: no backtrace/QR panic screen. A panic

@@ -26,8 +26,9 @@
 //! what a console needs besides the ROM and the battery to power on the way the
 //! session did (the GBA: cartridge options, BIOS identity, clock start). The
 //! decoder returns it raw, like the variant; an empty extension is written as
-//! a version 3 header, so a Game Boy recording is byte for byte what it always
-//! was and older tools still read it.
+//! a version 3 header, so a Game Boy recording is byte for byte a version 3 file
+//! and a version 3 reader still reads it. A reader from before version 3 (the
+//! one that wrote version 2, with no system byte) does not (DECISIONS #44).
 //!
 //! A record's `kind` is a button index plus `0x80` for a press, or `0x40`
 //! (marker) or `0x41` (end). The index is the button's position in

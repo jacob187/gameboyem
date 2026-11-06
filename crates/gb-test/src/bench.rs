@@ -48,7 +48,7 @@ use gba_core::{Button, Gba};
 use gb_test::{roms_dir, workspace_root};
 
 /// What a benchmark ROM runs on.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Target {
     Gb(Model),
     /// A GBA ROM; `start` presses START for [`START_FRAMES`] frames from that frame.
@@ -58,18 +58,12 @@ enum Target {
 }
 
 impl Target {
-    fn system(self) -> &'static str {
+    /// This target's index in [`SYSTEMS`]. An exhaustive match, so a new target
+    /// does not compile until it names its slot.
+    fn slot(self) -> usize {
         match self {
-            Target::Gb(_) => "gb",
-            Target::Gba { .. } => "gba",
-        }
-    }
-
-    /// Native frame rate of the system (both are about 59.73).
-    fn native_fps(self) -> f64 {
-        match self {
-            Target::Gb(_) => FRAMES_PER_SECOND,
-            Target::Gba { .. } => gba_core::FRAMES_PER_SECOND,
+            Target::Gb(_) => 0,
+            Target::Gba { .. } => 1,
         }
     }
 }
@@ -106,8 +100,12 @@ const ROMS: [(&str, Target); 10] = [
     ("test/gba/tonc/bin/m7_demo.gba", Target::Gba { start: None }),
 ];
 
-/// The systems in `ROMS`, in the order their overall lines print.
-const SYSTEMS: [&str; 2] = ["gb", "gba"];
+/// The systems in `ROMS`, in the order their overall lines print, with the native
+/// frame rate of each (both are about 59.73). Indexed by [`Target::slot`].
+const SYSTEMS: [(&str, f64); 2] = [
+    ("gb", FRAMES_PER_SECOND),
+    ("gba", gba_core::FRAMES_PER_SECOND),
+];
 
 const DEFAULT_FRAMES: u32 = 3600;
 const DEFAULT_REPEATS: u32 = 3;
@@ -353,10 +351,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             }
         }
         let Some(r) = best else { continue };
-        let slot = SYSTEMS
-            .iter()
-            .position(|&s| s == target.system())
-            .expect("every target's system is listed");
+        let slot = target.slot();
         totals[slot].0 += 1;
         totals[slot].1 += r.elapsed;
         let fps = f64::from(frames) / r.elapsed.as_secs_f64();
@@ -382,7 +377,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         };
         println!(
             "{name:<38} {fps:>10.0} {:>9.1}x  {:016x}  {:016x}{verdict}",
-            fps / target.native_fps(),
+            fps / SYSTEMS[slot].1,
             r.video_hash,
             r.audio_hash
         );
@@ -391,8 +386,8 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             actual.rom_hash, actual.video_hash, actual.audio_hash
         ));
     }
-    for (&system, &(roms, total)) in SYSTEMS.iter().zip(&totals) {
-        let expected = ROMS.iter().filter(|(_, t)| t.system() == system).count();
+    for (slot, (&(system, native), &(roms, total))) in SYSTEMS.iter().zip(&totals).enumerate() {
+        let expected = ROMS.iter().filter(|(_, t)| t.slot() == slot).count();
         if let Some(why) = incomplete_system(system, expected, roms) {
             // A ROM that was missing or failed already failed the run; say what that
             // means for this system's speed line, and never skip its floor check.
@@ -400,11 +395,6 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             ok = false;
             continue;
         }
-        let native = ROMS
-            .iter()
-            .map(|&(_, t)| t)
-            .find(|t| t.system() == system)
-            .map_or(FRAMES_PER_SECOND, Target::native_fps);
         let all = f64::from(frames) * f64::from(roms) / total.as_secs_f64();
         let speed = all / native;
         println!(
@@ -454,6 +444,22 @@ mod tests {
         assert!(parse_pins("1200 zz 2 3 a.gb").is_err());
         assert!(parse_pins("1200 1 2 3").is_err());
         assert!(parse_pins("x 1 2 3 a.gb").is_err());
+    }
+
+    /// A bare `--bench --check` runs DEFAULT_FRAMES and CI runs 1200: every ROM needs
+    /// a pin at both, or the check fails for want of one.
+    #[test]
+    fn every_rom_is_pinned_at_the_default_and_the_ci_frame_counts() {
+        let text = std::fs::read_to_string(workspace_root().join(PINS_FILE)).unwrap();
+        let pins = parse_pins(&text).unwrap();
+        for (name, _) in ROMS {
+            for frames in [1200, DEFAULT_FRAMES] {
+                assert!(
+                    pins.iter().any(|(f, p, _)| *f == frames && p == name),
+                    "{name} has no pin at {frames} frames"
+                );
+            }
+        }
     }
 
     #[test]

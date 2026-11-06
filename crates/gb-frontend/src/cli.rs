@@ -33,6 +33,7 @@ controls:
   Q / R = GBA L / R shoulders (no effect on a Game Boy)
   P = pause    Tab (hold) = fast-forward    C = screenshot (marks the frame when recording)
   K = save state    L = load state    1-9 = state slot (default 1)
+  (S used to save a state; WASD now drives the D-pad, so S is D-pad Down)
   Esc = quit";
 
 pub const DEFAULT_SCALE: u32 = 4;
@@ -701,6 +702,13 @@ mod tests {
     fn help() {
         assert_eq!(p(&["-h"]).unwrap(), Command::Help);
         assert_eq!(p(&["g.gb", "--help"]).unwrap(), Command::Help);
+    }
+
+    #[test]
+    fn help_says_where_save_state_went() {
+        assert!(USAGE.contains("K = save state    L = load state"));
+        assert!(USAGE.contains("S used to save a state"));
+        assert!(USAGE.contains("S is D-pad Down"));
     }
 
     #[test]
