@@ -507,7 +507,11 @@ mod tests {
         let mut g = port();
         start(&mut g, 0);
         let fx = command(&mut g, 1, false, 0);
-        assert!(!fx.rtc_changed, "nothing changed until the data arrives");
+        assert!(
+            fx.rtc_changed,
+            "the first command is the first use of the clock"
+        );
+        assert_eq!(g.rtc().control, 0x82, "but no register changed yet");
         let fx = write_bytes(&mut g, &[0x40], 0);
         assert!(fx.rtc_changed);
         assert_eq!(g.rtc().control, 0x80 | 0x40, "24h set, power flag kept");
@@ -582,7 +586,14 @@ mod tests {
         let mut g = port();
         start(&mut g, 0);
         let fx = command(&mut g, 6, false, 0);
-        assert!(fx.irq && !fx.rtc_changed);
+        assert!(fx.irq);
+        end(&mut g);
+        start(&mut g, 0);
+        let fx = command(&mut g, 6, false, 0);
+        assert!(
+            fx.irq && !fx.rtc_changed,
+            "only the first use bumps the save"
+        );
     }
 
     #[test]
