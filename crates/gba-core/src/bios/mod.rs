@@ -46,6 +46,16 @@ impl Bios {
 // entry, dispatch table and return in BIOS code; paid again on every retry of a
 // waiting call so a wait loop always advances time) and the compute cost below.
 
+/// The most clock cycles one memory-moving SWI (CpuSet, CpuFastSet, Bg/ObjAffineSet,
+/// BitUnPack, the decompressors and unfilters) may spend: 16 frames. A call runs
+/// inside one instruction step, so nothing else can interrupt it; a loop that
+/// reaches the budget stops, keeping what it has written and charging only that
+/// (DECISIONS #68). Real hardware would grind through such a call, taking just as
+/// long on a hostile count; the cap protects the host, not the timing. It leaves
+/// room for the largest honest call (a 256 KiB LZ77 into EWRAM costs about 3M
+/// cycles).
+pub const SWI_CYCLE_CAP: u64 = 16 * crate::CYCLES_PER_FRAME as u64;
+
 /// Exception entry, dispatch and return.
 const SWI_OVERHEAD: u64 = 48;
 const DIV_COST: u64 = 40;
