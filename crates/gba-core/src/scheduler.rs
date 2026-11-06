@@ -139,6 +139,12 @@ impl Scheduler {
         self.queue.iter().find(|e| e.event == event).map(|e| e.at)
     }
 
+    /// Events pending (test hook).
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Timestamp of the next pending event.
     #[inline]
     pub fn next_at(&self) -> Option<u64> {

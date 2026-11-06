@@ -206,6 +206,12 @@ impl Cpu {
         Registers { r, cpsr: self.cpsr }
     }
 
+    /// Whether an HLE wait is pending a retry of its SWI (test hook).
+    #[cfg(test)]
+    pub(crate) fn retrying(&self) -> bool {
+        self.retry.is_some()
+    }
+
     /// CPSR (test and debug hook).
     pub fn cpsr(&self) -> u32 {
         self.cpsr

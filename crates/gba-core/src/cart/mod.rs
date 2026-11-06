@@ -212,6 +212,14 @@ impl Cart {
         )
     }
 
+    /// Bytes the GPIO block takes in a state (test hook).
+    #[cfg(test)]
+    pub(crate) fn gpio_state_len(&self) -> usize {
+        let mut w = StateWriter::new();
+        self.gpio.save_state(&mut w);
+        w.into_bytes().len()
+    }
+
     /// Mark the save data as changed so the host rewrites its `.sav` (a loaded
     /// state replaces the chip's contents).
     pub(crate) fn bump_generation(&mut self) {

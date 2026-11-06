@@ -231,20 +231,7 @@ impl Bus {
         w.u8(tag::SCHEDULER);
         self.sched.save_state(w);
         w.u8(tag::BUS);
-        w.bytes(&self.ewram);
-        w.bytes(&self.iwram);
-        w.bool(self.halted);
-        w.bool(self.stopped);
-        w.u64(self.frames);
-        w.u16(self.waitcnt);
-        w.u32(self.open_bus);
-        w.u32(self.bios_latch);
-        w.bool(self.fetching_bios);
-        w.u8(self.postflg);
-        w.bool(self.intr_wait.is_some());
-        w.u16(self.intr_wait.unwrap_or(0));
-        put_u32s(w, &self.fifo_latch);
-        put_u16s(w, &self.sio_regs);
+        self.save_misc(w);
         w.u8(tag::IRQ);
         self.irq.save_state(w);
         w.u8(tag::TIMERS);
@@ -261,6 +248,24 @@ impl Bus {
         self.prefetch.save_state(w);
         w.u8(tag::CART);
         self.cart.save_state(w);
+    }
+
+    /// The bus's own fields: both work RAMs and the flags and latches.
+    pub(crate) fn save_misc(&self, w: &mut StateWriter) {
+        w.bytes(&self.ewram);
+        w.bytes(&self.iwram);
+        w.bool(self.halted);
+        w.bool(self.stopped);
+        w.u64(self.frames);
+        w.u16(self.waitcnt);
+        w.u32(self.open_bus);
+        w.u32(self.bios_latch);
+        w.bool(self.fetching_bios);
+        w.u8(self.postflg);
+        w.bool(self.intr_wait.is_some());
+        w.u16(self.intr_wait.unwrap_or(0));
+        put_u32s(w, &self.fifo_latch);
+        put_u16s(w, &self.sio_regs);
     }
 
     /// Restore what [`Bus::save_state`] wrote. Components validate their own

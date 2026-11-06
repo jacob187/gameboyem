@@ -69,9 +69,13 @@ pub const MAX_ROM_SIZE: usize = 32 * 1024 * 1024;
 pub const BIOS_SIZE: usize = 16 * 1024;
 
 /// Upper bound on a save state, which a frontend uses to refuse an oversized file
-/// unread. GBA states come in P3; this 1 MiB is a placeholder that P3 tightens to
-/// the real size (the machine's RAM plus the largest save chip is well under it).
-pub const MAX_STATE_BYTES: usize = 1024 * 1024;
+/// unread. The state is fixed-size apart from a scheduler queue of at most 14
+/// entries: EWRAM 256 KiB, IWRAM 32 KiB, VRAM 96 KiB, palette and OAM 2 KiB, two
+/// 75 KiB frames and the save chip (at most 128 KiB of Flash) come to 681 166
+/// bytes at worst (a full queue); the cap is that plus a little. A test builds
+/// each chip's state and fails if the layout outgrows the cap or the cap drifts
+/// well above the real size (DECISIONS #73).
+pub const MAX_STATE_BYTES: usize = 680 * 1024;
 
 /// FNV-1a 64 of a byte slice (ties save states and recordings to their ROM).
 ///

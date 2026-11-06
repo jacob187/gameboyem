@@ -95,6 +95,12 @@ impl Prefetch {
         Ok(())
     }
 
+    /// Halfwords buffered (test hook).
+    #[cfg(test)]
+    pub(crate) fn buffered(&self) -> u8 {
+        self.count
+    }
+
     /// WAITCNT bit 14 changed. Turning it off empties the buffer; turning it on
     /// starts with nothing buffered.
     pub fn set_enabled(&mut self, on: bool) {
