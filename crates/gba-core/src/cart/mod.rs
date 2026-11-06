@@ -280,13 +280,18 @@ impl Cart {
         }
     }
 
-    /// ROM halfword at the even `offset`.
+    /// ROM halfword at the even `offset`. An odd-length image ends mid-halfword:
+    /// the last real byte is kept and the floating bus supplies the other, as
+    /// [`Cart::read_rom8`] does (deep-review #11).
     #[inline]
     pub fn read_rom16(&self, offset: u32) -> u16 {
         let o = offset as usize;
         match self.rom.get(o..o + 2) {
             Some(b) => u16::from_le_bytes([b[0], b[1]]),
-            None => (offset >> 1) as u16,
+            None => match self.rom.get(o) {
+                Some(&lo) => u16::from(lo) | u16::from(self.read_rom8(offset + 1)) << 8,
+                None => (offset >> 1) as u16,
+            },
         }
     }
 
@@ -455,11 +460,6 @@ impl Cart {
         self.gpio.rtc().at(now).time()
     }
 
-    /// The RTC's control register (test and debug hook).
-    pub fn rtc_control(&self) -> u8 {
-        self.gpio.rtc().control
-    }
-
     /// Whether the GPIO port is present (see [`RtcMode`]).
     pub fn gpio_live(&self) -> bool {
         self.gpio.live()
@@ -530,6 +530,27 @@ mod tests {
         let mut rom = vec![0; HEADER_SIZE];
         rom[0xA0..0xA4].copy_from_slice(b"TEST");
         assert_eq!(Cart::from_rom(rom).unwrap().title(), "TEST");
+    }
+
+    /// An image of odd length ends mid-halfword: its last real byte shows at every
+    /// width, and the other half of that halfword floats (deep-review #11).
+    #[test]
+    fn the_last_byte_of_an_odd_length_image_reads_the_same_at_every_width() {
+        let mut rom = vec![0; 0x201];
+        rom[0x200] = 0xAB;
+        let c = Cart::from_rom(rom).unwrap();
+        let floating = u16::from(c.read_rom8(0x201));
+        assert_eq!(c.read_rom8(0x200), 0xAB);
+        assert_eq!(c.read_rom16(0x200), 0xAB | floating << 8);
+        assert_eq!(c.read_rom32(0x200) & 0xFFFF, 0xAB | u32::from(floating) << 8);
+        // Three bytes past a word boundary: the halfword before it is whole.
+        let mut rom = vec![0x11; 0x203];
+        rom[0x202] = 0xCD;
+        let c = Cart::from_rom(rom).unwrap();
+        assert_eq!(c.read_rom16(0x200), 0x1111);
+        assert_eq!(c.read_rom16(0x202) as u8, 0xCD);
+        assert_eq!(c.read_rom32(0x200) >> 16 & 0xFF, 0xCD);
+        assert_eq!(c.read_rom32(0x200) & 0xFFFF, 0x1111);
     }
 
     #[test]
