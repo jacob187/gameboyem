@@ -635,6 +635,7 @@ fn busy_machine(id: &[u8]) -> Gba {
         g.bus.write16(0x0200_0000 + 2 * i, (i * 5) as u16, N);
     }
     let io = |g: &mut Gba, off: u32, v: u16| g.bus.write_io16(off, v, 0xFFFF);
+    io(&mut g, 0x204, 0x4317); // WAITCNT: prefetch on, so its fields are live
     io(&mut g, 0x84, 0x80); // sound on
     io(&mut g, 0x80, 0xFF77);
     io(&mut g, 0x82, 0x9B0F | 0x0400); // FIFO A on timer 1, B on timer 0, PSG 100%
@@ -695,6 +696,7 @@ fn busy_machine(id: &[u8]) -> Gba {
     assert!(g.bus.apu.fifo_lens().iter().all(|&n| n > 0), "FIFOs fed");
     assert!(g.bus.timers.sound.iter().any(|&s| s), "a FIFO timer runs");
     assert!(g.bus.halted || g.bus.intr_wait.is_some(), "waiting");
+    assert!(g.bus.prefetch.enabled);
     g
 }
 
@@ -782,6 +784,34 @@ fn specific_impossible_fields_are_refused() {
     let mut bad = snap.clone();
     bad[seq_timer_at..seq_timer_at + 4].fill(0);
     refuse("frame sequencer timer", &bad);
+    // APU: `now` is ahead of the master clock, or so far behind that the next
+    // drain would run the channels for ages.
+    let clock = a.cycles();
+    assert!(
+        clock > 2 * u64::from(crate::CYCLES_PER_FRAME),
+        "the machine ran"
+    );
+    for apu_now in [clock + 1, 0] {
+        let mut bad = snap.clone();
+        bad[apu.1 + 1..apu.1 + 9].copy_from_slice(&apu_now.to_le_bytes());
+        refuse("APU clock", &bad);
+    }
+    // Prefetch: a completion time far ahead would jump the clock by that much
+    // (and the machine would then dispatch every event in between).
+    let prefetch = sec("prefetch").1;
+    let done_at_at = prefetch + 1 + 1 + 1 + 4 + 1;
+    let mut bad = snap.clone();
+    bad[done_at_at..done_at_at + 8].copy_from_slice(&(clock + (1 << 40)).to_le_bytes());
+    refuse("prefetch completion time", &bad);
+    // Scheduler: a line end far from the clock would freeze the picture.
+    let entries = sched + 1 + 16 + 1;
+    let line_end = (0..usize::from(snap[sched + 1 + 16]))
+        .map(|i| entries + 18 * i)
+        .find(|&e| snap[e] == 3)
+        .expect("the line end is queued");
+    let mut bad = snap.clone();
+    bad[line_end + 2..line_end + 10].copy_from_slice(&(clock + 100_000).to_le_bytes());
+    refuse("line end far ahead", &bad);
     let sample_acc_at = apu.1 + apu.2 - 8;
     let mut bad = snap.clone();
     bad[sample_acc_at..sample_acc_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());

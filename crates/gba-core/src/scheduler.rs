@@ -11,9 +11,10 @@
 use crate::state::{MAX_CLOCK, StateError, check};
 use emu_common::state::{StateReader, StateWriter};
 
-/// How far ahead of the clock a pending event can be: a timer on the slowest
-/// prescaler (1024 cycles per tick) counting all 65 536 ticks, plus its start
-/// delay, is 2^26 + 2 cycles. 2^27 leaves room without admitting nonsense.
+/// How far ahead of the clock a timer event (or one nothing schedules yet) can
+/// be: a timer on the slowest prescaler (1024 cycles per tick) counting all 65 536
+/// ticks, plus its start delay, is 2^26 + 2 cycles. 2^27 leaves room without
+/// admitting nonsense.
 const MAX_EVENT_AHEAD: u64 = 1 << 27;
 
 /// Something that happens at a point in time. One pending instance per variant
@@ -44,6 +45,19 @@ impl Event {
     /// The most events pending at once: one per variant (`TimerOverflow` and
     /// `DmaStart` have four each).
     const MAX_PENDING: usize = 14;
+
+    /// The furthest past the clock this event can be scheduled: the PPU's events
+    /// are within the current line, the APU pump one interval away (each handler
+    /// schedules from its own time, which is not after the clock).
+    fn max_ahead(self) -> u64 {
+        match self {
+            Self::PpuRender | Self::PpuHBlank | Self::PpuFirstLine | Self::PpuLineEnd => {
+                u64::from(crate::CYCLES_PER_LINE)
+            }
+            Self::ApuSample => crate::apu::PUMP_CYCLES,
+            Self::TimerOverflow(_) | Self::DmaStart(_) | Self::IrqLine => MAX_EVENT_AHEAD,
+        }
+    }
 
     /// `(kind, argument)` as a save state stores the event.
     fn to_id(self) -> (u8, u8) {
@@ -185,8 +199,8 @@ impl Scheduler {
     /// Restore what [`Scheduler::save_state`] wrote. Entries must be in strict
     /// `(at, seq)` order with distinct events (one pending instance per variant),
     /// each `seq` below the counter, each time within a frame behind the clock
-    /// (events due but not yet dispatched at power-on) or a timer's longest
-    /// period ahead of it; the line end and the APU pump must be pending, or the
+    /// (events due but not yet dispatched at power-on) or no further ahead than
+    /// the event can be scheduled ([`Event::max_ahead`]); the line end and the APU pump must be pending, or the
     /// machine would never advance a frame.
     pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
         let now = r.u64()?;
@@ -202,7 +216,7 @@ impl Scheduler {
             check(entry_seq < seq, "scheduler entry sequence")?;
             check(
                 at.saturating_add(u64::from(crate::CYCLES_PER_FRAME)) >= now
-                    && at <= now + MAX_EVENT_AHEAD,
+                    && at <= now + event.max_ahead(),
                 "scheduler entry time",
             )?;
             check(

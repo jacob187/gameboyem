@@ -193,7 +193,12 @@ impl Apu {
     /// phase is a fraction of a host sample (below `CYCLES_PER_SECOND`), which
     /// stays meaningful at a different rate; the partial sums are bounded by the
     /// number of cycles in one host sample at the lowest rate (8 kHz).
-    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+    ///
+    /// `now` is the restored master clock. The APU is synced lazily and its pump
+    /// runs after every step, so it trails the clock by well under a frame; a state
+    /// that has it further behind would make the next drain run the channels for
+    /// all that time.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader, now: u64) -> Result<(), StateError> {
         let mut next = Self {
             sample_rate: self.sample_rate,
             ..Self::default()
@@ -215,7 +220,10 @@ impl Apu {
         next.mix_r = r.u64()? as i64;
         next.mix_n = r.u32()?;
         next.sample_acc = r.u64()?;
-        check(next.now < crate::state::MAX_CLOCK, "APU clock")?;
+        check(
+            next.now <= now && now - next.now <= u64::from(crate::CYCLES_PER_FRAME),
+            "APU clock is ahead of, or far behind, the master clock",
+        )?;
         check(next.seq_step < 8, "frame sequencer step")?;
         check(
             (1..=SEQUENCER_CYCLES).contains(&next.seq_timer),

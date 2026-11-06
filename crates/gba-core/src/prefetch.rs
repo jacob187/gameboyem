@@ -29,7 +29,7 @@
 //! (`Cpu::internal`, DECISIONS #51), so with prefetch off that fetch is charged N.
 
 use crate::bus::{Access, WaitTable};
-use crate::state::{MAX_CLOCK, StateError, check};
+use crate::state::{StateError, check};
 use emu_common::state::{StateReader, StateWriter};
 
 /// Halfwords the buffer holds.
@@ -74,8 +74,12 @@ impl Prefetch {
     }
 
     /// At most eight halfwords are buffered. `enabled` is WAITCNT bit 14, which
-    /// the bus cross-checks against the restored WAITCNT.
-    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+    /// the bus cross-checks against the restored WAITCNT. `done_at` is when the
+    /// halfword being read completes: at most a read's cost (tens of cycles) past
+    /// `now`, the restored master clock, or stale and behind it. A fetch waits for
+    /// it, so a value far ahead would jump the clock and make the machine
+    /// dispatch every event in between; a frame of slack is allowed.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader, now: u64) -> Result<(), StateError> {
         let enabled = r.bool()?;
         let valid = r.bool()?;
         let head = r.u32()?;
@@ -83,7 +87,10 @@ impl Prefetch {
         let done_at = r.u64()?;
         let seq = r.bool()?;
         check(count <= CAPACITY, "prefetch count")?;
-        check(done_at < MAX_CLOCK, "prefetch completion time")?;
+        check(
+            done_at <= now + u64::from(crate::CYCLES_PER_FRAME),
+            "prefetch completion time is far in the future",
+        )?;
         *self = Self {
             enabled,
             valid,

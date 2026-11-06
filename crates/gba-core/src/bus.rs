@@ -312,14 +312,14 @@ impl Bus {
         self.dma.load_state(r)?;
         r.tag(tag::PPU)?;
         self.ppu.load_state(r)?;
+        let now = self.sched.now();
         r.tag(tag::APU)?;
-        self.apu.load_state(r)?;
+        self.apu.load_state(r, now)?;
         r.tag(tag::KEYPAD)?;
         self.keypad.load_state(r)?;
         r.tag(tag::PREFETCH)?;
-        self.prefetch.load_state(r)?;
+        self.prefetch.load_state(r, now)?;
         r.tag(tag::CART)?;
-        let now = self.sched.now();
         self.cart.load_state(r, now)?;
 
         // Relations between components.
@@ -328,10 +328,6 @@ impl Bus {
         check(
             self.prefetch.enabled == (waitcnt & WAITCNT_PREFETCH != 0),
             "prefetch enable disagrees with WAITCNT",
-        )?;
-        check(
-            self.apu.now() <= now,
-            "APU clock is ahead of the master clock",
         )
     }
 
