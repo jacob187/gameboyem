@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use emu_common::replay::{Event, Record};
-use emu_common::{Button, Core, FrameRef, Pixels as FramePixels, System};
+use emu_common::{Button, Core, FrameRef, Pixels as FramePixels};
 use gb_core::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
@@ -65,14 +65,6 @@ fn window_title(game: &str) -> String {
         "gb".to_owned()
     } else {
         format!("gb - {game}")
-    }
-}
-
-/// How the console is named in a message to the user.
-fn system_label(system: System) -> &'static str {
-    match system {
-        System::Gb => "Game Boy",
-        System::Gba => "GBA",
     }
 }
 
@@ -275,29 +267,12 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// Say so, instead of touching a slot file, if the core has no state format
-    /// (the GBA until P3). True when states are available.
-    fn states_available(&mut self) -> bool {
-        if self.core.supports_save_state() {
-            return true;
-        }
-        let label = system_label(self.core.system());
-        self.show_status(format!("save states are not supported for {label} yet"));
-        false
-    }
-
     fn save_state(&mut self) {
-        if !self.states_available() {
-            return;
-        }
         let msg = self.states.save(&self.core).unwrap_or_else(|e| e);
         self.show_status(msg);
     }
 
     fn load_state(&mut self) {
-        if !self.states_available() {
-            return;
-        }
         match self.states.load(&mut self.core) {
             Ok(msg) => {
                 // The state replaces the machine (and the frame it is on), so
@@ -635,6 +610,7 @@ impl<C: Core> ApplicationHandler for App<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use emu_common::System;
     use gb_core::{FRAMES_PER_SECOND, GameBoy, M_CYCLES_PER_FRAME, Model};
     use gba_core::Gba;
     use std::fs;
@@ -1066,32 +1042,62 @@ mod tests {
         present(&f, &app.palette, &mut rgba);
     }
 
-    /// K and L on a GBA say so and touch nothing: no slot file, the recording
-    /// goes on, and the answer comes through `Box<dyn Core>` (a defaulted trait
-    /// method that was not forwarded would say "supported").
+    /// K and L on a GBA, held as the `Box<dyn Core>` `main` builds, write a slot
+    /// file and restore from it: a state taken at one frame comes back after the
+    /// machine has run on.
     #[test]
-    fn save_state_keys_on_a_gba_say_so_and_write_nothing() {
+    fn save_state_keys_on_a_gba_round_trip_through_a_slot() {
         let dir = tempfile::tempdir().unwrap();
         let core: Box<dyn Core> = Box::new(Gba::new(gba_rom(), None).unwrap());
         let mut app = gba_app(dir.path(), core);
         app.step_once();
+        let snap = app.core.save_state();
         app.save_state();
-        assert_eq!(
-            app.status.as_ref().unwrap().0,
-            "save states are not supported for GBA yet"
-        );
-        app.status = None;
-        app.load_state();
-        assert!(
-            app.status
-                .as_ref()
-                .unwrap()
-                .0
-                .contains("not supported for GBA")
-        );
-        for n in 1..=9 {
-            assert!(!dir.path().join(format!("g.ss{n}")).exists());
+        assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
+        let slot = fs::read(dir.path().join("g.ss1")).unwrap();
+        assert_eq!(slot, snap);
+        assert!(slot.len() <= gba_core::MAX_STATE_BYTES);
+        for _ in 0..4 {
+            app.step_once();
         }
+        assert_ne!(app.core.save_state(), snap);
+        app.load_state();
+        assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
+        assert_eq!(app.core.save_state(), snap);
+    }
+
+    /// A state of a GBA session started with other options or another BIOS says
+    /// what to match, and a corrupt slot leaves the machine as it was.
+    #[test]
+    fn a_gba_state_load_failure_names_the_cause_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = Gba::with_options(
+            gba_rom(),
+            None,
+            gba_core::CartOptions {
+                save: gba_core::SaveChoice::Sram,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::write(dir.path().join("g.ss1"), other.save_state()).unwrap();
+        let mut app = gba_app(dir.path(), Gba::new(gba_rom(), None).unwrap());
+        app.step_once();
+        let before = app.core.save_state();
+        app.load_state();
+        let msg = app.status.as_ref().unwrap().0.clone();
+        assert!(
+            msg.contains("--bios") && msg.contains("--save-type"),
+            "{msg}"
+        );
+        assert_eq!(app.core.save_state(), before);
+
+        let mut bad = before.clone();
+        bad.truncate(bad.len() / 2);
+        fs::write(dir.path().join("g.ss1"), bad).unwrap();
+        app.load_state();
+        assert!(app.status.as_ref().unwrap().0.contains("truncated"));
+        assert_eq!(app.core.save_state(), before);
     }
 
     /// L and R (Q and R on the keyboard) reach a GBA and its recording, which

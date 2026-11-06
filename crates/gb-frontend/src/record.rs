@@ -4,11 +4,11 @@
 //! while playing), so a crash loses at most the final `End` record;
 //! `gb-test --replay` still plays such a file up to its last input.
 //!
-//! Recordings are system-aware (format v3): the header carries the system byte,
-//! so a GBA session records its L and R buttons and its battery image (at most
-//! 128 KiB of Flash, inside the codec's 256 KiB bound). `gb-test --replay` is
-//! Game Boy only: it rejects a GBA recording as the wrong system until the GBA
-//! replayer lands in P3 (DECISIONS #62).
+//! Recordings are system-aware (format v3 and v4): the header carries the system
+//! byte, so a GBA session records its L and R buttons and its battery image (at
+//! most 128 KiB of Flash, inside the codec's 256 KiB bound), and, from the core's
+//! `recording_ext`, what else powers the machine on the way the session did (a GBA's
+//! cartridge options, BIOS identity and clock start, DECISIONS #74).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -25,6 +25,7 @@ pub fn header_for(core: &dyn Core, rom_hash: u64) -> Header {
         rom_hash,
         battery: core.battery_ram(),
         variant: core.hw_variant(),
+        ext: core.recording_ext(),
     }
 }
 
@@ -160,6 +161,7 @@ mod tests {
             rom_hash: 0,
             battery: None,
             variant: 0,
+            ext: Vec::new(),
         };
         assert!(Recorder::create(&path, &header).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");

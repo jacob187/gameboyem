@@ -90,6 +90,12 @@ impl Core for Gba {
         0
     }
 
+    /// The cartridge options, BIOS identity and clock start (see
+    /// [`crate::replay`]).
+    fn recording_ext(&self) -> Vec<u8> {
+        crate::replay::Header::of(self).ext()
+    }
+
     fn save_state(&self) -> Vec<u8> {
         Gba::save_state(self)
     }
