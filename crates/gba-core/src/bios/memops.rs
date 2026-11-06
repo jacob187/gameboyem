@@ -92,7 +92,10 @@ impl Sink {
         } else if self.pos & 1 == 0 {
             self.pending = b;
         } else {
-            m.w16(at.wrapping_sub(1), u16::from(self.pending) | u16::from(b) << 8);
+            m.w16(
+                at.wrapping_sub(1),
+                u16::from(self.pending) | u16::from(b) << 8,
+            );
         }
         self.pos += 1;
     }
@@ -116,11 +119,7 @@ pub(super) fn cpu_set(bus: &mut Bus, r: &[u32; 4]) {
     let mut v = 0;
     for i in 0..n {
         if !fill || i == 0 {
-            v = if word {
-                m.r32(s)
-            } else {
-                u32::from(m.r16(s))
-            };
+            v = if word { m.r32(s) } else { u32::from(m.r16(s)) };
         }
         if word {
             m.w32(d, v);

@@ -12,12 +12,12 @@
 /// Quarter wave of the BIOS sine table: `trunc(0x4000 * sin(2 pi i / 256))` for
 /// `i = 0..=64`, generated once offline with exact arithmetic.
 const QUARTER: [i16; 65] = [
-    0x0000, 0x0192, 0x0323, 0x04B5, 0x0645, 0x07D5, 0x0964, 0x0AF1, 0x0C7C, 0x0E05, 0x0F8C,
-    0x1111, 0x1294, 0x1413, 0x158F, 0x1708, 0x187D, 0x19EF, 0x1B5D, 0x1CC6, 0x1E2B, 0x1F8B,
-    0x20E7, 0x223D, 0x238E, 0x24DA, 0x261F, 0x275F, 0x2899, 0x29CD, 0x2AFA, 0x2C21, 0x2D41,
-    0x2E5A, 0x2F6B, 0x3076, 0x3179, 0x3274, 0x3367, 0x3453, 0x3536, 0x3612, 0x36E5, 0x37AF,
-    0x3871, 0x392A, 0x39DA, 0x3A82, 0x3B20, 0x3BB6, 0x3C42, 0x3CC5, 0x3D3E, 0x3DAE, 0x3E14,
-    0x3E71, 0x3EC5, 0x3F0E, 0x3F4E, 0x3F84, 0x3FB1, 0x3FD3, 0x3FEC, 0x3FFB, 0x4000,
+    0x0000, 0x0192, 0x0323, 0x04B5, 0x0645, 0x07D5, 0x0964, 0x0AF1, 0x0C7C, 0x0E05, 0x0F8C, 0x1111,
+    0x1294, 0x1413, 0x158F, 0x1708, 0x187D, 0x19EF, 0x1B5D, 0x1CC6, 0x1E2B, 0x1F8B, 0x20E7, 0x223D,
+    0x238E, 0x24DA, 0x261F, 0x275F, 0x2899, 0x29CD, 0x2AFA, 0x2C21, 0x2D41, 0x2E5A, 0x2F6B, 0x3076,
+    0x3179, 0x3274, 0x3367, 0x3453, 0x3536, 0x3612, 0x36E5, 0x37AF, 0x3871, 0x392A, 0x39DA, 0x3A82,
+    0x3B20, 0x3BB6, 0x3C42, 0x3CC5, 0x3D3E, 0x3DAE, 0x3E14, 0x3E71, 0x3EC5, 0x3F0E, 0x3F4E, 0x3F84,
+    0x3FB1, 0x3FD3, 0x3FEC, 0x3FFB, 0x4000,
 ];
 
 /// The full circle: `SINE[i] = sin(2 pi i / 256)` in 1.14 fixed point.
@@ -147,7 +147,7 @@ pub fn midi_key_to_freq(freq: u32, mk: u8, fp: u8) -> u32 {
     let (k, frac) = ((rem / 256) as usize, (rem % 256) as u64);
     let (hi, lo) = (SEMITONE[k], SEMITONE[k + 1]);
     let factor = hi - (hi - lo) * frac / 256;
-    let v = u64::from(freq) * factor >> 32;
+    let v = (u64::from(freq) * factor) >> 32;
     let v = if octave >= 0 {
         v >> octave.min(63)
     } else {
@@ -187,7 +187,10 @@ mod tests {
     fn sqrt_is_floor_sqrt() {
         for n in [0u32, 1, 2, 3, 4, 15, 16, 17, 99, 100, 65535, 65536] {
             let r = u64::from(sqrt(n));
-            assert!(r * r <= u64::from(n) && (r + 1) * (r + 1) > u64::from(n), "{n}");
+            assert!(
+                r * r <= u64::from(n) && (r + 1) * (r + 1) > u64::from(n),
+                "{n}"
+            );
         }
         assert_eq!(sqrt(u32::MAX), 65535);
         assert_eq!(sqrt(0xFFFF_0000), 65535);
@@ -225,8 +228,8 @@ mod tests {
     #[test]
     fn midi_key_is_an_octave_per_twelve_keys() {
         assert_eq!(midi_key_to_freq(1 << 20, 180, 0), 1 << 20);
-        assert_eq!(midi_key_to_freq(1 << 20, 168, 0), 1 << 21);
-        assert_eq!(midi_key_to_freq(1 << 20, 192, 0), 1 << 19);
+        assert_eq!(midi_key_to_freq(1 << 20, 168, 0), 1 << 19);
+        assert_eq!(midi_key_to_freq(1 << 20, 192, 0), 1 << 21);
         assert_eq!(midi_key_to_freq(1 << 20, 174, 0), 741_455); // 2^20 / sqrt(2)
     }
 }

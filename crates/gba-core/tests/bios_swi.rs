@@ -92,7 +92,11 @@ fn cpu_set_copies_and_fills_both_widths() {
     call(&mut b, 0x0B, [EWRAM, EWRAM + 0x100, 3, 0]);
     assert_eq!(get(&mut b, EWRAM + 0x100, 8), [1, 2, 3, 4, 5, 6, 0, 0]);
     // 32-bit fill (bit 24) of 3 words from the first word.
-    call(&mut b, 0x0B, [EWRAM, EWRAM + 0x200, 3 | 1 << 24 | 1 << 26, 0]);
+    call(
+        &mut b,
+        0x0B,
+        [EWRAM, EWRAM + 0x200, 3 | 1 << 24 | 1 << 26, 0],
+    );
     assert_eq!(
         get(&mut b, EWRAM + 0x200, 13),
         [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 0]
@@ -135,7 +139,11 @@ fn lz77_wram_and_vram() {
     call(&mut b, 0x11, [EWRAM, EWRAM + 0x100, 0, 0]);
     assert_eq!(get(&mut b, EWRAM + 0x100, 9), b"AAAAAAAA\0");
     // 6 bytes "AB" then a 4-byte copy from 2 back, written to VRAM as halfwords.
-    put(&mut b, EWRAM + 0x40, &[0x10, 6, 0, 0, 0x20, b'A', b'B', 0x10, 0x01]);
+    put(
+        &mut b,
+        EWRAM + 0x40,
+        &[0x10, 6, 0, 0, 0x20, b'A', b'B', 0x10, 0x01],
+    );
     call(&mut b, 0x12, [EWRAM + 0x40, VRAM, 0, 0]);
     assert_eq!(get(&mut b, VRAM, 6), b"ABABAB");
 }
@@ -158,7 +166,10 @@ fn run_length_expands_both_kinds_of_run() {
     let mut b = bus();
     put(&mut b, EWRAM, &[0x30, 7, 0, 0, 0x81, b'X', 0x02, 1, 2, 3]);
     call(&mut b, 0x14, [EWRAM, EWRAM + 0x100, 0, 0]);
-    assert_eq!(get(&mut b, EWRAM + 0x100, 8), [b'X', b'X', b'X', b'X', 1, 2, 3, 0]);
+    assert_eq!(
+        get(&mut b, EWRAM + 0x100, 8),
+        [b'X', b'X', b'X', b'X', 1, 2, 3, 0]
+    );
     call(&mut b, 0x15, [EWRAM, VRAM, 0, 0]);
     assert_eq!(get(&mut b, VRAM, 6), [b'X', b'X', b'X', b'X', 1, 2]);
 }
@@ -185,7 +196,11 @@ fn diff_unfilters_accumulate() {
     assert_eq!(get(&mut b, EWRAM + 0x100, 4), [10, 11, 12, 13]);
     call(&mut b, 0x17, [EWRAM, VRAM, 0, 0]);
     assert_eq!(get(&mut b, VRAM, 4), [10, 11, 12, 13]);
-    put(&mut b, EWRAM + 0x40, &[0x82, 6, 0, 0, 100, 0, 1, 0, 0xFF, 0xFF]);
+    put(
+        &mut b,
+        EWRAM + 0x40,
+        &[0x82, 6, 0, 0, 100, 0, 1, 0, 0xFF, 0xFF],
+    );
     call(&mut b, 0x18, [EWRAM + 0x40, EWRAM + 0x140, 0, 0]);
     assert_eq!(b.peek16(EWRAM + 0x140), 100);
     assert_eq!(b.peek16(EWRAM + 0x142), 101);
@@ -212,14 +227,20 @@ fn affine_sets_use_the_bios_sine_table() {
     // ObjAffineSet: scale 1.0, angle 0 then 90 degrees, contiguous (offset 2).
     put32(&mut b, EWRAM, &[0x0100_0100, 0x0000, 0x0100_0100, 0x4000]);
     call(&mut b, 0x0F, [EWRAM, EWRAM + 0x100, 2, 2]);
-    let p: Vec<i16> = (0..8).map(|i| b.peek16(EWRAM + 0x100 + 2 * i) as i16).collect();
+    let p: Vec<i16> = (0..8)
+        .map(|i| b.peek16(EWRAM + 0x100 + 2 * i) as i16)
+        .collect();
     assert_eq!(p, [0x100, 0, 0, 0x100, 0, -0x100, 0x100, 0]);
     // OAM-style spacing (offset 8).
     call(&mut b, 0x0F, [EWRAM, EWRAM + 0x200, 1, 8]);
     assert_eq!(b.peek16(EWRAM + 0x200), 0x100);
     assert_eq!(b.peek16(EWRAM + 0x218), 0x100);
     // BgAffineSet: centre (100, 80) maps to display (120, 80), unrotated 1:1.
-    put32(&mut b, EWRAM + 0x300, &[100 << 8, 80 << 8, 80 << 16 | 120, 0x0100_0100, 0]);
+    put32(
+        &mut b,
+        EWRAM + 0x300,
+        &[100 << 8, 80 << 8, 80 << 16 | 120, 0x0100_0100, 0],
+    );
     call(&mut b, 0x0E, [EWRAM + 0x300, EWRAM + 0x400, 1, 0]);
     assert_eq!(b.peek16(EWRAM + 0x400), 0x100);
     assert_eq!(b.peek16(EWRAM + 0x406), 0x100);
@@ -300,7 +321,11 @@ fn intr_wait_protocol_discard_wait_and_consume() {
     let (res, r) = call(&mut b, 0x04, [1, 1, 0, 0]);
     assert_eq!(res, SwiResult::WaitThenRetry);
     assert_ne!(r[2], 0);
-    assert_eq!(b.peek16(BIOS_IF), 0x0002, "only the awaited bit was discarded");
+    assert_eq!(
+        b.peek16(BIOS_IF),
+        0x0002,
+        "only the awaited bit was discarded"
+    );
     assert!(b.halted);
     // Retry without a new flag keeps waiting; a new flag finishes and clears it
     // (the retry must not discard it again, r0 is still 1).

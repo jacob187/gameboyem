@@ -44,13 +44,27 @@ fn strb_i(rd: u32, rn: u32, off: i32) -> u32 {
     mem(false, true, rd, rn, off)
 }
 fn mem(load: bool, byte: bool, rd: u32, rn: u32, off: i32) -> u32 {
-    let (u, m) = if off >= 0 { (1, off as u32) } else { (0, (-off) as u32) };
-    AL | 1 << 26 | 1 << 24 | u << 23 | (byte as u32) << 22 | (load as u32) << 20 | rn << 16
+    let (u, m) = if off >= 0 {
+        (1, off as u32)
+    } else {
+        (0, (-off) as u32)
+    };
+    AL | 1 << 26
+        | 1 << 24
+        | u << 23
+        | (byte as u32) << 22
+        | (load as u32) << 20
+        | rn << 16
         | rd << 12
         | m
 }
 fn half(load: bool, rd: u32, rn: u32, off: u32) -> u32 {
-    AL | 1 << 24 | 1 << 23 | 1 << 22 | (load as u32) << 20 | rn << 16 | rd << 12
+    AL | 1 << 24
+        | 1 << 23
+        | 1 << 22
+        | (load as u32) << 20
+        | rn << 16
+        | rd << 12
         | (off >> 4) << 8
         | 0xB0
         | off & 0xF
@@ -144,7 +158,18 @@ fn vblank_intr_wait_through_the_bios_irq_path() {
     let mut gba = Gba::new(rom(&p), None).unwrap();
     let ok = run_to(&mut gba, idle_at, 8);
     let r = gba.cpu_registers();
-    assert!(ok, "never reached the idle loop: pc={:#x} r5={} cpsr={:#x} frames={} ie={:#x} if={:#x} biosif={:#x} h={:#x}", r.r[15], r.r[5], r.cpsr, gba.frames(), gba.peek16(0x0400_0200), gba.peek16(0x0400_0202), gba.peek16(0x0300_7FF8), gba.peek32(0x0300_7FFC));
+    assert!(
+        ok,
+        "never reached the idle loop: pc={:#x} r5={} cpsr={:#x} frames={} ie={:#x} if={:#x} biosif={:#x} h={:#x}",
+        r.r[15],
+        r.r[5],
+        r.cpsr,
+        gba.frames(),
+        gba.peek16(0x0400_0200),
+        gba.peek16(0x0400_0202),
+        gba.peek16(0x0300_7FF8),
+        gba.peek32(0x0300_7FFC)
+    );
     assert_eq!(gba.cpu_registers().r[5], 3);
     // Each wait consumed a whole frame: three frames, give or take the first.
     assert!((3..=4).contains(&gba.frames()), "{} frames", gba.frames());

@@ -247,8 +247,9 @@ fn sound_bias(bus: &mut Bus, level: u32) {
 /// `flags`, which GBATEK documents. WAITCNT and POSTFLG are left alone.
 fn register_ram_reset(bus: &mut Bus, flags: u32) {
     bus.sched.advance(RAM_RESET_BASE);
-    let cost =
-        |bus: &Bus, base: u32, bytes: usize| (bytes as u64 / 4) * bus.cost(base, Width::W, Access::Seq);
+    let cost = |bus: &Bus, base: u32, bytes: usize| {
+        (bytes as u64 / 4) * bus.cost(base, Width::W, Access::Seq)
+    };
     if flags & 0x01 != 0 {
         bus.ewram.fill(0);
         let c = cost(bus, 0x0200_0000, bus.ewram.len());
