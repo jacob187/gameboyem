@@ -54,6 +54,11 @@ impl Flash {
         }
     }
 
+    /// An erased chip of the same size.
+    pub fn blank_like(&self) -> Self {
+        Self::new(self.data.len())
+    }
+
     pub fn data(&self) -> &[u8] {
         &self.data
     }

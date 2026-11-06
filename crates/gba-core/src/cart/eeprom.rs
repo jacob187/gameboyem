@@ -58,6 +58,15 @@ impl Default for Eeprom {
 
 impl Eeprom {
     /// A chip of known size (`--save-type`): 512 or 8192 bytes.
+    /// A blank chip configured as this one is by the cartridge options (a forced
+    /// size stays; otherwise the size is still to be found).
+    pub fn blank_like(&self) -> Self {
+        match (self.forced, self.size) {
+            (true, Some(size)) => Self::with_size(size),
+            _ => Self::default(),
+        }
+    }
+
     pub fn with_size(size: usize) -> Self {
         Self {
             size: Some(size),

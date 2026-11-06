@@ -23,6 +23,7 @@ pub(crate) const MAGIC: [u8; 4] = *b"GBAS";
 pub(crate) const VERSION: u16 = 1;
 /// Bytes before the first section: magic, version, ROM hash, BIOS kind and hash,
 /// save choice, RTC mode.
+#[cfg(test)]
 pub(crate) const HEADER_LEN: usize = 4 + 2 + 8 + 1 + 8 + 1 + 1;
 
 /// Section tags, in file order.
@@ -38,6 +39,7 @@ pub(crate) mod tag {
     pub const KEYPAD: u8 = 9;
     pub const PREFETCH: u8 = 10;
     pub const CART: u8 = 11;
+    pub const RTC_START: u8 = 12;
 }
 
 // The byte-level primitives live in `emu-common`.

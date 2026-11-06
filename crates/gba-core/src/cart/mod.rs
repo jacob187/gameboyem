@@ -220,6 +220,29 @@ impl Cart {
         w.into_bytes().len()
     }
 
+    /// A powered-off cartridge of the same kind (same chip, same options) with no
+    /// ROM, for a state to be loaded into without touching this one.
+    /// [`Cart::exchange_rom`] gives it the ROM once the load succeeded.
+    pub(crate) fn blank_like(&self) -> Self {
+        let backup = match &self.backup {
+            Backup::None => Backup::None,
+            Backup::Sram(_) => Backup::new_sram(),
+            Backup::Flash(f) => Backup::Flash(f.blank_like()),
+            Backup::Eeprom(e) => Backup::Eeprom(e.blank_like()),
+        };
+        Self {
+            rom: Vec::new(),
+            backup,
+            gpio: self.gpio.blank_like(),
+            generation: self.generation,
+        }
+    }
+
+    /// Swap the ROM images of two cartridges.
+    pub(crate) fn exchange_rom(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.rom, &mut other.rom);
+    }
+
     /// Mark the save data as changed so the host rewrites its `.sav` (a loaded
     /// state replaces the chip's contents).
     pub(crate) fn bump_generation(&mut self) {

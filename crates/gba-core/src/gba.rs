@@ -9,6 +9,39 @@ use crate::state::{self, StateError, check, tag};
 use crate::{CYCLES_PER_FRAME, Framebuffer, MAX_STATE_BYTES};
 use emu_common::state::{StateReader, StateWriter};
 
+/// The clock start the host gave [`Gba::set_rtc`], as a state stores it: a flag
+/// and six fixed-width fields (zero when absent). It is host configuration that a
+/// recording's header reads back, so a loaded machine must agree with the state
+/// about it (code-review ST#8).
+fn save_rtc_start(w: &mut StateWriter, t: Option<RtcTime>) {
+    w.bool(t.is_some());
+    w.u16(t.map_or(0, |t| t.year()));
+    for v in t.map_or([0; 5], |t| {
+        [t.month(), t.day(), t.hour(), t.minute(), t.second()]
+    }) {
+        w.u8(v);
+    }
+}
+
+fn load_rtc_start(r: &mut StateReader) -> Result<Option<RtcTime>, StateError> {
+    let given = r.bool()?;
+    let year = r.u16()?;
+    let mut f = [0u8; 5];
+    for v in &mut f {
+        *v = r.u8()?;
+    }
+    if !given {
+        check(
+            year == 0 && f == [0; 5],
+            "clock start fields without a clock start",
+        )?;
+        return Ok(None);
+    }
+    RtcTime::new(year, f[0], f[1], f[2], f[3], f[4])
+        .map(Some)
+        .map_err(|_| StateError::Invalid("clock start"))
+}
+
 /// A complete Game Boy Advance: CPU + bus (which owns every other component).
 pub struct Gba {
     cpu: Cpu,
@@ -255,6 +288,8 @@ impl Gba {
         w.u8(tag::CPU);
         self.cpu.save_state(&mut w);
         self.bus.save_state(&mut w);
+        w.u8(tag::RTC_START);
+        save_rtc_start(&mut w, self.rtc_start);
         w.into_bytes()
     }
 
@@ -304,22 +339,39 @@ impl Gba {
         {
             return Err(StateError::ModelMismatch);
         }
-        let backup = self.save_state();
-        if let Err(e) = self.load_sections(r) {
-            // Our own fresh output always decodes.
-            self.load_sections(StateReader::new(&backup[state::HEADER_LEN..]))
-                .expect("restoring the pre-load snapshot failed");
-            return Err(e);
-        }
-        self.bus.apu.drain_samples(&mut Vec::new());
-        self.bus.cart.bump_generation();
+        // Load into a scratch machine and swap it in only on success, so a state
+        // that fails anywhere leaves this one untouched and nothing depends on
+        // this machine's own state passing the validators (code-review ST#1).
+        let mut next = self.scratch();
+        next.load_sections(r)?;
+        next.bus.cart.exchange_rom(&mut self.bus.cart);
+        next.bus.cart.bump_generation();
+        *self = next;
         Ok(())
+    }
+
+    /// A powered-off machine of the same ROM, BIOS and options with the host's
+    /// audio rate and the cartridge's save generation, to load a state into. The
+    /// ROM stays with `self` until the load succeeded ([`Cart::exchange_rom`]).
+    fn scratch(&self) -> Self {
+        let mut bus = Bus::new(self.bus.cart.blank_like(), self.bus.bios.clone());
+        bus.apu.set_sample_rate(self.bus.apu.sample_rate());
+        Self {
+            cpu: Cpu::reset(),
+            bus,
+            rom_hash: self.rom_hash,
+            options: self.options,
+            bios_hash: self.bios_hash,
+            rtc_start: None,
+        }
     }
 
     fn load_sections(&mut self, mut r: StateReader) -> Result<(), StateError> {
         r.tag(tag::CPU)?;
         self.cpu.load_state(&mut r)?;
         self.bus.load_state(&mut r)?;
+        r.tag(tag::RTC_START)?;
+        self.rtc_start = load_rtc_start(&mut r)?;
         r.finish()
     }
 

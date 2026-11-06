@@ -520,6 +520,7 @@ fn sections(g: &Gba) -> Vec<(&'static str, usize, usize)> {
     add("keypad", &|w| g.bus.keypad.save_state(w));
     add("prefetch", &|w| g.bus.prefetch.save_state(w));
     add("cart", &|w| g.bus.cart.save_state(w));
+    add("rtc start", &|w| save_rtc_start(w, g.rtc_start));
     assert_eq!(
         off,
         g.save_state().len(),
@@ -737,6 +738,9 @@ fn specific_impossible_fields_are_refused() {
     for _ in 0..30_000 {
         a.step_instruction();
     }
+    for _ in 0..20 {
+        a.step_frame(); // past the 16 frames an APU lag is allowed
+    }
     let snap = a.save_state();
     let table = sections(&a);
     let sec = |name: &str| *table.iter().find(|s| s.0 == name).unwrap();
@@ -767,15 +771,6 @@ fn specific_impossible_fields_are_refused() {
     let mut bad = snap.clone();
     bad[vcount_at..vcount_at + 2].copy_from_slice(&228u16.to_le_bytes());
     refuse("VCOUNT", &bad);
-    // CPU: a Thumb pipeline opcode wider than 16 bits (CPSR T set, pipe[0] big).
-    let cpu = sec("cpu").1;
-    let cpsr_at = cpu + 1 + 4 * 16;
-    let pipe_at = cpsr_at + 4 + 4 * 6 + 4 * 12 + 4 * 5 + 4 * 5;
-    let mut bad = snap.clone();
-    let cpsr = u32::from_le_bytes(bad[cpsr_at..cpsr_at + 4].try_into().unwrap()) | 0x20;
-    bad[cpsr_at..cpsr_at + 4].copy_from_slice(&cpsr.to_le_bytes());
-    bad[pipe_at..pipe_at + 4].copy_from_slice(&0xE3A0_0001u32.to_le_bytes());
-    refuse("wide Thumb opcode", &bad);
     // APU: a zero frame-sequencer timer would make a zero-length segment.
     // The sequencer timer is followed by cur_l, cur_r, mix_l, mix_r, mix_n and
     // sample_acc: 4 + 4 + 8 + 8 + 4 + 8 bytes.
@@ -787,10 +782,7 @@ fn specific_impossible_fields_are_refused() {
     // APU: `now` is ahead of the master clock, or so far behind that the next
     // drain would run the channels for ages.
     let clock = a.cycles();
-    assert!(
-        clock > 2 * u64::from(crate::CYCLES_PER_FRAME),
-        "the machine ran"
-    );
+    assert!(clock > crate::bios::SWI_CYCLE_CAP, "the machine ran");
     for apu_now in [clock + 1, 0] {
         let mut bad = snap.clone();
         bad[apu.1 + 1..apu.1 + 9].copy_from_slice(&apu_now.to_le_bytes());
@@ -909,4 +901,90 @@ fn the_state_size_is_fixed_per_chip_and_fits_the_cap() {
     .unwrap();
     g.set_rtc(RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap());
     assert_eq!(fixed_size(&g), sizes[3]);
+}
+
+/// code-review ST#1: a failed load must not depend on this machine's own state
+/// passing the loader's validators (the old rollback re-loaded a snapshot of it
+/// and `expect`ed that to succeed). Here the live machine holds a DMA control
+/// value the loader would refuse; a bad load leaves it exactly as it was, and a
+/// good state still loads afterwards.
+#[test]
+fn a_failed_load_leaves_a_machine_the_validators_would_refuse_untouched() {
+    let rom = flash_rom();
+    let mut good = gba(&rom);
+    good.step_frame();
+    let snap = good.save_state();
+
+    let mut g = gba(&rom);
+    g.step_frame();
+    g.step_frame();
+    g.bus.dma.ch[0].control = 0x0001; // bits no write can store
+    g.bus.irq.if_ = 0x8000; // nor can an IF bit past the 14 sources
+    let before = g.save_state();
+    assert!(
+        gba(&rom).load_state(&before).is_err(),
+        "this machine's own state is one the loader refuses"
+    );
+    for bad in [&snap[..snap.len() / 2], &snap[..30], b"GBAS"] {
+        assert!(g.load_state(bad).is_err());
+        assert!(g.save_state() == before, "unchanged after a failed load");
+    }
+    let mut corrupt = snap.clone();
+    let apu = sections(&good).iter().find(|s| s.0 == "apu").unwrap().1;
+    corrupt[apu + 1 + 8 + 0x20 * 2 + 1] = 7; // a bool that is not 0 or 1
+    assert!(g.load_state(&corrupt).is_err());
+    assert!(g.save_state() == before);
+    // The machine still runs, and a good state loads and round-trips.
+    g.step_frame();
+    g.load_state(&snap).unwrap();
+    assert!(g.save_state() == snap);
+    let again = g.save_state();
+    g.step_frame();
+    g.load_state(&again).unwrap();
+    assert!(g.save_state() == again);
+}
+
+/// The Thumb decode masks its table index, so even a state whose pipeline holds
+/// ARM opcodes in Thumb state loads and runs without panicking.
+#[test]
+fn a_thumb_state_with_arm_opcodes_in_the_pipeline_runs() {
+    let rom = flash_rom();
+    let mut a = gba(&rom);
+    a.step_frame();
+    let snap = a.save_state();
+    let cpu = state::HEADER_LEN + 1;
+    let mut bad = snap.clone();
+    let cpsr_at = cpu + 4 * 16;
+    let cpsr = u32::from_le_bytes(bad[cpsr_at..cpsr_at + 4].try_into().unwrap()) | 0x20;
+    bad[cpsr_at..cpsr_at + 4].copy_from_slice(&cpsr.to_le_bytes());
+    let pipe_at = cpsr_at + 4 + 4 * 6 + 4 * 12 + 4 * 5 + 4 * 5;
+    bad[pipe_at..pipe_at + 8].fill(0xFF);
+    let mut g = gba(&rom);
+    g.load_state(&bad).unwrap();
+    g.step_frame();
+}
+
+#[test]
+fn the_clock_start_is_part_of_the_state() {
+    // code-review ST#8: a loaded machine reports the start its state came from,
+    // so a recording header made after a load matches the machine.
+    let rom = flash_rom();
+    let t = RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap();
+    let mut with = gba(&rom);
+    with.set_rtc(t);
+    let mut without = gba(&rom);
+    assert_eq!((with.rtc_start(), without.rtc_start()), (Some(t), None));
+    let (s_with, s_without) = (with.save_state(), without.save_state());
+    without.load_state(&s_with).unwrap();
+    assert_eq!(without.rtc_start(), Some(t));
+    with.load_state(&s_without).unwrap();
+    assert_eq!(with.rtc_start(), None);
+    // A flag without a time, or a time that is not a date, is refused.
+    let tail = s_with.len() - 8;
+    let mut bad = s_with.clone();
+    bad[tail + 3] = 31; // day... of month 2
+    assert!(gba(&rom).load_state(&bad).is_err());
+    let mut bad = s_without.clone();
+    bad[tail] = 5;
+    assert!(gba(&rom).load_state(&bad).is_err());
 }

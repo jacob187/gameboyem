@@ -141,6 +141,11 @@ impl Gpio {
         }
     }
 
+    /// A port as `new` makes it, for the same `--rtc` mode.
+    pub fn blank_like(&self) -> Self {
+        Self::new(self.mode)
+    }
+
     pub fn live(&self) -> bool {
         self.live
     }
