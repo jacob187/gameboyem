@@ -215,7 +215,10 @@ pub fn gba_cartridge_message(path: &Path, e: &CartError, archive: Option<&str>) 
             "the file is larger than 32 MiB, the biggest ROM a GBA can map".to_owned()
         }
         // Save-related errors cannot come from loading a ROM; keep the core's text.
-        CartError::SaveSize { .. } | CartError::NoSave => e.to_string(),
+        CartError::SaveSize { .. }
+        | CartError::NoSave
+        | CartError::BadRtcFooter(_)
+        | CartError::BadRtcTime => e.to_string(),
     };
     let hint = archive.map_or(String::new(), |kind| {
         format!(" (this looks like a {kind} archive; extract the ROM first)")

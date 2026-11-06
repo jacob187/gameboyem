@@ -7,9 +7,15 @@
 //! A read request is followed by a 68-bit read: 4 ignored bits, then 64 data
 //! bits MSB first. When idle the chip reads 1 ("ready"); writes finish instantly.
 //!
-//! The chip size is not detectable from the ROM. It is inferred from the length of
-//! the first DMA to the chip (9 or 73 bits = 6-bit addressing = 512 B; 17 or 81
-//! bits = 14-bit addressing = 8 KiB) or from the size of a loaded save file.
+//! The chip size is not detectable from the ROM. It is, in order of precedence:
+//! forced by `--save-type eeprom512|eeprom8k`; taken from the size of a loaded
+//! save file; inferred from the length of the first DMA to the chip (9 or 73 bits
+//! = 6-bit addressing = 512 B; 17 or 81 bits = 14-bit addressing = 8 KiB); or,
+//! for a game that drives the chip with CPU stores instead of DMA, inferred from
+//! the length of the first request when the game first reads the chip back (the
+//! request is 9/73 bits for 512 B and 17/81 for 8 KiB, and a CPU-driven game
+//! has no other end-of-request marker). A request of any other length, or one
+//! that completes before that read, is taken as 8 KiB (DECISIONS #67).
 
 pub const SIZE_512: usize = 512;
 pub const SIZE_8K: usize = 8 * 1024;
@@ -19,8 +25,11 @@ pub struct Eeprom {
     data: Box<[u8]>,
     /// 512 or 8192 once known.
     size: Option<usize>,
-    /// The size came from a DMA length, not a loaded file.
+    /// The size is settled: a DMA length, a loaded file, or `with_size`. A later
+    /// DMA length no longer changes it.
     size_confirmed: bool,
+    /// `--save-type` fixed the size, so a save file of the other size is refused.
+    forced: bool,
     /// Request bits received so far (MSB first) and how many.
     rx: u128,
     rx_len: u32,
@@ -35,6 +44,7 @@ impl Default for Eeprom {
             data: vec![0xFF; SIZE_8K].into_boxed_slice(),
             size: None,
             size_confirmed: false,
+            forced: false,
             rx: 0,
             rx_len: 0,
             tx: 0,
@@ -44,12 +54,30 @@ impl Default for Eeprom {
 }
 
 impl Eeprom {
+    /// A chip of known size (`--save-type`): 512 or 8192 bytes.
+    pub fn with_size(size: usize) -> Self {
+        Self {
+            size: Some(size),
+            size_confirmed: true,
+            forced: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a save of `len` bytes fits this chip.
+    pub fn accepts(&self, len: usize) -> bool {
+        match (self.forced, self.size) {
+            (true, Some(size)) => len == size,
+            _ => len == SIZE_512 || len == SIZE_8K,
+        }
+    }
+
     /// The used part of the chip, once the size is known.
     pub fn data(&self) -> Option<&[u8]> {
         self.size.map(|s| &self.data[..s])
     }
 
-    /// Install a loaded save (length already validated as 512 or 8192).
+    /// Install a loaded save (length already checked with [`Eeprom::accepts`]).
     pub fn load(&mut self, bytes: &[u8]) {
         self.data.fill(0xFF);
         self.data[..bytes.len()].copy_from_slice(bytes);
@@ -91,6 +119,11 @@ impl Eeprom {
     pub fn write_bit(&mut self, bit: u16) -> bool {
         self.rx = (self.rx << 1) | u128::from(bit & 1);
         self.rx_len += 1;
+        self.step()
+    }
+
+    /// Look at the request received so far and act if it is complete.
+    fn step(&mut self) -> bool {
         let n = self.addr_bits();
         if self.rx_len == 2 && self.rx & 3 < 2 {
             // Not a request prefix (`10` / `11`): drop it.
@@ -100,6 +133,7 @@ impl Eeprom {
         let mask = 0x3FF_u128; // 8 KiB uses 10 address bits; 512 B uses 6
         let amask = if n == 6 { 0x3F } else { mask };
         if self.rx_len == 2 + n + 1 && self.rx >> (n + 1) == 0b11 {
+            self.settle_size();
             let addr = ((self.rx >> 1) & amask) as usize;
             self.tx = u64::from_be_bytes(self.data[addr * 8..addr * 8 + 8].try_into().unwrap());
             self.tx_left = 68;
@@ -108,6 +142,7 @@ impl Eeprom {
         } else if self.rx_len == 2 + n + 64 + 1 {
             let prefix = self.rx >> (n + 65);
             let changed = if prefix == 0b10 {
+                self.settle_size();
                 let addr = ((self.rx >> 65) & amask) as usize;
                 let value = ((self.rx >> 1) as u64).to_be_bytes();
                 let cell = &mut self.data[addr * 8..addr * 8 + 8];
@@ -121,6 +156,33 @@ impl Eeprom {
             return changed;
         }
         false
+    }
+
+    /// A request completed while the size was unknown, so it was parsed as the
+    /// 14-bit (8 KiB) form: that is the size.
+    fn settle_size(&mut self) {
+        if self.size.is_none() {
+            self.size = Some(SIZE_8K);
+            self.size_confirmed = true;
+        }
+    }
+
+    /// The game is about to read the chip back with the size still unknown and a
+    /// request half-received: it is CPU-driven (no DMA length announced the
+    /// size), so the bits received so far are the whole request. A length of 9 or
+    /// 73 means 6-bit addresses (512 B), 17 or 81 means 14-bit (8 KiB), anything
+    /// else defaults to 8 KiB. The pending request is then re-examined under the
+    /// settled size. Returns true if that write changed the stored data.
+    pub fn infer_pending(&mut self) -> bool {
+        if self.size.is_some() || self.rx_len == 0 {
+            return false;
+        }
+        self.size = Some(match self.rx_len {
+            9 | 73 => SIZE_512,
+            _ => SIZE_8K,
+        });
+        self.size_confirmed = true;
+        self.step()
     }
 
     /// Shift one bit out (1 when idle).
@@ -233,5 +295,83 @@ mod tests {
         // Still 14-bit addressing: the last block is reachable.
         send(&mut e, &read_req(0x3FF, 14));
         assert_eq!(read_value(&mut e), 0x0001_0203_0405_0607);
+    }
+
+    /// Bits stored one at a time by the CPU: no DMA announces the length.
+    fn send_cpu(e: &mut Eeprom, bits: &[u8]) -> bool {
+        bits.iter()
+            .fold(false, |c, &b| e.write_bit(u16::from(b)) | c)
+    }
+
+    #[test]
+    fn cpu_driven_512_is_sized_from_the_request_length_at_the_first_read() {
+        let mut e = Eeprom::default();
+        // A 73-bit write is not complete under the 14-bit assumption, so nothing
+        // is stored and the size is still open...
+        assert!(!send_cpu(
+            &mut e,
+            &write_req(0x2A, 6, 0x0123_4567_89AB_CDEF)
+        ));
+        assert!(e.data().is_none());
+        // ...until the ready poll: 73 bits means 6-bit addressing.
+        assert!(e.infer_pending());
+        assert_eq!(e.data().unwrap().len(), SIZE_512);
+        assert_eq!(e.read_bit(), 1, "ready");
+        send_cpu(&mut e, &read_req(0x2A, 6));
+        assert!(!e.infer_pending());
+        assert_eq!(read_value(&mut e), 0x0123_4567_89AB_CDEF);
+    }
+
+    #[test]
+    fn cpu_driven_read_request_of_512_starts_at_the_first_read() {
+        let mut e = Eeprom::default();
+        send_cpu(&mut e, &write_req(3, 6, 99));
+        e.infer_pending();
+        send_cpu(&mut e, &read_req(3, 6));
+        e.infer_pending();
+        assert_eq!(read_value(&mut e), 99);
+        assert_eq!(e.data().unwrap().len(), SIZE_512);
+    }
+
+    #[test]
+    fn cpu_driven_8k_completes_under_the_default_assumption() {
+        let mut e = Eeprom::default();
+        assert!(send_cpu(&mut e, &write_req(0x3FF, 14, 42)));
+        assert_eq!(
+            e.data().unwrap().len(),
+            SIZE_8K,
+            "an 81-bit request is 8 KiB"
+        );
+        assert!(!e.infer_pending());
+        send_cpu(&mut e, &read_req(0x3FF, 14));
+        assert_eq!(read_value(&mut e), 42);
+        // A 17-bit read request on a fresh chip sizes it the same way.
+        let mut f = Eeprom::default();
+        send_cpu(&mut f, &read_req(5, 14));
+        assert_eq!(f.data().unwrap().len(), SIZE_8K);
+    }
+
+    #[test]
+    fn an_unrecognised_length_defaults_to_8k_and_no_request_infers_nothing() {
+        let mut e = Eeprom::default();
+        assert!(!e.infer_pending(), "an idle poll decides nothing");
+        assert!(e.data().is_none());
+        send_cpu(&mut e, &[1, 0, 1, 0, 1]);
+        e.infer_pending();
+        assert_eq!(e.data().unwrap().len(), SIZE_8K);
+    }
+
+    #[test]
+    fn a_forced_size_is_exclusive() {
+        let mut e = Eeprom::with_size(SIZE_512);
+        assert_eq!(e.data().unwrap().len(), SIZE_512);
+        assert!(e.accepts(SIZE_512) && !e.accepts(SIZE_8K));
+        // A DMA length cannot change it.
+        e.begin_write_dma(81);
+        assert_eq!(e.data().unwrap().len(), SIZE_512);
+        let e = Eeprom::with_size(SIZE_8K);
+        assert!(e.accepts(SIZE_8K) && !e.accepts(SIZE_512));
+        let free = Eeprom::default();
+        assert!(free.accepts(SIZE_512) && free.accepts(SIZE_8K) && !free.accepts(100));
     }
 }

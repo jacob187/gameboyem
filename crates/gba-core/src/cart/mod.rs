@@ -1,19 +1,31 @@
-//! The Game Pak: ROM, header, and the save backend (SRAM / Flash / EEPROM). Owned by
-//! P1-SYS (P3-CART adds GPIO/RTC and wider save detection).
+//! The Game Pak: ROM, header, the save backend (SRAM / Flash / EEPROM) and, from
+//! P3-CART, the GPIO port with its S-3511 real-time clock.
 //!
 //! **Contract:** [`Cart::from_rom`], [`Cart::title`], [`CartError`], and the
 //! region accessors the bus calls.
+//!
+//! **Save image (DECISIONS #67).** `.sav` = the backup chip's bytes, optionally
+//! followed by a 24-byte RTC footer ([`RTC_FOOTER_LEN`], `rtc.rs`). A file with no
+//! footer (every save made before P3-CART, or by a cartridge without a clock)
+//! loads as before; a footer that is present but invalid rejects the whole file.
 
 mod detect;
 mod eeprom;
 mod flash;
+mod gpio;
+mod rtc;
 
 use std::fmt;
 
-pub use detect::SaveKind;
+use crate::bus::Width;
 use detect::detect_save;
+pub use detect::{SaveChoice, SaveKind};
 use eeprom::Eeprom;
 use flash::Flash;
+use gpio::Gpio;
+pub use gpio::{GpioEffect, RtcMode};
+use rtc::Rtc;
+pub use rtc::{FOOTER_LEN as RTC_FOOTER_LEN, RtcTime};
 
 /// Why a ROM image was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +38,12 @@ pub enum CartError {
     SaveSize { got: usize, expected: &'static str },
     /// A save file for a cartridge with no backup chip.
     NoSave,
+    /// The RTC footer after the save data is present but invalid; the save is
+    /// refused rather than loaded with a made-up clock.
+    BadRtcFooter(&'static str),
+    /// A date or time the RTC cannot hold (outside 2000-01-01..2099-12-31, or an
+    /// impossible calendar day).
+    BadRtcTime,
 }
 
 impl fmt::Display for CartError {
@@ -40,6 +58,8 @@ impl fmt::Display for CartError {
                 write!(f, "save file is {got} bytes, expected {expected}")
             }
             Self::NoSave => write!(f, "this cartridge has no battery-backed save"),
+            Self::BadRtcFooter(why) => write!(f, "the save's RTC footer is invalid ({why})"),
+            Self::BadRtcTime => write!(f, "not a time the cartridge clock can hold"),
         }
     }
 }
@@ -58,31 +78,87 @@ enum Backup {
     Eeprom(Eeprom),
 }
 
+/// What the host asks of the cartridge besides the ROM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CartOptions {
+    /// `--save-type`.
+    pub save: SaveChoice,
+    /// `--rtc`.
+    pub rtc: RtcMode,
+}
+
+impl Backup {
+    fn new_sram() -> Self {
+        Self::Sram(vec![0xFF; SRAM_SIZE].into_boxed_slice())
+    }
+
+    /// Whether a save of `len` bytes (without any RTC footer) fits this chip.
+    fn accepts(&self, len: usize) -> bool {
+        match self {
+            Self::None => false,
+            Self::Sram(_) => len == SRAM_SIZE,
+            Self::Flash(f) => len == f.data().len(),
+            Self::Eeprom(e) => e.accepts(len),
+        }
+    }
+
+    /// What `accepts` wants, for the error message.
+    fn expected(&self) -> &'static str {
+        match self {
+            Self::None => "no save",
+            Self::Sram(_) => "32768 (SRAM)",
+            Self::Flash(f) if f.data().len() == flash::SIZE_128K => "131072 (128 KiB flash)",
+            Self::Flash(_) => "65536 (64 KiB flash)",
+            Self::Eeprom(e) if e.accepts(eeprom::SIZE_8K) && e.accepts(eeprom::SIZE_512) => {
+                "512 or 8192 (EEPROM)"
+            }
+            Self::Eeprom(e) if e.accepts(eeprom::SIZE_512) => "512 (EEPROM)",
+            Self::Eeprom(_) => "8192 (EEPROM)",
+        }
+    }
+}
+
 pub struct Cart {
     rom: Vec<u8>,
     backup: Backup,
+    /// The GPIO port and the clock behind it.
+    gpio: Gpio,
     /// Bumps on every change to the save data and on a successful load.
     generation: u64,
 }
 
 impl Cart {
+    /// A cartridge with the save type detected from the ROM and the RTC in `auto`.
     pub fn from_rom(rom: Vec<u8>) -> Result<Self, CartError> {
+        Self::with_options(rom, CartOptions::default())
+    }
+
+    pub fn with_options(rom: Vec<u8>, options: CartOptions) -> Result<Self, CartError> {
         if rom.len() < HEADER_SIZE {
             return Err(CartError::TooSmall(rom.len()));
         }
         if rom.len() > crate::MAX_ROM_SIZE {
             return Err(CartError::TooLarge(rom.len()));
         }
-        let backup = match detect_save(&rom) {
-            SaveKind::None => Backup::None,
-            SaveKind::Sram => Backup::Sram(vec![0xFF; SRAM_SIZE].into_boxed_slice()),
-            SaveKind::Flash64 => Backup::Flash(Flash::new(flash::SIZE_64K)),
-            SaveKind::Flash128 => Backup::Flash(Flash::new(flash::SIZE_128K)),
-            SaveKind::Eeprom => Backup::Eeprom(Eeprom::default()),
+        let backup = match options.save {
+            SaveChoice::Auto => match detect_save(&rom) {
+                SaveKind::None => Backup::None,
+                SaveKind::Sram => Backup::new_sram(),
+                SaveKind::Flash64 => Backup::Flash(Flash::new(flash::SIZE_64K)),
+                SaveKind::Flash128 => Backup::Flash(Flash::new(flash::SIZE_128K)),
+                SaveKind::Eeprom => Backup::Eeprom(Eeprom::default()),
+            },
+            SaveChoice::None => Backup::None,
+            SaveChoice::Sram => Backup::new_sram(),
+            SaveChoice::Flash64 => Backup::Flash(Flash::new(flash::SIZE_64K)),
+            SaveChoice::Flash128 => Backup::Flash(Flash::new(flash::SIZE_128K)),
+            SaveChoice::Eeprom512 => Backup::Eeprom(Eeprom::with_size(eeprom::SIZE_512)),
+            SaveChoice::Eeprom8k => Backup::Eeprom(Eeprom::with_size(eeprom::SIZE_8K)),
         };
         Ok(Self {
             rom,
             backup,
+            gpio: Gpio::new(options.rtc),
             generation: 0,
         })
     }
@@ -199,10 +275,15 @@ impl Cart {
         }
     }
 
-    /// One bit read from the EEPROM (1 when idle).
+    /// One bit read from the EEPROM (1 when idle). The first read after a
+    /// CPU-driven request fixes an unknown chip size from that request's length
+    /// (`Eeprom::infer_pending`).
     pub fn eeprom_read(&mut self) -> u16 {
         match &mut self.backup {
-            Backup::Eeprom(e) => e.read_bit(),
+            Backup::Eeprom(e) => {
+                self.generation += u64::from(e.infer_pending());
+                e.read_bit()
+            }
             _ => 1,
         }
     }
@@ -224,40 +305,116 @@ impl Cart {
         self.generation
     }
 
-    /// Restore a `.sav` image. The file is untrusted: its length must match the
-    /// detected chip (EEPROM accepts 512 or 8192 and takes its size from it).
+    /// Restore a `.sav` image at power-on (see [`Cart::load_battery_ram_at`]).
     pub fn load_battery_ram(&mut self, data: &[u8]) -> Result<(), CartError> {
-        let size_err = |expected| CartError::SaveSize {
-            got: data.len(),
-            expected,
+        self.load_battery_ram_at(data, 0)
+    }
+
+    /// Restore a `.sav` image at master-clock cycle `now`. The file is untrusted.
+    /// Its length must be the detected chip's size (an EEPROM takes 512 or 8192
+    /// unless `--save-type` fixed it and takes its size from the file), or that
+    /// plus an RTC footer, which is validated field by field. Nothing changes
+    /// unless the whole file is accepted.
+    pub fn load_battery_ram_at(&mut self, data: &[u8], now: u64) -> Result<(), CartError> {
+        if matches!(self.backup, Backup::None) {
+            return Err(CartError::NoSave);
+        }
+        let split = data.len().saturating_sub(RTC_FOOTER_LEN);
+        let (body, footer) = if self.backup.accepts(data.len()) {
+            (data, None)
+        } else if data.len() > RTC_FOOTER_LEN && self.backup.accepts(split) {
+            (&data[..split], Some(&data[split..]))
+        } else {
+            return Err(CartError::SaveSize {
+                got: data.len(),
+                expected: self.backup.expected(),
+            });
         };
+        let rtc = footer.map(|f| Rtc::from_footer(f, now)).transpose()?;
         match &mut self.backup {
-            Backup::None => return Err(CartError::NoSave),
-            Backup::Sram(d) => {
-                if data.len() != SRAM_SIZE {
-                    return Err(size_err("32768 (SRAM)"));
-                }
-                d.copy_from_slice(data);
-            }
-            Backup::Flash(f) => {
-                if data.len() != f.data().len() {
-                    return Err(size_err(if f.data().len() == flash::SIZE_128K {
-                        "131072 (128 KiB flash)"
-                    } else {
-                        "65536 (64 KiB flash)"
-                    }));
-                }
-                f.load(data);
-            }
-            Backup::Eeprom(e) => {
-                if data.len() != eeprom::SIZE_512 && data.len() != eeprom::SIZE_8K {
-                    return Err(size_err("512 or 8192 (EEPROM)"));
-                }
-                e.load(data);
-            }
+            Backup::None => {}
+            Backup::Sram(d) => d.copy_from_slice(body),
+            Backup::Flash(f) => f.load(body),
+            Backup::Eeprom(e) => e.load(body),
+        }
+        if let Some(rtc) = rtc {
+            self.gpio.load_rtc(rtc);
         }
         self.generation += 1;
         Ok(())
+    }
+
+    /// The `.sav` image at master-clock cycle `now`: [`Cart::battery_ram`] plus,
+    /// once the game has used the clock or a save with a footer was loaded, the
+    /// footer. `None`
+    /// exactly when `battery_ram` is.
+    pub fn battery_save(&self, now: u64) -> Option<Vec<u8>> {
+        let mut image = self.battery_ram()?.to_vec();
+        if let Some(footer) = self.gpio.footer(now) {
+            image.extend_from_slice(&footer);
+        }
+        Some(image)
+    }
+
+    /// Start the clock at `t` at master-clock cycle `now` (the host's one entry
+    /// point for real time; DECISIONS #66). It only sets the time: the save
+    /// image gains no footer until the game uses the clock.
+    pub fn set_rtc(&mut self, t: RtcTime, now: u64) {
+        self.gpio.rtc_mut().set_time(t, now);
+    }
+
+    /// The clock's date and time at cycle `now`, whether or not the game has
+    /// started using it.
+    pub fn rtc_time(&self, now: u64) -> RtcTime {
+        self.gpio.rtc().at(now).time()
+    }
+
+    /// The RTC's control register (test and debug hook).
+    pub fn rtc_control(&self) -> u8 {
+        self.gpio.rtc().control
+    }
+
+    /// Whether the GPIO port is present (see [`RtcMode`]).
+    pub fn gpio_live(&self) -> bool {
+        self.gpio.live()
+    }
+
+    /// A data read at ROM offset `off` (0..0x0200_0000) of width `w`, if it hits
+    /// a GPIO register that is currently readable: `None` means read the ROM.
+    /// Registers are 0xC4 data, 0xC6 direction, 0xC8 control; a word covering a
+    /// register and ROM mixes the two.
+    pub fn gpio_read(&self, off: u32, w: Width) -> Option<u32> {
+        if !(0xC4..0xCA).contains(&off) {
+            return None;
+        }
+        let half = |a: u32| self.gpio.read16(a);
+        match w {
+            Width::B => half(off & !1).map(|h| u32::from(h) >> ((off & 1) * 8) & 0xFF),
+            Width::H => half(off & !1).map(u32::from),
+            Width::W => {
+                let a = off & !3;
+                let (lo, hi) = (half(a), half(a + 2));
+                if lo.is_none() && hi.is_none() {
+                    return None;
+                }
+                let lo = lo.unwrap_or_else(|| self.read_rom16(a));
+                let hi = hi.unwrap_or_else(|| self.read_rom16(a + 2));
+                Some(u32::from(lo) | u32::from(hi) << 16)
+            }
+        }
+    }
+
+    /// A data write of `w` to ROM offset `off`. Only halfword and word stores
+    /// reach the port (a byte store is ignored, GBATEK); a word store at 0xC4
+    /// sets data and direction. Returns whether the game pak interrupt fires.
+    pub fn gpio_write(&mut self, off: u32, v: u32, w: Width, now: u64) -> bool {
+        let fx = match w {
+            Width::B => return false,
+            Width::H => self.gpio.write16(off & !1, v as u16, now),
+            Width::W => self.gpio.write32(off & !3, v, now),
+        };
+        self.generation += u64::from(fx.rtc_changed);
+        fx.irq
     }
 }
 
