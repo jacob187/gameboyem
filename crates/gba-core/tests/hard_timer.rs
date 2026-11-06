@@ -1,7 +1,6 @@
-//! Timer event elision and coalescing (DECISIONS #69), driven through the bus the
-//! way `sys_*.rs` does. A timer nothing observes schedules no overflow events, and
-//! a fast one that is only counted (IRQ flag, cascade) is coalesced; neither may
-//! change what the program can see.
+//! Timer event elision (DECISIONS #69), driven through the bus the way `sys_*.rs`
+//! does. A timer nothing observes schedules no overflow events, and eliding them
+//! may not change what the program can see.
 
 mod sys_common;
 
@@ -10,7 +9,6 @@ use gba_core::scheduler::Event;
 use sys_common::{N, bus, run};
 
 const TM: u32 = 0x0400_0100;
-const IF: u32 = 0x202;
 const IRQ: u32 = 0x40;
 const COUNT_UP: u32 = 0x04;
 const ENABLE: u32 = 0x80;
@@ -27,14 +25,6 @@ fn counter(b: &Bus, n: u32) -> u16 {
 
 fn pending(b: &Bus, n: u8) -> bool {
     b.sched.when(Event::TimerOverflow(n)).is_some()
-}
-
-/// A write to the disabled timer 3's control: changes nothing visible, but any
-/// timer write first delivers the overflows of coalesced timers.
-fn flush(b: &mut Bus) {
-    b.write16(TM + 14, 0, N);
-    // The write itself took cycles; dispatch what fell due meanwhile.
-    run(b, 0);
 }
 
 #[test]
@@ -98,93 +88,41 @@ fn a_reload_write_applies_from_the_next_overflow_even_after_a_long_elision() {
     assert_eq!(counter(&b, 2), 0xF000 + 10);
 }
 
-/// Everything a program can read from timers 0..=2 and IF.
-fn snapshot(b: &Bus) -> [u16; 4] {
-    [counter(b, 0), counter(b, 1), counter(b, 2), b.irq.if_]
-}
-
-/// Run `setup` on a coalescing bus and on a reference bus where timer 0 clocks
-/// a FIFO in use (so it keeps one event per overflow; nothing is written to the
-/// FIFO, so the pops change nothing) and compare what a program can read at
-/// checkpoints. Returns the coalesced bus.
-fn compare_with_per_event_run(setup: impl Fn(&mut Bus)) -> Bus {
-    let mut batched = bus();
-    setup(&mut batched);
-    let mut exact = bus();
-    let now = exact.sched.now();
-    exact.timers.set_sound([true, false], now, &mut exact.sched);
-    setup(&mut exact);
-    assert!(pending(&exact, 0));
-    for step in 1..=30 {
-        for b in [&mut batched, &mut exact] {
-            flush(b);
-            b.write16(0x0400_0000 + IF, 0xFFFF, N);
+/// The same programs on a bus whose timers are all observed (IRQ on, so every
+/// overflow has an event) and on one whose timers are all elided (IRQ off) read
+/// the same counters at every point, across restarts with new reloads and prescalers.
+#[test]
+fn elided_timers_read_the_same_counters_as_observed_ones() {
+    let mut elided = bus();
+    let mut observed = bus();
+    let mut step = 0u64;
+    for round in 0..40u32 {
+        for (b, irq) in [(&mut elided, 0u32), (&mut observed, IRQ)] {
+            for n in 0..4 {
+                let reload = 0xFF00 | (round * 7 + n * 13) as u16;
+                // Stopped while the reload changes, so no overflow is in flight.
+                b.write16(TM + 4 * n + 2, 0, N);
+                b.write16(TM + 4 * n, reload, N);
+                b.write16(TM + 4 * n + 2, ((round + n) % 4 | irq | ENABLE) as u16, N);
+            }
         }
-        for _ in 0..(10_000 / 4) {
-            run(&mut batched, 4);
-            run(&mut exact, 4);
+        for _ in 0..300 {
+            step += 1;
+            run(&mut elided, 3 + step % 5);
+            run(&mut observed, 3 + step % 5);
+            if step % 17 == 0 {
+                for n in 0..4 {
+                    assert_eq!(counter(&elided, n), counter(&observed, n), "step {step}");
+                }
+            }
         }
-        flush(&mut batched);
-        flush(&mut exact);
-        assert_eq!(snapshot(&batched), snapshot(&exact), "checkpoint {step}");
+        assert!((0..4).all(|n| !pending(&elided, n)));
     }
-    assert_eq!(exact.timers.t[0].batch, 1);
-    batched
-}
-
-#[test]
-fn coalesced_cascade_chain_matches_the_per_event_run() {
-    // Timer 0 overflows every 16 cycles, timer 1 counts it (wraps every 2), timer 2
-    // counts timer 1 and has no IRQ; timer 1 has one.
-    let b = compare_with_per_event_run(|b| {
-        start(b, 0, 0xFFF0, 0);
-        start(b, 1, 0xFFFE, COUNT_UP | IRQ);
-        start(b, 2, 0xFF00, COUNT_UP);
-    });
-    assert!(
-        b.timers.t[0].batch > 1,
-        "coalesced: {}",
-        b.timers.t[0].batch
-    );
-}
-
-#[test]
-fn a_batch_that_wraps_a_follower_many_times_matches_the_per_event_run() {
-    // Timer 0 overflows every cycle; timer 1 (reload 0xFFFF) overflows with it, so
-    // one batch of 256 wraps it 256 times; timer 2 counts those.
-    let b = compare_with_per_event_run(|b| {
-        start(b, 0, 0xFFFF, 0);
-        start(b, 1, 0xFFFF, COUNT_UP);
-        start(b, 2, 0xFFF0, COUNT_UP | IRQ);
-    });
-    assert!(b.timers.t[0].batch >= 256);
-}
-
-#[test]
-fn an_irq_storm_still_sets_if_with_few_events() {
-    let mut b = bus();
-    start(&mut b, 0, 0xFFFF, IRQ);
-    let mut dispatches = 0;
-    let mut last = b.timers.t[0].start;
-    let frames = 10;
-    for _ in 0..(frames * 280_896 / 4) {
-        run(&mut b, 4);
-        if b.timers.t[0].start != last {
-            last = b.timers.t[0].start;
-            dispatches += 1;
-        }
-    }
-    // One event per overflow would be 2.8 million.
-    assert!(dispatches < 20_000, "{dispatches} events");
-    b.write16(0x0400_0000 + IF, 0xFFFF, N);
-    assert_eq!(b.irq.if_ & 1 << 3, 0);
-    run(&mut b, 600);
-    assert_ne!(b.irq.if_ & 1 << 3, 0, "IF is raised again within a batch");
 }
 
 #[test]
 fn a_few_fast_overflows_keep_their_exact_timing() {
-    // A short delay: the IRQ must arrive at the first overflow, not a batch later.
+    // A short delay: the IRQ must arrive at the first overflow, not later.
     let mut b = bus();
     start(&mut b, 0, 0xFFF0, IRQ);
     let first = b.sched.when(Event::TimerOverflow(0)).unwrap();
@@ -208,7 +146,6 @@ fn fifo_clock_timers_stay_exact() {
     assert!(b.timers.sound[1] && !b.timers.sound[0]);
     assert!(pending(&b, 1) && !pending(&b, 0));
     run(&mut b, 10_000);
-    assert_eq!(b.timers.t[1].batch, 1, "never coalesced");
     // Moving the select to timer 0 moves the events.
     b.write16(0x0400_0082, 0x0304, N);
     assert!(pending(&b, 0) && !pending(&b, 1));
@@ -242,7 +179,6 @@ fn a_counted_timer_is_exact_when_its_follower_clocks_a_fifo() {
     start(&mut b, 1, 0xFFFF, COUNT_UP);
     run(&mut b, 20_000);
     assert!(pending(&b, 0));
-    assert_eq!(b.timers.t[0].batch, 1);
 }
 
 #[test]

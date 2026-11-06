@@ -110,7 +110,6 @@ impl Bus {
             0x100..=0x10F => {
                 let n = ((off - 0x100) >> 2) as usize;
                 let now = self.sched.now();
-                self.flush_timers();
                 if off & 2 == 0 {
                     self.timers.write_reload(n, v, mask, now, &mut self.sched);
                 } else {
@@ -205,44 +204,16 @@ impl Bus {
             }
         }
         if clock != self.timers.sound {
-            self.flush_timers();
             let now = self.sched.now();
             self.timers.set_sound(clock, now, &mut self.sched);
         }
     }
 
-    /// Deliver the overflows of coalesced timers that are already past, so a
-    /// change to the timers or to what observes them takes effect after them.
-    pub(crate) fn flush_timers(&mut self) {
-        if !self.timers.any_batched() {
-            return;
-        }
-        let now = self.sched.now();
-        for n in 0..4 {
-            if self.timers.t[n].batch > 1 {
-                let count = self.timers.pending_overflows(n, now);
-                self.timers.sync(n, now);
-                if count > 0 {
-                    self.timer_effects(n, now, count);
-                }
-            }
-        }
-        self.check_wake();
-    }
-
     /// Timer `n` overflowed at `at`: reload, schedule the next event, then the
-    /// effects of the overflow(s) the event stood for.
+    /// effects of the overflow.
     pub(crate) fn timer_overflow(&mut self, n: usize, at: u64) {
-        let count = self.timers.t[n].batch.max(1);
         self.timers.overflow(n, at, &mut self.sched);
-        self.timer_effects(n, at, count);
-    }
-
-    /// The effects of `count` overflows of timer `n` ending at `at`: IRQ, APU
-    /// clocking, FIFO DMA and the cascade into the following timers. `count` is
-    /// 1 for any timer that clocks a FIFO (it is never coalesced), so each pop
-    /// lands at the overflow's own time.
-    fn timer_effects(&mut self, mut n: usize, at: u64, mut count: u32) {
+        let mut n = n;
         loop {
             if self.timers.t[n].irq_enabled() {
                 self.irq.raise(Interrupt::timer(n));
@@ -258,15 +229,11 @@ impl Bus {
                     self.dma.trigger(crate::dma::DmaTrigger::FifoB);
                 }
             }
-            if n < 3 {
-                let wraps = self.timers.cascade(n + 1, count);
-                if wraps > 0 {
-                    // The cascaded timer overflowed too: handle it at the same
-                    // instant (it is count-up, so it has no event of its own).
-                    n += 1;
-                    count = wraps;
-                    continue;
-                }
+            if n < 3 && self.timers.cascade(n + 1) {
+                // The cascaded timer overflowed too: handle it at the same
+                // instant (it is count-up, so it has no event of its own).
+                n += 1;
+                continue;
             }
             return;
         }

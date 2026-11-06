@@ -9,31 +9,19 @@
 //! previous timer's overflow increments them. On an overflow of timer 0 or 1 the
 //! bus also tells the APU (`Apu::on_timer_overflow`), which may request a FIFO DMA.
 //!
-//! Overflow events exist only for timers something observes, and fast ones are
-//! coalesced (DECISIONS #69). A timer is observed when its IRQ is enabled, a
-//! running count-up timer follows it, or it clocks a Direct Sound FIFO that is in
-//! use ([`Timers::sound`]). An unobserved timer has no event: `read_counter`
-//! folds the elapsed time, and [`Timers::sync`] catches `counter`/`start` up
-//! (keeping the prescaler phase) when it becomes observed or its reload changes.
-//! A timer that overflows faster than [`COALESCE_BELOW`] cycles, and whose
-//! overflows are only counted (IRQ flag, cascade), gets one event per `batch`
-//! overflows after a short run at full rate. Whoever changes any state that
-//! decides this must first call `Bus::flush_timers` so the batched overflows are delivered.
+//! Overflow events exist only for timers something observes (DECISIONS #69). A
+//! timer is observed when its IRQ is enabled, a running count-up timer follows it,
+//! or it clocks a Direct Sound FIFO that is in use ([`Timers::sound`]). An
+//! unobserved timer has no event: `read_counter` folds the elapsed time, and
+//! [`Timers::sync`] catches `counter`/`start` up (keeping the prescaler phase)
+//! when it becomes observed or its reload changes. An observed timer has exactly
+//! one event per overflow, at the overflow's own cycle.
 
 use crate::scheduler::{Event, Scheduler};
 
 /// Cycles between enabling a timer and its first counted tick. GBATEK doesn't
 /// give the figure; two cycles is the commonly measured value (DECISIONS #54).
 pub const START_DELAY: u64 = 2;
-
-/// A timer whose overflow period is shorter than this many cycles is coalesced
-/// (when nothing needs each overflow on its own): one event per at least this
-/// many cycles. The IRQ flag and the cascade arrive up to this much late.
-pub const COALESCE_BELOW: u64 = 256;
-
-/// Events dispatched at full rate before a fast timer is coalesced, so a short
-/// delay (a handful of overflows) keeps its exact timing.
-pub const COALESCE_AFTER: u8 = 16;
 
 const PRESCALER_SHIFT: [u32; 4] = [0, 6, 8, 10];
 
@@ -46,10 +34,6 @@ pub struct Timer {
     /// current value for a count-up timer).
     pub counter: u16,
     pub start: u64,
-    /// Overflows the pending event stands for; 0 or 1 is one event per overflow.
-    pub batch: u32,
-    /// Consecutive events dispatched for a period under [`COALESCE_BELOW`].
-    pub streak: u8,
 }
 
 impl Timer {
@@ -68,11 +52,6 @@ impl Timer {
     /// Prescaled ticks from a reload to the next overflow.
     fn reload_ticks(&self) -> u64 {
         0x1_0000 - u64::from(self.reload)
-    }
-
-    /// Cycles between two overflows once the counter has reloaded.
-    fn period(&self) -> u64 {
-        self.reload_ticks() << self.shift()
     }
 }
 
@@ -103,22 +82,6 @@ impl Timers {
         self.t[n].irq_enabled() || (n < 2 && self.sound[n]) || self.cascades_into(n)
     }
 
-    /// Every overflow of timer `n` must be handled on its own, at its exact time:
-    /// it clocks a FIFO, directly or through the count-up chain.
-    fn needs_exact(&self, n: usize) -> bool {
-        (n < 2 && self.sound[n]) || (self.cascades_into(n) && self.needs_exact(n + 1))
-    }
-
-    /// How many overflows one event of timer `n` stands for.
-    fn batch_size(&self, n: usize) -> u32 {
-        let t = &self.t[n];
-        let period = t.period();
-        if t.streak < COALESCE_AFTER || period >= COALESCE_BELOW || self.needs_exact(n) {
-            return 1;
-        }
-        COALESCE_BELOW.div_ceil(period) as u32
-    }
-
     /// TMxCNT_L: the live counter.
     pub fn read_counter(&self, n: usize, now: u64) -> u16 {
         let t = &self.t[n];
@@ -135,21 +98,6 @@ impl Timers {
         // 0xFFFF.
         let period = t.reload_ticks();
         (u64::from(t.reload) + (total - 0x1_0000) % period) as u16
-    }
-
-    /// Overflows a running prescaled timer has made since its `counter`/`start`
-    /// point, up to `now`. Zero for a stopped or count-up timer.
-    pub fn pending_overflows(&self, n: usize, now: u64) -> u32 {
-        let t = &self.t[n];
-        if !t.enabled() || self.countup(n) {
-            return 0;
-        }
-        let ticks = now.saturating_sub(t.start) >> t.shift();
-        let total = u64::from(t.counter) + ticks;
-        if total <= 0xFFFF {
-            return 0;
-        }
-        (1 + (total - 0x1_0000) / t.reload_ticks()) as u32
     }
 
     /// Move a running prescaled timer's `counter`/`start` forward to the last
@@ -208,7 +156,6 @@ impl Timers {
         }
         self.t[n].control = new;
         if timing_changed {
-            self.t[n].streak = 0;
             if was && is && (old ^ new) & 4 != 0 {
                 // Count-up -> prescaled: the prescaler starts now.
                 self.t[n].start = now;
@@ -235,16 +182,10 @@ impl Timers {
         t.start = now;
     }
 
-    /// Record which timers clock a FIFO in use and reschedule. Flush the batches
-    /// first.
+    /// Record which timers clock a FIFO in use and reschedule.
     pub fn set_sound(&mut self, sound: [bool; 2], now: u64, sched: &mut Scheduler) {
         self.sound = sound;
         self.reschedule_all(now, sched);
-    }
-
-    /// Whether any timer has a coalesced event pending.
-    pub fn any_batched(&self) -> bool {
-        self.t.iter().any(|t| t.batch > 1)
     }
 
     /// Bring every timer's event in line with what is observed now.
@@ -260,8 +201,6 @@ impl Timers {
         let ev = Event::TimerOverflow(n as u8);
         if !self.t[n].enabled() || self.countup(n) || !self.observed(n) {
             sched.cancel(ev);
-            self.t[n].batch = 0;
-            self.t[n].streak = 0;
             return;
         }
         if sched.when(ev).is_none() {
@@ -271,50 +210,36 @@ impl Timers {
         self.schedule(n, sched);
     }
 
-    /// Schedule the event for timer `n`'s next batch of overflows, leaving an
-    /// already correct event (and its place in the tie order) alone.
-    fn schedule(&mut self, n: usize, sched: &mut Scheduler) {
+    /// Schedule the event for timer `n`'s next overflow, leaving an already
+    /// correct event (and its place in the tie order) alone.
+    fn schedule(&self, n: usize, sched: &mut Scheduler) {
         let ev = Event::TimerOverflow(n as u8);
-        let k = self.batch_size(n);
-        let t = &mut self.t[n];
-        let first = t.start + ((0x1_0000 - u64::from(t.counter)) << t.shift());
-        let at = first + u64::from(k - 1) * t.period();
-        t.batch = k;
+        let t = &self.t[n];
+        let at = t.start + ((0x1_0000 - u64::from(t.counter)) << t.shift());
         if sched.when(ev) != Some(at) {
             sched.schedule_at(ev, at);
         }
     }
 
-    /// Timer `n`'s event fired at `at` (the last of its `batch` overflows):
-    /// reload it and schedule the next. The IRQ and the cascade are the caller's
-    /// job (see [`Timers::cascade`]).
+    /// Timer `n`'s event fired at `at`: reload it and schedule the next. The IRQ
+    /// and the cascade are the caller's job (see [`Timers::cascade`]).
     pub fn overflow(&mut self, n: usize, at: u64, sched: &mut Scheduler) {
         let t = &mut self.t[n];
         t.counter = t.reload;
         t.start = at;
-        t.streak = if t.period() < COALESCE_BELOW {
-            t.streak.saturating_add(1)
-        } else {
-            0
-        };
         self.schedule(n, sched);
     }
 
-    /// Timer `n - 1` overflowed `count` times: advance timer `n` if it counts up.
-    /// Returns how many times that overflowed `n` in turn.
-    pub fn cascade(&mut self, n: usize, count: u32) -> u32 {
+    /// Timer `n - 1` overflowed: tick timer `n` if it counts up. Returns true if
+    /// that overflows `n` in turn.
+    pub fn cascade(&mut self, n: usize) -> bool {
         if n >= 4 || !self.t[n].enabled() || !self.countup(n) {
-            return 0;
+            return false;
         }
         let t = &mut self.t[n];
-        let total = u64::from(t.counter) + u64::from(count);
-        if total <= 0xFFFF {
-            t.counter = total as u16;
-            return 0;
-        }
-        let over = total - 0x1_0000;
-        t.counter = (u64::from(t.reload) + over % t.reload_ticks()) as u16;
-        (1 + over / t.reload_ticks()) as u32
+        let (c, wrapped) = t.counter.overflowing_add(1);
+        t.counter = if wrapped { t.reload } else { c };
+        wrapped
     }
 }
 
@@ -422,15 +347,15 @@ mod tests {
         let mut s = Scheduler::new();
         start(&mut t, &mut s, 1, 0xFFFE, 4);
         assert!(s.when(Event::TimerOverflow(1)).is_none());
-        assert_eq!(t.cascade(1, 1), 0);
+        assert!(!t.cascade(1));
         assert_eq!(t.read_counter(1, 12345), 0xFFFF);
-        assert_eq!(t.cascade(1, 1), 1, "wraps");
+        assert!(t.cascade(1), "wraps");
         // Timer 0 ignores the count-up bit; the running count-up timer 1 makes
         // it observed.
         t.write_control(0, 0x84, 0xFFFF, 0, &mut s);
         assert!(s.when(Event::TimerOverflow(0)).is_some());
         // A stopped or non-count-up timer does not cascade.
-        assert_eq!(t.cascade(2, 1), 0);
+        assert!(!t.cascade(2));
     }
 
     #[test]
