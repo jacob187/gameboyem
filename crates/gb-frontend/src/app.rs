@@ -515,6 +515,9 @@ impl<C: Core> ApplicationHandler for App<C> {
         self.upload();
         self.reset_clock();
         if let Some(w) = &self.window {
+        if self.test.is_none() && self.core.system() == emu_common::System::Gb {
+            eprintln!("{}", crate::keymap::SAVE_KEY_NOTICE);
+        }
             w.request_redraw();
         }
     }
