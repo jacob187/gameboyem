@@ -36,6 +36,9 @@ const FOOTER_MAGIC: [u8; 8] = *b"AGBRTC01";
 
 const CPS: u64 = CYCLES_PER_SECOND as u64;
 
+/// Days in the 100-year cycle of the two-digit year (see [`days_in_month`]).
+const DAYS_PER_CENTURY: u64 = 36_525;
+
 /// A calendar date and time, as the host supplies it to start the clock. The
 /// RTC has a two-digit year, so only 2000..=2099 exists. The fields are private:
 /// [`RtcTime::new`] is the only way to make one, so every value is a real date
@@ -216,6 +219,10 @@ impl Rtc {
             subsecond: r.u32()?,
             synced_at: r.u64()?,
         };
+        check(
+            next.control & !(CTRL_POWER | CTRL_WRITABLE) == 0,
+            "RTC control",
+        )?;
         check(next.year <= 99, "RTC year")?;
         check((1..=12).contains(&next.month), "RTC month")?;
         check(
@@ -308,10 +315,13 @@ impl Rtc {
         self.hour = (rem / 3600) as u8;
         self.minute = (rem % 3600 / 60) as u8;
         self.second = (rem % 60) as u8;
-        // A calendar day at a time; the weekday cycle repeats every 7 days, so
-        // only the date needs the loop.
+        // A calendar day at a time. The weekday cycle repeats every 7 days, and
+        // the date every 100 years (the year wraps at 100 and every year divisible
+        // by 4 is a leap year, so 25 * 366 + 75 * 365 = 36 525 days), so only the
+        // date needs the loop, and only for the days left after whole periods
+        // (deep-review #22).
         self.weekday = ((u64::from(self.weekday) + days) % 7) as u8;
-        for _ in 0..days {
+        for _ in 0..days % DAYS_PER_CENTURY {
             self.next_day();
         }
     }
@@ -769,5 +779,64 @@ mod tests {
         r.write_datetime([0x23, 0x04, 0x30, 9, 0x01, 0x02, 0x03]);
         assert_eq!((r.month, r.day), (4, 30));
         load_back(&r);
+    }
+
+    /// Every field `load_state` range-checks is refused when out of range, by name.
+    #[test]
+    fn a_state_with_an_impossible_clock_field_is_refused() {
+        let mut ok = Rtc::power_on();
+        ok.set_time(RtcTime::new(2024, 4, 30, 1, 2, 3).unwrap(), 0);
+        let load = |r: &Rtc| {
+            let mut w = StateWriter::new();
+            r.save_state(&mut w);
+            let bytes = w.into_bytes();
+            Rtc::power_on().load_state(&mut StateReader::new(&bytes))
+        };
+        assert!(load(&ok).is_ok());
+        let cases: [(&str, fn(&mut Rtc)); 11] = [
+            ("RTC control", |r| r.control = 0x01),
+            ("RTC control", |r| r.control = 0x04),
+            ("RTC year", |r| r.year = 100),
+            ("RTC month", |r| r.month = 13),
+            ("RTC month", |r| r.month = 0),
+            ("RTC day", |r| r.day = 31), // April has 30
+            ("RTC weekday", |r| r.weekday = 7),
+            ("RTC time of day", |r| r.hour = 24),
+            ("RTC sub-second count", |r| r.subsecond = CPS as u32),
+            ("RTC sync time", |r| r.synced_at = crate::state::MAX_CLOCK),
+            ("RTC time of day", |r| r.minute = 60),
+        ];
+        for (name, break_it) in cases {
+            let mut bad = ok.clone();
+            break_it(&mut bad);
+            assert_eq!(load(&bad), Err(StateError::Invalid(name)), "{name}");
+        }
+        // The control bits a game can hold are accepted (deep-review #12).
+        for control in [0x80, 0x82, 0x40, 0x6A | 0x80] {
+            let mut r = ok.clone();
+            r.control = control;
+            assert!(load(&r).is_ok(), "{control:#x}");
+        }
+    }
+
+    /// Whole 100-year cycles of the date cost nothing (deep-review #22): a
+    /// clock far from its sync point reads the same date as one a cycle closer,
+    /// and does not step a billion days to get there.
+    #[test]
+    fn a_huge_elapsed_time_skips_whole_calendar_cycles() {
+        let mut base = Rtc::power_on();
+        base.set_time(RtcTime::new(2023, 12, 31, 23, 59, 30).unwrap(), 0);
+        let cycle_secs = DAYS_PER_CENTURY * 86_400;
+        for extra in [0u64, 1, 45, 86_400 * 59 + 7, 86_400 * 1000] {
+            let mut near = base.clone();
+            near.add_seconds(extra);
+            let mut far = base.clone();
+            far.add_seconds(extra + 1_000_000_000 * cycle_secs);
+            // The weekday is not part of the date cycle: 36 525 days are 5217
+            // weeks + 6 days, so it moves by 6 per cycle.
+            let weekday = (u64::from(near.weekday) + 1_000_000_000 * (DAYS_PER_CENTURY % 7)) % 7;
+            near.weekday = weekday as u8;
+            assert_eq!(far, near, "extra {extra}");
+        }
     }
 }
