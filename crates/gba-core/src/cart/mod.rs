@@ -18,9 +18,11 @@ mod rtc;
 use std::fmt;
 
 use crate::bus::Width;
+use crate::state::{StateError, check};
 use detect::detect_save;
 pub use detect::{SaveChoice, SaveKind};
 use eeprom::Eeprom;
+use emu_common::state::{StateReader, StateWriter};
 use flash::Flash;
 use gpio::Gpio;
 pub use gpio::{GpioEffect, RtcMode};
@@ -161,6 +163,59 @@ impl Cart {
             gpio: Gpio::new(options.rtc),
             generation: 0,
         })
+    }
+
+    /// The backup chip's id as a save state stores it ([`SaveKind`] order).
+    fn backup_id(&self) -> u8 {
+        match self.save_kind() {
+            SaveKind::None => 0,
+            SaveKind::Sram => 1,
+            SaveKind::Flash64 => 2,
+            SaveKind::Flash128 => 3,
+            SaveKind::Eeprom => 4,
+        }
+    }
+
+    /// The save chip with its protocol state, then the GPIO port and the clock.
+    /// The ROM is not stored (the state's header ties it to its hash) and neither
+    /// is the generation counter, which is host bookkeeping.
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.backup_id());
+        match &self.backup {
+            Backup::None => {}
+            Backup::Sram(d) => w.bytes(d),
+            Backup::Flash(f) => f.save_state(w),
+            Backup::Eeprom(e) => e.save_state(w),
+        }
+        self.gpio.save_state(w);
+    }
+
+    /// The chip kind is fixed by the ROM and the `--save-type` option, so a state
+    /// with another kind is corrupt. `now` is the restored master clock: the
+    /// clock's sync time cannot be ahead of it.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader, now: u64) -> Result<(), StateError> {
+        check(r.u8()? == self.backup_id(), "save chip kind")?;
+        match &mut self.backup {
+            Backup::None => {}
+            Backup::Sram(d) => {
+                let mut next = vec![0; d.len()].into_boxed_slice();
+                r.bytes_into(&mut next)?;
+                *d = next;
+            }
+            Backup::Flash(f) => f.load_state(r)?,
+            Backup::Eeprom(e) => e.load_state(r)?,
+        }
+        self.gpio.load_state(r)?;
+        check(
+            self.gpio.rtc().synced_at() <= now,
+            "RTC sync time is in the future",
+        )
+    }
+
+    /// Mark the save data as changed so the host rewrites its `.sav` (a loaded
+    /// state replaces the chip's contents).
+    pub(crate) fn bump_generation(&mut self) {
+        self.generation += 1;
     }
 
     /// The 12-byte game title at 0xA0, trimmed at the first NUL.

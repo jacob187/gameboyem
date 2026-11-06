@@ -7,6 +7,9 @@
 //! "Obscure Behavior"). GBATEK "GBA Sound Channel 1" only specifies the plain
 //! decay/grow behaviour below.
 
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
 /// A 3-bit period field (envelope step time, sweep time) as a reload value:
 /// 0 counts as 8 so the timer still runs, though the unit never steps.
 pub(super) fn period_or_8(bits: u8) -> u8 {
@@ -33,6 +36,22 @@ impl Length {
             enabled: false,
             max,
         }
+    }
+
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.u16(self.counter);
+        w.bool(self.enabled);
+    }
+
+    /// The counter never exceeds the channel's `max` (64 or 256): it is loaded as
+    /// `max - value`, decremented, or reloaded to `max`.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let counter = r.u16()?;
+        let enabled = r.bool()?;
+        check(counter <= self.max, "length counter")?;
+        self.counter = counter;
+        self.enabled = enabled;
+        Ok(())
     }
 
     /// Length write: the counter counts down from `max - value`.
@@ -91,6 +110,27 @@ pub(super) struct Envelope {
 }
 
 impl Envelope {
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.nr2);
+        w.u8(self.volume);
+        w.u8(self.timer);
+        w.bool(self.auto);
+    }
+
+    /// The volume is a 4-bit level and the timer a 3-bit period (1..=8).
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let (nr2, volume, timer, auto) = (r.u8()?, r.u8()?, r.u8()?, r.bool()?);
+        check(volume <= 15, "envelope volume")?;
+        check(timer <= 8, "envelope timer")?;
+        *self = Self {
+            nr2,
+            volume,
+            timer,
+            auto,
+        };
+        Ok(())
+    }
+
     /// The channel's DAC is on iff NRx2 bits 7-3 are not all zero (the GB family
     /// rule; GBATEK is silent, and the AGB PSG is the same circuit).
     pub fn dac_on(&self) -> bool {

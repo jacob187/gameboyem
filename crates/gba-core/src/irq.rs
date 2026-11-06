@@ -1,6 +1,9 @@
 //! Interrupt controller: IE (0x0400_0200), IF (0x0400_0202), IME (0x0400_0208).
 //! **Contract.** GBATEK "GBA Interrupt Control".
 
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
 /// Interrupt sources, as bit numbers of IE/IF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -42,6 +45,20 @@ pub struct Irq {
 }
 
 impl Irq {
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u16(self.ie);
+        w.u16(self.if_);
+        w.bool(self.ime);
+    }
+
+    /// IE and IF hold the 14 interrupt sources (bits 0..=13); nothing writes more.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let (ie, if_, ime) = (r.u16()?, r.u16()?, r.bool()?);
+        check(ie & !0x3FFF == 0 && if_ & !0x3FFF == 0, "interrupt bits")?;
+        *self = Self { ie, if_, ime };
+        Ok(())
+    }
+
     /// Set `src`'s IF bit (a component requesting an interrupt).
     #[inline]
     pub fn raise(&mut self, src: Interrupt) {

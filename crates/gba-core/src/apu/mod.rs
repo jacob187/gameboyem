@@ -28,6 +28,8 @@ mod square;
 mod wave;
 
 use crate::CYCLES_PER_SECOND;
+use crate::state::{StateError, check, get_u16s, put_u16s};
+use emu_common::state::{StateReader, StateWriter};
 use fifo::Fifo;
 use noise::Noise;
 use square::Square;
@@ -154,6 +156,89 @@ impl Default for Apu {
 impl Apu {
     fn index(off: u32) -> usize {
         (off as usize - 0x60) >> 1
+    }
+
+    /// Bytes buffered in FIFO A and B, for the bus's mirror (`Timers::fifo_len`).
+    pub(crate) fn fifo_lens(&self) -> [u8; 2] {
+        [self.fifo[0].len() as u8, self.fifo[1].len() as u8]
+    }
+
+    /// Every register and channel, the frame sequencer, both FIFOs (data, indices
+    /// and the held output sample), the current mix level and the resampler
+    /// (the partial sums and the sample phase), all of which a bit-identical
+    /// continuation needs (DECISIONS #73). Not saved: the host's sample rate and
+    /// the buffered samples (a load drops them; they belong to the old timeline).
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u64(self.now);
+        put_u16s(w, &self.regs);
+        w.bool(self.master);
+        self.ch1.save_state(w);
+        self.ch2.save_state(w);
+        self.ch3.save_state(w);
+        self.ch4.save_state(w);
+        self.fifo[0].save_state(w);
+        self.fifo[1].save_state(w);
+        w.u8(self.seq_step);
+        w.u32(self.seq_timer);
+        w.i32(self.cur_l);
+        w.i32(self.cur_r);
+        w.u64(self.mix_l as u64);
+        w.u64(self.mix_r as u64);
+        w.u32(self.mix_n);
+        w.u64(self.sample_acc);
+    }
+
+    /// Restore the state, keeping the host's sample rate and buffered samples
+    /// (the caller drains the latter once the whole load succeeded). The sample
+    /// phase is a fraction of a host sample (below `CYCLES_PER_SECOND`), which
+    /// stays meaningful at a different rate; the partial sums are bounded by the
+    /// number of cycles in one host sample at the lowest rate (8 kHz).
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut next = Self {
+            sample_rate: self.sample_rate,
+            ..Self::default()
+        };
+        next.now = r.u64()?;
+        get_u16s(r, &mut next.regs)?;
+        next.master = r.bool()?;
+        next.ch1.load_state(r)?;
+        next.ch2.load_state(r)?;
+        next.ch3.load_state(r)?;
+        next.ch4.load_state(r)?;
+        next.fifo[0].load_state(r)?;
+        next.fifo[1].load_state(r)?;
+        next.seq_step = r.u8()?;
+        next.seq_timer = r.u32()?;
+        next.cur_l = r.i32()?;
+        next.cur_r = r.i32()?;
+        next.mix_l = r.u64()? as i64;
+        next.mix_r = r.u64()? as i64;
+        next.mix_n = r.u32()?;
+        next.sample_acc = r.u64()?;
+        check(next.now < crate::state::MAX_CLOCK, "APU clock")?;
+        check(next.seq_step < 8, "frame sequencer step")?;
+        check(
+            (1..=SEQUENCER_CYCLES).contains(&next.seq_timer),
+            "frame sequencer timer",
+        )?;
+        check(
+            (0..=MIX_MAX).contains(&next.cur_l) && (0..=MIX_MAX).contains(&next.cur_r),
+            "mix level",
+        )?;
+        let max_n = CYCLES_PER_SECOND / 8_000 + 1;
+        check(next.mix_n <= max_n, "resampler cycle count")?;
+        let max_sum = i64::from(MIX_MAX) * i64::from(max_n);
+        check(
+            (0..=max_sum).contains(&next.mix_l) && (0..=max_sum).contains(&next.mix_r),
+            "resampler sums",
+        )?;
+        check(
+            next.sample_acc < u64::from(CYCLES_PER_SECOND),
+            "resampler phase",
+        )?;
+        next.samples = std::mem::take(&mut self.samples);
+        *self = next;
+        Ok(())
     }
 
     /// Timer `n` (0 or 1) overflowed: FIFOs clocked by it pop a sample, and any

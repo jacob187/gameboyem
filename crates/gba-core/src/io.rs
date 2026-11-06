@@ -15,7 +15,7 @@ const SOUNDCNT_H: u32 = 0x082;
 /// WAITCNT's writable bits (bit 15, the cart type, is read-only).
 const WAITCNT_MASK: u16 = 0x7FFF;
 /// WAITCNT bit 14: GamePak prefetch buffer enable.
-const WAITCNT_PREFETCH: u16 = 1 << 14;
+pub(crate) const WAITCNT_PREFETCH: u16 = 1 << 14;
 
 #[inline]
 fn merge(old: u16, v: u16, mask: u16) -> u16 {
@@ -232,16 +232,6 @@ impl Bus {
             let now = self.sched.now();
             self.timers.set_sound(clock, now, &mut self.sched);
         }
-    }
-
-    /// Recompute all timer elision state from the registers and reschedule every
-    /// timer event: the one call P3-STATE makes after loading a state. It needs
-    /// `Timers::fifo_len` to be right (saved with the state, or set to `[32, 32]`,
-    /// which only keeps the FIFO timers observed until they have popped 32 times).
-    pub fn rederive_timer_events(&mut self) {
-        let clock = self.sound_clock();
-        let now = self.sched.now();
-        self.timers.set_sound(clock, now, &mut self.sched);
     }
 
     /// Timer `n` overflowed at `at`: reload, schedule the next event, then the

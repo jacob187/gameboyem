@@ -8,6 +8,14 @@
 //! Adding a variant to [`Event`] is allowed (additive); changing the API is a
 //! contract change.
 
+use crate::state::{MAX_CLOCK, StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
+/// How far ahead of the clock a pending event can be: a timer on the slowest
+/// prescaler (1024 cycles per tick) counting all 65 536 ticks, plus its start
+/// delay, is 2^26 + 2 cycles. 2^27 leaves room without admitting nonsense.
+const MAX_EVENT_AHEAD: u64 = 1 << 27;
+
 /// Something that happens at a point in time. One pending instance per variant
 /// (scheduling a variant that is already pending replaces it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +38,41 @@ pub enum Event {
     DmaStart(u8),
     /// A delayed interrupt-flag update becomes visible to the CPU.
     IrqLine,
+}
+
+impl Event {
+    /// The most events pending at once: one per variant (`TimerOverflow` and
+    /// `DmaStart` have four each).
+    const MAX_PENDING: usize = 14;
+
+    /// `(kind, argument)` as a save state stores the event.
+    fn to_id(self) -> (u8, u8) {
+        match self {
+            Self::PpuRender => (0, 0),
+            Self::PpuHBlank => (1, 0),
+            Self::PpuFirstLine => (2, 0),
+            Self::PpuLineEnd => (3, 0),
+            Self::TimerOverflow(n) => (4, n),
+            Self::ApuSample => (5, 0),
+            Self::DmaStart(n) => (6, n),
+            Self::IrqLine => (7, 0),
+        }
+    }
+
+    /// The inverse of [`Event::to_id`]; `None` for a pair no event has.
+    fn from_id(kind: u8, arg: u8) -> Option<Self> {
+        Some(match (kind, arg) {
+            (0, 0) => Self::PpuRender,
+            (1, 0) => Self::PpuHBlank,
+            (2, 0) => Self::PpuFirstLine,
+            (3, 0) => Self::PpuLineEnd,
+            (4, n @ 0..=3) => Self::TimerOverflow(n),
+            (5, 0) => Self::ApuSample,
+            (6, n @ 0..=3) => Self::DmaStart(n),
+            (7, 0) => Self::IrqLine,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,6 +157,71 @@ impl Scheduler {
             }
             _ => None,
         }
+    }
+
+    /// Write the clock, the sequence counter and every queue entry exactly as
+    /// they are: the order and the tie-breaking `seq` of each entry are what make
+    /// a restored machine dispatch events exactly as the original would
+    /// (DECISIONS #73).
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.u64(self.now);
+        w.u64(self.seq);
+        w.u8(self.queue.len() as u8);
+        for e in &self.queue {
+            let (kind, arg) = e.event.to_id();
+            w.u8(kind);
+            w.u8(arg);
+            w.u64(e.at);
+            w.u64(e.seq);
+        }
+    }
+
+    /// Restore what [`Scheduler::save_state`] wrote. Entries must be in strict
+    /// `(at, seq)` order with distinct events (one pending instance per variant),
+    /// each `seq` below the counter, each time within a frame behind the clock
+    /// (events due but not yet dispatched at power-on) or a timer's longest
+    /// period ahead of it; the line end and the APU pump must be pending, or the
+    /// machine would never advance a frame.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let now = r.u64()?;
+        let seq = r.u64()?;
+        check(now < MAX_CLOCK && seq < MAX_CLOCK, "scheduler clock")?;
+        let n = usize::from(r.u8()?);
+        check(n <= Event::MAX_PENDING, "scheduler queue length")?;
+        let mut queue: Vec<Entry> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (kind, arg) = (r.u8()?, r.u8()?);
+            let event = Event::from_id(kind, arg).ok_or(StateError::Invalid("scheduler event"))?;
+            let (at, entry_seq) = (r.u64()?, r.u64()?);
+            check(entry_seq < seq, "scheduler entry sequence")?;
+            check(
+                at.saturating_add(u64::from(crate::CYCLES_PER_FRAME)) >= now
+                    && at <= now + MAX_EVENT_AHEAD,
+                "scheduler entry time",
+            )?;
+            check(
+                queue.iter().all(|e| e.event != event),
+                "duplicate scheduler event",
+            )?;
+            check(
+                queue.last().is_none_or(|p| (p.at, p.seq) < (at, entry_seq)),
+                "scheduler order",
+            )?;
+            queue.push(Entry {
+                at,
+                seq: entry_seq,
+                event,
+            });
+        }
+        let pending = |ev| queue.iter().any(|e| e.event == ev);
+        check(
+            pending(Event::PpuLineEnd) && pending(Event::ApuSample),
+            "scheduler is missing the line end or the APU pump",
+        )?;
+        self.now = now;
+        self.seq = seq;
+        self.queue = queue;
+        Ok(())
     }
 
     /// Jump the clock to the next event (used while the CPU is halted).

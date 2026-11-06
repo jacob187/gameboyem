@@ -17,6 +17,8 @@
 
 use super::CartError;
 use crate::CYCLES_PER_SECOND;
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// Control register: bit 7 is the power-off flag (read-only; set when the clock
 /// lost power, cleared by reading the register or by a reset).
@@ -179,6 +181,61 @@ impl Rtc {
         r.reset();
         r.control = CTRL_POWER_ON;
         r
+    }
+
+    /// Every register, the sub-second count and the cycle they are valid for.
+    /// The fields are binary here (BCD only exists on the wire), so the save
+    /// stores them as they are.
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.u8(self.control);
+        w.u8(self.year);
+        w.u8(self.month);
+        w.u8(self.day);
+        w.u8(self.weekday);
+        w.u8(self.hour);
+        w.u8(self.minute);
+        w.u8(self.second);
+        w.u32(self.subsecond);
+        w.u64(self.synced_at);
+    }
+
+    /// The clock never holds an impossible time (`write_datetime` and
+    /// `write_time` ignore a field that is not valid BCD in range), so every
+    /// field is range-checked, the day against its month and year. `synced_at`
+    /// is checked against the restored clock by the cart ([`Rtc::synced_at`]).
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let next = Self {
+            control: r.u8()?,
+            year: r.u8()?,
+            month: r.u8()?,
+            day: r.u8()?,
+            weekday: r.u8()?,
+            hour: r.u8()?,
+            minute: r.u8()?,
+            second: r.u8()?,
+            subsecond: r.u32()?,
+            synced_at: r.u64()?,
+        };
+        check(next.year <= 99, "RTC year")?;
+        check((1..=12).contains(&next.month), "RTC month")?;
+        check(
+            (1..=days_in_month(next.year, next.month)).contains(&next.day),
+            "RTC day",
+        )?;
+        check(next.weekday <= 6, "RTC weekday")?;
+        check(
+            next.hour <= 23 && next.minute <= 59 && next.second <= 59,
+            "RTC time of day",
+        )?;
+        check(u64::from(next.subsecond) < CPS, "RTC sub-second count")?;
+        check(next.synced_at < crate::state::MAX_CLOCK, "RTC sync time")?;
+        *self = next;
+        Ok(())
+    }
+
+    /// The master-clock cycle the fields are valid for.
+    pub fn synced_at(&self) -> u64 {
+        self.synced_at
     }
 
     /// Force reset: every register to 0, except day and month which become 1.

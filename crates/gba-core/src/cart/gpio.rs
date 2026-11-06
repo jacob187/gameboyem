@@ -22,6 +22,8 @@
 //! is caught up to the master clock only when a command starts.
 
 use super::rtc::{CTRL_POWER, FOOTER_LEN, Rtc};
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// `--rtc`: whether the cartridge has a GPIO port with a clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +39,27 @@ pub enum RtcMode {
     On,
     /// Absent: writes are ignored and the addresses always read as ROM.
     Off,
+}
+
+impl RtcMode {
+    /// The byte a save state or a recording stores.
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::On => 1,
+            Self::Off => 2,
+        }
+    }
+
+    /// The inverse of [`RtcMode::id`]; `None` for a byte no mode writes.
+    pub const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Auto),
+            1 => Some(Self::On),
+            2 => Some(Self::Off),
+            _ => None,
+        }
+    }
 }
 
 const SCK: u8 = 1;
@@ -120,6 +143,131 @@ impl Gpio {
 
     pub fn live(&self) -> bool {
         self.live
+    }
+
+    /// The port registers, the serial phase of the S-3511 protocol with its
+    /// buffers, the clock and the `used` flag. The mode (`--rtc`) comes from the
+    /// cartridge options and is not stored.
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.live);
+        w.u8(self.data);
+        w.u8(self.dir);
+        w.u8(self.control);
+        w.u8(self.driven);
+        match &self.phase {
+            Phase::Idle => w.u8(0),
+            Phase::Command { value, bits } => {
+                w.u8(1);
+                w.u8(*value);
+                w.u8(*bits);
+            }
+            Phase::Write {
+                reg,
+                len,
+                buf,
+                got,
+                bits,
+            } => {
+                w.u8(2);
+                w.u8(*reg);
+                w.u8(*len);
+                w.bytes(buf);
+                w.u8(*got);
+                w.u8(*bits);
+            }
+            Phase::Read {
+                buf,
+                len,
+                byte,
+                bit,
+            } => {
+                w.u8(3);
+                w.bytes(buf);
+                w.u8(*len);
+                w.u8(*byte);
+                w.u8(*bit);
+            }
+        }
+        w.bool(self.sio);
+        w.bool(self.used);
+        self.rtc.save_state(w);
+    }
+
+    /// `live` follows the mode: always for `On`, never for `Off`. The phases'
+    /// counters index their 7-byte buffers (`buf[got]`, `buf[byte]`) and their bit
+    /// counters shift a byte, so they are bounded; a write is for a register that
+    /// takes one (1, 2, 3 or an alarm/free one) with the length that register has.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let live = r.bool()?;
+        let (data, dir, control, driven) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
+        check(data <= 0xF && dir <= 0xF && driven <= 0xF, "GPIO pins")?;
+        check(control <= 1, "GPIO control")?;
+        let phase = match r.u8()? {
+            0 => Phase::Idle,
+            1 => {
+                let (value, bits) = (r.u8()?, r.u8()?);
+                check(bits < 8, "RTC command bits")?;
+                Phase::Command { value, bits }
+            }
+            2 => {
+                let (reg, len) = (r.u8()?, r.u8()?);
+                let mut buf = [0; 7];
+                r.bytes_into(&mut buf)?;
+                let (got, bits) = (r.u8()?, r.u8()?);
+                let want = match reg {
+                    2 => 7,
+                    3 => 3,
+                    1 | 4 | 5 | 7 => 1,
+                    _ => return Err(StateError::Invalid("RTC write register")),
+                };
+                check(len == want && got < len && bits < 8, "RTC write phase")?;
+                Phase::Write {
+                    reg,
+                    len,
+                    buf,
+                    got,
+                    bits,
+                }
+            }
+            3 => {
+                let mut buf = [0; 7];
+                r.bytes_into(&mut buf)?;
+                let (len, byte, bit) = (r.u8()?, r.u8()?, r.u8()?);
+                check(
+                    (1..=7).contains(&len) && byte <= len && bit < 8,
+                    "RTC read phase",
+                )?;
+                Phase::Read {
+                    buf,
+                    len,
+                    byte,
+                    bit,
+                }
+            }
+            _ => return Err(StateError::Invalid("RTC phase")),
+        };
+        let sio = r.bool()?;
+        let used = r.bool()?;
+        let mut rtc = self.rtc.clone();
+        rtc.load_state(r)?;
+        match self.mode {
+            RtcMode::On => check(live, "GPIO port of an --rtc on cartridge")?,
+            RtcMode::Off => check(!live, "GPIO port of an --rtc off cartridge")?,
+            RtcMode::Auto => {}
+        }
+        *self = Self {
+            mode: self.mode,
+            live,
+            data,
+            dir,
+            control,
+            driven,
+            phase,
+            sio,
+            rtc,
+            used,
+        };
+        Ok(())
     }
 
     /// Whether any register currently reads back instead of ROM (the port exists

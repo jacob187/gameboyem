@@ -17,6 +17,8 @@ mod arm;
 mod thumb;
 
 use crate::bus::{Access, CpuBus, SwiResult};
+use crate::state::{StateError, check, get_u32s, put_u32s};
+use emu_common::state::{StateReader, StateWriter};
 use std::marker::PhantomData;
 
 pub(crate) const FLAG_N: u32 = 1 << 31;
@@ -259,6 +261,68 @@ impl Cpu {
         s.r_und = c.banked[5];
         s.spsr = [c.spsr[1], c.spsr[3], c.spsr[4], c.spsr[2], c.spsr[5]];
         s
+    }
+
+    // ---- save states ------------------------------------------------------
+
+    /// Every field exactly as it is, including the banked slot of the live mode
+    /// (stale, but part of the byte-for-byte snapshot) and the pipeline
+    /// (DECISIONS #73).
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        put_u32s(w, &self.r);
+        w.u32(self.cpsr);
+        put_u32s(w, &self.spsr);
+        for bank in &self.banked {
+            put_u32s(w, bank);
+        }
+        put_u32s(w, &self.fiq_hi);
+        put_u32s(w, &self.usr_hi);
+        put_u32s(w, &self.pipe);
+        w.bool(self.seq);
+        w.bool(self.flushed);
+        w.bool(self.needs_refill);
+        w.bool(self.retry.is_some());
+        w.u32(self.retry.unwrap_or(0));
+    }
+
+    /// The CPSR mode is not checked: MSR can write any value to an SPSR and
+    /// `restore_spsr` copies it into the CPSR, and `bank_of` maps all 32 mode
+    /// values (an invalid one to the user bank), so every value is reachable and
+    /// harmless. The one thing that would index out of range is a Thumb-state
+    /// opcode wider than 16 bits (`THUMB[op >> 6]`), which is checked.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let regs = get_u32s::<16>(r)?;
+        let cpsr = r.u32()?;
+        let spsr = get_u32s::<6>(r)?;
+        let mut banked = [[0; 2]; 6];
+        for bank in &mut banked {
+            *bank = get_u32s::<2>(r)?;
+        }
+        let fiq_hi = get_u32s::<5>(r)?;
+        let usr_hi = get_u32s::<5>(r)?;
+        let pipe = get_u32s::<2>(r)?;
+        let (seq, flushed, needs_refill) = (r.bool()?, r.bool()?, r.bool()?);
+        let has_retry = r.bool()?;
+        let retry_op = r.u32()?;
+        check(
+            cpsr & PSR_T == 0 || pipe.iter().all(|&op| op <= 0xFFFF),
+            "Thumb pipeline opcode wider than 16 bits",
+        )?;
+        check(has_retry || retry_op == 0, "retry opcode without a retry")?;
+        *self = Self {
+            r: regs,
+            cpsr,
+            spsr,
+            banked,
+            fiq_hi,
+            usr_hi,
+            pipe,
+            seq,
+            flushed,
+            needs_refill,
+            retry: has_retry.then_some(retry_op),
+        };
+        Ok(())
     }
 
     // ---- modes and PSRs ---------------------------------------------------

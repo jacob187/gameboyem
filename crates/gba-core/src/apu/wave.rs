@@ -8,6 +8,8 @@
 //! the second bank, the dimension bit and the forced 75% volume.
 
 use super::common::Length;
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// CPU cycles per wave digit: the sample rate is `2097152 / (2048 - n)` Hz
 /// (GBATEK SOUND3CNT_X), i.e. `8 * (2048 - n)` cycles at 16.78 MHz.
@@ -56,6 +58,51 @@ impl Wave {
     }
 
     /// SOUNDCNT_X bit 7 cleared: the registers reset, wave RAM is kept.
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.bool(self.dac);
+        w.bool(self.two_banks);
+        w.u8(self.bank);
+        w.u8(self.level);
+        w.bool(self.force_75);
+        w.u16(self.freq);
+        w.u32(self.timer);
+        w.u8(self.pos);
+        w.u8(self.sample);
+        self.length.save_state(w);
+        w.bytes(&self.ram[0]);
+        w.bytes(&self.ram[1]);
+    }
+
+    /// `bank` picks one of two RAM banks, `pos` is a digit of a 32- or 64-digit
+    /// pattern, `sample` a 4-bit digit, and the timer a countdown from one
+    /// period (never zero).
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut next = Self::new();
+        next.enabled = r.bool()?;
+        next.dac = r.bool()?;
+        next.two_banks = r.bool()?;
+        next.bank = r.u8()?;
+        next.level = r.u8()?;
+        next.force_75 = r.bool()?;
+        next.freq = r.u16()?;
+        next.timer = r.u32()?;
+        next.pos = r.u8()?;
+        next.sample = r.u8()?;
+        next.length.load_state(r)?;
+        r.bytes_into(&mut next.ram[0])?;
+        r.bytes_into(&mut next.ram[1])?;
+        check(next.bank <= 1 && next.level <= 3, "wave bank or level")?;
+        check(next.freq <= 2047, "wave frequency")?;
+        check(
+            (1..=DIGIT_CYCLES * 2048).contains(&next.timer),
+            "wave timer",
+        )?;
+        check(next.pos < 64 && next.sample <= 15, "wave position")?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         let ram = self.ram;
         *self = Self::new();

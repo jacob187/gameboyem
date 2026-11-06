@@ -7,6 +7,8 @@
 //! the DMG zombie-mode envelope write.
 
 use super::common::{Envelope, Length, period_or_8};
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// Duty waveforms, one bit per step, first step first (GBATEK: duty 12.5%,
 /// 25%, 50%, 75%).
@@ -80,6 +82,53 @@ impl Square {
             env: Envelope::default(),
             sweep: Sweep::default(),
         }
+    }
+
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.u8(self.duty);
+        w.u8(self.pos);
+        w.u16(self.freq);
+        w.u32(self.timer);
+        self.length.save_state(w);
+        self.env.save_state(w);
+        w.u8(self.sweep.nr10);
+        w.u16(self.sweep.shadow);
+        w.u8(self.sweep.timer);
+        w.bool(self.sweep.enabled);
+    }
+
+    /// `duty` and `pos` index the 4x8 duty table; `freq` and the sweep's shadow
+    /// are 11-bit (`2048 - freq`, and a shadow past 2047 would overflow the
+    /// sweep arithmetic); a timer counts down from at most one full period and a
+    /// zero would make the APU's segment length zero.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut next = Self::new(self.has_sweep);
+        next.enabled = r.bool()?;
+        next.duty = r.u8()?;
+        next.pos = r.u8()?;
+        next.freq = r.u16()?;
+        next.timer = r.u32()?;
+        next.length.load_state(r)?;
+        next.env.load_state(r)?;
+        next.sweep = Sweep {
+            nr10: r.u8()?,
+            shadow: r.u16()?,
+            timer: r.u8()?,
+            enabled: r.bool()?,
+        };
+        check(next.duty <= 3 && next.pos <= 7, "square duty")?;
+        check(
+            next.freq <= 2047 && next.sweep.shadow <= 2047,
+            "square frequency",
+        )?;
+        check(
+            (1..=STEP_CYCLES * 2048).contains(&next.timer),
+            "square timer",
+        )?;
+        check(next.sweep.timer <= 8, "sweep timer")?;
+        *self = next;
+        Ok(())
     }
 
     /// SOUNDCNT_X bit 7 cleared: every register of the channel reads zero.

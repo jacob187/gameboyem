@@ -29,6 +29,8 @@
 //! (`Cpu::internal`, DECISIONS #51), so with prefetch off that fetch is charged N.
 
 use crate::bus::{Access, WaitTable};
+use crate::state::{MAX_CLOCK, StateError, check};
+use emu_common::state::{StateReader, StateWriter};
 
 /// Halfwords the buffer holds.
 pub const CAPACITY: u8 = 8;
@@ -60,6 +62,39 @@ pub struct Prefetch {
 }
 
 impl Prefetch {
+    /// The whole buffer state (DECISIONS #73). It is lazily evaluated from the
+    /// master clock, so `done_at` is an absolute time and is saved as one.
+    pub(crate) fn save_state(&self, w: &mut StateWriter) {
+        w.bool(self.enabled);
+        w.bool(self.valid);
+        w.u32(self.head);
+        w.u8(self.count);
+        w.u64(self.done_at);
+        w.bool(self.seq);
+    }
+
+    /// At most eight halfwords are buffered. `enabled` is WAITCNT bit 14, which
+    /// the bus cross-checks against the restored WAITCNT.
+    pub(crate) fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let enabled = r.bool()?;
+        let valid = r.bool()?;
+        let head = r.u32()?;
+        let count = r.u8()?;
+        let done_at = r.u64()?;
+        let seq = r.bool()?;
+        check(count <= CAPACITY, "prefetch count")?;
+        check(done_at < MAX_CLOCK, "prefetch completion time")?;
+        *self = Self {
+            enabled,
+            valid,
+            head,
+            count,
+            done_at,
+            seq,
+        };
+        Ok(())
+    }
+
     /// WAITCNT bit 14 changed. Turning it off empties the buffer; turning it on
     /// starts with nothing buffered.
     pub fn set_enabled(&mut self, on: bool) {

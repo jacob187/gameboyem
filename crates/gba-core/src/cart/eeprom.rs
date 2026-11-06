@@ -17,6 +17,9 @@
 //! has no other end-of-request marker). A request of any other length, or one
 //! that completes before that read, is taken as 8 KiB (DECISIONS #67).
 
+use crate::state::{StateError, check};
+use emu_common::state::{StateReader, StateWriter};
+
 pub const SIZE_512: usize = 512;
 pub const SIZE_8K: usize = 8 * 1024;
 
@@ -65,6 +68,55 @@ impl Eeprom {
     }
 
     /// Whether a save of `len` bytes fits this chip.
+    /// The whole 8 KiB array (a chip of 512 bytes keeps the rest erased), the
+    /// size state and the request and response shift registers, so a state taken
+    /// between two bits of a DMA still completes the request.
+    pub fn save_state(&self, w: &mut StateWriter) {
+        w.bytes(&self.data);
+        w.u32(self.size.map_or(0, |s| s as u32));
+        w.bool(self.size_confirmed);
+        w.bool(self.forced);
+        w.u64((self.rx >> 64) as u64);
+        w.u64(self.rx as u64);
+        w.u32(self.rx_len);
+        w.u64(self.tx);
+        w.u32(self.tx_left);
+    }
+
+    /// `forced` follows the cartridge options (`--save-type eeprom512|eeprom8k`),
+    /// so it must match this chip, and a forced chip keeps its size. A request
+    /// has at most 2 + 14 + 64 + 1 = 81 bits and a response 68.
+    pub fn load_state(&mut self, r: &mut StateReader) -> Result<(), StateError> {
+        let mut data = vec![0; SIZE_8K].into_boxed_slice();
+        r.bytes_into(&mut data)?;
+        let size = match r.u32()? {
+            0 => None,
+            512 => Some(SIZE_512),
+            8192 => Some(SIZE_8K),
+            _ => return Err(StateError::Invalid("EEPROM size")),
+        };
+        let size_confirmed = r.bool()?;
+        let forced = r.bool()?;
+        let rx = u128::from(r.u64()?) << 64 | u128::from(r.u64()?);
+        let rx_len = r.u32()?;
+        let tx = r.u64()?;
+        let tx_left = r.u32()?;
+        check(forced == self.forced, "EEPROM size option")?;
+        check(!forced || size == self.size, "forced EEPROM size")?;
+        check(rx_len <= 81 && tx_left <= 68, "EEPROM transfer")?;
+        *self = Self {
+            data,
+            size,
+            size_confirmed,
+            forced,
+            rx,
+            rx_len,
+            tx,
+            tx_left,
+        };
+        Ok(())
+    }
+
     pub fn accepts(&self, len: usize) -> bool {
         match (self.forced, self.size) {
             (true, Some(size)) => len == size,

@@ -32,11 +32,13 @@ pub mod memory;
 pub mod ppu;
 pub mod prefetch;
 pub mod scheduler;
+mod state;
 pub mod timer;
 
 pub use cart::{CartError, CartOptions, RtcMode, RtcTime, SaveChoice};
 pub use gba::Gba;
 pub use keypad::Button;
+pub use state::StateError;
 
 /// LCD width in pixels.
 pub const SCREEN_WIDTH: usize = 240;
