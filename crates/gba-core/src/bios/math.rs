@@ -73,9 +73,10 @@ pub fn sqrt(n: u32) -> u32 {
     r
 }
 
-/// ArcTan of a 1.14 fixed-point tangent: a degree-7 polynomial in `-i^2`.
+/// ArcTan of a 1.14 fixed-point tangent (the SWI passes a sign-extended 16-bit
+/// value; the arithmetic wraps for any other input, so it cannot panic): a degree-7 polynomial in `-i^2`.
 /// Returns an angle in 0x4000 = a quarter turn units (so tan 1.0 = 0x2000).
-pub fn arctan(i: i32) -> i32 {
+pub(crate) fn arctan(i: i32) -> i32 {
     let a = -(i.wrapping_mul(i) >> 14);
     let mut b = (0xA9i32.wrapping_mul(a) >> 14) + 0x390;
     for c in [0x91C, 0xFB6, 0x16AA, 0x2081, 0x3651, 0xA2F9] {
@@ -84,10 +85,11 @@ pub fn arctan(i: i32) -> i32 {
     i.wrapping_mul(b) >> 16
 }
 
-/// ArcTan2 of 1.14 fixed-point `x`, `y`: 0..=0xFFFF for 0 <= theta < 2 pi. The
+/// ArcTan2 of 1.14 fixed-point `x`, `y` (sign-extended 16-bit values from the SWI,
+/// which keeps every shift and negation below in range): 0..=0xFFFF for 0 <= theta < 2 pi. The
 /// polynomial is only accurate within +-45 degrees, so the other octants use
 /// the complementary ratio.
-pub fn arctan2(x: i32, y: i32) -> u32 {
+pub(crate) fn arctan2(x: i32, y: i32) -> u32 {
     let r = if y == 0 {
         if x >= 0 { 0 } else { 0x8000 }
     } else if x == 0 {
