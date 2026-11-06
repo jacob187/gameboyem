@@ -132,7 +132,7 @@ jobs:
 
       # Pinned output hashes (bit-identical emulation on every OS) plus a speed
       # floor, applied to the Game Boy and the GBA ROMs separately. Dev Macs run
-      # ~40x (GB) and ~17x (GBA) real time; 5x leaves room for slow, noisy
+      # ~40x (GB) and ~17-24x (GBA) real time; 5x leaves room for slow, noisy
       # runners while still catching a real regression.
       - name: Benchmark (pinned hashes + speed floor)
         run: cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5
@@ -222,7 +222,7 @@ jobs:
 
       # Pinned output hashes (bit-identical emulation on every OS) plus a speed
       # floor, applied to the Game Boy and the GBA ROMs separately. Dev Macs run
-      # ~40x (GB) and ~17x (GBA) real time; 5x leaves room for slow, noisy
+      # ~40x (GB) and ~17-24x (GBA) real time; 5x leaves room for slow, noisy
       # runners while still catching a real regression.
       - name: Benchmark (pinned hashes + speed floor)
         run: cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5
