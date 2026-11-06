@@ -295,14 +295,15 @@ fn intr_wait_protocol_discard_wait_and_consume() {
     assert_eq!(res, SwiResult::Done);
     assert_eq!(b.peek16(BIOS_IF), 0);
     assert!(b.irq.ime, "IntrWait forces IME = 1");
-    // r0 = 1 discards the old flag, then waits; r0 comes back 0 for the retry.
+    // r0 = 1 discards the old flag, then waits; r2 carries the retry marker.
     b.write16(BIOS_IF, 0x0003, N);
     let (res, r) = call(&mut b, 0x04, [1, 1, 0, 0]);
     assert_eq!(res, SwiResult::WaitThenRetry);
-    assert_eq!(r[0], 0);
+    assert_ne!(r[2], 0);
     assert_eq!(b.peek16(BIOS_IF), 0x0002, "only the awaited bit was discarded");
     assert!(b.halted);
-    // Retry without a new flag keeps waiting; a new flag finishes and clears it.
+    // Retry without a new flag keeps waiting; a new flag finishes and clears it
+    // (the retry must not discard it again, r0 is still 1).
     assert_eq!(call(&mut b, 0x04, r).0, SwiResult::WaitThenRetry);
     b.write16(BIOS_IF, 0x0003, N);
     assert_eq!(call(&mut b, 0x04, r).0, SwiResult::Done);
@@ -310,7 +311,9 @@ fn intr_wait_protocol_discard_wait_and_consume() {
     // VBlankIntrWait is IntrWait(1, 1).
     b.write16(BIOS_IF, 0x0001, N);
     let (res, r) = call(&mut b, 0x05, [0; 4]);
-    assert_eq!((res, r[0], r[1]), (SwiResult::WaitThenRetry, 0, 1));
+    assert_eq!((res, r[0], r[1]), (SwiResult::WaitThenRetry, 1, 1));
+    b.write16(BIOS_IF, 0x0001, N);
+    assert_eq!(call(&mut b, 0x05, r).0, SwiResult::Done);
 }
 
 #[test]

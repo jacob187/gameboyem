@@ -198,23 +198,32 @@ fn hang(bus: &mut Bus) -> SwiResult {
     SwiResult::WaitThenRetry
 }
 
-/// SWI 0x04 IntrWait (GBATEK "BIOS Halt Functions"). The CPU re-runs the SWI with
-/// the registers handed back, and an IRQ taken during the wait also returns to
-/// the SWI, so the first attempt does the one-time work (IME = 1, discarding old
-/// flags) and clears r0 so the retries only check.
+/// Marker the first attempt of IntrWait leaves in r2 (unused on the GBA) so a
+/// retry knows the one-time work is done. The CPU re-runs the SWI with the
+/// registers handed back, and an IRQ taken during the wait also returns to the
+/// SWI with them restored from the stack, so the marker survives both. It keeps
+/// the wait's state in registers, not in the bus (nothing extra to save).
+const INTR_WAIT_MARK: u32 = 0x4957_4954; // "IWIT"
+
+/// SWI 0x04 IntrWait (GBATEK "BIOS Halt Functions"): IME = 1, optionally discard
+/// old flags (r0 = 1), then wait in halt until a flag in r1 is set in the BIOS
+/// interrupt flags, and consume it. Returns `WaitThenRetry` while waiting.
 fn intr_wait(bus: &mut Bus, r: &mut [u32; 4]) -> SwiResult {
     let wanted = r[1] as u16;
-    bus.irq.ime = true;
-    if r[0] != 0 {
-        let flags = bus.read16(BIOS_IF, Access::NonSeq);
-        bus.write16(BIOS_IF, flags & !wanted, Access::NonSeq);
-        r[0] = 0;
+    if r[2] != INTR_WAIT_MARK {
+        bus.irq.ime = true;
+        if r[0] != 0 {
+            let flags = bus.read16(BIOS_IF, Access::NonSeq);
+            bus.write16(BIOS_IF, flags & !wanted, Access::NonSeq);
+        }
+        r[2] = INTR_WAIT_MARK;
     }
     let flags = bus.read16(BIOS_IF, Access::NonSeq);
     let hit = flags & wanted;
     if hit != 0 {
         // The matched flags are consumed.
         bus.write16(BIOS_IF, flags & !hit, Access::NonSeq);
+        r[2] = 0;
         return SwiResult::Done;
     }
     bus.halted = true;
