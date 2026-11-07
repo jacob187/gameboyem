@@ -135,7 +135,7 @@ impl Bus {
             0x200 => self.irq.ie = merge(self.irq.ie, v, mask) & 0x3FFF,
             0x202 => self.irq.write_if(v & mask),
             0x204 => {
-                // Halfwords read so far were read at the old timings (code-review T#1).
+                // Halfwords read so far were read at the old timings.
                 if self.prefetch.enabled {
                     self.prefetch.sync(self.sched.now(), &self.waits);
                 }
@@ -161,7 +161,7 @@ impl Bus {
                     self.halted = true;
                     self.stopped = v & 0x8000 != 0;
                     // An enabled interrupt that is already pending ends the halt
-                    // at once, without a clock skip (code-review S#3).
+                    // at once, without a clock skip.
                     self.check_wake();
                 }
             }
@@ -200,8 +200,8 @@ impl Bus {
     }
 
     /// Which of timers 0 and 1 clock a Direct Sound FIFO that is in use, from the
-    /// current registers (they schedule overflow events only for observed timers,
-    /// DECISIONS #69). A FIFO is in use while it holds data (`Timers::fifo_len`) or
+    /// current registers (they schedule overflow events only for observed timers; a prescaler-1 timer
+    /// at reload 0xFFFF would otherwise queue an event per cycle). A FIFO is in use while it holds data (`Timers::fifo_len`) or
     /// a sound-FIFO DMA channel (DMA1/2 enabled, start timing 3) may fill it;
     /// otherwise a pop is a no-op and a refill request starts nothing. The timer
     /// is the SOUNDCNT_H select, whatever the output enables say, because the APU

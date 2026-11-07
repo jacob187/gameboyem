@@ -5,18 +5,23 @@
 //! uses, so the clock is charged and the VRAM/palette/OAM byte-write rules apply.
 //! The first access of a call is non-sequential, the rest sequential.
 //!
-//! **Work bound (DECISIONS #68).** A call runs inside one instruction step, so the
-//! run loop's frame cap cannot interrupt it. Every loop therefore checks a per-call
-//! cycle budget, [`SWI_CYCLE_CAP`], and stops when it is spent; only the units done
-//! by then are written and charged. A hostile count or size field cannot stall the
-//! host or push the clock far past the budget.
+//! **Work bound.** A call runs inside one instruction step, so the
+//! run loop's frame cap cannot interrupt it, and the count or size in a register
+//! is guest-controlled (BgAffineSet over a 32-bit r2, or Huffman with size
+//! 0xFFFFFF, would run for minutes and then replay the PPU events of hundreds of
+//! thousands of frames). Every loop therefore checks a per-call
+//! cycle budget, [`SWI_CYCLE_CAP`], measured as the bus time since the call began
+//! plus the compute cycles accrued so far, and stops when it is spent; only the
+//! units done by then are written and charged, and a VRAM-variant decompressor
+//! that stops on an odd byte leaves its low half unwritten. A hostile count or
+//! size field cannot stall the host or push the clock far past the budget.
 
 use super::{SWI_CYCLE_CAP, math};
 use crate::BIOS_SIZE;
 use crate::bus::{Access, Bus, CpuBus};
 
 /// Extra cycles per unit on top of the bus accesses (loop control and ALU work
-/// of the BIOS code, DECISIONS #65).
+/// of the BIOS code). These are plausible magnitudes, not hardware measurements.
 pub(super) const SET_PER_UNIT: u64 = 2;
 pub(super) const FAST_SET_PER_BLOCK: u64 = 4;
 pub(super) const AFFINE_PER_ENTRY: u64 = 36;
@@ -211,7 +216,7 @@ pub(super) fn cpu_fast_set(bus: &mut Bus, r: &[u32; 4]) {
 /// `(pa, pb, pc, pd)` for scales `sx`, `sy` (8.8) and angle `theta`:
 /// `pa = sx cos`, `pb = -sx sin`, `pc = sy sin`, `pd = sy cos`, each `>> 14`.
 /// APPROXIMATION: the negation happens before the shift (the real BIOS may
-/// round `pb` the other way by one LSB). DECISIONS #65.
+/// round `pb` the other way by one LSB).
 fn affine_params(sx: i32, sy: i32, theta: u16) -> (i32, i32, i32, i32) {
     let (sin, cos) = math::sin_cos(theta);
     (
@@ -303,7 +308,7 @@ pub(super) fn bit_unpack(bus: &mut Bus, r: &[u32; 4]) {
                 v = v.wrapping_add(offset);
             }
             // The sum is cut to the destination unit, so an overflow cannot spill
-            // into the next unit (DECISIONS #65).
+            // into the next unit.
             if dw < 32 {
                 v &= (1 << dw) - 1;
             }
@@ -402,7 +407,8 @@ pub(super) fn rl(bus: &mut Bus, r: &[u32; 4], vram: bool) {
 /// bits 6 (child 1) and 7 (child 0). The pair sits at `(node & !1) + offset * 2 +
 /// 2`, always past the node itself. A pair, and the leaf data byte that a leaf flag
 /// selects, must lie inside the table; a node that points out of it marks the data
-/// malformed and ends the decode (DECISIONS #68), with the words written so far
+/// malformed and ends the decode (the real BIOS would read past the tree instead; stopping protects
+/// the host and does not match hardware), with the words written so far
 /// kept. Because every step moves forward, a walk is at most 256 nodes long.
 pub(super) fn huff(bus: &mut Bus, r: &[u32; 4]) {
     let mut m = Mem::new(bus);
@@ -410,7 +416,7 @@ pub(super) fn huff(bus: &mut Bus, r: &[u32; 4]) {
     let hdr = m.r32(src);
     let (bits, size) = (hdr & 0xF, hdr >> 8);
     // GBATEK: data size in bit units, normally 4 or 8; only 1, 2, 4 and 8 pack
-    // evenly into the output words. Anything else is a no-op (DECISIONS #65).
+    // evenly into the output words. Anything else is a no-op.
     if !matches!(bits, 1 | 2 | 4 | 8) {
         return;
     }

@@ -31,7 +31,7 @@ const MAX_EVENT_AHEAD: u64 = 1 << 27;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// The PPU's visible dots end (cycle 960 of a visible line): the line is
-    /// drawn from the state as it is now (DECISIONS #71).
+    /// drawn from the state as it is now.
     PpuRender,
     /// The HBlank flag, IRQ and DMA trigger of the current line (cycle 1006).
     PpuHBlank,
@@ -190,8 +190,7 @@ impl Scheduler {
 
     /// Write the clock, the sequence counter and every queue entry exactly as
     /// they are: the order and the tie-breaking `seq` of each entry are what make
-    /// a restored machine dispatch events exactly as the original would
-    /// (DECISIONS #73).
+    /// a restored machine dispatch events exactly as the original would.
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
         w.u64(self.now);
         w.u64(self.seq);

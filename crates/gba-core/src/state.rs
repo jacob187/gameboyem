@@ -1,4 +1,6 @@
-//! Save states: a versioned binary snapshot of the whole machine (DECISIONS #73).
+//! Save states: a versioned binary snapshot of the whole machine. Every field
+//! is stored bit for bit and the scheduler queue is restored verbatim (nothing is
+//! rescheduled after a load), so a restored machine replays exactly.
 //!
 //! Layout: magic `GBAS`, a `u16` format version, the FNV-1a hash of the ROM, a
 //! BIOS kind byte (0 built-in HLE, 1 a real dump) with the FNV-1a hash of the

@@ -327,7 +327,8 @@ fn run_case(c: &Case, verbose_budget: &mut usize, stats: &mut Stats) {
 }
 
 /// The exclusions and masks below are the deliberate deviations from the
-/// reference data listed in DECISIONS #50 and #51; everything else must match.
+/// reference data (SingleStepTests, generated from NanoBoyAdvance rather than
+/// hardware) listed below; everything else must match.
 ///
 /// Encodings the ARM architecture marks UNPREDICTABLE, where the reference data
 /// shows implementation accidents rather than behaviour worth copying:

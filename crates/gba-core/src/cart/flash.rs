@@ -12,7 +12,7 @@ use emu_common::state::{StateReader, StateWriter};
 /// Manufacturer / device IDs reported in ID mode, from GBATEK's device table.
 ///
 /// 64 KiB: Panasonic MN63F805MNP (ID 0x1B32). 128 KiB: Sanyo LE26FV10N1TS (ID
-/// 0x1362). Both are on the list of commonly emulated chips (DECISIONS #53).
+/// 0x1362). Both are on the list of commonly emulated chips; no commercial game was checked against them.
 const ID_64K: [u8; 2] = [0x32, 0x1B];
 /// The 128 KiB part's ID bytes (see [`ID_64K`]).
 const ID_128K: [u8; 2] = [0x62, 0x13];
@@ -160,8 +160,7 @@ impl Flash {
                     self.state = State::Unlocked1;
                 } else {
                     // Anything but the start of an unlock aborts a pending erase:
-                    // it is one six-write sequence (`AA 55 80 AA 55 10/30`)
-                    // (deep-review #10).
+                    // it is one six-write sequence (`AA 55 80 AA 55 10/30`).
                     self.erase_armed = false;
                     if v == 0xF0 {
                         // Reset / terminate ID mode without the unlock sequence.
@@ -176,7 +175,7 @@ impl Flash {
                     false
                 } else {
                     // Not the second unlock byte: look at it as a fresh start, so
-                    // a repeated 0xAA@0x5555 keeps the unlock going (code-review S#4).
+                    // a repeated 0xAA@0x5555 keeps the unlock going.
                     self.state = State::Idle;
                     self.write(addr, v)
                 }
@@ -300,7 +299,7 @@ mod tests {
     type Abort = (&'static str, fn(&mut Flash));
 
     /// `AA 55 80` arms an erase for the very next unlock sequence only: a reset, a
-    /// stray write or an aborted unlock cancels it (deep-review #10).
+    /// stray write or an aborted unlock cancels it.
     #[test]
     fn an_aborted_erase_sequence_does_not_stay_armed() {
         let aborts: [Abort; 3] = [

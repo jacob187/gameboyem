@@ -1,13 +1,18 @@
 //! Pure arithmetic of the HLE BIOS: Div, Sqrt, ArcTan, ArcTan2, the sine table
 //! and MidiKey2Freq. No bus access, no floats (so native and wasm agree).
 //!
-//! Provenance (DECISIONS #64): GBATEK ("BIOS Arithmetic Functions") specifies
+//! Provenance: GBATEK ("BIOS Arithmetic Functions") specifies
 //! the registers, ranges and the Div example only. It gives neither the ArcTan
 //! polynomial nor the sine table, so those come from the documented BIOS
 //! algorithms (the table is `trunc(0x4000 * sin(2 pi i / 256))`, the first
 //! sixteen entries match the values quoted in homebrew documentation, and the
 //! ArcTan coefficients telescope so that tan = 1.0 gives exactly 0x2000; all
-//! three facts are tests below).
+//! three facts are tests below). The ArcTan coefficients (0xA9, 0x390, 0x91C,
+//! 0xFB6, 0x16AA, 0x2081, 0x3651, 0xA2F9, each step `>> 14`) were written from the
+//! documented algorithm, not from another emulator's source; ArcTan2's octant
+//! boundaries are as remembered, so ties may land one polynomial step apart.
+//! The sine table is stored as a const quarter wave, so there is no float at run
+//! time and native and wasm agree.
 
 /// Quarter wave of the BIOS sine table: `trunc(0x4000 * sin(2 pi i / 256))` for
 /// `i = 0..=64`, generated once offline with exact arithmetic.
@@ -175,7 +180,7 @@ mod tests {
         assert_eq!(sin_cos(0x4000), (0x4000, 0));
     }
 
-    /// Every quarter-wave entry is the documented formula (deep-review #75). The
+    /// Every quarter-wave entry is the documented formula. The
     /// runtime has no floats; the test uses `f64`, which agrees with the exact
     /// table on all 65 entries (none is within rounding of an integer).
     #[test]

@@ -296,8 +296,8 @@ fn brightness_obeys_the_window_effect_bit_too() {
 
 #[test]
 fn semi_transparent_sprites_are_also_gated_by_the_window_effect_bit() {
-    // An approximation recorded in DECISIONS #59: the window's effect bit disables
-    // the semi-transparent blend as well.
+    // An approximation: GBATEK does not spell out whether the window's effect bit
+    // also disables the semi-transparent blend; here it does.
     let mut rig = stack();
     with_sprite(&mut rig, 1, 0);
     rig.write(BLDALPHA, 8 | 8 << 8);

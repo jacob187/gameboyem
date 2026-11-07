@@ -2,8 +2,9 @@
 //! halfword registers are made of (GBATEK "GBA Sound Channel 1 - Tone & Sweep",
 //! "Channel 2 - Tone").
 //!
-//! Adapted from `gb-core`'s `apu/square.rs` (DECISIONS #61). Time is in CPU
-//! cycles, not M-cycles. Added: save states, with range checks on load. Dropped:
+//! Adapted from `gb-core`'s `apu/square.rs` (copied, not shared). Time is in CPU
+//! cycles, not M-cycles: a duty step is `16 * (2048 - n)` (GBATEK's frequency
+//! formula). Added: save states, with range checks on load. Dropped:
 //! the NR10 negate-clear quirk and the DMG zombie-mode envelope write.
 
 use super::common::{Envelope, Length, period_or_8};
@@ -421,8 +422,7 @@ mod tests {
 
     /// Each `load_state` refusal fires on its own field: a duty or position past
     /// the table would index out of bounds, a frequency or shadow past 11 bits
-    /// would overflow, a zero or oversized timer breaks the segment length
-    /// (deep-review #74).
+    /// would overflow, a zero or oversized timer breaks the segment length.
     #[test]
     fn a_state_with_an_impossible_square_field_is_refused() {
         let load = |s: &Square| {

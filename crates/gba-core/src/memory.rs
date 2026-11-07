@@ -13,7 +13,8 @@
 //!   address bits, at the *unaligned* address (so the save window is decoded
 //!   before the alignment the other regions get).
 //! * Unmapped regions, and the BIOS while the CPU runs outside it, read as the
-//!   open-bus value (DECISIONS #52).
+//!   open-bus value: the last value the CPU fetched, a deliberate approximation of
+//!   the real pipeline-dependent value.
 
 use crate::bus::{Bus, Width};
 
@@ -49,14 +50,14 @@ impl Bus {
     /// the EEPROM's serial read pointer. Only halfword reads advance it, since
     /// the chip is accessed in 16-bit units through DMA3 (GBATEK "GBA Cart Backup
     /// EEPROM"); byte and word reads of that region see plain ROM contents and
-    /// leave the chip alone (code-review S#7). Opcode fetches never come here.
+    /// leave the chip alone. Opcode fetches never come here.
     /// No time is charged.
     #[inline]
     pub(crate) fn read_value(&mut self, addr: u32, w: Width) -> u32 {
         if w == Width::H && self.cart.eeprom_at(addr) {
             return u32::from(self.cart.eeprom_read());
         }
-        // P2-APU (code-review A2#1): a sound register or wave RAM read sees the
+        // P2-APU: a sound register or wave RAM read sees the
         // APU at the current cycle, not at the last sync. `peek*` stays pure.
         if addr >> 24 == 4 && (0x60..0xA0).contains(&(addr & 0x00FF_FFFF)) {
             self.apu.advance_to(self.sched.now());

@@ -9,7 +9,8 @@
 //! previous timer's overflow increments them. On an overflow of timer 0 or 1 the
 //! bus also tells the APU (`Apu::on_timer_overflow`), which may request a FIFO DMA.
 //!
-//! Overflow events exist only for timers something observes (DECISIONS #69). A
+//! Overflow events exist only for timers something observes (a prescaler-1 timer at reload 0xFFFF would otherwise queue an
+//! event per cycle). A
 //! timer is observed when its IRQ is enabled, a running count-up timer follows it,
 //! or it clocks a Direct Sound FIFO that is in use ([`Timers::sound`]). An
 //! unobserved timer has no event: `read_counter` folds the elapsed time, and
@@ -22,7 +23,7 @@ use crate::state::{StateError, check};
 use emu_common::state::{StateReader, StateWriter};
 
 /// Cycles between enabling a timer and its first counted tick. GBATEK doesn't
-/// give the figure; two cycles is the commonly measured value (DECISIONS #54).
+/// give the figure; two cycles is the commonly measured value.
 pub const START_DELAY: u64 = 2;
 
 const PRESCALER_SHIFT: [u32; 4] = [0, 6, 8, 10];
@@ -81,7 +82,8 @@ impl Timers {
     /// APU's FIFOs, so the bus sets it from them after loading
     /// ([`crate::bus::Bus::load_state`]), and the two cannot disagree. The overflow
     /// events live in the scheduler's section and are restored verbatim, not
-    /// re-derived (DECISIONS #73).
+    /// re-derived (`sound` legitimately lags `sound_clock()` after a sound DMA switches
+    /// itself off, so rederiving would change a reachable state).
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
         for t in &self.t {
             w.u16(t.reload);
@@ -122,7 +124,7 @@ impl Timers {
     /// the cycle the timer's own `counter`/`start` give. `schedule` recomputes
     /// the event from those fields, so a stale `start` would make every later
     /// overflow replay from the past, one dispatch per period, in a single
-    /// `process_events` call (deep-review #2).
+    /// `process_events` call (a hang for a state taken late in a session).
     pub(crate) fn check_events(&self, now: u64, sched: &Scheduler) -> Result<(), StateError> {
         check(
             self.t.iter().all(|t| t.start <= now + START_DELAY),
@@ -445,7 +447,7 @@ mod tests {
 
     /// A pending overflow event must sit where its timer's `counter`/`start` say:
     /// `schedule` recomputes it from them, so a stale `start` would replay every
-    /// period since then in one `process_events` call (deep-review #2).
+    /// period since then in one `process_events` call.
     #[test]
     fn a_pending_overflow_that_disagrees_with_its_timer_is_refused() {
         let mut t = Timers::default();

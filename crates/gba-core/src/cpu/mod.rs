@@ -9,8 +9,21 @@
 //!
 //! Layout: `mod.rs` holds the state, mode banking, exceptions and the step loop;
 //! `arm.rs` and `thumb.rs` hold the instruction handlers and their decode tables
-//! (DECISIONS #50); `alu.rs` the arithmetic helpers. Pipeline and N/S modelling
-//! is DECISIONS #51.
+//! (two compile-time function-pointer tables, indexed by opcode bits 27..20 and
+//! 7..4 for ARM and bits 15..6 for Thumb, so `step` is one indexed call with no
+//! `dyn`; handlers that depend on a few opcode bits are generic over them as a
+//! const, so the hot path holds no flag tests); `alu.rs` the arithmetic helpers.
+//!
+//! Pipeline and N/S modelling: `pipe` holds two prefetched opcodes and `r15` is
+//! the next fetch address, reading as instruction + 8 (ARM) or + 4 (Thumb). The
+//! opcode two ahead is fetched before the instruction runs, so a store to the
+//! next instruction does not change it (jsmolka's nes.gba relies on this). Every
+//! bus access says N or S and the CPU counts internal cycles; wait states are
+//! entirely the bus's business. After a data access or an internal cycle the next
+//! fetch is N; a branch or PC write refills with an N fetch of the target then an
+//! S fetch. IRQs are polled before each instruction and LR is the next
+//! instruction + 4, so `subs pc, lr, #4` resumes it. Open: the exact latency of
+//! IRQ entry on hardware (the SWI-like 2S+N is charged).
 
 mod alu;
 mod arm;
@@ -262,8 +275,7 @@ impl Cpu {
     // ---- save states ------------------------------------------------------
 
     /// Every field exactly as it is, including the banked slot of the live mode
-    /// (stale, but part of the byte-for-byte snapshot) and the pipeline
-    /// (DECISIONS #73).
+    /// (stale, but part of the byte-for-byte snapshot) and the pipeline.
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
         put_u32s(w, &self.r);
         w.u32(self.cpsr);
@@ -423,7 +435,8 @@ impl Cpu {
     fn refill<B: CpuBus>(&mut self, bus: &mut B, target: u32) {
         if self.cpsr & PSR_T == 0 {
             // Fetches are word aligned, but r15 keeps the low bits of the target
-            // (the reference data, NanoBoyAdvance, does the same; DECISIONS #51).
+            // (the reference data, SingleStepTests generated from NanoBoyAdvance, does the
+            // same).
             let t = target & !3;
             self.pipe[0] = bus.fetch32(t, Access::NonSeq);
             self.pipe[1] = bus.fetch32(t.wrapping_add(4), Access::Seq);

@@ -1,6 +1,7 @@
 //! Noise channel 4 (GBATEK "GBA Sound Channel 4 - Noise", SOUND4CNT_L/H).
 //!
-//! Adapted from `gb-core`'s `apu/noise.rs` (DECISIONS #61). The LFSR is
+//! Adapted from `gb-core`'s `apu/noise.rs` (copied, not shared; see the APU
+//! module docs). The LFSR is
 //! GBATEK's, not the DMG's XNOR form: shift right, and if the bit shifted out
 //! was 1 output HIGH and XOR the register with 0x60 (7-bit) or 0x6000 (15-bit);
 //! the seed on restart is 0x40 / 0x4000.
@@ -267,7 +268,8 @@ mod tests {
     }
 
     /// The LFSR is seeded nonzero and no step reaches 0 or bit 15, so a state
-    /// holding either is refused (deep-review #7).
+    /// holding either is refused (a saved state is untrusted input; zero would lock the
+    /// register).
     #[test]
     fn a_state_with_an_unreachable_lfsr_is_refused() {
         let load = |n: &Noise| {

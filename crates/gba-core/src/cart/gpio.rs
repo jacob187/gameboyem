@@ -31,7 +31,9 @@ use emu_common::state::{StateReader, StateWriter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RtcMode {
     /// The port stays inert (all reads are ROM) until the game writes a value
-    /// that looks like GPIO setup to 0x0800_00C4..=C9 (DECISIONS #66). Waking it
+    /// that looks like GPIO setup to 0x0800_00C4..=C9. Any RTC game's driver starts that way (it must
+    /// enable reads to see the clock), and a ROM that never stores there is
+    /// bit-identical to one with no port. Waking it
     /// is harmless for a game that is not using a clock: reads still return ROM
     /// until the control register enables them, and the save image gains a
     /// footer only once a valid RTC command arrives.
@@ -120,7 +122,7 @@ pub(super) struct Gpio {
     /// The clock has been used: the chip received a valid command byte (CS high
     /// and a full `0110 ccc r`), or its state was loaded from a save footer. Only
     /// then does the save image carry the footer, so a game that never talks to a
-    /// clock keeps a chip-sized `.sav` (code-review K#2, K#3).
+    /// clock keeps a chip-sized `.sav` that other emulators accept.
     used: bool,
 }
 
@@ -365,7 +367,7 @@ impl Gpio {
     /// A 32-bit write to the word-aligned ROM offset `reg`. At 0xC4 it sets data
     /// (low half) and direction (high half) together: the pin state is computed
     /// once from both, so no intermediate "new data, old direction" state can
-    /// clock the chip (code-review K#1). At 0xC8 only the control register (low
+    /// clock the chip. At 0xC8 only the control register (low
     /// half) is a register.
     pub fn write32(&mut self, reg: u32, v: u32, now: u64) -> GpioEffect {
         let mut fx = GpioEffect::default();

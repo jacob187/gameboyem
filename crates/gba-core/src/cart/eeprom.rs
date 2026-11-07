@@ -11,14 +11,15 @@
 //! forced by `--save-type eeprom512|eeprom8k`; inferred from the length of a DMA
 //! to the chip (9 or 73 bits = 6-bit addressing = 512 B; 17 or 81 bits = 14-bit
 //! addressing = 8 KiB), which overrides the size of a loaded save file (a 512-byte
-//! game's save padded to 8 KiB by another tool shrinks to 512, deep-review #1;
+//! game's save padded to 8 KiB by another tool shrinks to 512;
 //! a real 8 KiB game never sends a 9- or 73-bit request); taken from the size of
 //! a loaded save file until such a DMA; or,
 //! for a game that drives the chip with CPU stores instead of DMA, inferred from
 //! the length of the first request when the game first reads the chip back (the
 //! request is 9/73 bits for 512 B and 17/81 for 8 KiB, and a CPU-driven game
 //! has no other end-of-request marker). A request of any other length, or one
-//! that completes before that read, is taken as 8 KiB (DECISIONS #67).
+//! that completes before that read, is taken as 8 KiB. GBATEK says CPU-driven EEPROM does not work on hardware;
+//! this inference is for tolerance only.
 
 use crate::state::{StateError, check};
 use emu_common::state::{StateReader, StateWriter};
@@ -111,7 +112,7 @@ impl Eeprom {
         // A request completes, and restarts, at 2 + n + 1 bits (read) or
         // 2 + n + 64 + 1 (write) for n address bits, so one still being received
         // is at most 2 + n + 64 bits long; n is 6 for a 512-byte chip and 14 for
-        // the 8 KiB or still unknown one (deep-review #9).
+        // the 8 KiB or still unknown one.
         let max_rx = if size == Some(SIZE_512) { 72 } else { 80 };
         check(rx_len <= max_rx && tx_left <= 68, "EEPROM transfer")?;
         *self = Self {
@@ -163,7 +164,7 @@ impl Eeprom {
     /// request, and take the size from the transfer's length unless the size is
     /// forced. A recognised length wins over a loaded save's size: it is what the
     /// game itself uses, so a 512-byte game's save padded to 8 KiB must not pin
-    /// 14-bit addressing (deep-review #1). Shrinking erases the unused tail.
+    /// 14-bit addressing. Shrinking erases the unused tail.
     pub fn begin_write_dma(&mut self, count: u32) {
         self.reset_serial();
         if self.forced {
@@ -319,7 +320,7 @@ mod tests {
 
     /// A request in flight is shorter than any request the chip's address width
     /// completes at; a longer count is a state no run produces, and on a 512-byte
-    /// chip nothing would ever finish it (deep-review #9).
+    /// chip nothing would ever finish it.
     #[test]
     fn a_state_with_an_unfinishable_request_length_is_refused() {
         let load = |e: &Eeprom| {
@@ -385,7 +386,7 @@ mod tests {
     #[test]
     fn a_dma_length_wins_over_a_loaded_size_of_the_other_chip() {
         // An 8 KiB file for a 512-byte game (a tool that pads every EEPROM save):
-        // the game's 9- and 73-bit requests must still work (deep-review #1).
+        // the game's 9- and 73-bit requests must still work.
         let mut e = Eeprom::default();
         let mut img = vec![0xFF; SIZE_8K];
         img[5 * 8..5 * 8 + 8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);

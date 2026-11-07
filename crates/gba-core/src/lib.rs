@@ -3,13 +3,16 @@
 //! Like `gb-core`, it performs no I/O, reads no clocks and uses no randomness: the
 //! same ROM + input sequence always produces the same frames and audio.
 //!
-//! Timing model (DECISIONS #45): one master clock in CPU cycles (16.78 MHz). The CPU
+//! Timing model: one master clock in CPU cycles (16.78 MHz). The CPU
 //! is stepped one instruction at a time and charges every bus access to the clock
 //! through [`bus::CpuBus`]; each access costs the region's wait states for its
 //! [`bus::Access`] kind. Everything else (PPU line timing, timers, DMA starts, the
 //! sound FIFOs) is driven by cycle-stamped events on the [`scheduler::Scheduler`]
-//! rather than ticked every cycle. Events that fall due during an instruction are
-//! dispatched after it.
+//! rather than ticked every cycle (most components matter only at a few points per
+//! line, so ticking them all each cycle would cost several times the work for no
+//! observable accuracy). Events that fall due during an instruction are
+//! dispatched after it, so a store can land up to one instruction (a few cycles)
+//! late, the accepted cost; while halted the clock jumps to the next event.
 //!
 //! The modules: `cpu/` (ARM7TDMI), `ppu/`, `apu/` (PSG channels and the two
 //! Direct Sound FIFOs), `bios/` (the high-level BIOS), `cart/` (ROM, backup
@@ -77,7 +80,7 @@ pub const BIOS_SIZE: usize = 16 * 1024;
 /// 75 KiB frames and the save chip (at most 128 KiB of Flash) come to 681 175
 /// bytes at worst (a full queue); the cap is that plus a little. A test builds
 /// each chip's state and fails if the layout outgrows the cap or the cap drifts
-/// well above the real size (DECISIONS #73).
+/// well above the real size.
 pub const MAX_STATE_BYTES: usize = 680 * 1024;
 
 /// FNV-1a 64 of a byte slice (ties save states and recordings to their ROM).

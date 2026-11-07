@@ -179,7 +179,7 @@ fn hblank_dma_waits_for_the_trigger_and_repeats() {
         0x8000 | 2 << 12 | 1 << 9 | 3 << 5,
     );
     assert!(b.dma.active_channel().is_none());
-    // The PPU's HBlank signal (line 0, DECISIONS #55) starts it.
+    // The PPU's HBlank signal (line 0, cycle 1006) starts it.
     run_to(&mut b, u64::from(HDRAW_CYCLES));
     assert_eq!(b.dma.active_channel(), Some(0));
     settle(&mut b);

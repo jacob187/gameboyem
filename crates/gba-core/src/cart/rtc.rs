@@ -2,11 +2,13 @@
 //! Cart Real-Time Clock (RTC)"), as a register file plus calendar arithmetic.
 //! The serial protocol that reaches it is in `gpio.rs`.
 //!
-//! **Time base (DECISIONS #66).** The clock holds a calendar date and time and a
+//! **Time base.** The clock holds a calendar date and time and a
 //! sub-second remainder counted in master-clock cycles. It advances only when
 //! told the current emulated cycle ([`Rtc::advance_to`]); no host clock is read
-//! anywhere in the core. The host's only way in is [`RtcTime`] through
-//! `Gba::set_rtc`.
+//! anywhere in the core, and the clock is caught up to the scheduler's cycle only
+//! when a command starts, a write finishes or a save image is taken, so a run is
+//! a function of ROM, input and the starting state. The host's only way in is
+//! [`RtcTime`] through `Gba::set_rtc`.
 //!
 //! Registers are held in binary and encoded to BCD on read, as the chip presents
 //! them: `year month day weekday hour minute second`, each BCD except the weekday
@@ -43,7 +45,7 @@ const DAYS_PER_CENTURY: u64 = 36_525;
 /// RTC has a two-digit year, so only 2000..=2099 exists. The fields are private:
 /// [`RtcTime::new`] is the only way to make one, so every value is a real date
 /// (day valid for its month and year, time of day in range) with the weekday
-/// computed from it (code-review K#4).
+/// computed from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtcTime {
     year: u16,
@@ -318,8 +320,7 @@ impl Rtc {
         // A calendar day at a time. The weekday cycle repeats every 7 days, and
         // the date every 100 years (the year wraps at 100 and every year divisible
         // by 4 is a leap year, so 25 * 366 + 75 * 365 = 36 525 days), so only the
-        // date needs the loop, and only for the days left after whole periods
-        // (deep-review #22).
+        // date needs the loop, and only for the days left after whole periods.
         self.weekday = ((u64::from(self.weekday) + days) % 7) as u8;
         for _ in 0..days % DAYS_PER_CENTURY {
             self.next_day();
@@ -436,7 +437,8 @@ impl Rtc {
     ///
     /// The fields are the clock's value at the cycle the save was taken; the
     /// sub-second remainder is the "emulated-time reference", so a save and a load
-    /// lose nothing. No host timestamp is stored (DECISIONS #67).
+    /// lose nothing. No host timestamp is stored (unlike gb-core's 48-byte VBA footer, which
+    /// stores a zero timestamp and no sub-second count).
     pub fn footer(&self) -> [u8; FOOTER_LEN] {
         let mut f = [0u8; FOOTER_LEN];
         f[..8].copy_from_slice(&FOOTER_MAGIC);
@@ -750,7 +752,7 @@ mod tests {
     }
 
     /// Writing the month or year alone must not leave the old day past the end of
-    /// the new month (code-review ST#2): the day is clamped, so the clock holds a
+    /// the new month: the day is clamped, so the clock holds a
     /// real date and a state taken from it loads.
     #[test]
     fn a_datetime_write_never_leaves_an_impossible_date() {
@@ -813,7 +815,7 @@ mod tests {
             break_it(&mut bad);
             assert_eq!(load(&bad), Err(StateError::Invalid(name)), "{name}");
         }
-        // The control bits a game can hold are accepted (deep-review #12).
+        // The control bits a game can hold are accepted.
         for control in [0x80, 0x82, 0x40, 0x6A | 0x80] {
             let mut r = ok.clone();
             r.control = control;
@@ -821,7 +823,7 @@ mod tests {
         }
     }
 
-    /// Whole 100-year cycles of the date cost nothing (deep-review #22): a
+    /// Whole 100-year cycles of the date cost nothing: a
     /// clock far from its sync point reads the same date as one a cycle closer,
     /// and does not step a billion days to get there.
     #[test]

@@ -1,7 +1,9 @@
 //! Building blocks shared by the PSG channels: length counter and volume
 //! envelope.
 //!
-//! Adapted from `gb-core`'s `apu/common.rs` (DECISIONS #61). Added: save-state
+//! Adapted from `gb-core`'s `apu/common.rs`; copied rather than shared, so
+//! `gb-core` and its bench pins stay untouched and the two cores can differ
+//! freely. Added: save-state
 //! code, with range checks on load. Dropped: the envelope "zombie mode" volume
 //! glitch on NRx2 writes and the
 //! "trigger just before the envelope step" timer bonus (DMG-specific, Pan Docs
@@ -253,7 +255,7 @@ mod tests {
     }
 
     /// Length enable on a step whose successor does not clock length adds one
-    /// clock, and only on a rising edge of the flag (deep-review #73).
+    /// clock, and only on a rising edge of the flag (the GB length quirk the AGB PSG keeps).
     #[test]
     fn enabling_length_before_an_odd_step_clocks_it_once() {
         let loaded = || {
@@ -281,7 +283,7 @@ mod tests {
     }
 
     /// A trigger on an expired counter reloads it to `max`, one less when length
-    /// is enabled and the next step is odd (deep-review #73).
+    /// is enabled and the next step is odd (the GB trigger-length quirk the AGB PSG keeps).
     #[test]
     fn triggering_an_expired_length_before_an_odd_step_loses_one() {
         for (enabled, odd, want) in [

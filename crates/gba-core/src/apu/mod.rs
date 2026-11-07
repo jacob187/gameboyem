@@ -3,7 +3,7 @@
 //! **Contract** for the bus: FIFO writes (0x0400_00A0 / 0x0400_00A4) and
 //! [`Apu::on_timer_overflow`].
 //!
-//! # Timing and resampling (DECISIONS #60)
+//! # Timing and resampling
 //!
 //! The APU is lazily synchronised to the master clock: [`Apu::advance_to`]
 //! runs it up to a timestamp, and the bus calls it before every sound register
@@ -18,8 +18,21 @@
 //! and no separate internal sample rate: the host sample count is
 //! `floor(rate * cycles / 2^24)` exactly, with no drift. SOUNDBIAS bits 14-15
 //! (the hardware's 6..9-bit / 262..32 kHz resolution) are stored but not
-//! modelled. No clocks, no randomness, no floating point in the state: the
+//! modelled, so the output is not quantised and keeps the full 10-bit mix. The
+//! output value is `(mix - 0x200) / 0x200` for the mix after the SOUNDBIAS level
+//! and the 0..=0x3FF clamp, so the default bias is exactly 0.0 and bias 0 is
+//! -1.0. The host phase is an integer accumulator (`rate` added per cycle, a
+//! sample completes at 2^24), so sixty frames at 48 kHz yield 48 219 samples
+//! against 48 218.9 ideal, however often the host drains or the run loop chunks
+//! time. No clocks, no randomness, no floating point in the state: the
 //! same register writes at the same cycles give bit-identical audio.
+//!
+//! Choices GBATEK leaves open: PSG channels are unsigned (no centring), a FIFO
+//! that runs dry holds its last sample, FIFOs keep popping and requesting
+//! refills while SOUNDCNT_X is off (they are just silent), and a FIFO reset
+//! also zeroes its output sample. Writes to 0x060..0x080 are ignored while
+//! SOUNDCNT_X bit 7 is clear (GBATEK: held at zero), and turning it on restarts
+//! the frame sequencer at step 0.
 
 mod common;
 mod fifo;
@@ -48,7 +61,8 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 /// Interval of the bus's `Event::ApuSample` pump in CPU cycles (4096, about 4096
 /// Hz). It only bounds how far the APU can lag the clock; the output is exact
 /// without it, because every register read and write, FIFO timer overflow and
-/// drain syncs the APU itself (code-review A2#1). It was 512, one hardware
+/// drain syncs the APU itself, so a SOUNDCNT_X read sees current channel ON
+/// flags. It was 512, one hardware
 /// output sample; the pump then dispatched 8x more events than it needed to.
 pub const PUMP_CYCLES: u64 = 4096;
 
@@ -59,7 +73,7 @@ const SEQUENCER_CYCLES: u32 = CYCLES_PER_SECOND / 512;
 
 /// Seconds of audio kept if the host never drains. When the buffer is full the
 /// newest samples are dropped, exactly as `gb-core`'s APU does, so a frontend
-/// sees the same overflow behaviour from both cores (code-review A2#3).
+/// sees the same overflow behaviour from both cores.
 const MAX_BUFFERED_SECS: usize = 1;
 
 /// Mix units: a quarter of one SOUNDBIAS output LSB, so the PSG's 25% ratio
@@ -166,7 +180,7 @@ impl Apu {
     /// Every register and channel, the frame sequencer, both FIFOs (data, indices
     /// and the held output sample), the current mix level and the resampler
     /// (the partial sums and the sample phase), all of which a bit-identical
-    /// continuation needs (DECISIONS #73). Not saved: the host's sample rate and
+    /// continuation needs. Not saved: the host's sample rate and
     /// the buffered samples (a load drops them; they belong to the old timeline).
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
         w.u64(self.now);

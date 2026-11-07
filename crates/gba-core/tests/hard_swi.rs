@@ -1,4 +1,4 @@
-//! Hostile SWI arguments (DECISIONS #68). A call runs inside one instruction step,
+//! Hostile SWI arguments. A call runs inside one instruction step,
 //! so every memory-moving SWI stops at a per-call cycle budget,
 //! `gba_core::bios::SWI_CYCLE_CAP`, keeping what it wrote and charging only that.
 //! Assertions are on emulated cycles, never wall-clock time.
@@ -255,7 +255,7 @@ fn lz_cycles(n: u32) -> u64 {
 #[test]
 fn decompression_compute_is_charged_per_output_byte() {
     // 4 cycles a byte of compute on top of the accesses, however the output is
-    // produced (DECISIONS #65).
+    // produced.
     assert!(rl_cycles(2000) - rl_cycles(1000) >= 1000 * 4);
     assert!(lz_cycles(2000) - lz_cycles(1000) >= 1000 * 4);
 }

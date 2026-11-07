@@ -1,4 +1,4 @@
-//! Timer event elision (DECISIONS #69), driven through the bus the way `sys_*.rs`
+//! Timer event elision, driven through the bus the way `sys_*.rs`
 //! does. A timer nothing observes schedules no overflow events, and eliding them
 //! may not change what the program can see.
 

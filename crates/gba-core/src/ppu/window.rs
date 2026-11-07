@@ -10,7 +10,7 @@
 //! X2=240" (likewise Y2>160 or Y1>Y2: Y2=160). Tonc ("Windowing") and
 //! hardware instead *wrap* when the right/bottom edge is below the left/top edge:
 //! "everything on that line is inside the window, except the pixels between R and
-//! L". We wrap (DECISIONS #59); an edge past the screen is simply clipped.
+//! L". We wrap; an edge past the screen is simply clipped.
 
 use super::render::{ENABLE_ALL, Layers, OBJ_WINDOW, Regs};
 use crate::{SCREEN_HEIGHT, SCREEN_WIDTH};

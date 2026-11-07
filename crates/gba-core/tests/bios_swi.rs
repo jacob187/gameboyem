@@ -299,8 +299,7 @@ fn register_ram_reset_clears_palette_oam_sio_and_sound_by_their_flags() {
     assert_eq!(b.peek16(OAM), 0);
     assert_eq!(b.read_io16(0x128), 0x5555);
 
-    // SIO: general-purpose mode; the keypad registers beside it are not SIO
-    // (deep-review #8).
+    // SIO: general-purpose mode; the keypad registers beside it are not SIO.
     call(&mut b, 0x01, [0x20, 0, 0, 0]);
     assert_eq!(b.read_io16(0x128), 0);
     assert_eq!(b.read_io16(0x134), 0x8000, "RCNT: general purpose");
@@ -424,7 +423,7 @@ fn memory_calls_charge_the_bus_per_access() {
 
 #[test]
 fn intr_wait_ignores_a_caller_r2_that_looks_like_a_marker() {
-    // code-review B#1: r2 used to carry the retry marker; it is the caller's now.
+    // r2 used to carry the retry marker; it is the caller's now.
     let mut b = bus();
     b.write16(BIOS_IF, 0x0001, N);
     let regs = [1, 1, 0x4957_4954, 0x1234];
@@ -436,7 +435,7 @@ fn intr_wait_ignores_a_caller_r2_that_looks_like_a_marker() {
 
 #[test]
 fn intr_wait_returns_once_for_a_flag_set_mid_wait() {
-    // code-review B#2: a flag the IRQ handler sets while the call waits is
+    // A flag the IRQ handler sets while the call waits is
     // never discarded by a retry, and satisfies exactly one call.
     let mut b = bus();
     let (res, r) = call(&mut b, 0x04, [1, 1, 0, 0]);
@@ -456,7 +455,7 @@ fn intr_wait_returns_once_for_a_flag_set_mid_wait() {
 
 #[test]
 fn unhandled_swis_are_not_charged_the_hle_overhead() {
-    // code-review B#3: the image's own code is charged by the bus.
+    // The image's own code is charged by the bus.
     let mut b = bus();
     let t = b.sched.now();
     call(&mut b, 0x00, [0; 4]);
@@ -468,7 +467,7 @@ fn unhandled_swis_are_not_charged_the_hle_overhead() {
 
 #[test]
 fn huffman_rejects_unsupported_bit_widths() {
-    // code-review B#4: only 1, 2, 4 and 8 are valid; 3 is a no-op, not a misaligned write.
+    // Only 1, 2, 4 and 8 are valid; 3 is a no-op, not a misaligned write.
     let mut b = bus();
     put(
         &mut b,
@@ -489,7 +488,7 @@ fn huffman_rejects_unsupported_bit_widths() {
 
 #[test]
 fn bit_unpack_masks_the_sum_to_the_destination_width() {
-    // code-review B#5: 0xF + 1 overflows a 4-bit unit and must not spill into the next.
+    // 0xF + 1 overflows a 4-bit unit and must not spill into the next.
     let mut b = bus();
     put(&mut b, EWRAM, &[0xFF; 4]);
     put32(&mut b, EWRAM + 0x100, &[0xFFFF_FFFF]);

@@ -1,4 +1,10 @@
-//! The GamePak prefetch buffer (WAITCNT bit 14), P3-TIMING. DECISIONS #70.
+//! The GamePak prefetch buffer (WAITCNT bit 14), P3-TIMING.
+//!
+//! The model is lazily evaluated from the master clock, not per cycle: the head
+//! address, the halfwords buffered (0..8), when the halfword being read completes
+//! and whether the next read is sequential are brought up to date from
+//! `sched.now()` whenever the CPU or DMA touches the bus (at most eight steps), so
+//! no event is scheduled and the whole state is a few small fields.
 //!
 //! GBATEK "GBA GamePak Prefetch": while the CPU is not using the cartridge bus the
 //! GBA reads the opcodes that follow the last ROM opcode fetch into a buffer of up to
@@ -26,7 +32,7 @@
 //! The "prefetch disable bug" (GBATEK: with prefetch off, the opcode after an
 //! instruction with internal cycles that does not change R15 is fetched N, not S) needs
 //! no code here: the CPU already clears its sequential flag after any internal cycle
-//! (`Cpu::internal`, DECISIONS #51), so with prefetch off that fetch is charged N.
+//! (`Cpu::internal`), so with prefetch off that fetch is charged N.
 
 use crate::bus::{Access, WaitTable};
 use crate::state::{StateError, check};
@@ -62,7 +68,7 @@ pub struct Prefetch {
 }
 
 impl Prefetch {
-    /// The whole buffer state (DECISIONS #73). It is lazily evaluated from the
+    /// The whole buffer state. It is lazily evaluated from the
     /// master clock, so `done_at` is an absolute time and is saved as one.
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
         w.bool(self.enabled);
@@ -430,7 +436,7 @@ mod tests {
 
     #[test]
     fn a_waitcnt_write_syncs_the_buffer_under_the_old_timings() {
-        // code-review T#1: halfwords read before the write were read at the old S
+        // Halfwords read before the write were read at the old S
         // time (2 cycles), not the new one (3).
         let mut b = bus(WS0_FAST | PREFETCH);
         b.fetch16(ROM, Access::NonSeq); // t = 4, reading ROM+2 until 6
@@ -449,7 +455,7 @@ mod tests {
 
     #[test]
     fn hle_bios_reads_of_rom_use_the_cartridge_bus() {
-        // code-review T#2: a CpuSet from ROM is cartridge-bus traffic, so the buffer
+        // A CpuSet from ROM is cartridge-bus traffic, so the buffer
         // does not fill "for free" while it runs. ws2 is slow enough (S = 9 cycles)
         // that the SWI's 48-cycle overhead does not fill the buffer on its own. Same
         // elapsed time, once as a CpuSet and once as idle: the CpuSet's reads keep

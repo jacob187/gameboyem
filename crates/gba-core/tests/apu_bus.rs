@@ -159,7 +159,7 @@ fn gba_drain_returns_exactly_the_samples_for_the_elapsed_time() {
     }
     let cycles = gba.cycles() - t0;
     // step_frame stops after the instruction that crosses VBlank, so a real
-    // CPU overshoots each frame end by a few cycles (DECISIONS #45). The
+    // CPU overshoots each frame end by a few cycles. The
     // sample count below is checked against the cycles that really elapsed.
     let frames = 60 * u64::from(CYCLES_PER_FRAME);
     assert!(
@@ -196,7 +196,7 @@ fn the_pump_keeps_the_apu_within_one_interval_of_the_clock() {
     assert!(lag <= gba_core::apu::PUMP_CYCLES + 48, "lag {lag}");
 }
 
-/// code-review A2#1: reads see the APU at the current cycle, not the last pump.
+/// Reads see the APU at the current cycle, not the last pump.
 #[test]
 fn sound_register_reads_see_the_current_cycle() {
     let mut b = new_bus();
@@ -214,7 +214,7 @@ fn sound_register_reads_see_the_current_cycle() {
     assert_eq!(rd(&mut b, 0x84) & 1, 0, "already expired");
 }
 
-/// code-review A2#2: a rate change applies from now on, not retroactively.
+/// A rate change applies from now on, not retroactively.
 #[test]
 fn a_rate_change_through_the_facade_counts_each_stretch_at_its_rate() {
     let mut gba = Gba::new(vec![0; 0x200], None).unwrap();

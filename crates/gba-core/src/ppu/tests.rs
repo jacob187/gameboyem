@@ -336,7 +336,7 @@ fn io_register_read_masks() {
 
 #[test]
 fn a_line_is_drawn_at_cycle_960_and_a_later_write_shows_on_the_next_line() {
-    // DECISIONS #71: the render event is separate from the HBlank event. With no
+    // The render event is separate from the HBlank event. With no
     // layer enabled every pixel is the backdrop, palette entry 0.
     let mut rig = Rig::new();
     rig.pal(0, 0x001F);
@@ -356,7 +356,7 @@ fn a_line_is_drawn_at_cycle_960_and_a_later_write_shows_on_the_next_line() {
 
 #[test]
 fn affine_reference_points_advance_with_the_render_event() {
-    // The latch step is tied to the render (DECISIONS #58): a BG2X write after cycle
+    // The latch step is tied to the render: a BG2X write after cycle
     // 960 reloads the point after this line's step, so it is the next line's start.
     let mut rig = Rig::new();
     rig.write(0x022, 0x0001); // BG2PB = 1 (a nonzero step)
@@ -401,7 +401,7 @@ fn vcount_irq_fires_for_line_0_of_the_first_frame() {
 #[test]
 fn a_write_that_makes_the_vcount_match_true_mid_line_raises_nothing() {
     // GBATEK and nba hw-test status-irq-dma leave this open; the IRQ stays a line-start
-    // event (DECISIONS #71). The flag itself is live.
+    // event. The flag itself is live.
     let mut rig = Rig::new();
     rig.run_to_line(10, 100);
     rig.write(DISPSTAT, 1 << 5 | 10 << 8);

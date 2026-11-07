@@ -165,10 +165,11 @@ pub struct Bus {
     /// WAITCNT (0x0400_0204) and the costs derived from it.
     pub waitcnt: u16,
     pub waits: WaitTable,
-    /// The GamePak prefetch buffer (WAITCNT bit 14, DECISIONS #70).
+    /// The GamePak prefetch buffer (WAITCNT bit 14).
     pub prefetch: Prefetch,
     /// The last value the CPU fetched, replicated to 32 bits for a halfword
-    /// fetch: what unmapped regions read as (open bus, DECISIONS #52).
+    /// fetch: what unmapped regions read as (open bus; a deliberate approximation of the
+    /// real pipeline-dependent value).
     pub open_bus: u32,
     /// The last word fetched from the BIOS: what BIOS reads return while the CPU
     /// executes outside the BIOS (read protection).
@@ -178,7 +179,7 @@ pub struct Bus {
     /// POSTFLG (0x0400_0300, low byte).
     pub postflg: u8,
     /// P2-BIOS: an HLE IntrWait/VBlankIntrWait is waiting, with the interrupt
-    /// flags it waits for. Save-state data (DECISIONS #65).
+    /// flags it waits for. Save-state data.
     pub intr_wait: Option<u16>,
     /// FIFO A/B words being assembled from halfword/byte writes.
     pub fifo_latch: [u32; 2],
@@ -223,7 +224,8 @@ impl Bus {
         bus
     }
 
-    /// Every component but the CPU, in the section order of DECISIONS #73. The
+    /// Every component but the CPU, in the state's fixed section order (bus, IRQ, timers, DMA, PPU, APU,
+    /// keypad, prefetch, cart, after the CPU and scheduler). The
     /// scheduler goes first and is restored verbatim; nothing is re-derived from
     /// the registers afterwards except the wait-state table (a pure function of
     /// WAITCNT) and the timers' FIFO-length mirror (a copy of the APU's lengths).
@@ -383,8 +385,7 @@ impl Bus {
     /// and a status read sees the current line, instead of being up to an
     /// instruction early or late. A store to a timer register does the same: an
     /// overflow that fell earlier in the instruction must fire (IRQ, cascade, FIFO
-    /// pop) before the write stops, re-prescales or reloads the timer (deep-review
-    /// #13, #15). Only the CPU's own accesses do this; a DMA unit is never
+    /// pop) before the write stops, re-prescales or reloads the timer. Only the CPU's own accesses do this; a DMA unit is never
     /// interrupted by event dispatch.
     #[inline]
     fn sync_ppu_write(&mut self, addr: u32) {
@@ -446,7 +447,7 @@ impl Bus {
                 }
             }
             // Palette and VRAM: 16-bit bus, no waits (the PPU contention penalty
-            // is not modelled, DECISIONS #71); a word is two accesses.
+            // is not modelled); a word is two accesses.
             0x05 | 0x06 => {
                 if w == Width::W {
                     2
@@ -501,7 +502,7 @@ impl Bus {
     }
 
     /// Cost of a cartridge-ROM opcode fetch: the only access the prefetch buffer
-    /// serves (`Prefetch::fetch`, DECISIONS #70).
+    /// serves (`Prefetch::fetch`).
     #[inline]
     fn rom_fetch_cost(&mut self, addr: u32, w: Width, access: Access) -> u64 {
         if self.prefetch.enabled {
@@ -669,7 +670,7 @@ mod tests {
     fn a_cpu_store_after_the_render_point_lands_on_the_next_line() {
         // The store's own access crosses cycle 960, so the line is drawn first
         // even though the run loop would only dispatch the event after the
-        // instruction (DECISIONS #71).
+        // instruction.
         const PAL: u32 = 0x0500_0000;
         let mut bus = Bus::new(Cart::from_rom(vec![0; 0x400]).unwrap(), Bios::Hle);
         bus.write16(PAL, 0x001F, Access::NonSeq); // cycle 1

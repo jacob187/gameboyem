@@ -12,7 +12,7 @@ use emu_common::state::{StateReader, StateWriter};
 /// The clock start the host gave [`Gba::set_rtc`], as a state stores it: a flag
 /// and six fixed-width fields (zero when absent). It is host configuration that a
 /// recording's header reads back, so a loaded machine must agree with the state
-/// about it (code-review ST#8).
+/// about it.
 fn save_rtc_start(w: &mut StateWriter, t: Option<RtcTime>) {
     w.bool(t.is_some());
     w.u16(t.map_or(0, |t| t.year()));
@@ -87,7 +87,7 @@ impl Gba {
         let hle = matches!(bios, Bios::Hle);
         let mut bus = Bus::new(cart, bios);
         if hle {
-            // P2-BIOS: the I/O and IWRAM state the BIOS leaves (DECISIONS #64).
+            // P2-BIOS: the I/O and IWRAM state the BIOS leaves (POSTFLG, SOUNDBIAS, the zeroed top of IWRAM).
             crate::bios::post_boot(&mut bus);
         }
         Ok(Self {
@@ -172,7 +172,7 @@ impl Gba {
     }
 
     pub fn set_audio_sample_rate(&mut self, hz: u32) {
-        // P2-APU (code-review A2#2): cycles already elapsed are accounted at the
+        // P2-APU: cycles already elapsed are accounted at the
         // old rate; the new one applies from now on.
         self.bus.apu.advance_to(self.bus.sched.now());
         self.bus.apu.set_sample_rate(hz);
@@ -229,8 +229,8 @@ impl Gba {
 
     /// The `.sav` image: [`Gba::battery_ram`] followed, once the game has used the
     /// cartridge's clock (a valid command reached it) or a save with a footer
-    /// was loaded, by the 24-byte RTC footer
-    /// (DECISIONS #67). The clock in it is the emulated time now; no host time
+    /// was loaded, by the 24-byte RTC footer.
+    /// The clock in it is the emulated time now; no host time
     /// is stored.
     pub fn battery_save(&self) -> Option<Vec<u8>> {
         self.bus.cart.battery_save(self.bus.sched.now())
@@ -247,7 +247,8 @@ impl Gba {
     }
 
     /// Set the cartridge clock to `t`, a time the host read from its own clock
-    /// (the one place real time enters; the core never reads it, DECISIONS #66).
+    /// (the one place real time enters; the core reads no host clock, so a run stays a function of ROM, input and the
+    /// starting state).
     /// Call it before loading a save: a save's own footer replaces it. Also
     /// clears the clock's power-loss flag. It does not add a footer to the save
     /// by itself; that waits for the game to use the clock.
@@ -341,7 +342,7 @@ impl Gba {
         }
         // Load into a scratch machine and swap it in only on success, so a state
         // that fails anywhere leaves this one untouched and nothing depends on
-        // this machine's own state passing the validators (code-review ST#1).
+        // this machine's own state passing the validators (an earlier rollback re-loaded a snapshot of it and could panic the host).
         let mut next = self.scratch();
         next.load_sections(r)?;
         next.bus.cart.exchange_rom(&mut self.bus.cart);
@@ -538,7 +539,7 @@ mod tests {
 
     #[test]
     fn an_ie_ime_write_that_makes_an_irq_pending_is_taken_before_the_next_instruction() {
-        // code-review T#6: the IRQ line is level (IME & IE & IF), not an event, so the
+        // The IRQ line is level (IME & IE & IF), not an event, so the
         // gate cannot delay it. VBlank is already flagged; IE then IME open the gate.
         let rom = rom_with(&[
             0xE3A0_0301, // mov r0, #0x04000000

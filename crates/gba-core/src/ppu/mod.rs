@@ -26,12 +26,13 @@ mod window;
 
 /// Cycles from the start of a line to the HBlank event: the DISPSTAT HBlank flag,
 /// the HBlank IRQ and the HBlank DMA trigger happen here, at cycle 1006 (GBATEK
-/// "LCD Status", measured by mGBA/NBA). DECISIONS #55.
+/// "LCD Status", measured by mGBA/NBA).
 pub const HDRAW_CYCLES: u32 = 1006;
 
 /// Cycles from the start of a line to the render event: 240 dots x 4 = 960, where
 /// the last visible pixel is drawn. The line is drawn from the state at this
-/// point, so a write between 960 and 1006 shows on the next line (DECISIONS #71).
+/// point, so a write between 960 and 1006 shows on the next line. The CPU's own video accesses first dispatch due events,
+/// so a store that crosses cycle 960 mid-instruction also lands on the next line.
 pub const RENDER_CYCLES: u32 = 960;
 
 /// DISPSTAT bits.
@@ -72,7 +73,7 @@ pub struct Ppu {
     /// The internal affine reference points `[BG2, BG3][x, y]` (20.8 fixed point,
     /// sign-extended from 28 bits): what a line is drawn from. Reloaded from
     /// BGxX/BGxY at VBlank and whenever either register is written, advanced by
-    /// PB/PD after each visible line (DECISIONS #58).
+    /// PB/PD after each visible line (GBATEK "LCD I/O BG Rotation/Scaling").
     affine_latch: [[i32; 2]; 2],
     vcount: u16,
     /// The HBlank flag: set by the HBlank event, cleared at line end.
@@ -80,7 +81,7 @@ pub struct Ppu {
     /// Per-layer line buffers (scratch; see `render.rs`).
     layers: Box<render::Layers>,
     /// The frame being drawn, one line per `PpuRender` event (cycle 960 of a
-    /// visible line, before the HBlank flag at 1006; DECISIONS #71).
+    /// visible line, before the HBlank flag at 1006).
     back: Box<Framebuffer>,
     /// The last complete frame (swapped in at VBlank start).
     front: Box<Framebuffer>,
@@ -96,7 +97,7 @@ impl Ppu {
     pub fn new() -> Self {
         // The BIOS leaves the rotation/scaling matrices as the identity (PA = PD =
         // 0x100 = 1.0), which the bitmap modes 3-5 draw through. The core starts
-        // after the BIOS (DECISIONS #47), so the registers start in that state.
+        // after the BIOS, so the registers start in that state.
         let mut io = [0; 0x30];
         for off in [
             AFFINE_PA[0],
@@ -121,7 +122,7 @@ impl Ppu {
     }
 
     /// Palette, VRAM, OAM, the I/O registers, the affine reference points, the
-    /// line counter, the HBlank flag and both framebuffers (DECISIONS #73). The
+    /// line counter, the HBlank flag and both framebuffers. The
     /// back buffer is mid-frame (lines above `vcount` are drawn, and `vcount`
     /// itself once the clock is past cycle 960 of it), so it cannot be
     /// re-rendered from the registers; the per-line layer buffers are scratch that
@@ -212,7 +213,8 @@ impl Ppu {
                     }
                 }
                 // The VCount IRQ is requested as the line starts, not when DISPSTAT
-                // is written (DECISIONS #56, #71).
+                // is written (neither GBATEK nor the nba hw-test `status-irq-dma` says what
+                // hardware does for a mid-line match).
                 sig.irq |= vcount_match_irq(stat, self.vcount);
                 if u32::from(self.vcount) < crate::VISIBLE_LINES {
                     sched.schedule_at(Event::PpuRender, at + u64::from(RENDER_CYCLES));
