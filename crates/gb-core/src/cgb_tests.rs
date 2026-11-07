@@ -1,6 +1,6 @@
 //! CGB register, banking and post-boot tests. ROMs here set the CGB flag
 //! (0x143) explicitly: a flag-less ROM on a CGB runs in DMG-compatibility mode,
-//! where most of these registers are unmapped (DECISIONS #33).
+//! where most of these registers are unmapped.
 
 use super::*;
 use crate::bus::{Bus, CpuBus};

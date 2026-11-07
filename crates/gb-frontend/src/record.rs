@@ -8,7 +8,8 @@
 //! byte, so a GBA session records its L and R buttons and its battery image (at
 //! most 128 KiB of Flash, inside the codec's 256 KiB bound), and, from the core's
 //! `recording_ext`, what else powers the machine on the way the session did (a GBA's
-//! cartridge options, BIOS identity and clock start, DECISIONS #74).
+//! cartridge options, BIOS identity and clock start: the ROM and battery alone
+//! do not reproduce a GBA run).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;

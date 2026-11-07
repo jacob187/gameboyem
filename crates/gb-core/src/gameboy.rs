@@ -35,9 +35,11 @@ impl GameBoy {
 
     /// Power on `model` with `rom` inserted, in the post-boot-ROM state.
     ///
-    /// The core never picks the model from the ROM (DECISIONS #31); a host that
-    /// wants that can call [`Model::from_header`] on a
-    /// [`CartridgeHeader::parse`] of the ROM first.
+    /// The core never picks the model from the ROM, because a CGB-flagged ROM
+    /// must still run as a DMG when the host asks for one (the Blargg
+    /// cpu_instrs / instr_timing / mem_timing ROMs carry CGB flag 0x80 and are
+    /// DMG tests). A host that wants detection can call [`Model::from_header`]
+    /// on a [`CartridgeHeader::parse`] of the ROM first.
     pub fn with_model(rom: Vec<u8>, model: Model) -> Result<Self, CartridgeError> {
         let rom_hash = state::fnv1a(&rom);
         let cart = cartridge::from_rom(rom)?;
@@ -125,7 +127,8 @@ impl GameBoy {
 
     /// Last completed frame: 160x144 shades 0..=3 (0 = lightest). On a CGB
     /// running in colour mode ([`GameBoy::cgb_framebuffer`] is `Some`) the frame is
-    /// not shades: this buffer is then all zero, never written (DECISIONS #36).
+    /// not shades: this buffer is then all zero, never written, so shade-based
+    /// checks see a deterministic blank frame instead of a guessed grey mapping.
     pub fn framebuffer(&self) -> &Framebuffer {
         self.bus.ppu.framebuffer()
     }

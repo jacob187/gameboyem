@@ -4,7 +4,7 @@
 //! The core performs no I/O, reads no clocks and uses no randomness, so the same
 //! ROM + input sequence always produces the same frames, audio and serial output.
 //!
-//! Timing model (see `DECISIONS.md`): the CPU is stepped one instruction at a time,
+//! Timing model: the CPU is stepped one instruction at a time,
 //! and every memory access / internal cycle the instruction performs advances the
 //! rest of the machine (timer, PPU, DMA, APU, serial) by one M-cycle through the
 //! [`bus::CpuBus`] trait. This is "per instruction" stepping with the cycles

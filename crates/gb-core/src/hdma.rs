@@ -100,7 +100,7 @@ impl Hdma {
             // `0x80 | (v & 0x7F)`, not the blocks that were left (SameBoy; the
             // hardware-verified SameSuite `hdma_lcd_off` / `hdma_mode0` expect
             // $80 after cancelling with 0; Pan Docs says the remaining length
-            // stays, DECISIONS #40).
+            // stays).
             self.hblank = false;
             return Start::Cancelled;
         }

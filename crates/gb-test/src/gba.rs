@@ -1,5 +1,6 @@
 //! Game Boy Advance cases for the harness: the `-gba` kinds in `expected.txt`, plus the
-//! `--dump-gba` screenshot aid. DECISIONS #57 has the rationale.
+//! `--dump-gba` screenshot aid. A `-gba` suffix on a kind picks `gba-core`, the way
+//! `-cgb` picks a CGB; only `jsmolka`, `fuzzarm` and `smoke` have a GBA form.
 //!
 //! * `jsmolka-gba`: jsmolka/gba-tests end in a single `b .` (`0xEAFFFFFE`). The runner finds that
 //!   word in the ROM, steps instruction by instruction until PC is exactly on its address (for

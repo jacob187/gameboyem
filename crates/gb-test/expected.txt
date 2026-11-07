@@ -139,7 +139,10 @@ pass mooneye 600 test/mooneye/emulator-only/mbc5/rom_8Mb.gb
 # --- dmg-acid2 (framebuffer vs reference-dmg.png) ---
 pass acid2 120 test/dmg-acid2/dmg-acid2.gb
 
-# --- cgb-acid2 (RGB555 framebuffer -> RGB888 vs reference.png; DECISIONS #10, #35) ---
+# --- cgb-acid2 (RGB555 framebuffer -> RGB888 vs reference.png) ---
+# ROM v1.1 and the reference image from that tag's commit (not the moving master). Each RGB555 channel c
+# widens to 8 bits as (c << 3) | (c >> 2), with no colour correction (the cgb-acid2 README rule); the
+# result must equal the reference exactly.
 pass acid2-cgb 120 test/cgb-acid2/cgb-acid2.gbc
 
 # --- Homebrew smoke tests (600 frames, framebuffer not blank) ---
@@ -150,7 +153,8 @@ pass smoke 600 homebrew/breakout.gb
 pass play-snake 400 homebrew/snake.gb
 pass play-breakout 400 homebrew/breakout.gb
 
-# --- Homebrew CGB demo (CGB-only ROM; RGB555 colour frame; DECISIONS #37) ---
+# --- Homebrew CGB demo (CGB-only ROM; RGB555 colour frame) ---
+# The harness reads cgb_framebuffer(), because framebuffer() is all zero in colour mode.
 pass play-cgbdemo-cgb 200 homebrew/cgbdemo.gb
 
 # --- Homebrew saves (play to game over, carry battery RAM into a fresh machine, title HI differs) ---
@@ -167,11 +171,11 @@ pass smoke 600 corpus/airplanz.gb
 pass smoke 600 corpus/renegade-rush.gb
 
 # --- CGB homebrew corpus, run as a CGB (kind `smoke-cgb`: RGB555 frame has 2+ colours and is not
-# frozen; scripts/fetch-homebrew-corpus.sh, DECISIONS #39) ---
+# frozen; scripts/fetch-homebrew-corpus.sh) ---
 pass smoke-cgb 600 corpus/tobutobugirl-dx.gb
 pass smoke-cgb 600 corpus/escape-obliterizer-dx.gb
 # Three 240-frame splash screens (static for most of each) come before the animated title screen at ~frame 850,
-# so it gets 900 boot frames instead of 600 (DECISIONS #39).
+# so it gets 900 boot frames instead of 600.
 pass smoke-cgb 900 corpus/rebound.gb
 pass smoke-cgb 600 corpus/aevilia.gb
 pass smoke-cgb 600 corpus/ucity.gb
@@ -186,16 +190,17 @@ pass play-renegade 700 corpus/renegade-rush.gb
 pass sfx-snake 700 homebrew/snake.gb
 pass sfx-breakout 1500 homebrew/breakout.gb
 
-# --- Mooneye, CGB subset, run as a CGB (kind `mooneye-cgb`; DECISIONS #32) ---
-# These ROMs have no CGB flag, so the CGB boot ROM runs them in DMG-compatibility mode (#33).
+# --- Mooneye, CGB subset, run as a CGB (kind `mooneye-cgb`) ---
+# These ROMs have no CGB flag, so the CGB boot ROM runs them in DMG-compatibility mode. Only ROMs for
+# implemented features are listed; boot_div-cgb0 is a different boot-ROM revision and is not a target.
 pass mooneye-cgb 600 test/mooneye/misc/boot_regs-cgb.gb
 pass mooneye-cgb 600 test/mooneye/misc/boot_hwio-C.gb
 pass mooneye-cgb 600 test/mooneye/misc/bits/unused_hwio-C.gb
 pass mooneye-cgb 600 test/mooneye/misc/boot_div-cgbABCDE.gb
-# On a CGB the line-144 STAT mode-2 pulse comes one M-cycle before VBlank (DECISIONS #38).
+# On a CGB the line-144 STAT mode-2 pulse comes one M-cycle before VBlank.
 pass mooneye-cgb 600 test/mooneye/misc/ppu/vblank_stat_intr-C.gb
 
-# --- CGB speed switch, double speed and HDMA (P2; DECISIONS #38, #40) ---
+# --- CGB speed switch, double speed and HDMA ---
 # SameSuite dma/ (LIJI32) and the AGE speed-switch tests, both CGB-flagged and reporting with the
 # Fibonacci register protocol. Fetched from the pinned c-sp/game-boy-test-roms v7.0 zip.
 pass mooneye-cgb 600 test/same-suite/dma/gbc_dma_cont.gb
@@ -231,10 +236,10 @@ fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/10-wave trigger while on.gb
 fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/11-regs after power.gb
 fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/12-wave.gb
 
-# --- Game Boy Advance (kinds with a `-gba` suffix run on gba-core; DECISIONS #48, #57) ---
+# --- Game Boy Advance (kinds with a `-gba` suffix run on gba-core) ---
 # Run against the full core (CPU, bus, PPU, APU, HLE BIOS). Smoke lines were added only after their
 # frames were checked by eye. Fetched by scripts/fetch-gba-test-roms.sh into roms/test/gba/ (a missing ROM is
-# skipped locally and fails in CI, like the GB ones). Left out on purpose (DECISIONS #48): jsmolka
+# skipped locally and fails in CI, like the GB ones). Left out on purpose: jsmolka
 # bios.gba (needs the official BIOS) and unsafe.gba (fails on hardware); armwrestler, nba-hw-test and
 # the other tonc demos are screen-only and not wired up yet.
 #   jsmolka-gba: run until PC is on the ROM's single `b .`, failed-test register (r12, r7 for thumb) must
@@ -275,6 +280,6 @@ pass smoke-gba 120 test/gba/tonc/bin/bld_demo.gba
 pass smoke-gba 120 test/gba/tonc/bin/m7_demo.gba
 pass smoke-gba 120 test/gba/tonc/bin/dma_demo.gba
 pass smoke-gba 120 test/gba/tonc/bin/tmr_demo.gba
-# The HLE BIOS (DECISIONS #64): both agb games use the BIOS IRQ path and VBlankIntrWait.
+# The HLE BIOS: both agb games use the BIOS IRQ path and VBlankIntrWait.
 pass smoke-gba 700 homebrew/grains.gba
 pass smoke-gba 700 homebrew/moth.gba

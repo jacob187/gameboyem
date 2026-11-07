@@ -181,7 +181,7 @@ impl Bus {
     fn write_cgb_io(&mut self, addr: u16, value: u8) {
         match (self.hw, addr) {
             (Hw::Dmg, _) => {}
-            // Assumption (DECISIONS #33): in compat mode VBK is locked to bank 0,
+            // Assumption: in compat mode VBK is locked to bank 0,
             // so the write is dropped. Nothing pins this: the mooneye tests mask
             // bit 0 of VBK.
             (Hw::CgbCompat, 0xFF4F) => {}

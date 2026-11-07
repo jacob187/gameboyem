@@ -360,7 +360,7 @@ impl Apu {
     /// system counter (the frame sequencer is clocked by its bit 12 falling edge).
     /// In CPU double speed the bus calls this every other CPU M-cycle with the
     /// counter shifted right once, so the sequencer sees counter bit 13 and
-    /// everything else keeps its real-time rate (DECISIONS #38).
+    /// everything else keeps its real-time rate.
     pub fn tick_mcycle(&mut self, div_counter: u16) {
         // The edge is tracked while powered off too, so powering on never sees
         // a spurious step. DIV writes / STOP clear the counter, which produces

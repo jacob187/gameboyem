@@ -28,7 +28,8 @@
 //! decoder returns it raw, like the variant; an empty extension is written as
 //! a version 3 header, so a Game Boy recording is byte for byte a version 3 file
 //! and a version 3 reader still reads it. A reader from before version 3 (the
-//! one that wrote version 2, with no system byte) does not (DECISIONS #44).
+//! one that wrote version 2, with no system byte) does not and reports an
+//! unsupported version; the current reader decodes versions 1 to 4.
 //!
 //! A record's `kind` is a button index plus `0x80` for a press, or `0x40`
 //! (marker) or `0x41` (end). The index is the button's position in

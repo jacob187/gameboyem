@@ -31,7 +31,8 @@ use crate::state::{StateError, StateReader, StateWriter};
 const POST_BOOT_COUNTER: u16 = 0xABC8;
 /// The same for the CGB boot ROM (DIV = 0x26). Found like [`POST_BOOT_COUNTER`]:
 /// scanning every M-cycle phase for mooneye `boot_div-cgbABCDE`, which has
-/// exactly one solution (DECISIONS #34).
+/// exactly one solution. The CGB boot ROM's length depends on the header, so
+/// this is calibrated for the compat-mode header only.
 const CGB_POST_BOOT_COUNTER: u16 = 0x2674;
 
 #[derive(Clone, Debug)]

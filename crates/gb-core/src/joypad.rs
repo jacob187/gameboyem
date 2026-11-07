@@ -82,7 +82,7 @@ impl Joypad {
 
     /// CGB post-boot P1. In DMG-compatibility mode no group is selected (reads
     /// 0xFF, mooneye `boot_hwio-C`); in CGB mode both are, as on a DMG (Pan
-    /// Docs lists 0xC7 / 0xCF; the choice of 0xCF is DECISIONS #34).
+    /// Docs lists 0xC7 / 0xCF; 0xCF is the choice here, and no test ROM pins it).
     pub fn new_cgb(compat: bool) -> Self {
         Self {
             select: if compat { 0x30 } else { 0x00 },

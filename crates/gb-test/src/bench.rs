@@ -9,7 +9,7 @@
 //! performance change can be checked for bit-identical behaviour by comparing
 //! the hashes before and after. Not part of `cargo test`.
 //!
-//! Four GBA ROMs run alongside (DECISIONS #72): FuzzARM `ARM_Any` (CPU), the `moth` and
+//! Four GBA ROMs run alongside: FuzzARM `ARM_Any` (CPU), the `moth` and
 //! `grains` homebrew (mode 0 with direct-sound audio; mode 4) and tonc's `m7_demo` (mode 7
 //! affine). Their video hash covers each frame's 240x160 RGB555 buffer (little-endian
 //! halfwords) and there is no serial output; the audio hash is over the host-rate f32

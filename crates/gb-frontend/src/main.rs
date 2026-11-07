@@ -43,7 +43,7 @@ fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), S
 }
 
 /// A GBA core for `rom`, booted through `--bios` if given (else the built-in
-/// HLE BIOS, DECISIONS #47), and the hash of the ROM it hashed.
+/// HLE BIOS, which needs no copyrighted dump), and the hash of the ROM it hashed.
 fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), String> {
     let archive = rom::archive_kind(&rom);
     let bios = match &opts.bios {
@@ -78,7 +78,7 @@ fn main() -> ExitCode {
     };
 
     // The file is read once; the system (and so the size cap) comes from the
-    // flag, the name or the header (DECISIONS #46).
+    // flag, the name or the header.
     let (system, rom) = match rom::load_rom(&opts.rom, opts.system) {
         Ok(r) => r,
         Err(msg) => {
