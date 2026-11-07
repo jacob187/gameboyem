@@ -63,7 +63,8 @@ no magic yet), so HI reads 0 rather than a torn value. RAM is enabled only aroun
 access (`ENABLE_RAM`/`DISABLE_RAM`). The helpers are `hiscore_load()` and
 `hiscore_update()` in `common/`.
 
-Emulators keep the RAM in a `.sav` file next to the ROM. Delete it to reset HI.
+`gb` keeps the RAM in a `.sav` file in its app data folder (`saves/<game>-<hash>.sav`; the
+folder is listed in the main README). Delete it to reset HI.
 The headless harness cases `save-snake` / `save-breakout` (`crates/gb-test`) play a
 game to game over, load the resulting battery RAM into a fresh machine and check
 that its title screen differs from a fresh-RAM one.
