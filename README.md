@@ -23,7 +23,7 @@ Builds for macOS, Windows and Linux are on the [Releases page](https://github.co
 - **Windows:** run `gameboyem-<version>-windows-x64-setup.exe` (a per-user install, no administrator rights). Or unzip the `-portable.zip` and run `gb.exe`.
 - **Linux:** `chmod +x` the `.AppImage` and run it, or `sudo apt install ./gameboyem-<version>-linux-x86_64.deb`. The `.tar.gz` holds the bare `gb` binary. Needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or newer).
 
-Open a ROM with the dialog that appears when you start the app, or drag a `.gb`, `.gbc` or `.gba` file onto its window. Dragging works on macOS, Windows and X11, not under native Wayland. On Linux the dialog needs a desktop portal (`xdg-desktop-portal` with a GTK or KDE backend) or `zenity`. The installers also associate `.gb`, `.gbc` and `.gba` files with the app. On Windows and Linux opening such a file starts the ROM. On macOS the app shows up under "Open With" but doesn't receive the file yet, so it starts and asks you to choose it.
+Open a ROM with the dialog that appears when you start the app, or drag a `.gb`, `.gbc` or `.gba` file onto its window. Dragging works on macOS, Windows and X11, not under native Wayland. On Linux the dialog needs a desktop portal (`xdg-desktop-portal` with a GTK or KDE backend) or `zenity`. The Windows installer and the `.deb` also associate `.gb`, `.gbc` and `.gba` files with the app, so opening one starts the ROM. The AppImage, the `.tar.gz` and the portable zip register nothing. On macOS the app is listed under "Open With" but doesn't receive the file yet, so it may just start and ask you to choose a ROM (Finder may also say it can't open that format).
 
 **The builds are unsigned**, so the first launch is blocked by the OS:
 
