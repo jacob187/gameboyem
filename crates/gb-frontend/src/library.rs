@@ -306,11 +306,6 @@ impl GamePaths {
         self.states_dir.join(RESUME_FILE)
     }
 
-    /// Where a resume point that could not be loaded is kept.
-    pub fn resume_bad(&self) -> PathBuf {
-        self.states_dir.join(format!("{RESUME_FILE}.bad"))
-    }
-
     /// The snapshot taken at `unix_secs`: `states/<id>/snap-<unix-secs>.state`.
     pub fn snapshot_state(&self, unix_secs: u64) -> PathBuf {
         self.states_dir.join(format!("snap-{unix_secs}.state"))
@@ -1605,7 +1600,8 @@ mod tests {
             fs::write(append_ext(&p.sav, "bak"), b"s").unwrap();
             fs::create_dir_all(p.states_dir()).unwrap();
             fs::write(p.resume_state(), b"s").unwrap();
-            fs::write(p.resume_bad(), b"s").unwrap();
+            fs::write(p.states_dir().join("resume-5.bad"), b"s").unwrap();
+            fs::write(p.states_dir().join("resume-6.mismatch"), b"s").unwrap();
             fs::write(p.snapshot_state(5), b"s").unwrap();
             fs::write(p.snapshot_image(5), b"s").unwrap();
             fs::write(p.legacy_state(9), b"s").unwrap();
@@ -1617,7 +1613,8 @@ mod tests {
             gone.sav.clone(),
             append_ext(&gone.sav, "bak"),
             gone.resume_state(),
-            gone.resume_bad(),
+            gone.states_dir().join("resume-5.bad"),
+            gone.states_dir().join("resume-6.mismatch"),
             gone.snapshot_state(5),
             gone.snapshot_image(5),
             gone.states_dir().to_owned(),

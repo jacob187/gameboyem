@@ -6,7 +6,7 @@
 //! app carries it out after the frame, so a file dialog or a file write never runs in
 //! the middle of drawing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
@@ -59,6 +59,9 @@ pub struct Screen<'a> {
     pub can_restart: bool,
     /// The running game's snapshots, newest first.
     pub snapshots: &'a [SnapshotItem],
+    /// The library games that have a resume point, worked out when the library was entered
+    /// or changed (nothing is read from the disk while drawing).
+    pub resumable: &'a HashSet<GameId>,
     /// There is a library to go back to.
     pub can_return: bool,
     pub toasts: &'a Toasts,
@@ -451,7 +454,7 @@ fn library_screen(
                             Some(library) => thumbnail(ui.ctx(), thumbs, library, entry),
                             None => None,
                         };
-                        let resume = screen.library.is_some_and(|l| l.has_resume(&entry.id));
+                        let resume = screen.resumable.contains(&entry.id);
                         card(ui, entry, texture, resume, &mut view.confirm, actions);
                     }
                 });
@@ -1107,6 +1110,13 @@ mod tests {
         }
         let toasts = Toasts::default();
         let snapshots = items();
+        let resumable: HashSet<GameId> = library
+            .entries()
+            .iter()
+            .filter(|e| library.has_resume(&e.id))
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(resumable.len(), 1, "ONE resumes, TWO does not");
         let screen = |mode, library| Screen {
             mode,
             library,
@@ -1115,6 +1125,7 @@ mod tests {
             can_save: true,
             can_restart: true,
             snapshots: &snapshots,
+            resumable: &resumable,
             can_return: true,
             toasts: &toasts,
         };
@@ -1158,6 +1169,7 @@ mod tests {
         assert!(run(&screen(Mode::Paused, Some(&library)), &mut view).is_empty());
         let none = Screen {
             snapshots: &[],
+            resumable: &HashSet::new(),
             ..screen(Mode::Paused, None)
         };
         assert!(run(&none, &mut view).is_empty());
@@ -1192,6 +1204,7 @@ mod tests {
             can_save: true,
             can_restart: true,
             snapshots: &snapshots,
+            resumable: &HashSet::new(),
             can_return: true,
             toasts: &toasts,
         };
@@ -1238,6 +1251,70 @@ mod tests {
         assert!(!text.to_lowercase().contains("slot"), "{text}");
     }
 
+    /// Only the games in `resumable` get the Resume tag, and drawing reads nothing from disk.
+    #[test]
+    fn the_resume_tag_follows_the_set_the_app_worked_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataDir::at(tmp.path().join("data")).created().unwrap();
+        let mut library = Library::open(&data);
+        let mut ids = Vec::new();
+        for title in ["ONE", "TWO"] {
+            let path = tmp.path().join(format!("{title}.gb"));
+            fs::write(&path, rom(title)).unwrap();
+            ids.push(library.add_rom(&path).unwrap().entry.id);
+        }
+        // A resume point on disk that the app has not told the screen about.
+        let paths = library.paths_for(&ids[1]);
+        fs::create_dir_all(paths.states_dir()).unwrap();
+        fs::write(paths.resume_state(), b"x").unwrap();
+
+        let toasts = Toasts::default();
+        let tags = |resumable: &HashSet<GameId>| {
+            let screen = Screen {
+                mode: Mode::Library,
+                library: Some(&library),
+                data_dir: None,
+                game_title: "",
+                can_save: false,
+                can_restart: false,
+                snapshots: &[],
+                resumable,
+                can_return: false,
+                toasts: &toasts,
+            };
+            let ctx = egui::Context::default();
+            let (mut view, mut thumbs, mut snap_thumbs, mut actions) =
+                (View::default(), HashMap::new(), HashMap::new(), Vec::new());
+            let mut count = 0;
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 650.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(input, |ui| {
+                    build(
+                        ui,
+                        &mut view,
+                        (&mut thumbs, &mut snap_thumbs),
+                        &screen,
+                        &mut actions,
+                    );
+                });
+                count = out
+                    .shapes
+                    .iter()
+                    .filter(|s| {
+                        matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.text() == "Resume")
+                    })
+                    .count();
+            }
+            count
+        };
+        assert_eq!(tags(&HashSet::new()), 0, "the set decides, not the disk");
+        assert_eq!(tags(&HashSet::from([ids[0].clone()])), 1);
+        assert_eq!(tags(&ids.iter().cloned().collect()), 2);
+    }
+
     #[test]
     fn esc_closes_the_front_most_pop_up_first() {
         let mut view = View {
@@ -1267,6 +1344,7 @@ mod tests {
             can_save: false,
             can_restart: false,
             snapshots: &[],
+            resumable: &HashSet::new(),
             can_return: false,
             toasts: &toasts,
         };

@@ -378,7 +378,7 @@ fn main() -> ExitCode {
         app = app.in_library();
     } else {
         // The battery save is loaded; now continue where the game was left.
-        app = app.continue_game();
+        app = app.continue_game(&opts.power_on_flags());
     }
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {

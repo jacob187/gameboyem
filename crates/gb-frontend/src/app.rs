@@ -24,7 +24,7 @@ use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::record::{self, Recorder};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
-use crate::state::{Resume, StateStore};
+use crate::state::{Aside, Resume, StateStore};
 use crate::ui::{
     EscapeEffect, Mode, SnapshotItem, ThumbnailTrigger, Toasts, UiAction, escape_effect,
     frame_is_uniform, friendly_time_local, snapshot_items,
@@ -37,6 +37,9 @@ const FAST_FORWARD_SPEED: f64 = 4.0;
 /// How often the resume point is rewritten while a game is played, so a crash loses at most
 /// this much.
 const RESUME_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a toast that must be read stays (a resume point that could not be used).
+const LONG_TOAST_DURATION: Duration = Duration::from_secs(8);
 
 /// How long a snapshot message stays in the window title.
 const STATUS_DURATION: Duration = Duration::from_secs(2);
@@ -178,6 +181,13 @@ pub struct App<C: Core> {
     resume_enabled: bool,
     /// When the resume point is next written during play.
     next_resume: Instant,
+    /// No resume point is written while this game runs: one exists that this run did not
+    /// use (a power-on option was given, or it could not be put aside), and writing would
+    /// replace it. Cleared when another game starts.
+    freeze_resume: bool,
+    /// The library games that have a resume point, read when the library is entered or
+    /// changed (the cards are drawn from this, not from the disk).
+    resumable: HashSet<GameId>,
     /// The running game's snapshots as the pause menu lists them, newest first. Read when
     /// the menu opens and after a change, not on every frame.
     snapshot_list: Vec<SnapshotItem>,
@@ -247,6 +257,8 @@ impl<C: Core> App<C> {
             rom_path: None,
             resume_enabled: false,
             next_resume: Instant::now() + RESUME_INTERVAL,
+            freeze_resume: false,
+            resumable: HashSet::new(),
             snapshot_list: Vec::new(),
             thumbnail: ThumbnailTrigger::default(),
             toasts: Toasts::default(),
@@ -296,7 +308,27 @@ impl<C: Core> App<C> {
     /// Continue the game given to [`App::new`] from its resume point, if resume is on and
     /// it has one (a game started from the command line; a library game is resumed as it is
     /// opened). The battery save is already loaded.
-    pub fn continue_game(mut self) -> Self {
+    ///
+    /// `forced` are the power-on options the player passed on the command line (`--model`,
+    /// `--rtc-start`, ...). The resume point was made with other ones, so it is not used;
+    /// the game starts fresh and the player is told. The resume point is left untouched:
+    /// nothing is written to it while this game runs (the battery save and snapshots are
+    /// unaffected), so a plain start afterwards still continues from it.
+    pub fn continue_game(mut self, forced: &[&'static str]) -> Self {
+        if !forced.is_empty() {
+            let has_point = self.storage.as_ref().is_some_and(|s| s.states.has_resume());
+            if self.resume_enabled && self.test.is_none() && has_point {
+                self.freeze_resume = true;
+                let text = format!(
+                    "Started fresh because of {}; your resume point is kept (open from the \
+                     library to continue)",
+                    forced.join(", ")
+                );
+                log::info!("{text}");
+                self.toast_long(log::Level::Info, text);
+            }
+            return self;
+        }
         if self.try_resume() {
             for button in Button::ALL {
                 self.set_button(button, self.input.is_down(button));
@@ -323,6 +355,7 @@ impl<C: Core> App<C> {
     pub fn in_library(mut self) -> Self {
         self.detach_game();
         self.set_mode(Mode::Library);
+        self.refresh_resumable();
         self.title = window_title("");
         self
     }
@@ -332,6 +365,7 @@ impl<C: Core> App<C> {
     fn detach_game(&mut self) {
         self.storage = None;
         self.rom_path = None;
+        self.freeze_resume = false;
         self.snapshot_list.clear();
         if let Some(core) = self.idle.as_ref().and_then(|idle| idle()) {
             self.core = core;
@@ -385,6 +419,25 @@ impl<C: Core> App<C> {
     fn toast(&mut self, level: log::Level, text: impl Into<String>) {
         self.toasts.push(level, text, Instant::now());
         self.request_redraw();
+    }
+
+    /// Show `text` in a toast long enough to read a sentence or two ([`LONG_TOAST_DURATION`]).
+    fn toast_long(&mut self, level: log::Level, text: impl Into<String>) {
+        self.toasts
+            .push_for(level, text, Instant::now(), LONG_TOAST_DURATION);
+        self.request_redraw();
+    }
+
+    /// Read which library games have a resume point (see `resumable`).
+    fn refresh_resumable(&mut self) {
+        self.resumable = self.library.as_ref().map_or_else(HashSet::new, |library| {
+            library
+                .entries()
+                .iter()
+                .filter(|e| library.has_resume(&e.id))
+                .map(|e| e.id.clone())
+                .collect()
+        });
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, msg: String) {
@@ -486,7 +539,11 @@ impl<C: Core> App<C> {
     /// Write the resume point of the running game (after its battery save, so the save is
     /// never older than the point). Nothing when resume is off, as under `--record`.
     fn write_resume(&mut self) {
-        if !self.resume_enabled || self.test.is_some() || !self.core.supports_save_state() {
+        if !self.resume_enabled
+            || self.freeze_resume
+            || self.test.is_some()
+            || !self.core.supports_save_state()
+        {
             return;
         }
         let Some(storage) = self.storage.as_ref() else {
@@ -498,8 +555,10 @@ impl<C: Core> App<C> {
     }
 
     /// Continue the running game from its resume point. Returns whether it did. A resume
-    /// point that cannot be used is kept as `resume.state.bad`, the game starts normally
-    /// and the player is told.
+    /// point that cannot be used is put aside (never deleted, never overwritten), the game
+    /// starts normally and the player is told, in a toast that stays long enough to read.
+    /// If the file could not be put aside it is still there, so no resume point is written
+    /// for this game (see `freeze_resume`).
     fn try_resume(&mut self) -> bool {
         if !self.resume_enabled || self.test.is_some() {
             return false;
@@ -520,20 +579,33 @@ impl<C: Core> App<C> {
                 self.toast(log::Level::Info, "Resumed where you left off");
                 true
             }
-            Resume::Failed { why, kept } => {
-                let kept = kept.map_or(String::new(), |k| {
-                    format!(
-                        " The old file was kept as {}.",
-                        k.file_name().map_or_else(
-                            || k.display().to_string(),
-                            |n| n.to_string_lossy().into_owned()
-                        )
+            Resume::Failed { why, aside, kept } => {
+                if kept.is_none() && storage.states.has_resume() {
+                    self.freeze_resume = true;
+                }
+                let name = kept.as_ref().map(|k| {
+                    k.file_name().map_or_else(
+                        || k.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
                     )
                 });
-                self.show_status(
-                    log::Level::Warn,
-                    format!("Could not resume ({why}). Starting from the beginning.{kept}"),
-                );
+                let text = match (aside, name) {
+                    (Aside::Mismatch, Some(name)) => format!(
+                        "Could not resume ({why}). Started from the beginning. Your resume \
+                         point is kept as {name} in the game's states folder: start with the \
+                         original options and rename it to resume.state to continue."
+                    ),
+                    (Aside::Bad, Some(name)) => format!(
+                        "Could not resume ({why}). Started from the beginning. The old file \
+                         was kept as {name}."
+                    ),
+                    (_, None) => format!(
+                        "Could not resume ({why}). Started from the beginning. The old resume \
+                         point is left where it is and not overwritten."
+                    ),
+                };
+                self.show_status(log::Level::Warn, text.clone());
+                self.toast_long(log::Level::Warn, text);
                 false
             }
         }
@@ -563,7 +635,7 @@ impl<C: Core> App<C> {
         );
         match saved {
             Ok(saved) => {
-                self.refresh_snapshots();
+                self.snapshot_list = snapshot_items(saved.snapshots);
                 let text = if saved.evicted > 0 {
                     format!(
                         "Snapshot saved. The oldest one was removed; at most {} are kept.",
@@ -598,7 +670,10 @@ impl<C: Core> App<C> {
         let Some(storage) = self.storage.as_mut() else {
             return false;
         };
-        match storage.states.load_snapshot(&mut self.core, secs) {
+        let result = storage.states.load_snapshot(&mut self.core, secs);
+        // A snapshot that was gone or unreadable should not stay in the list.
+        self.refresh_snapshots();
+        match result {
             Ok(backup) => {
                 // The state replaces the machine (and the frame it is on), so
                 // the replay of a recording that goes on would diverge.
@@ -613,15 +688,11 @@ impl<C: Core> App<C> {
                 // Show the restored picture even while paused.
                 self.upload();
                 self.request_redraw();
+                if let Some(backup) = backup {
+                    log::info!("the previous save is kept as {}", backup.display());
+                }
                 let when = friendly_time_local(secs);
-                let text = match backup {
-                    Some(b) => format!(
-                        "Loaded the snapshot from {when} (previous save kept as {})",
-                        b.display()
-                    ),
-                    None => format!("Loaded the snapshot from {when}"),
-                };
-                self.announce(log::Level::Info, text);
+                self.announce(log::Level::Info, format!("Loaded the snapshot from {when}"));
                 true
             }
             Err(msg) => {
@@ -729,6 +800,7 @@ impl<C: Core> App<C> {
             paths,
         });
         self.rom_path = Some(path.to_owned());
+        self.freeze_resume = false;
         self.refresh_snapshots();
         self.next_resume = Instant::now() + RESUME_INTERVAL;
         if fresh {
@@ -862,6 +934,7 @@ impl<C: Core> App<C> {
         self.stop_recording("returned to the library");
         self.release_core_buttons();
         self.detach_game();
+        self.refresh_resumable();
         self.set_mode(self.mode.back_to_library());
         self.title = window_title("");
         self.set_fast_forward(false);
@@ -1187,6 +1260,7 @@ impl<C: Core> App<C> {
             can_save,
             can_restart,
             snapshots: &self.snapshot_list,
+            resumable: &self.resumable,
             can_return,
             toasts: &self.toasts,
         };
@@ -1291,6 +1365,7 @@ impl<C: Core> App<C> {
         };
         match library.remove(id, saves) {
             Ok(entry) => {
+                self.refresh_resumable();
                 if let Some(gui) = self.gui.as_mut() {
                     gui.forget_thumbnail(id);
                 }
@@ -2492,6 +2567,57 @@ mod tests {
     }
 
     #[test]
+    fn the_snapshot_list_follows_the_disk_after_a_failed_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.save_snapshot();
+        app.save_snapshot();
+        app.on_key(KeyCode::Escape, true);
+        assert_eq!(app.snapshot_list.len(), 2);
+        // One goes missing behind the app's back; loading it fails and the list notices.
+        let gone = app.snapshot_list[0].secs;
+        fs::remove_file(dir.path().join(format!("g.states/snap-{gone}.state"))).unwrap();
+        app.perform(UiAction::LoadSnapshot(gone));
+        assert_eq!(app.mode, Mode::Paused);
+        assert!(app.toasts.iter().any(|t| t.level == log::Level::Warn));
+        assert_eq!(app.snapshot_list.len(), 1);
+        assert!(app.snapshot_list.iter().all(|s| s.secs != gone));
+        // The same for a delete of one that is already gone.
+        let other = app.snapshot_list[0].secs;
+        fs::remove_file(dir.path().join(format!("g.states/snap-{other}.state"))).unwrap();
+        app.perform(UiAction::DeleteSnapshot(other));
+        assert!(app.snapshot_list.is_empty());
+    }
+
+    #[test]
+    fn the_library_marks_resumable_games_when_it_is_entered_or_changed_not_when_drawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, id, _) = library_with_a_game(dir.path());
+        let paths = library.paths_for(&id);
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_game(Some(id.clone()));
+        assert!(app.resumable.is_empty());
+        fs::create_dir_all(paths.states_dir()).unwrap();
+        fs::write(paths.resume_state(), b"x").unwrap();
+        assert!(app.resumable.is_empty(), "nothing reads the disk by itself");
+
+        app.perform(UiAction::BackToLibrary);
+        assert!(app.resumable.contains(&id), "read on entering the library");
+        fs::remove_file(paths.resume_state()).unwrap();
+        assert!(app.resumable.contains(&id), "not re-read while it is shown");
+
+        app.perform(UiAction::Remove {
+            id,
+            delete_saves: true,
+        });
+        assert!(
+            app.resumable.is_empty(),
+            "read again once the library changed"
+        );
+    }
+
+    #[test]
     fn the_snapshot_cap_removes_the_oldest_and_a_toast_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
@@ -2552,6 +2678,24 @@ mod tests {
             "rewound with the snapshot"
         );
         assert_eq!(fs::read(dir.path().join("g.sav.bak")).unwrap()[0], 0xAB);
+        // The toast and the title say when; the backup path is for the log only.
+        let said = app
+            .toasts
+            .iter()
+            .find(|t| t.text.starts_with("Loaded"))
+            .unwrap();
+        assert_eq!(
+            said.text,
+            format!(
+                "Loaded the snapshot from {}",
+                crate::ui::friendly_time_local(app.snapshot_list[0].secs)
+            )
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(t, _)| !t.contains(".bak"))
+        );
     }
 
     #[test]
@@ -3138,7 +3282,9 @@ mod tests {
         let left = first.core.save_state();
         first.finish();
 
-        let app = headless_app(dir.path()).with_resume(true).continue_game();
+        let app = headless_app(dir.path())
+            .with_resume(true)
+            .continue_game(&[]);
         assert_eq!(app.core.save_state(), left);
         assert!(
             app.toasts
@@ -3147,7 +3293,9 @@ mod tests {
         );
         // With nothing to continue from, nothing is said.
         let other = tempfile::tempdir().unwrap();
-        let app = headless_app(other.path()).with_resume(true).continue_game();
+        let app = headless_app(other.path())
+            .with_resume(true)
+            .continue_game(&[]);
         assert!(app.toasts.is_empty());
     }
 
@@ -3180,7 +3328,7 @@ mod tests {
         let power_on = app.core.save_state();
         let mut app = app.with_resume(true);
         assert!(!app.resume_enabled);
-        app = app.continue_game();
+        app = app.continue_game(&[]);
         assert_eq!(app.core.save_state(), power_on, "powered on, not resumed");
         assert!(app.toasts.is_empty());
         run_frames(&mut app, 3);
@@ -3254,21 +3402,213 @@ mod tests {
         fs::write(states.join("resume.state"), b"not a state").unwrap();
         let power_on = headless_app(dir.path()).core.save_state();
 
-        let app = headless_app(dir.path()).with_resume(true).continue_game();
+        let app = headless_app(dir.path())
+            .with_resume(true)
+            .continue_game(&[]);
 
         assert_eq!(app.core.save_state(), power_on);
         assert!(!states.join("resume.state").exists());
-        assert_eq!(
-            fs::read(states.join("resume.state.bad")).unwrap(),
-            b"not a state"
-        );
+        let bad = aside_files(&states, "bad");
+        assert_eq!(bad.len(), 1);
+        assert_eq!(fs::read(&bad[0]).unwrap(), b"not a state");
         let toast = app
             .toasts
             .iter()
             .find(|t| t.level == log::Level::Warn)
             .unwrap();
         assert!(toast.text.contains("Could not resume"), "{}", toast.text);
-        assert!(toast.text.contains("resume.state.bad"), "{}", toast.text);
+        let name = bad[0].file_name().unwrap().to_string_lossy();
+        assert!(toast.text.contains(&*name), "{}", toast.text);
+        // Long enough to read, and the title says it too.
+        assert!(
+            toast.until > Instant::now() + Duration::from_secs(6),
+            "the warning stays up for more than the usual five seconds"
+        );
+        assert!(app.status.as_ref().unwrap().0.contains("Could not resume"));
+    }
+
+    /// The put-aside resume points of one kind (`bad` or `mismatch`) in `states`.
+    fn aside_files(states: &Path, ext: &str) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(states)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with("resume-") && name.ends_with(&format!(".{ext}"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_resume_point_from_other_options_is_kept_as_a_mismatch_and_says_how_to_get_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cgb = GameBoy::with_model(joypad_to_cgb_palette_rom(), Model::Cgb).unwrap();
+        cgb.step_frame();
+        let states = dir.path().join("g.states");
+        fs::create_dir_all(&states).unwrap();
+        fs::write(states.join("resume.state"), cgb.save_state()).unwrap();
+        let dmg = GameBoy::with_model(joypad_to_cgb_palette_rom(), Model::Dmg).unwrap();
+
+        let app = headless_app_with(dir.path(), dmg)
+            .with_resume(true)
+            .continue_game(&[]);
+
+        let kept = aside_files(&states, "mismatch");
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(fs::read(&kept[0]).unwrap(), cgb.save_state());
+        assert!(
+            aside_files(&states, "bad").is_empty(),
+            "nothing is wrong with it"
+        );
+        let toast = app
+            .toasts
+            .iter()
+            .find(|t| t.text.contains("Could not resume"))
+            .unwrap();
+        assert!(
+            toast.text.contains("rename it to resume.state"),
+            "{}",
+            toast.text
+        );
+        assert!(toast.text.contains("--model"), "{}", toast.text);
+        assert!(toast.until > Instant::now() + Duration::from_secs(6));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_point_that_cannot_be_put_aside_is_not_written_over() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let states = dir.path().join("g.states");
+        fs::create_dir_all(&states).unwrap();
+        fs::write(
+            states.join("resume.state"),
+            b"precious but unreadable to the core",
+        )
+        .unwrap();
+        // A folder that cannot be changed: the file can be read but not moved.
+        fs::set_permissions(&states, fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = fs::write(states.join("probe"), b"x").is_ok();
+        let mut app = headless_app(dir.path())
+            .with_resume(true)
+            .continue_game(&[]);
+        fs::set_permissions(&states, fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            return; // running as root: permissions do not apply
+        }
+
+        assert!(app.freeze_resume);
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("not overwritten"))
+        );
+        app.step_once();
+        app.tick_saves(Instant::now() + Duration::from_secs(120));
+        app.perform(UiAction::BackToLibrary);
+        app.finish();
+        assert_eq!(
+            fs::read(states.join("resume.state")).unwrap(),
+            b"precious but unreadable to the core",
+            "left exactly as it was"
+        );
+    }
+
+    /// A power-on option on the command line: the game starts fresh, the point stays as it
+    /// was through every kind of write, and a plain start afterwards still continues.
+    #[test]
+    fn a_power_on_option_starts_fresh_and_leaves_the_resume_point_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut earlier = headless_app(dir.path()).with_resume(true);
+        for _ in 0..4 {
+            earlier.step_once();
+        }
+        let left = earlier.core.save_state();
+        earlier.finish();
+        let power_on = headless_app(dir.path()).core.save_state();
+        let before = fs::read(resume_file(dir.path())).unwrap();
+
+        let mut app = headless_app(dir.path())
+            .with_resume(true)
+            .continue_game(&["--rtc-start"]);
+
+        assert_eq!(app.core.save_state(), power_on, "not resumed");
+        let toast = app
+            .toasts
+            .iter()
+            .next()
+            .expect("the player is told")
+            .clone();
+        assert_eq!(
+            toast.text,
+            "Started fresh because of --rtc-start; your resume point is kept (open from the \
+             library to continue)"
+        );
+        assert!(toast.until > Instant::now() + Duration::from_secs(6));
+        for _ in 0..3 {
+            app.step_once();
+        }
+        app.tick_saves(Instant::now() + Duration::from_secs(120)); // the minute tick
+        assert_eq!(
+            fs::read(resume_file(dir.path())).unwrap(),
+            before,
+            "after the tick"
+        );
+        app.perform(UiAction::BackToLibrary); // leaving
+        assert_eq!(
+            fs::read(resume_file(dir.path())).unwrap(),
+            before,
+            "after leaving"
+        );
+        app.finish(); // quitting
+        assert_eq!(
+            fs::read(resume_file(dir.path())).unwrap(),
+            before,
+            "after quitting"
+        );
+        assert!(aside_files(&dir.path().join("g.states"), "bad").is_empty());
+
+        // The next plain start continues from it, and writes again.
+        let mut next = headless_app(dir.path())
+            .with_resume(true)
+            .continue_game(&[]);
+        assert_eq!(next.core.save_state(), left);
+        next.step_once();
+        next.finish();
+        assert_ne!(fs::read(resume_file(dir.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn a_power_on_option_with_no_resume_point_to_protect_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path())
+            .with_resume(true)
+            .continue_game(&["--model"]);
+        assert!(app.toasts.is_empty(), "nothing to say");
+        assert!(!app.freeze_resume);
+        app.step_once();
+        app.finish();
+        assert!(
+            resume_file(dir.path()).is_file(),
+            "the session can be resumed"
+        );
+    }
+
+    #[test]
+    fn a_game_opened_later_in_the_session_is_not_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut earlier = headless_app(dir.path()).with_resume(true);
+        earlier.step_once();
+        earlier.finish();
+        let mut app = headless_app(dir.path())
+            .with_resume(true)
+            .continue_game(&["--model"]);
+        assert!(app.freeze_resume);
+        app.perform(UiAction::BackToLibrary);
+        assert!(!app.freeze_resume, "the frozen game was let go of");
     }
 
     #[test]
@@ -3287,7 +3627,7 @@ mod tests {
         app.perform(UiAction::Play(id));
 
         assert_eq!(app.mode, Mode::Playing, "the game starts anyway");
-        assert!(dir.path().join("one.states/resume.state.bad").is_file());
+        assert_eq!(aside_files(&dir.path().join("one.states"), "bad").len(), 1);
         assert!(
             app.toasts
                 .iter()

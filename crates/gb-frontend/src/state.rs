@@ -2,13 +2,20 @@
 //! `library.rs`), every file written atomically:
 //!
 //! - `resume.state`: written when the player leaves the game and every minute of play; the
-//!   next start continues from it.
+//!   next start continues from it. One that cannot be used is never deleted or overwritten: it
+//!   is moved to `resume-<unix-secs>.bad` (damaged, or from another version), or to
+//!   `resume-<unix-secs>.mismatch` (taken with other hardware or cartridge options, so it is
+//!   fine in itself). The three newest of each kind are kept.
 //! - `snap-<unix-secs>.state` and `snap-<unix-secs>.png`: a snapshot the player took, and
 //!   the picture on screen when they did. The time is the name; there are no numbers.
 //!
 //! Loading a state also rewinds battery RAM, which the battery saver then writes to the
-//! game's `.sav`, so a load that could cost progress first backs that file up.
+//! game's `.sav`, so a load that could cost progress backs that file up. The backup is made
+//! only once the state has been accepted by the core (a state that does not load costs
+//! nothing, so it leaves no backup); if the backup then fails, the core is put back as it
+//! was and the load is refused, because loading without it could lose real progress.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -43,9 +50,9 @@ pub fn max_state_bytes(system: System) -> u64 {
 pub const MAX_IMAGE_BYTES: u64 = 1024 * 1024;
 
 /// `game.gb` -> `game.ss<slot>`: where the oldest versions kept numbered slots, next to
-/// the ROM, which is now only read to turn them into snapshots. Like the battery save, the
-/// extension is appended instead if that would name the ROM itself.
-pub fn state_path(rom: &Path, slot: u8) -> PathBuf {
+/// the ROM. Only [`migrate_legacy_states`] reads these, to turn them into snapshots. Like
+/// the battery save, the extension is appended instead if that would name the ROM itself.
+fn state_path(rom: &Path, slot: u8) -> PathBuf {
     let ext = format!("ss{slot}");
     let path = rom.with_extension(&ext);
     if path == rom {
@@ -55,12 +62,12 @@ pub fn state_path(rom: &Path, slot: u8) -> PathBuf {
     }
 }
 
-/// The text for a failed `load_state`. A GBA mismatch names the options a state
-/// is tied to. A Game Boy model mismatch names the way out: a pre-CGB (v1) state is a DMG one, and `--model auto` now starts
-/// CGB-flagged ROMs as a Game Boy Color, so they need `--model dmg` to load it.
-/// `variant` is [`Core::hw_variant`] (Game Boy: 0 DMG, 1 CGB), decoded through
+/// The text for a failed `load_state`. A GBA mismatch names the options a state is tied to.
+/// A Game Boy model mismatch names the way out: an older state is a DMG one, and
+/// `--model auto` starts CGB-flagged ROMs as a Game Boy Color, so they need `--model dmg` to
+/// load it. `variant` is [`Core::hw_variant`] (Game Boy: 0 DMG, 1 CGB), decoded through
 /// [`Model::from_id`] so that a new model fails to compile here until it has a hint.
-pub fn load_error(e: &StateError, system: System, variant: u8) -> String {
+fn load_error(e: &StateError, system: System, variant: u8) -> String {
     match (e, system) {
         (StateError::ModelMismatch, System::Gb) => match Model::from_id(variant) {
             Some(Model::Cgb) => format!(
@@ -97,12 +104,48 @@ fn snapshot_secs(name: &str, ext: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Why a resume point was put aside; also the extension of the file it was moved to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aside {
+    /// Damaged, from another ROM or from an unsupported version.
+    Bad,
+    /// Taken with other hardware or cartridge options than this run has (a Game Boy model,
+    /// a GBA BIOS, save type or clock): nothing is wrong with the file.
+    Mismatch,
+}
+
+impl Aside {
+    const ALL: [Aside; 2] = [Aside::Bad, Aside::Mismatch];
+
+    fn ext(self) -> &'static str {
+        match self {
+            Aside::Bad => "bad",
+            Aside::Mismatch => "mismatch",
+        }
+    }
+}
+
+/// Put-aside resume points kept of each kind; the oldest go.
+const KEEP_ASIDE: usize = 3;
+
+/// The time in a put-aside file name `resume-<unix-secs>.<ext>`.
+fn aside_secs(name: &str, aside: Aside) -> Option<u64> {
+    let digits = name
+        .strip_prefix("resume-")?
+        .strip_suffix(aside.ext())?
+        .strip_suffix('.')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Whether `name` is a file this module writes into a states folder (also the leftovers of
 /// an interrupted write), so removing a game can delete exactly those.
 pub fn is_state_file_name(name: &str) -> bool {
     let name = name.strip_suffix(".tmp").unwrap_or(name);
     name == RESUME_FILE
-        || name.strip_prefix(RESUME_FILE) == Some(".bad")
+        || Aside::ALL.iter().any(|&a| aside_secs(name, a).is_some())
         || snapshot_secs(name, "state").is_some()
         || snapshot_secs(name, "png").is_some()
 }
@@ -117,11 +160,13 @@ pub struct Snapshot {
 }
 
 /// What [`StateStore::save_snapshot`] did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotSaved {
     pub secs: u64,
     /// Oldest snapshots removed to stay within [`MAX_SNAPSHOTS`].
     pub evicted: usize,
+    /// The game's snapshots now, newest first (from the one directory scan the save made).
+    pub snapshots: Vec<Snapshot>,
 }
 
 /// What [`StateStore::load_resume`] found.
@@ -133,8 +178,21 @@ pub enum Resume {
     /// when the resume point was older than that save.
     Loaded { backup: Option<PathBuf> },
     /// It could not be used; the game was left as powered on. `kept` is where the file was
-    /// moved to (`resume.state.bad`), if that worked.
-    Failed { why: String, kept: Option<PathBuf> },
+    /// moved to, as `aside` says. If that failed, `kept` is `None` and `resume.state` is
+    /// still there: the caller must not write a new resume point over it.
+    Failed {
+        why: String,
+        aside: Aside,
+        kept: Option<PathBuf>,
+    },
+}
+
+/// Why [`StateStore::apply`] did not load a state.
+enum Refused {
+    /// The core did not accept it; the core is unchanged.
+    State(StateError),
+    /// The `.sav` could not be backed up, so the load was undone.
+    Backup(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +232,20 @@ impl StateStore {
         }
     }
 
+    /// Whether there is a resume point.
+    pub fn has_resume(&self) -> bool {
+        self.paths.resume_state().is_file()
+    }
+
     /// Continue from the resume point into `core`, which has just been powered on with
-    /// its battery save. A resume point that cannot be loaded is moved to
-    /// `resume.state.bad`, and `core` is left as it was.
+    /// its battery save. A resume point that cannot be used is put aside (see [`Aside`]),
+    /// never deleted, and `core` is left as it was.
+    ///
+    /// If the game's own save is newer than the resume point (the program died after the
+    /// game saved), loading would rewind that save, so the save is copied to `.bak` once
+    /// the core has accepted the state. If that copy fails the load is undone and the
+    /// resume point put aside: losing a minute of "where you were" is safer than losing
+    /// the game's own progress, and the file stays recoverable.
     pub fn load_resume(&mut self, core: &mut dyn Core) -> Resume {
         if !core.supports_save_state() {
             return Resume::Absent;
@@ -185,43 +254,58 @@ impl StateStore {
         let data = match read_capped(&path, max_state_bytes(core.system()), "resume point") {
             Ok(Some(data)) => data,
             Ok(None) => return Resume::Absent,
-            Err(e) => return self.set_aside(&path, format!("cannot read it: {e}")),
+            Err(e) => return self.set_aside(&path, Aside::Bad, format!("cannot read it: {e}")),
         };
-        // A resume point is at most a minute older than the game's save when the program
-        // ended cleanly (the save is written first), so a newer save means a crash after
-        // the game saved: loading would rewind that save, so keep a copy of it.
-        let backup = if modified(&self.paths.sav) > modified(&path) {
-            match self.backup_sav_once() {
-                Ok(backup) => backup,
-                // The file is fine; do not set it aside.
-                Err(why) => return Resume::Failed { why, kept: None },
-            }
-        } else {
-            None
-        };
-        match core.load_state(&data) {
-            Ok(()) => {
+        let sav_is_newer = modified(&self.paths.sav) > modified(&path);
+        match self.apply(core, &data, sav_is_newer) {
+            Ok(backup) => {
                 self.sav_backed_up |= backup.is_some();
                 Resume::Loaded { backup }
             }
-            Err(e) => {
+            Err(Refused::State(e)) => {
+                let aside = match e {
+                    StateError::ModelMismatch => Aside::Mismatch,
+                    _ => Aside::Bad,
+                };
                 let why = load_error(&e, core.system(), core.hw_variant());
-                self.set_aside(&path, why)
+                self.set_aside(&path, aside, why)
             }
+            Err(Refused::Backup(why)) => self.set_aside(&path, Aside::Bad, why),
         }
     }
 
-    /// Keep an unusable resume point as `resume.state.bad` instead of deleting it.
-    fn set_aside(&self, path: &Path, why: String) -> Resume {
-        let bad = self.paths.resume_bad();
-        match fs::rename(path, &bad) {
-            Ok(()) => Resume::Failed {
-                why,
-                kept: Some(bad),
-            },
+    /// Move an unusable resume point out of the way, to a name that no earlier one has, and
+    /// keep only the newest [`KEEP_ASIDE`] of its kind.
+    fn set_aside(&self, path: &Path, aside: Aside, why: String) -> Resume {
+        let dir = self.paths.states_dir();
+        let newest = list_aside(dir, aside).first().copied();
+        let secs = newest.map_or(now_secs(), |n| now_secs().max(n + 1));
+        let target = dir.join(format!("resume-{secs}.{}", aside.ext()));
+        match fs::rename(path, &target) {
+            Ok(()) => {
+                for old in list_aside(dir, aside).into_iter().skip(KEEP_ASIDE) {
+                    let file = dir.join(format!("resume-{old}.{}", aside.ext()));
+                    if let Err(e) = fs::remove_file(&file) {
+                        log::warn!("cannot delete {}: {e}", file.display());
+                    }
+                }
+                Resume::Failed {
+                    why,
+                    aside,
+                    kept: Some(target),
+                }
+            }
             Err(e) => {
-                log::warn!("cannot keep {} as {}: {e}", path.display(), bad.display());
-                Resume::Failed { why, kept: None }
+                log::warn!(
+                    "cannot keep {} as {}: {e}",
+                    path.display(),
+                    target.display()
+                );
+                Resume::Failed {
+                    why,
+                    aside,
+                    kept: None,
+                }
             }
         }
     }
@@ -233,7 +317,8 @@ impl StateStore {
 
     /// Add a snapshot of `core` taken at `now` (Unix seconds), with the picture `png` if
     /// there is one (a picture that cannot be written is only logged). Past
-    /// [`MAX_SNAPSHOTS`] the oldest are removed.
+    /// [`MAX_SNAPSHOTS`] the oldest are removed. The folder is scanned once, and the result
+    /// is handed back as [`SnapshotSaved::snapshots`].
     pub fn save_snapshot(
         &self,
         core: &dyn Core,
@@ -243,25 +328,35 @@ impl StateStore {
         if !core.supports_save_state() {
             return Err(NO_STATES.to_owned());
         }
+        let mut all = list_snapshots(&self.paths);
         // Never the name of an existing snapshot, and never older than the newest, so two
         // saves in one second (or a clock set back) still list in the order they were made.
-        let newest = list_snapshots(&self.paths).first().map(|s| s.secs);
-        let secs = newest.map_or(now, |n| now.max(n.saturating_add(1)));
+        let secs = all
+            .first()
+            .map_or(now, |newest| now.max(newest.secs.saturating_add(1)));
         self.write(&self.paths.snapshot_state(secs), &core.save_state())?;
-        if let Some(png) = png {
+        let image = png.and_then(|png| {
             let path = self.paths.snapshot_image(secs);
-            if let Err(e) = write_atomic(&path, png) {
-                log::warn!("cannot write {}: {e}", path.display());
+            match write_atomic(&path, png) {
+                Ok(()) => Some(path),
+                Err(e) => {
+                    log::warn!("cannot write {}: {e}", path.display());
+                    None
+                }
             }
-        }
+        });
+        all.insert(0, Snapshot { secs, image });
+        let evicted = prune_list(&self.paths, &mut all);
         Ok(SnapshotSaved {
             secs,
-            evicted: prune_snapshots(&self.paths),
+            evicted,
+            snapshots: all,
         })
     }
 
     /// Load the snapshot taken at `secs` into `core`. On error `core` is unchanged. The
-    /// first load of a session copies the `.sav` aside; the path of the copy is returned.
+    /// first load of a session copies the `.sav` aside, once the state is known to load; the
+    /// path of the copy is returned.
     pub fn load_snapshot(
         &mut self,
         core: &mut dyn Core,
@@ -276,15 +371,50 @@ impl StateStore {
             Ok(None) => return Err("that snapshot is gone".to_owned()),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
-        let backup = self.backup_sav_once()?;
-        core.load_state(&data).map_err(|e| {
-            format!(
-                "cannot load the snapshot: {}",
-                load_error(&e, core.system(), core.hw_variant())
-            )
-        })?;
+        let backup = self
+            .apply(core, &data, true)
+            .map_err(|refused| match refused {
+                Refused::State(e) => format!(
+                    "cannot load the snapshot: {}",
+                    load_error(&e, core.system(), core.hw_variant())
+                ),
+                Refused::Backup(why) => why,
+            })?;
         self.sav_backed_up = true;
         Ok(backup)
+    }
+
+    /// Load `data` into `core`. If `backup_wanted`, the game's `.sav` is copied aside first
+    /// time this session, after the core has accepted the state; should that copy fail, the
+    /// state from before is put back. A state the core refuses leaves `core` unchanged and
+    /// makes no copy.
+    fn apply(
+        &self,
+        core: &mut dyn Core,
+        data: &[u8],
+        backup_wanted: bool,
+    ) -> Result<Option<PathBuf>, Refused> {
+        let sav = &self.paths.sav;
+        let backup_wanted = backup_wanted && !self.sav_backed_up && sav.is_file();
+        let before = backup_wanted.then(|| core.save_state());
+        core.load_state(data).map_err(Refused::State)?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        // The file on disk is untouched until the battery saver next runs, so the copy still
+        // holds the progress the state would rewind.
+        match backup_without_overwrite(sav) {
+            Ok(backup) => Ok(Some(backup)),
+            Err(e) => {
+                if let Err(undo) = core.load_state(&before) {
+                    log::error!("cannot put the game back after a refused load: {undo}");
+                }
+                Err(Refused::Backup(format!(
+                    "not loading: cannot back up {} first: {e}",
+                    sav.display()
+                )))
+            }
+        }
     }
 
     /// Delete the snapshot taken at `secs`, picture included.
@@ -297,43 +427,58 @@ impl StateStore {
             .and_then(|()| write_atomic(path, data))
             .map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
-
-    /// Before the first load of a session that could rewind it, copy the game's `.sav`
-    /// aside: the loaded state's battery RAM replaces it on the next autosave. Refuses the
-    /// load if the copy fails, so real progress is never silently overwritten.
-    fn backup_sav_once(&self) -> Result<Option<PathBuf>, String> {
-        let sav = &self.paths.sav;
-        if self.sav_backed_up || !sav.is_file() {
-            return Ok(None);
-        }
-        backup_without_overwrite(sav)
-            .map(Some)
-            .map_err(|e| format!("not loading: cannot back up {} first: {e}", sav.display()))
-    }
 }
 
 fn modified(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// The times of the put-aside resume points of one kind, newest first.
+fn list_aside(dir: &Path, aside: Aside) -> Vec<u64> {
+    let Ok(listing) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<u64> = listing
+        .filter_map(Result::ok)
+        .filter_map(|e| aside_secs(&e.file_name().to_string_lossy(), aside))
+        .collect();
+    found.sort_unstable_by_key(|&s| std::cmp::Reverse(s));
+    found
+}
+
+/// The snapshots in the game's folder, newest first, in one scan. A picture whose
+/// snapshot is gone (an interrupted delete) is removed on the way.
 fn list_snapshots(paths: &GamePaths) -> Vec<Snapshot> {
     let Ok(listing) = fs::read_dir(paths.states_dir()) else {
         return Vec::new();
     };
-    let mut found: Vec<Snapshot> = listing
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter_map(|e| snapshot_secs(&e.file_name().to_string_lossy(), "state"))
-        .map(|secs| {
-            let image = paths.snapshot_image(secs);
-            Snapshot {
-                secs,
-                image: image.is_file().then_some(image),
-            }
+    let (mut states, mut images) = (Vec::new(), HashSet::new());
+    for entry in listing.filter_map(Result::ok) {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(secs) = snapshot_secs(&name, "state") {
+            states.push(secs);
+        } else if let Some(secs) = snapshot_secs(&name, "png") {
+            images.insert(secs);
+        }
+    }
+    for orphan in images.iter().filter(|s| !states.contains(s)) {
+        let file = paths.snapshot_image(*orphan);
+        log::info!("removing {}, whose snapshot is gone", file.display());
+        if let Err(e) = fs::remove_file(&file) {
+            log::warn!("cannot delete {}: {e}", file.display());
+        }
+    }
+    states.sort_unstable_by_key(|&s| std::cmp::Reverse(s));
+    states
+        .into_iter()
+        .map(|secs| Snapshot {
+            secs,
+            image: images.contains(&secs).then(|| paths.snapshot_image(secs)),
         })
-        .collect();
-    found.sort_by_key(|s| std::cmp::Reverse(s.secs));
-    found
+        .collect()
 }
 
 fn remove_snapshot(paths: &GamePaths, secs: u64) {
@@ -346,18 +491,18 @@ fn remove_snapshot(paths: &GamePaths, secs: u64) {
     }
 }
 
-/// Remove the oldest snapshots beyond [`MAX_SNAPSHOTS`]; returns how many went.
-fn prune_snapshots(paths: &GamePaths) -> usize {
-    let all = list_snapshots(paths);
-    let extra = all.len().saturating_sub(MAX_SNAPSHOTS);
-    for old in all.iter().rev().take(extra) {
-        log::info!(
-            "removing the oldest snapshot ({} kept at most)",
-            MAX_SNAPSHOTS
-        );
-        remove_snapshot(paths, old.secs);
+/// Remove the oldest of `all` (newest first) beyond [`MAX_SNAPSHOTS`], from the disk and
+/// the list; returns how many went.
+fn prune_list(paths: &GamePaths, all: &mut Vec<Snapshot>) -> usize {
+    let mut evicted = 0;
+    while all.len() > MAX_SNAPSHOTS {
+        if let Some(old) = all.pop() {
+            log::info!("removing the oldest snapshot ({MAX_SNAPSHOTS} are kept at most)");
+            remove_snapshot(paths, old.secs);
+            evicted += 1;
+        }
     }
-    extra
+    evicted
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +577,7 @@ pub fn migrate_legacy_states(rom: &Path, paths: &GamePaths) -> usize {
             ),
         }
     }
-    prune_snapshots(paths);
+    prune_list(paths, &mut list_snapshots(paths));
     made
 }
 
@@ -595,7 +740,8 @@ mod tests {
         }
         for ours in [
             "resume.state",
-            "resume.state.bad",
+            "resume-1700000000.bad",
+            "resume-1700000000.mismatch",
             "resume.state.tmp",
             "snap-5.state",
             "snap-5.png",
@@ -606,7 +752,10 @@ mod tests {
         for other in [
             "notes.txt",
             "snap-x.state",
-            "resume.state.bad.tmp2",
+            "resume.state.bad",
+            "resume-x.bad",
+            "resume-5.other",
+            "resume-.mismatch",
             "g.sav",
         ] {
             assert!(!is_state_file_name(other), "{other}");
@@ -621,13 +770,8 @@ mod tests {
         gb.step_frame();
         let snap = gb.save_state();
         let saved = store.save_snapshot(&gb, Some(b"png"), 1_000).unwrap();
-        assert_eq!(
-            saved,
-            SnapshotSaved {
-                secs: 1_000,
-                evicted: 0
-            }
-        );
+        assert_eq!((saved.secs, saved.evicted), (1_000, 0));
+        assert_eq!(saved.snapshots, store.snapshots(), "the list it hands back");
         let paths = &store.paths;
         assert_eq!(fs::read(paths.snapshot_state(1_000)).unwrap(), snap);
         assert_eq!(fs::read(paths.snapshot_image(1_000)).unwrap(), b"png");
@@ -704,14 +848,12 @@ mod tests {
         }
         assert_eq!(store.snapshots().len(), MAX_SNAPSHOTS);
         let saved = store.save_snapshot(&gb, Some(b"p"), 10_000).unwrap();
-        assert_eq!(
-            saved,
-            SnapshotSaved {
-                secs: 10_000,
-                evicted: 1
-            }
-        );
+        assert_eq!((saved.secs, saved.evicted), (10_000, 1));
         let list = store.snapshots();
+        assert_eq!(
+            saved.snapshots, list,
+            "the list it hands back, after the eviction"
+        );
         assert_eq!(list.len(), MAX_SNAPSHOTS);
         assert_eq!(list.first().unwrap().secs, 10_000);
         assert_eq!(list.last().unwrap().secs, 20, "the snapshot at 10 went");
@@ -803,15 +945,92 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_load_still_backs_up_before_the_next_try() {
+    fn a_snapshot_that_does_not_load_makes_no_backup() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("g.sav"), vec![1; 0x2000]).unwrap();
         let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let before = gb.save_state();
         let mut store = store_in(dir.path());
         fs::create_dir_all(store.paths.states_dir()).unwrap();
-        fs::write(store.paths.snapshot_state(1), b"junk").unwrap();
-        assert!(store.load_snapshot(&mut gb, 1).is_err());
+        let other = GameBoy::new(battery_rom(0x03)).unwrap().save_state();
+        for bad in [b"junk".to_vec(), other] {
+            fs::write(store.paths.snapshot_state(1), bad).unwrap();
+            assert!(store.load_snapshot(&mut gb, 1).is_err());
+        }
         assert!(!store.sav_backed_up);
+        assert!(
+            !dir.path().join("g.sav.bak").exists(),
+            "a load that cannot happen costs nothing, so it leaves no backup"
+        );
+        assert_eq!(gb.save_state(), before);
+        // A good one still backs up, once, on the next try.
+        store.save_snapshot(&gb, None, 9).unwrap();
+        assert!(store.load_snapshot(&mut gb, 9).unwrap().is_some());
+        assert!(dir.path().join("g.sav.bak").exists());
+    }
+
+    /// A save the backup cannot read: the load is undone and refused.
+    #[cfg(unix)]
+    fn unreadable_sav(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let sav = dir.join("g.sav");
+        fs::write(&sav, vec![0x42; 0x2000]).unwrap();
+        fs::set_permissions(&sav, fs::Permissions::from_mode(0o000)).unwrap();
+        sav
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_load_is_undone_when_the_save_cannot_be_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let mut store = store_in(dir.path());
+        store.save_snapshot(&gb, None, 1).unwrap();
+        for _ in 0..5 {
+            gb.step_frame();
+        }
+        let before = gb.save_state();
+        let sav = unreadable_sav(dir.path());
+        if fs::read(&sav).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        let err = store.load_snapshot(&mut gb, 1).unwrap_err();
+        assert!(err.contains("cannot back up"), "{err}");
+        assert_eq!(gb.save_state(), before, "put back as it was");
+        assert!(!store.sav_backed_up);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_point_is_put_aside_not_left_to_be_overwritten_when_the_save_cannot_be_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let mut store = store_in(dir.path());
+        gb.step_frame();
+        store.save_resume(&gb).unwrap();
+        let resume = fs::read(store.paths.resume_state()).unwrap();
+        for _ in 0..5 {
+            gb.step_frame();
+        }
+        let before = gb.save_state();
+        let sav = unreadable_sav(dir.path());
+        if fs::read(&sav).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        // The save is newer than the resume point (a crash), and cannot be copied.
+        set_mtime(&store.paths.resume_state(), 1_000);
+
+        let Resume::Failed { why, aside, kept } = store.load_resume(&mut gb) else {
+            panic!("the load must be refused");
+        };
+        assert!(why.contains("cannot back up"), "{why}");
+        assert_eq!(aside, Aside::Bad);
+        assert_eq!(gb.save_state(), before, "the machine is as it was");
+        assert!(
+            !store.paths.resume_state().exists(),
+            "nothing left to overwrite"
+        );
+        assert_eq!(fs::read(kept.expect("kept")).unwrap(), resume);
     }
 
     #[test]
@@ -855,12 +1074,14 @@ mod tests {
             fs::create_dir_all(store.paths.states_dir()).unwrap();
             fs::write(store.paths.resume_state(), &content).unwrap();
 
-            let Resume::Failed { why, kept } = store.load_resume(&mut gb) else {
+            let Resume::Failed { why, aside, kept } = store.load_resume(&mut gb) else {
                 panic!("a bad file must not load");
             };
             assert!(!why.is_empty());
+            assert_eq!(aside, Aside::Bad);
             let kept = kept.expect("kept aside");
-            assert!(kept.ends_with("resume.state.bad"));
+            let name = kept.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(aside_secs(&name, Aside::Bad).is_some(), "{name}");
             assert_eq!(
                 fs::read(&kept).unwrap(),
                 content,
@@ -874,6 +1095,93 @@ mod tests {
                 "only tried once"
             );
         }
+    }
+
+    #[test]
+    fn a_resume_point_from_other_options_is_set_aside_as_a_mismatch_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dmg = GameBoy::with_model(cgb_rom(0x02), Model::Dmg).unwrap();
+        let cgb = GameBoy::with_model(cgb_rom(0x02), Model::Cgb).unwrap();
+        let mut store = store_in(dir.path());
+        let mut kept = Vec::new();
+        // Two runs in a row, each finding the resume point the other kind of run left.
+        for run in 0..2u8 {
+            let mut left = GameBoy::with_model(cgb_rom(0x02), Model::Cgb).unwrap();
+            for _ in 0..=run {
+                left.step_frame();
+            }
+            store.save_resume(&left).unwrap();
+            let Resume::Failed {
+                why,
+                aside,
+                kept: Some(file),
+            } = store.load_resume(&mut dmg)
+            else {
+                panic!("a Game Boy Color state must not load into a DMG");
+            };
+            assert_eq!(aside, Aside::Mismatch);
+            assert!(why.contains("--model"), "{why}");
+            assert!(
+                file.to_string_lossy().ends_with(".mismatch"),
+                "{}",
+                file.display()
+            );
+            assert_eq!(fs::read(&file).unwrap(), left.save_state());
+            assert!(!store.paths.resume_state().exists());
+            kept.push(file);
+        }
+        assert_ne!(kept[0], kept[1], "the second run did not replace the first");
+        assert!(kept.iter().all(|f| f.exists()), "both are still there");
+        // A matching run still loads a resume point as usual.
+        store.save_resume(&cgb).unwrap();
+        let mut cgb2 = GameBoy::with_model(cgb_rom(0x02), Model::Cgb).unwrap();
+        assert_eq!(
+            store.load_resume(&mut cgb2),
+            Resume::Loaded { backup: None }
+        );
+    }
+
+    #[test]
+    fn only_the_three_newest_put_aside_files_of_a_kind_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let mut store = store_in(dir.path());
+        let mut files = Vec::new();
+        for n in 0..5u8 {
+            fs::create_dir_all(store.paths.states_dir()).unwrap();
+            fs::write(store.paths.resume_state(), [n; 8]).unwrap();
+            let Resume::Failed {
+                kept: Some(file), ..
+            } = store.load_resume(&mut gb)
+            else {
+                panic!("junk must not load");
+            };
+            files.push(file);
+        }
+        let present: Vec<bool> = files.iter().map(|f| f.exists()).collect();
+        assert_eq!(present, [false, false, true, true, true]);
+        // A kept mismatch is not counted with them.
+        let cgb = GameBoy::with_model(cgb_rom(0x02), Model::Cgb).unwrap();
+        let mut dmg = GameBoy::with_model(cgb_rom(0x02), Model::Dmg).unwrap();
+        store.save_resume(&cgb).unwrap();
+        assert!(matches!(store.load_resume(&mut dmg), Resume::Failed { .. }));
+        assert!(files[2..].iter().all(|f| f.exists()));
+    }
+
+    #[test]
+    fn a_picture_whose_snapshot_is_gone_is_removed_when_the_folder_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let store = store_in(dir.path());
+        store.save_snapshot(&gb, Some(b"a"), 10).unwrap();
+        store.save_snapshot(&gb, Some(b"b"), 20).unwrap();
+        fs::remove_file(store.paths.snapshot_state(10)).unwrap(); // an interrupted delete
+        assert_eq!(
+            store.snapshots().iter().map(|s| s.secs).collect::<Vec<_>>(),
+            [20]
+        );
+        assert!(!store.paths.snapshot_image(10).exists(), "the orphan went");
+        assert!(store.paths.snapshot_image(20).exists());
     }
 
     #[test]

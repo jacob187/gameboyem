@@ -226,10 +226,21 @@ pub struct Toasts {
 impl Toasts {
     /// Show `text` until `now + TOAST_DURATION`. The same text again just stays longer.
     pub fn push(&mut self, level: log::Level, text: impl Into<String>, now: Instant) {
+        self.push_for(level, text, now, TOAST_DURATION);
+    }
+
+    /// [`Toasts::push`] for `duration` instead of the usual time.
+    pub fn push_for(
+        &mut self,
+        level: log::Level,
+        text: impl Into<String>,
+        now: Instant,
+        duration: Duration,
+    ) {
         let text = text.into();
-        let until = now + TOAST_DURATION;
+        let until = now + duration;
         if let Some(t) = self.items.iter_mut().find(|t| t.text == text) {
-            t.until = until;
+            t.until = t.until.max(until);
             t.level = level;
             return;
         }
@@ -639,6 +650,28 @@ mod tests {
         assert_eq!(toasts.iter().count(), 1);
         assert_eq!(toasts.expire(t0 + Duration::from_secs(60)), None);
         assert!(toasts.is_empty());
+    }
+
+    #[test]
+    fn a_long_toast_stays_longer_than_the_usual_time() {
+        let t0 = Instant::now();
+        let mut toasts = Toasts::default();
+        toasts.push_for(log::Level::Warn, "read me", t0, Duration::from_secs(8));
+        assert_eq!(
+            toasts.expire(t0 + TOAST_DURATION),
+            Some(t0 + Duration::from_secs(8)),
+            "still there after the usual time"
+        );
+        assert!(toasts.expire(t0 + Duration::from_secs(8)).is_none());
+
+        // The same text pushed again for less time does not cut the long one short.
+        toasts.push_for(log::Level::Warn, "read me", t0, Duration::from_secs(8));
+        toasts.push(log::Level::Warn, "read me", t0);
+        assert_eq!(toasts.iter().count(), 1);
+        assert_eq!(
+            toasts.expire(t0 + TOAST_DURATION),
+            Some(t0 + Duration::from_secs(8))
+        );
     }
 
     #[test]

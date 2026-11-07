@@ -109,6 +109,30 @@ pub struct Options {
     pub gb_only: Vec<&'static str>,
 }
 
+impl Options {
+    /// The options the player passed that change how a game powers on or what a state of it
+    /// holds (`--model`, `--system`, `--bios`, `--save-type`, `--rtc`, `--rtc-start`), in the
+    /// order of that list. A resume point was made without them, so it is not used when any
+    /// is given. `--palette` only changes the colours drawn, so it is not one.
+    pub fn power_on_flags(&self) -> Vec<&'static str> {
+        let passed = |flag: &str| self.gb_only.contains(&flag) || self.gba_only.contains(&flag);
+        let mut flags = Vec::new();
+        for (flag, given) in [
+            ("--model", passed("--model")),
+            ("--system", self.system.is_some()),
+            ("--bios", self.bios.is_some()),
+            ("--save-type", passed("--save-type")),
+            ("--rtc", passed("--rtc")),
+            ("--rtc-start", passed("--rtc-start")),
+        ] {
+            if given {
+                flags.push(flag);
+            }
+        }
+        flags
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Run(Options),
@@ -736,6 +760,34 @@ mod tests {
         );
         assert!(p(&["--record=", "g.gb"]).is_err());
         assert!(p(&["--record", "s", "--test-pattern", "g.gb"]).is_err());
+    }
+
+    #[test]
+    fn power_on_options_are_the_ones_that_change_a_state() {
+        let flags = |args: &[&str]| run(args).power_on_flags();
+        assert!(flags(&["g.gb"]).is_empty());
+        assert!(flags(&["--scale", "2", "--mute", "--palette", "grey", "g.gb"]).is_empty());
+        assert_eq!(flags(&["--model", "dmg", "g.gb"]), ["--model"]);
+        assert_eq!(
+            flags(&["--model=auto", "g.gb"]),
+            ["--model"],
+            "even the default value"
+        );
+        assert_eq!(
+            flags(&[
+                "--rtc-start=2001-02-03T04:05:06",
+                "--bios",
+                "b.bin",
+                "--save-type",
+                "sram",
+                "--rtc",
+                "on",
+                "--system",
+                "gba",
+                "g.gba"
+            ]),
+            ["--system", "--bios", "--save-type", "--rtc", "--rtc-start"]
+        );
     }
 
     #[test]
