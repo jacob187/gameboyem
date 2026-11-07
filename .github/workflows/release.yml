@@ -1,0 +1,212 @@
+name: Release
+
+# A pushed tag `v*` builds the installers on every platform and publishes them, with a
+# SHA256SUMS file, as a GitHub Release. A manual run (Actions > Release > Run workflow)
+# builds the same packages and keeps them as workflow artifacts only: nothing is released.
+#
+# The packages are unsigned. The optional signing steps below turn on by themselves when
+# the matching repository secrets exist; see "Optional signing" in each job.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Installed with `cargo install`; bump deliberately.
+  CARGO_PACKAGER_VERSION: "0.11.8"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 and macos-13 are retired. macos-15 is arm64; macos-15-intel is the
+          # last Intel image GitHub offers, so the x86_64 build runs natively on it.
+          - name: macos-arm64
+            os: macos-15
+            formats: dmg
+          - name: macos-x86_64
+            os: macos-15-intel
+            formats: dmg
+          - name: windows-x64
+            os: windows-latest
+            formats: nsis
+          # The oldest image on offer, for the oldest glibc (2.35): the AppImage and the
+          # binary then run on any distribution at least that new. If GitHub retires
+          # ubuntu-22.04, move to ubuntu-24.04 and install libfuse2t64 instead of libfuse2.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            formats: appimage,deb
+    defaults:
+      run:
+        shell: bash
+    env:
+      # GitHub does not allow the `secrets` context in a step's `if:`, so each optional
+      # step is gated on one of these job-level flags instead. They hold only
+      # 'true' or 'false', never a secret's value.
+      HAVE_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      HAVE_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same packages ci.yml installs, plus FUSE for the AppImage tooling.
+      - name: Install Linux system dependencies (X11, Wayland, ALSA, udev, FUSE)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libwayland-dev libasound2-dev libudev-dev libfuse2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve the version
+        run: |
+          version=$(cargo pkgid -p gb-frontend | sed 's/.*[#@]//')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the crate version $VERSION; bump [workspace.package] version in Cargo.toml first"
+            exit 1
+          fi
+
+      - name: Build (release profile)
+        run: cargo build --release --locked -p gb-frontend
+
+      - name: Cache cargo-packager
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-packager*
+          key: cargo-packager-${{ env.CARGO_PACKAGER_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-packager
+        run: |
+          if ! command -v cargo-packager >/dev/null; then
+            cargo install cargo-packager --version "$CARGO_PACKAGER_VERSION" --locked
+          fi
+
+      # ---- Optional signing (untested: no certificates exist yet) --------------------
+      # Each step runs only when its secrets are set. Without them the build is unsigned.
+      #
+      # macOS needs the repository secrets APPLE_CERTIFICATE (base64 of a Developer ID
+      # Application .p12), APPLE_CERTIFICATE_PASSWORD and APPLE_SIGNING_IDENTITY
+      # ("Developer ID Application: Name (TEAMID)"). To notarize as well, add APPLE_ID,
+      # APPLE_PASSWORD (an app-specific password) and APPLE_TEAM_ID. The packager signs
+      # the .app and notarizes it when it finds all of them; it takes the signing
+      # identity from its config, so this step adds it there.
+      - name: Enable macOS code signing (optional)
+        if: runner.os == 'macOS' && env.HAVE_APPLE_CERT == 'true'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          printf '\n[package.metadata.packager.macos]\nsigningIdentity = "%s"\n' "$APPLE_SIGNING_IDENTITY" >> crates/gb-frontend/Cargo.toml
+
+      # Windows needs WINDOWS_CERTIFICATE (base64 of a code-signing .pfx) and
+      # WINDOWS_CERTIFICATE_PASSWORD. The certificate is imported into the user's store
+      # and the packager signs gb.exe, the uninstaller and the installer with signtool.
+      - name: Enable Windows code signing (optional)
+        if: runner.os == 'Windows' && env.HAVE_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          Add-Content crates/gb-frontend/Cargo.toml @"
+
+          [package.metadata.packager.windows]
+          certificateThumbprint = "$($cert.Thumbprint)"
+          digestAlgorithm = "sha256"
+          timestampUrl = "http://timestamp.digicert.com"
+          "@
+
+      - name: Package
+        env:
+          # Read by the packager only when macOS signing is enabled above; ignored otherwise.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # The AppImage tools are AppImages themselves: run them without FUSE.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "1"
+        run: |
+          mkdir dist
+          cargo packager --release -p gb-frontend --formats "${{ matrix.formats }}" -o dist -v
+          ls -l dist
+
+      # Descriptive file names: gameboyem-<version>-<os>-<arch>.<ext>.
+      - name: Collect release files
+        run: |
+          mkdir release
+          stem="gameboyem-$VERSION-${{ matrix.name }}"
+          case "$RUNNER_OS" in
+            macOS)
+              cp dist/*.dmg "release/$stem.dmg"
+              ;;
+            Windows)
+              cp dist/*-setup.exe "release/$stem-setup.exe"
+              pwsh -NoProfile -Command "Compress-Archive -Path target/release/gb.exe -DestinationPath release/$stem-portable.zip"
+              ;;
+            Linux)
+              cp dist/*.AppImage "release/$stem.AppImage"
+              chmod +x "release/$stem.AppImage"
+              cp dist/*.deb "release/$stem.deb"
+              mkdir "$stem"
+              cp target/release/gb "$stem/"
+              tar -czf "release/$stem.tar.gz" "$stem"
+              ;;
+          esac
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gameboyem-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Only for a pushed tag. A manual run stops after `build` and leaves the artifacts.
+  release:
+    name: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gameboyem-*
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd release
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v3.0.4
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
