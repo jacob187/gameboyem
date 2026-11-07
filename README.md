@@ -289,3 +289,11 @@ Everything here is a deliberate approximation or an unimplemented feature.
 ### Both
 
 - **Not supported:** debugger, rewind and shaders, and for the Game Boy, the link cable.
+
+## Legal
+
+This project is not affiliated with or endorsed by Nintendo. Game Boy, Game Boy Color and Game Boy Advance are trademarks of Nintendo.
+
+No games, BIOS images or other copyrighted Nintendo files are included in this repository or downloaded by its scripts. You need ROMs you have obtained legally, such as dumps of cartridges you own. The test ROMs the scripts fetch come from their authors' repositories under their own licences, as described above.
+
+The code is released under the [MIT licence](LICENSE).
