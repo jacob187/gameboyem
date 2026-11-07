@@ -269,10 +269,15 @@ impl GamePaths {
         append_ext(&self.state_prefix, &format!("ss{slot}"))
     }
 
-    /// The screenshot of emulated frame `frame`: `screenshots/<id>-f0001234.png`.
-    pub fn screenshot(&self, frame: u64) -> PathBuf {
+    /// The screenshot of emulated frame `frame` taken at `unix_secs` (wall clock, UTC):
+    /// `screenshots/<id>-20261107-190305-f0001234.png`. The time keeps a later session's
+    /// screenshot of the same frame number from replacing this one.
+    pub fn screenshot(&self, unix_secs: u64, frame: u64) -> PathBuf {
         let mut name = self.screenshot_prefix.clone().into_os_string();
-        name.push(format!("-f{frame:07}.png"));
+        name.push(format!(
+            "-{}-f{frame:07}.png",
+            crate::logging::utc_compact(unix_secs)
+        ));
         PathBuf::from(name)
     }
 
@@ -440,7 +445,7 @@ fn has_rom_extension(path: &Path) -> bool {
     })
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -908,7 +913,7 @@ impl Library {
         if saves == RemoveSaves::Delete {
             remove_with_prefix(&self.data.saves(), &format!("{id}."));
             remove_with_prefix(&self.data.states(), &format!("{id}."));
-            remove_with_prefix(&self.data.screenshots(), &format!("{id}-f"));
+            remove_screenshots(&self.data.screenshots(), id);
         }
         log::info!(
             "removed {id} from the library ({})",
@@ -1110,6 +1115,37 @@ fn remove_file_logged(path: &Path) {
     }
 }
 
+/// Whether `rest` is what follows `<id>-` in a screenshot name:
+/// `YYYYMMDD-HHMMSS-fNNNNNNN.png`.
+fn is_screenshot_suffix(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    b.len() == 28
+        && digits(0..8)
+        && b[8] == b'-'
+        && digits(9..15)
+        && b[15] == b'-'
+        && b[16] == b'f'
+        && digits(17..24)
+        && &b[24..] == b".png"
+}
+
+/// Delete the screenshots of `id` in `dir`. The whole name is checked, so another
+/// game whose id merely starts with this one's is not touched.
+fn remove_screenshots(dir: &Path, id: &GameId) {
+    let Ok(listing) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{id}-");
+    for entry in listing.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = name.strip_prefix(&prefix).is_some_and(is_screenshot_suffix);
+        if ours && entry.file_type().is_ok_and(|t| t.is_file()) {
+            remove_file_logged(&entry.path());
+        }
+    }
+}
+
 /// Delete the regular files in `dir` whose name starts with `prefix`.
 fn remove_with_prefix(dir: &Path, prefix: &str) {
     let Ok(listing) = fs::read_dir(dir) else {
@@ -1218,8 +1254,10 @@ mod tests {
         assert_eq!(p.sav, PathBuf::from(format!("/app/saves/{name}.sav")));
         assert_eq!(p.state(3), PathBuf::from(format!("/app/states/{name}.ss3")));
         assert_eq!(
-            p.screenshot(1234),
-            PathBuf::from(format!("/app/screenshots/{name}-f0001234.png"))
+            p.screenshot(1_700_000_000, 1234),
+            PathBuf::from(format!(
+                "/app/screenshots/{name}-20231114-221320-f0001234.png"
+            ))
         );
         // Other content gives other files; the same content the same ones.
         let other = GameId::new("MOTH", rom_hash(&gb_rom("MOTH", 1)));
@@ -1364,7 +1402,7 @@ mod tests {
         let paths = lib.paths_for(&e.id);
         fs::write(&paths.sav, b"save").unwrap();
         fs::write(paths.state(1), b"state").unwrap();
-        fs::write(paths.screenshot(5), b"png").unwrap();
+        fs::write(paths.screenshot(0, 5), b"png").unwrap();
         lib.set_thumbnail(&e.id, &tiny_png()).unwrap();
 
         let removed = lib.remove(&e.id, RemoveSaves::Keep).unwrap();
@@ -1372,7 +1410,7 @@ mod tests {
         assert!(lib.entries().is_empty());
         assert!(!e.rom_path.exists());
         assert!(!thumbnail_path(&f.data, &e.id).exists());
-        assert!(paths.sav.exists() && paths.state(1).exists() && paths.screenshot(5).exists());
+        assert!(paths.sav.exists() && paths.state(1).exists() && paths.screenshot(0, 5).exists());
         assert!(Library::open(&f.data).entries().is_empty());
         assert!(lib.remove(&e.id, RemoveSaves::Keep).is_err());
     }
@@ -1394,7 +1432,7 @@ mod tests {
             fs::write(&p.sav, b"s").unwrap();
             fs::write(append_ext(&p.sav, "bak"), b"s").unwrap();
             fs::write(p.state(9), b"s").unwrap();
-            fs::write(p.screenshot(1), b"s").unwrap();
+            fs::write(p.screenshot(0, 1), b"s").unwrap();
         }
         lib.remove(&e.id, RemoveSaves::Delete).unwrap();
         let gone = lib.paths_for(&e.id);
@@ -1402,12 +1440,12 @@ mod tests {
             gone.sav.clone(),
             append_ext(&gone.sav, "bak"),
             gone.state(9),
-            gone.screenshot(1),
+            gone.screenshot(0, 1),
         ] {
             assert!(!path.exists(), "{}", path.display());
         }
         let kept = lib.paths_for(&other.id);
-        assert!(kept.sav.exists() && kept.state(9).exists() && kept.screenshot(1).exists());
+        assert!(kept.sav.exists() && kept.state(9).exists() && kept.screenshot(0, 1).exists());
         assert!(lib.get(&other.id).is_some());
     }
 
@@ -1985,8 +2023,19 @@ mod tests {
     #[test]
     fn screenshot_names_count_frames_in_seven_digits() {
         let p = GamePaths::beside(Path::new("shots/Red.gb"));
-        assert_eq!(p.screenshot(1234), PathBuf::from("shots/Red-f0001234.png"));
-        assert_eq!(p.screenshot(5), PathBuf::from("shots/Red-f0000005.png"));
+        let at = 1_700_000_000;
+        assert_eq!(
+            p.screenshot(at, 1234),
+            PathBuf::from("shots/Red-20231114-221320-f0001234.png")
+        );
+        assert_eq!(
+            p.screenshot(at, 5),
+            PathBuf::from("shots/Red-20231114-221320-f0000005.png")
+        );
+        // The same frame in a later session does not reuse the name.
+        assert_ne!(p.screenshot(at, 5), p.screenshot(at + 60, 5));
+        assert!(!is_screenshot_suffix("f0000005.png"));
+        assert!(is_screenshot_suffix("20231114-221320-f0000005.png"));
         assert_eq!(p.sav, PathBuf::from("shots/Red.sav"));
         assert_eq!(p.state(2), PathBuf::from("shots/Red.ss2"));
     }

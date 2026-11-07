@@ -447,7 +447,9 @@ impl<C: Core> App<C> {
 
     /// Save the picture on screen in the game's screenshots and mark the frame.
     fn screenshot(&mut self) {
-        let path = self.paths.screenshot(self.frame);
+        let path = self
+            .paths
+            .screenshot(crate::library::now_secs(), self.frame);
         let frame = frame_of(self.test.as_ref(), &self.core);
         match record::write_png(frame, &path) {
             Ok(()) => log::info!("screenshot: {} (frame {})", path.display(), self.frame),
@@ -913,6 +915,47 @@ mod tests {
         (marker, total)
     }
 
+    /// The one screenshot of `frame` in `dir`, whatever second it was taken in.
+    fn screenshot_file(dir: &std::path::Path, frame: u64) -> PathBuf {
+        let suffix = format!("-f{frame:07}.png");
+        let found: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().ends_with(&suffix))
+            .collect();
+        assert_eq!(found.len(), 1, "screenshots of frame {frame}: {found:?}");
+        found.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_screenshot_name_carries_the_time_and_does_not_replace_an_earlier_one() {
+        use winit::keyboard::KeyCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.on_key_input(KeyCode::KeyC, true);
+        let first = screenshot_file(dir.path(), 0);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(is_stamped(&name), "{name}");
+
+        // A screenshot of the same frame from an earlier session sits there already.
+        let earlier = dir.path().join("g-19990101-000000-f0000000.png");
+        fs::write(&earlier, b"old session").unwrap();
+        app.on_key_input(KeyCode::KeyC, true);
+        assert_eq!(fs::read(&earlier).unwrap(), b"old session");
+        assert!(first.exists());
+    }
+
+    /// `g-YYYYMMDD-HHMMSS-fNNNNNNN.png`
+    fn is_stamped(name: &str) -> bool {
+        let b = name.as_bytes();
+        name.starts_with("g-")
+            && name.ends_with("-f0000000.png")
+            && b.len() == "g-20231114-221320-f0000000.png".len()
+            && b[2..10].iter().all(u8::is_ascii_digit)
+            && b[11..17].iter().all(u8::is_ascii_digit)
+    }
+
     /// Replay `rec` headlessly and require the machine, the colour or shade
     /// frame, and the screenshot file to be identical to the live session's.
     fn assert_replays_identically(
@@ -948,7 +991,7 @@ mod tests {
             }
         };
         step(&mut gb, &mut player, marker);
-        let shot = fs::read(GamePaths::beside(&dir.join("g.gb")).screenshot(marker)).unwrap();
+        let shot = fs::read(screenshot_file(dir, marker)).unwrap();
         let replayed = dir.join("replayed.png");
         record::write_png(gb.frame(), &replayed).unwrap();
         assert_eq!(
@@ -1355,7 +1398,7 @@ mod tests {
             }
         };
         step(&mut gba, marker);
-        let shot = fs::read(GamePaths::beside(&rom_path).screenshot(marker)).unwrap();
+        let shot = fs::read(screenshot_file(dir.path(), marker)).unwrap();
         let replayed = dir.path().join("replayed.png");
         record::write_png(Core::frame(&gba), &replayed).unwrap();
         assert_eq!(

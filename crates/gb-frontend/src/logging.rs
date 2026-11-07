@@ -171,6 +171,18 @@ fn utc_timestamp(since_epoch: Duration) -> String {
     )
 }
 
+/// `1700000000` as `20231114-221320` (UTC), for file names.
+pub(crate) fn utc_compact(secs: u64) -> String {
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let day_secs = secs % 86_400;
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+        day_secs / 3600,
+        day_secs % 3600 / 60,
+        day_secs % 60
+    )
+}
+
 /// Days since 1970-01-01 to a calendar date (Howard Hinnant's `civil_from_days`).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -362,6 +374,13 @@ mod tests {
         assert_eq!(t(1_700_000_000, 500), "2023-11-14T22:13:20.500Z");
         assert_eq!(t(951_782_400, 0), "2000-02-29T00:00:00.000Z");
         assert_eq!(t(4_102_444_800, 7), "2100-01-01T00:00:00.007Z");
+    }
+
+    #[test]
+    fn compact_stamps_are_utc_and_sort_by_time() {
+        assert_eq!(utc_compact(0), "19700101-000000");
+        assert_eq!(utc_compact(1_700_000_000), "20231114-221320");
+        assert!(utc_compact(1_700_000_000) < utc_compact(1_700_000_001));
     }
 
     #[test]
