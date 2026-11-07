@@ -4,6 +4,7 @@
 
 mod app;
 mod audio;
+mod bundled;
 mod cli;
 mod keymap;
 mod library;
@@ -185,6 +186,9 @@ fn main() -> ExitCode {
         );
     }
     log_startup(data.as_ref());
+    if let Some(data) = &data {
+        bundled::register_all(&mut Library::open(data));
+    }
 
     if opts.add {
         let Some(data) = &data else {
