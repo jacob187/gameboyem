@@ -186,9 +186,6 @@ fn main() -> ExitCode {
         );
     }
     log_startup(data.as_ref());
-    if let Some(data) = &data {
-        bundled::register_all(&mut Library::open(data));
-    }
 
     if opts.add {
         let Some(data) = &data else {
@@ -196,6 +193,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         };
         return add_to_library(data, opts.rom.take());
+    }
+
+    // List the bundled games in the library (not for `--add`, which returned above).
+    // Logs and carries on if it fails. Fold this open into the one the library UI makes.
+    if let Some(data) = &data {
+        bundled::register_all(&mut Library::open(data));
     }
 
     // Started from a launcher there is no command line: ask for the ROM. When it
