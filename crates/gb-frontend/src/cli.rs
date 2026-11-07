@@ -200,6 +200,8 @@ where
                 model = parse_model(&text["--model=".len()..])?;
                 push_unique(&mut gb_only, "--model");
             }
+            // Older macOS passes `-psn_0_<n>` when Finder opens an app; it is not a ROM or an option.
+            _ if text.starts_with("-psn_") => {}
             _ if text.starts_with('-') && text.len() > 1 => {
                 return Err(format!("unknown option `{text}`"));
             }
@@ -748,6 +750,21 @@ mod tests {
     fn double_dash_allows_at_most_one_rom() {
         assert!(p(&["--", "a.gb", "b.gb"]).is_err());
         assert!(p(&["a.gb", "--", "b.gb"]).is_err());
+    }
+
+    #[test]
+    fn the_process_serial_number_argument_from_finder_is_ignored() {
+        assert_eq!(run(&["-psn_0_12345"]).rom, None);
+        assert_eq!(
+            run(&["-psn_0_12345", "g.gb"]).rom,
+            Some(PathBuf::from("g.gb"))
+        );
+        // After `--` it is a ROM path like any other.
+        assert_eq!(
+            run(&["--", "-psn_0_1"]).rom,
+            Some(PathBuf::from("-psn_0_1"))
+        );
+        assert!(p(&["-pxn_0_1"]).is_err());
     }
 
     #[test]

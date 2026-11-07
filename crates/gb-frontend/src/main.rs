@@ -110,6 +110,13 @@ fn power_on(opts: &cli::Options, path: &Path) -> Result<(Box<dyn Core>, u64), Po
     .map_err(PowerOnError::Load)
 }
 
+fn new_event_loop() -> Result<EventLoop<()>, ExitCode> {
+    EventLoop::new().map_err(|e| {
+        eprintln!("error: cannot start the windowing system: {e}");
+        ExitCode::FAILURE
+    })
+}
+
 fn main() -> ExitCode {
     let mut opts = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Run(o)) => o,
@@ -123,26 +130,27 @@ fn main() -> ExitCode {
         }
     };
 
-    // Before any dialog: on macOS winit creates the application object here, so
-    // the dialog then runs against the app winit set up.
-    let event_loop = match EventLoop::new() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: cannot start the windowing system: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Started from a launcher there is no command line: ask for the ROM.
+    // Started from a launcher there is no command line: ask for the ROM. When it
+    // will ask, the event loop is built first: on macOS winit creates the
+    // application object there and sets up its launch handling, and the dialog
+    // should run against that. Otherwise it is built after the ROM loads, so a bad
+    // path is reported without needing a display.
+    let mut event_loop = None;
     let rom_path = match picker::startup(opts.rom.take(), opts.test_pattern) {
         Startup::Given(path) => path,
-        Startup::Ask => match picker::pick_rom() {
-            Some(path) => path,
-            None => {
-                eprintln!("no ROM chosen");
-                return ExitCode::SUCCESS;
+        Startup::Ask => {
+            event_loop = match new_event_loop() {
+                Ok(l) => Some(l),
+                Err(code) => return code,
+            };
+            match picker::pick_rom() {
+                Some(path) => path,
+                None => {
+                    eprintln!("no ROM chosen");
+                    return ExitCode::SUCCESS;
+                }
             }
-        },
+        }
         Startup::Missing => {
             eprintln!("error: missing ROM path\n\n{}", cli::USAGE);
             return ExitCode::from(2);
@@ -206,6 +214,10 @@ fn main() -> ExitCode {
         }
     };
 
+    let event_loop = match event_loop.map_or_else(new_event_loop, Ok) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
     let shutdown = ShutdownFlag::default();
     {
         let flag = shutdown.clone();
