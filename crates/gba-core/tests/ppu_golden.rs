@@ -2,9 +2,9 @@
 //! the FNV-1a hash of the framebuffer (little-endian bytes). Set `GBA_PPU_DUMP=1`
 //! to write the frames as PNGs into `target/gba-ppu/` for a visual check.
 //!
-//! The first six scenes use only P1 features (no windows, blending, mosaic, affine
-//! BGs or sprites) and leave those registers at zero, so P2 must not change their
-//! hashes. The last three pin the P2 features.
+//! The first six scenes use only the basic features (no windows, blending, mosaic, affine
+//! BGs or sprites) and leave those registers at zero, so adding those features must
+//! not change their hashes. The last three pin them.
 
 mod common;
 

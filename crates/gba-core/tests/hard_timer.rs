@@ -255,7 +255,7 @@ fn stopping_a_timer_does_not_drop_an_overflow_that_already_happened() {
     let mut b = started_and_past_its_first_overflow(IRQ);
     b.write16(TM + 2, 0, N);
     run(&mut b, 0);
-    assert_ne!(b.irq.if_ & 1 << 3, 0, "timer 0 IRQ (deep-review #13)");
+    assert_ne!(b.irq.if_ & 1 << 3, 0, "timer 0 IRQ");
 }
 
 #[test]
@@ -291,7 +291,7 @@ fn a_reload_write_after_a_due_overflow_takes_effect_from_the_next_one() {
     assert_eq!(b.timers.t[0].reload, 0xFFC0);
     assert_eq!(
         b.timers.t[0].counter, 0xFF00,
-        "the overflow that came first loaded the old reload (deep-review #15)"
+        "the overflow that came first loaded the old reload"
     );
     assert_eq!(
         b.sched.when(Event::TimerOverflow(0)),

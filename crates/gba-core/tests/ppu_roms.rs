@@ -1,7 +1,6 @@
-//! Real-ROM display checks. These need the CPU and system work (P1-CPU + P1-SYS),
-//! which is not part of the PPU branch, so they are `#[ignore]`d and never gate:
-//! each runs a ROM for some frames and dumps the frame as a PNG into
-//! `target/gba-ppu/` for review. Run with `cargo test -p gba-core --test ppu_roms
+//! Real-ROM display checks: each runs a ROM for some frames and dumps the frame
+//! as a PNG into `target/gba-ppu/` for manual review. They assert nothing, so
+//! they are `#[ignore]`d and never gate. Run with `cargo test -p gba-core --test ppu_roms
 //! -- --ignored`. The `roms/` tree is read-only.
 
 mod common;
@@ -32,7 +31,7 @@ fn dump(rel: &str, name: &str) {
 macro_rules! rom_dump {
     ($fn_name:ident, $rel:expr, $name:expr) => {
         #[test]
-        #[ignore = "needs P1-CPU+SYS"]
+        #[ignore = "writes PNGs for manual inspection"]
         fn $fn_name() {
             dump($rel, $name);
         }

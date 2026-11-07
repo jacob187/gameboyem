@@ -1,4 +1,4 @@
-//! P3-CART save handling: the `--save-type` override, an EEPROM driven by CPU
+//! Save handling: the `--save-type` override, an EEPROM driven by CPU
 //! stores, and the battery image with its RTC footer.
 
 mod cart_common;
@@ -214,7 +214,7 @@ fn used_image(id: &[u8], t: RtcTime) -> Vec<u8> {
 
 #[test]
 fn the_battery_image_has_a_footer_only_once_the_clock_is_used() {
-    // Never touched, in any mode: the image is the bare chip, as before P3-CART.
+    // Never touched, in any mode: the image is the bare chip.
     for mode in [RtcMode::Auto, RtcMode::On, RtcMode::Off] {
         let g = gba_with(b"SRAM_V113", SaveChoice::Auto, mode);
         assert_eq!(g.battery_save().unwrap().len(), 32768, "{mode:?}");
@@ -411,7 +411,7 @@ fn set_rtc_clears_the_power_loss_flag_and_bad_times_are_refused() {
     );
 }
 
-/// Code-review K#2/K#3: a game that never talks to a clock keeps a chip-sized
+/// A game that never talks to a clock keeps a chip-sized
 /// `.sav`, however the port was poked and whatever the host did.
 #[test]
 fn a_host_set_clock_and_a_stray_gpio_store_add_no_footer() {
@@ -438,7 +438,7 @@ fn a_host_set_clock_and_a_stray_gpio_store_add_no_footer() {
     assert_eq!(g.battery_save().unwrap().len(), 32768);
 }
 
-/// Code-review K#8: the footer reaches disk promptly. The first valid command
+/// The footer reaches disk promptly. The first valid command
 /// bumps the generation once; later reads that change nothing do not.
 #[test]
 fn the_first_clock_command_adds_the_footer_and_bumps_the_generation() {

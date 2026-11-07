@@ -1,8 +1,6 @@
 //! jsmolka/gba-tests ROMs for the system side: memory, save types. Each runs until
-//! the PC reaches the idle `b .` and checks r12 == 0 (gba-facts.md §1a). They need
-//! the real CPU, so they are `#[ignore]`d on the system branch and skipped when the
-//! ROMs are not checked out. Run with `cargo test -p gba-core --test sys_roms --
-//! --ignored`.
+//! the PC reaches the idle `b .` and checks r12 == 0. They are skipped
+//! when the ROMs are not checked out.
 
 use gba_core::Gba;
 use std::path::Path;
@@ -33,31 +31,26 @@ fn check(rel: &str, idle: u32) {
 }
 
 #[test]
-#[ignore = "needs P1-CPU"]
 fn memory() {
     check("memory/memory.gba", 0x0800_04C8);
 }
 
 #[test]
-#[ignore = "needs P1-CPU"]
 fn save_sram() {
     check("save/sram.gba", 0x0800_0470);
 }
 
 #[test]
-#[ignore = "needs P1-CPU"]
 fn save_flash64() {
     check("save/flash64.gba", 0x0800_0AC8);
 }
 
 #[test]
-#[ignore = "needs P1-CPU"]
 fn save_flash128() {
     check("save/flash128.gba", 0x0800_0C4C);
 }
 
 #[test]
-#[ignore = "needs P1-CPU"]
 fn save_none() {
     check("save/none.gba", 0x0800_02A8);
 }

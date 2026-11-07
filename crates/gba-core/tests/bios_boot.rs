@@ -235,7 +235,7 @@ const JSMOLKA_BIOS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../roms/test/gba/jsmolka/bios/bios.gba"
 );
-/// The `b .` after the result display (gba-facts.md 1a).
+/// The `b .` after the result display.
 const BIOS_GBA_IDLE: u32 = 0x0800_03C0;
 
 fn run_bios_gba(bios: Option<Box<[u8]>>, frames: u32) -> Option<u32> {

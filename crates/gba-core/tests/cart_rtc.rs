@@ -232,7 +232,7 @@ fn the_standard_drivers_first_transfer_works_from_a_fresh_auto_cart() {
     );
 }
 
-/// Code-review K#1: a 32-bit store at 0xC4 sets data and direction together.
+/// A 32-bit store at 0xC4 sets data and direction together.
 /// Applied one after the other, "new data, old direction" would raise SCK for a
 /// moment and clock an extra bit into the command.
 #[test]
