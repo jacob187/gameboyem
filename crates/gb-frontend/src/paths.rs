@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 /// Environment variable that replaces the OS data folder (tests, portable installs).
 pub const ENV_DATA_DIR: &str = "GAMEBOYEM_DATA_DIR";
 
-const QUALIFIER: &str = "io.github";
-const ORGANIZATION: &str = "jacob187";
+/// The app's folder name. No qualifier or organization is passed to `directories`, so
+/// the folder is plain `gameboyem` on every OS.
 const APPLICATION: &str = "gameboyem";
 
 const GAMES: &str = "games";
@@ -49,12 +49,12 @@ impl DataDir {
     }
 
     /// The data folder for this process: `GAMEBOYEM_DATA_DIR` if set and not
-    /// empty, else the OS location (macOS `~/Library/Application Support/io.github.jacob187.gameboyem`,
-    /// Windows `%APPDATA%\jacob187\gameboyem\data`, Linux `$XDG_DATA_HOME/gameboyem` or
+    /// empty, else the OS location (macOS `~/Library/Application Support/gameboyem`,
+    /// Windows `%APPDATA%\gameboyem\data`, Linux `$XDG_DATA_HOME/gameboyem` or
     /// `~/.local/share/gameboyem`).
     pub fn locate() -> Result<Self, String> {
-        let os_default = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-            .map(|d| d.data_dir().to_path_buf());
+        let os_default =
+            directories::ProjectDirs::from("", "", APPLICATION).map(|d| d.data_dir().to_path_buf());
         Self::resolve(std::env::var_os(ENV_DATA_DIR), os_default)
     }
 
@@ -217,9 +217,12 @@ mod tests {
     fn the_os_default_is_inside_a_gameboyem_folder() {
         // Whatever the platform, the OS location must name the app (or be absent
         // on a machine with no home folder).
-        let d = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION);
+        let d = directories::ProjectDirs::from("", "", APPLICATION);
         if let Some(d) = d {
-            assert!(d.data_dir().to_string_lossy().contains("gameboyem"));
+            let path = d.data_dir().to_string_lossy().into_owned();
+            assert!(path.contains("gameboyem"), "{path}");
+            // No organization or qualifier: the folder carries no account or domain name.
+            assert!(!path.contains("io.github"), "{path}");
         }
     }
 }

@@ -42,8 +42,8 @@ Everything you produce is kept in one folder per user, never next to the ROM:
 
 | OS | Folder |
 |----|--------|
-| macOS | `~/Library/Application Support/io.github.jacob187.gameboyem` |
-| Windows | `%APPDATA%\jacob187\gameboyem\data` |
+| macOS | `~/Library/Application Support/gameboyem` |
+| Windows | `%APPDATA%\gameboyem\data` |
 | Linux | `~/.local/share/gameboyem` (or `$XDG_DATA_HOME/gameboyem`) |
 
 Set `GAMEBOYEM_DATA_DIR` to use another folder. Inside it, `saves/`, `states/` and `screenshots/` hold your files, `games/` holds the game library, and `logs/gameboyem.log` is the log (three files of up to 1 MB).

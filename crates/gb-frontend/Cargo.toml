@@ -47,10 +47,10 @@ gb-test = { path = "../gb-test" }
 # secrets exist.
 [package.metadata.packager]
 productName = "gameboyem"
-identifier = "io.github.jacob187.gameboyem"
+identifier = "app.gameboyem"
 description = "Game Boy, Game Boy Color and Game Boy Advance emulator"
 homepage = "https://github.com/jacob187/gameboyem"
-publisher = "jacob187"
+publisher = "gameboyem"
 category = "Game"
 # The packager builds the .icns for macOS from these and installs them into the hicolor theme
 # on Linux; 1024 px is left out because it has no .icns type at density 1 and would make

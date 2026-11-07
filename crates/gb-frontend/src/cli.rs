@@ -35,8 +35,8 @@ options:
 
 environment:
   GAMEBOYEM_DATA_DIR use this folder for saves, states, screenshots, the library and logs
-                     (default: macOS ~/Library/Application Support/io.github.jacob187.gameboyem,
-                     Windows %APPDATA%\\jacob187\\gameboyem\\data, Linux ~/.local/share/gameboyem)
+                     (default: macOS ~/Library/Application Support/gameboyem,
+                     Windows %APPDATA%\\gameboyem\\data, Linux ~/.local/share/gameboyem)
   GAMEBOYEM_LOG      log level in logs/gameboyem.log: error, warn, info (default), debug or trace
 
 controls:
