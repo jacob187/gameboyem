@@ -252,10 +252,16 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// Report a save-state result in the log and, briefly, in the title.
-    fn show_status(&mut self, msg: String) {
-        log::info!("{msg}");
-        self.status = Some((msg, Instant::now() + STATUS_DURATION));
+    /// Report a result in the log, at `level` so failures show up as warnings and
+    /// errors, and, briefly, in the title (an error with its `error: ` prefix).
+    fn show_status(&mut self, level: log::Level, msg: String) {
+        log::log!(level, "{msg}");
+        let shown = if level == log::Level::Error {
+            format!("error: {msg}")
+        } else {
+            msg
+        };
+        self.status = Some((shown, Instant::now() + STATUS_DURATION));
         self.update_title();
     }
 
@@ -282,8 +288,10 @@ impl<C: Core> App<C> {
     }
 
     fn save_state(&mut self) {
-        let msg = self.states.save(&self.core).unwrap_or_else(|e| e);
-        self.show_status(msg);
+        match self.states.save(&self.core) {
+            Ok(msg) => self.show_status(log::Level::Info, msg),
+            Err(msg) => self.show_status(log::Level::Warn, msg),
+        }
     }
 
     fn load_state(&mut self) {
@@ -304,9 +312,9 @@ impl<C: Core> App<C> {
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
-                self.show_status(msg);
+                self.show_status(log::Level::Info, msg);
             }
-            Err(msg) => self.show_status(msg),
+            Err(msg) => self.show_status(log::Level::Warn, msg),
         }
     }
 
@@ -322,7 +330,7 @@ impl<C: Core> App<C> {
         };
         let (mut core, paths) = match loader(&path) {
             Ok(loaded) => loaded,
-            Err(msg) => return self.show_status(format!("error: {msg}")),
+            Err(msg) => return self.show_status(log::Level::Error, msg),
         };
         // The old game's progress is written before anything is replaced.
         self.saves.flush_final(&self.core);
@@ -412,7 +420,10 @@ impl<C: Core> App<C> {
             Some(Action::LoadState) => self.load_state(),
             Some(Action::SelectSlot(slot)) => {
                 self.states.select(slot);
-                self.show_status(format!("state slot {}", self.states.slot()));
+                self.show_status(
+                    log::Level::Info,
+                    format!("state slot {}", self.states.slot()),
+                );
             }
             _ => {}
         }
@@ -808,6 +819,7 @@ mod tests {
         assert_eq!((app.title.as_str(), app.frame), (title.as_str(), 7));
         let (msg, _) = app.status.as_ref().expect("the error is shown");
         assert!(msg.contains("file not found"), "{msg}");
+        assert!(msg.starts_with("error: "), "{msg}");
     }
 
     #[test]
@@ -1573,7 +1585,7 @@ mod tests {
     fn status_message_expires() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
-        app.show_status("hi".into());
+        app.show_status(log::Level::Info, "hi".into());
         let until = app.expire_status(Instant::now()).unwrap();
         assert!(app.status.is_some());
         assert_eq!(app.expire_status(until), None);
