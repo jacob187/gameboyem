@@ -948,7 +948,8 @@ impl Library {
     /// games, without copying them. Safe to call at every start: a game already
     /// listed is left as it is (its path is updated if the app moved), one the
     /// player imported themselves stays imported, and a bundled game whose ROM is
-    /// gone from `dir` is unlisted. Unusable files are skipped and logged.
+    /// not in `dir` is unlisted (its saves stay), so an entry from another folder, a
+    /// development build's say, does not linger. Unusable files are skipped and logged.
     pub fn register_bundled(&mut self, dir: &Path) -> Result<BundledReport, String> {
         let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
         let dir = dir.as_path();
@@ -1003,14 +1004,11 @@ impl Library {
                 }
             }
         }
-        // A bundled game goes only when its file is gone from `dir` (or now holds
-        // another game). One whose file is there but failed to read this once stays.
+        // A bundled game goes when its ROM is not in `dir` (or `dir` now holds another
+        // game under that name). One whose file is there but failed to read this once stays.
         let before = self.entries.len();
         self.entries.retain(|e| {
-            e.source != Source::Bundled
-                || seen.contains(&e.id)
-                || unreadable.contains(&e.rom_path)
-                || (e.rom_path.is_file() && !e.rom_path.starts_with(dir))
+            e.source != Source::Bundled || seen.contains(&e.id) || unreadable.contains(&e.rom_path)
         });
         report.removed = before - self.entries.len();
         if report != BundledReport::default() {
@@ -1833,6 +1831,27 @@ mod tests {
         assert_eq!((report.skipped, report.removed), (0, 1));
         assert!(lib.get(&one.id).is_none());
         assert_eq!(lib.entries().len(), 1);
+    }
+
+    #[test]
+    fn a_bundled_game_from_another_folder_is_unlisted_even_if_its_file_exists() {
+        let f = fixture();
+        let dev = f.roms.parent().unwrap().join("roms-homebrew");
+        fs::create_dir_all(&dev).unwrap();
+        write_rom(&dev, "one.gb", &gb_rom("ONE", 0));
+        let packaged = bundle_dir(&f);
+        write_rom(&packaged, "two.gb", &gb_rom("TWO", 0));
+        let mut lib = Library::open(&f.data);
+        lib.register_bundled(&dev).unwrap();
+        let one = lib.entries()[0].id.clone();
+        fs::write(lib.paths_for(&one).sav, b"progress").unwrap();
+
+        let report = lib.register_bundled(&packaged).unwrap();
+        assert_eq!((report.added, report.removed), (1, 1));
+        assert!(dev.join("one.gb").is_file());
+        assert!(lib.get(&one).is_none());
+        assert_eq!(lib.entries().len(), 1);
+        assert_eq!(fs::read(lib.paths_for(&one).sav).unwrap(), b"progress");
     }
 
     #[test]
