@@ -39,9 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::DataDir;
 use crate::rom;
-use crate::save::{
-    MAX_SAVE_BYTES, append_ext, backup_without_overwrite, read_capped, save_path, write_atomic,
-};
+use crate::save::{MAX_SAVE_BYTES, append_ext, read_capped, save_path, write_atomic};
 use crate::state::{FIRST_SLOT, LAST_SLOT, max_state_bytes, state_path};
 
 /// Version of the index file format.
@@ -236,6 +234,10 @@ pub struct Entry {
     pub last_played: Option<u64>,
     /// The thumbnail PNG, if one was set.
     pub thumbnail: Option<PathBuf>,
+    /// The ROM file is there. Worked out when the library is read, not stored: a
+    /// game whose file is missing for now (a drive that is not mounted, a bundled
+    /// ROM of an app that moved) stays listed, with its saves, and cannot be played.
+    pub available: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,11 +519,7 @@ impl Record {
                 if self.rom != rom_file_name(&id, system) {
                     return Err(format!("{id}: unexpected ROM file {:?}", self.rom));
                 }
-                let path = data.games().join(&self.rom);
-                if !path.is_file() {
-                    return Err(format!("{id}: {} is missing", path.display()));
-                }
-                path
+                data.games().join(&self.rom)
             }
             Source::Bundled => {
                 let path = PathBuf::from(&self.rom);
@@ -533,6 +531,7 @@ impl Record {
         };
         let title = clean_title(&self.title);
         Ok(Entry {
+            available: rom_path.is_file(),
             thumbnail: existing_thumbnail(data, &id),
             id,
             title: if title.is_empty() {
@@ -546,6 +545,46 @@ impl Record {
             added: self.added,
             last_played: self.last_played,
         })
+    }
+}
+
+/// Keep the index file under a name nothing else has (`library.json.bak`,
+/// `.bak1`, ...) before it is replaced. A corrupt index is moved (`keep_original`
+/// false: rename, so a huge or unreadable file is never read into memory); a
+/// good one that is about to lose entries is copied, streamed by the OS, and stays
+/// until the new one replaces it.
+fn backup_index(data: &DataDir, keep_original: bool) -> io::Result<PathBuf> {
+    let src = data.index_file();
+    for n in 0..=1000u32 {
+        let candidate = if n == 0 {
+            append_ext(&src, "bak")
+        } else {
+            append_ext(&src, &format!("bak{n}"))
+        };
+        if fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+        if keep_original {
+            fs::copy(&src, &candidate)?;
+        } else {
+            fs::rename(&src, &candidate)?;
+        }
+        return Ok(candidate);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "1000 backups of the library index already exist",
+    ))
+}
+
+/// [`backup_index`], with the outcome in the log.
+fn backup_index_logged(data: &DataDir, keep_original: bool, why: &str) {
+    match backup_index(data, keep_original) {
+        Ok(copy) => log::warn!(
+            "library: {why}; the old index was kept as {}",
+            copy.display()
+        ),
+        Err(e) => log::warn!("library: {why}; cannot keep a copy of the old index: {e}"),
     }
 }
 
@@ -648,6 +687,7 @@ fn adopt_orphans(data: &DataDir, entries: &mut Vec<Entry>) -> usize {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or_else(now_secs, |d| d.as_secs());
         entries.push(Entry {
+            available: true,
             thumbnail: existing_thumbnail(data, &id),
             title: probe.display_title(&path),
             system: probe.game,
@@ -718,10 +758,7 @@ impl Library {
                     "library: {why}; rebuilding it from {}",
                     data.games().display()
                 );
-                match backup_without_overwrite(&data.index_file()) {
-                    Ok(copy) => log::warn!("library: the old index was kept as {}", copy.display()),
-                    Err(e) => log::warn!("library: cannot keep a copy of the old index: {e}"),
-                }
+                backup_index_logged(data, false, "the index is unusable");
                 (Vec::new(), 0, true)
             }
         };
@@ -734,6 +771,14 @@ impl Library {
             log::info!(
                 "library: found {adopted} game(s) in {}",
                 data.games().display()
+            );
+        }
+        if dropped > 0 {
+            // The rewrite below leaves these entries out; keep what they said.
+            backup_index_logged(
+                data,
+                true,
+                &format!("{dropped} unusable entries are left out"),
             );
         }
         if (adopted > 0 || dropped > 0 || damaged)
@@ -778,8 +823,17 @@ impl Library {
         let id = probe.id();
         self.refresh();
         import_beside_rom(path, &self.paths_for(&id));
-        if let Some(entry) = self.get(&id) {
-            log::info!("{} is already in the library as {id}", path.display());
+        if let Some(index) = self.entries.iter().position(|e| e.id == id) {
+            let entry = &mut self.entries[index];
+            // Adding the ROM again is how a missing copy comes back.
+            if entry.source == Source::Imported && !entry.available {
+                write_atomic(&entry.rom_path, &probe.rom)
+                    .map_err(|e| format!("cannot copy {} into the library: {e}", path.display()))?;
+                entry.available = true;
+                log::info!("restored the missing ROM of {id} from {}", path.display());
+            } else {
+                log::info!("{} is already in the library as {id}", path.display());
+            }
             return Ok(Added {
                 entry: entry.clone(),
                 duplicate: true,
@@ -790,6 +844,7 @@ impl Library {
             .and_then(|()| write_atomic(&dest, &probe.rom))
             .map_err(|e| format!("cannot copy {} into the library: {e}", path.display()))?;
         let entry = Entry {
+            available: true,
             thumbnail: existing_thumbnail(&self.data, &id),
             title: probe.display_title(path),
             system: probe.game,
@@ -903,6 +958,7 @@ impl Library {
                 Some(_) => {} // the player already has this game; their copy stays
                 None => {
                     self.entries.push(Entry {
+                        available: true,
                         thumbnail: existing_thumbnail(&self.data, &id),
                         title: probe.display_title(&file),
                         system: probe.game,
@@ -975,10 +1031,24 @@ impl Library {
         .flatten()
     }
 
-    /// Replace the entries with what the index holds now, if it is readable.
+    /// Replace the entries with what the index holds now. The next change rewrites
+    /// the file, so an index that cannot be used (corrupt, or written by a newer
+    /// version) or that has entries this version drops is backed up first; the
+    /// entries in memory stay in the first case.
     fn refresh(&mut self) {
-        if let Ok(Some(loaded)) = load_index(&self.data) {
-            self.entries = loaded.entries;
+        match load_index(&self.data) {
+            Ok(Some(loaded)) => {
+                if loaded.dropped > 0 {
+                    backup_index_logged(
+                        &self.data,
+                        true,
+                        &format!("{} unusable entries are left out", loaded.dropped),
+                    );
+                }
+                self.entries = loaded.entries;
+            }
+            Ok(None) => {}
+            Err(why) => backup_index_logged(&self.data, false, &why),
         }
     }
 
@@ -1448,9 +1518,92 @@ mod tests {
             "games": [wrong_hash, 5, path_id, no_rom, relative_bundle, huge_added, good_json.clone(), good_json],
         });
         fs::write(f.data.index_file(), doc.to_string()).unwrap();
+        let original = fs::read(f.data.index_file()).unwrap();
         let lib = Library::open(&f.data);
-        assert_eq!(lib.entries().len(), 1);
-        assert_eq!(lib.entries()[0].id, good.id);
+        // The good entry and the one whose ROM file is missing stay; the rest go.
+        assert_eq!(lib.entries().len(), 2);
+        assert!(lib.get(&good.id).unwrap().available);
+        let gone = lib
+            .entries()
+            .iter()
+            .find(|e| e.id.as_str() == "gone-0000000000000001")
+            .unwrap();
+        assert!(!gone.available);
+        // The index as it was before the entries were dropped is kept.
+        assert_eq!(
+            fs::read(f.data.games().join("library.json.bak")).unwrap(),
+            original
+        );
+        assert_eq!(Library::open(&f.data).entries().len(), 2);
+    }
+
+    #[test]
+    fn a_game_with_a_missing_rom_stays_listed_and_comes_back_when_added_again() {
+        let f = fixture();
+        let src = write_rom(&f.roms, "a.gb", &gb_rom("MOTH", 0));
+        let mut lib = Library::open(&f.data);
+        let e = lib.add_rom(&src).unwrap().entry;
+        lib.touch_played(&e.id).unwrap();
+        fs::remove_file(&e.rom_path).unwrap();
+
+        let lib = Library::open(&f.data);
+        let gone = lib.get(&e.id).expect("still listed");
+        assert!(!gone.available);
+        assert!(gone.last_played.is_some(), "its history is kept");
+        assert!(
+            !f.data.games().join("library.json.bak").exists(),
+            "nothing was dropped, so nothing needs a backup"
+        );
+
+        let mut lib = lib;
+        let again = lib.add_rom(&src).unwrap();
+        assert!(again.duplicate && again.entry.available);
+        assert_eq!(fs::read(&e.rom_path).unwrap(), fs::read(&src).unwrap());
+        assert!(Library::open(&f.data).get(&e.id).unwrap().available);
+    }
+
+    #[test]
+    fn changing_a_library_whose_index_went_bad_keeps_the_bad_file_and_the_games() {
+        let f = fixture();
+        let mut lib = Library::open(&f.data);
+        let e = lib
+            .add_rom(&write_rom(&f.roms, "a.gb", &gb_rom("MOTH", 0)))
+            .unwrap()
+            .entry;
+        // Another program version wrote something this one cannot read.
+        let newer = br#"{"version":2,"games":[{"future":true}]}"#;
+        fs::write(f.data.index_file(), newer).unwrap();
+        lib.touch_played(&e.id).unwrap();
+        assert_eq!(
+            fs::read(f.data.games().join("library.json.bak")).unwrap(),
+            newer
+        );
+        let reopened = Library::open(&f.data);
+        assert!(reopened.get(&e.id).unwrap().last_played.is_some());
+    }
+
+    #[test]
+    fn a_change_that_would_drop_entries_backs_up_the_index_first() {
+        let f = fixture();
+        let mut lib = Library::open(&f.data);
+        let e = lib
+            .add_rom(&write_rom(&f.roms, "a.gb", &gb_rom("MOTH", 0)))
+            .unwrap()
+            .entry;
+        let mut bad = serde_json::to_value(Record::from_entry(&e)).unwrap();
+        bad["id"] = "!!".into();
+        let doc = serde_json::json!({
+            "version": 1,
+            "games": [serde_json::to_value(Record::from_entry(&e)).unwrap(), bad],
+        })
+        .to_string();
+        fs::write(f.data.index_file(), &doc).unwrap();
+        lib.touch_played(&e.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(f.data.games().join("library.json.bak")).unwrap(),
+            doc
+        );
+        assert_eq!(Library::open(&f.data).entries().len(), 1);
     }
 
     #[test]
