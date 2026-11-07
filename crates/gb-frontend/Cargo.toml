@@ -4,7 +4,7 @@ description = "Desktop frontend (window, input, audio) for the gb emulator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version = "1.88" # pixels 0.17 (wgpu 29) needs 1.88; workspace MSRV stays 1.85 for gb-core
+rust-version = "1.92" # rfd 0.18 needs 1.92 (pixels 0.17 / wgpu 29 need 1.88); workspace MSRV stays 1.85 for gb-core
 
 [[bin]]
 name = "gb"
@@ -19,7 +19,63 @@ pixels.workspace = true
 cpal.workspace = true
 ctrlc.workspace = true
 png = "0.18"
+# Native file-open dialog. On Linux the xdg-portal backend: no GTK build dependency
+# (libdbus is loaded at run time, with zenity as the fallback).
+rfd = { version = "=0.18.0", default-features = false, features = ["xdg-portal"] }
 
 [dev-dependencies]
 tempfile.workspace = true
 gb-test = { path = "../gb-test" }
+
+# Installers: `cargo packager --release` (cargo-packager, run by .github/workflows/release.yml).
+# Keys are camelCase because cargo-packager reads this table as JSON. The version comes from
+# the workspace and the `gb` binary is found from the package, so neither is repeated here.
+# cargo-packager runs from this crate's directory, hence the ../../ in the icon paths.
+# No `macos` or `windows` table is set: the release workflow appends one when signing
+# secrets exist.
+[package.metadata.packager]
+productName = "gameboyem"
+identifier = "io.github.jacob187.gameboyem"
+description = "Game Boy, Game Boy Color and Game Boy Advance emulator"
+homepage = "https://github.com/jacob187/gameboyem"
+publisher = "jacob187"
+category = "Game"
+# The packager builds the .icns for macOS from these and installs them into the hicolor theme
+# on Linux; 1024 px is left out because it has no .icns type at density 1 and would make
+# hicolor an odd 1024x1024@2 directory.
+icons = [
+  "../../assets/icon/32x32.png",
+  "../../assets/icon/128x128.png",
+  "../../assets/icon/256x256.png",
+  "../../assets/icon/512x512.png",
+]
+
+# macOS: CFBundleDocumentTypes ("Open With"; Finder passes the file as an Apple event, which
+# `gb` does not handle, so it starts and asks with the dialog). Windows: the installer
+# registers the extensions and passes the path as an argument. Linux: MimeType in the .desktop
+# file, and the file is passed as an argument (Exec=gb %F).
+[[package.metadata.packager.fileAssociations]]
+extensions = ["gb"]
+name = "Game Boy ROM"
+description = "Game Boy ROM"
+mimeType = "application/x-gameboy-rom"
+role = "viewer"
+
+[[package.metadata.packager.fileAssociations]]
+extensions = ["gbc"]
+name = "Game Boy Color ROM"
+description = "Game Boy Color ROM"
+mimeType = "application/x-gameboy-color-rom"
+role = "viewer"
+
+[[package.metadata.packager.fileAssociations]]
+extensions = ["gba"]
+name = "Game Boy Advance ROM"
+description = "Game Boy Advance ROM"
+mimeType = "application/x-gba-rom"
+role = "viewer"
+
+# libasound is linked at build time (Ubuntu 24.04 renamed it to libasound2t64). rfd's
+# file dialog needs a desktop portal or zenity at run time.
+[package.metadata.packager.deb]
+depends = ["libasound2 | libasound2t64", "libudev1", "xdg-desktop-portal | zenity"]

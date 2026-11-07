@@ -22,7 +22,7 @@ jobs:
             os: ubuntu-latest
             gbdk: gbdk-linux64.tar.gz
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             gbdk: gbdk-macos-arm64.tar.gz
     steps:
       - uses: actions/checkout@v4

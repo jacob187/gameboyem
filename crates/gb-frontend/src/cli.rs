@@ -11,7 +11,9 @@ use gba_core::{RtcMode, RtcTime, SaveChoice};
 use crate::video::PaletteKind;
 
 pub const USAGE: &str = "\
-usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
+usage: gb [options] [--] [rom.gb|rom.gbc|rom.gba]
+
+With no ROM path, a file dialog asks for one. A ROM file can also be dropped onto the window.
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)
@@ -64,7 +66,8 @@ impl ModelChoice {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
-    pub rom: PathBuf,
+    /// The ROM to run. `None` when none was given; see [`crate::picker::startup`].
+    pub rom: Option<PathBuf>,
     pub scale: u32,
     pub mute: bool,
     pub palette: PaletteKind,
@@ -197,6 +200,8 @@ where
                 model = parse_model(&text["--model=".len()..])?;
                 push_unique(&mut gb_only, "--model");
             }
+            // Older macOS passes `-psn_0_<n>` when Finder opens an app; it is not a ROM or an option.
+            _ if text.starts_with("-psn_") => {}
             _ if text.starts_with('-') && text.len() > 1 => {
                 return Err(format!("unknown option `{text}`"));
             }
@@ -204,7 +209,6 @@ where
         }
     }
 
-    let rom = rom.ok_or("missing ROM path")?;
     if test_pattern && record.is_some() {
         return Err("--record cannot be combined with --test-pattern".into());
     }
@@ -402,7 +406,7 @@ mod tests {
     #[test]
     fn defaults() {
         let o = run(&["game.gb"]);
-        assert_eq!(o.rom, PathBuf::from("game.gb"));
+        assert_eq!(o.rom, Some(PathBuf::from("game.gb")));
         assert_eq!(o.scale, 4);
         assert!(!o.mute && !o.test_pattern);
         assert_eq!(o.record, None);
@@ -726,25 +730,49 @@ mod tests {
 
     #[test]
     fn double_dash_ends_options() {
-        assert_eq!(run(&["--", "g.gb"]).rom, PathBuf::from("g.gb"));
+        assert_eq!(run(&["--", "g.gb"]).rom, Some(PathBuf::from("g.gb")));
         assert!(run(&["--mute", "--", "g.gb"]).mute);
-        assert_eq!(run(&["--", "-weird.gb"]).rom, PathBuf::from("-weird.gb"));
-        assert_eq!(run(&["--", "--mute"]).rom, PathBuf::from("--mute"));
+        assert_eq!(
+            run(&["--", "-weird.gb"]).rom,
+            Some(PathBuf::from("-weird.gb"))
+        );
+        assert_eq!(run(&["--", "--mute"]).rom, Some(PathBuf::from("--mute")));
         // Even `--help` and a second `--` are plain ROM paths after the first.
-        assert_eq!(run(&["--", "--help"]).rom, PathBuf::from("--help"));
-        assert_eq!(run(&["--", "--"]).rom, PathBuf::from("--"));
+        assert_eq!(run(&["--", "--help"]).rom, Some(PathBuf::from("--help")));
+        assert_eq!(run(&["--", "--"]).rom, Some(PathBuf::from("--")));
         // Options before the terminator still apply; none are parsed after it.
         let o = run(&["--scale", "2", "--", "-x.gb"]);
-        assert_eq!((o.scale, o.rom), (2, PathBuf::from("-x.gb")));
+        assert_eq!((o.scale, o.rom), (2, Some(PathBuf::from("-x.gb"))));
         assert!(!run(&["--", "--mute"]).mute);
     }
 
     #[test]
-    fn double_dash_still_needs_exactly_one_rom() {
-        assert!(p(&["--"]).is_err());
+    fn double_dash_allows_at_most_one_rom() {
         assert!(p(&["--", "a.gb", "b.gb"]).is_err());
         assert!(p(&["a.gb", "--", "b.gb"]).is_err());
-        assert!(p(&["--mute"]).is_err());
+    }
+
+    #[test]
+    fn the_process_serial_number_argument_from_finder_is_ignored() {
+        assert_eq!(run(&["-psn_0_12345"]).rom, None);
+        assert_eq!(
+            run(&["-psn_0_12345", "g.gb"]).rom,
+            Some(PathBuf::from("g.gb"))
+        );
+        // After `--` it is a ROM path like any other.
+        assert_eq!(
+            run(&["--", "-psn_0_1"]).rom,
+            Some(PathBuf::from("-psn_0_1"))
+        );
+        assert!(p(&["-pxn_0_1"]).is_err());
+    }
+
+    #[test]
+    fn the_rom_is_optional_so_a_launcher_can_ask_for_one() {
+        assert_eq!(run(&[]).rom, None);
+        assert_eq!(run(&["--"]).rom, None);
+        let o = run(&["--mute", "--scale", "2"]);
+        assert_eq!((o.rom, o.mute, o.scale), (None, true, 2));
     }
 
     #[test]
@@ -782,6 +810,9 @@ mod tests {
         let Command::Run(o) = parse([raw.clone()]).unwrap() else {
             panic!()
         };
-        assert_eq!(o.rom.as_os_str(), raw.as_os_str());
+        assert_eq!(
+            o.rom.as_deref().map(|r| r.as_os_str()),
+            Some(raw.as_os_str())
+        );
     }
 }

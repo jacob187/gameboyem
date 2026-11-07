@@ -15,9 +15,34 @@ A cycle-accurate-enough original Game Boy (DMG) emulator with Game Boy Color (CG
 | `crates/gb-test` | A headless test-ROM harness for all three systems. Every ROM is a `cargo test` case, and a table runner prints the results. |
 | `homebrew/` | Snake and Breakout (DMG) and `cgbdemo` (a CGB-only colour test card) in C (GBDK-2020), and GRAINS and MOTH (GBA) in Rust on `agb`. |
 
+## Download
+
+Builds for macOS, Windows and Linux are on the [Releases page](https://github.com/jacob187/gameboyem/releases). You don't need Rust. Each release has a `SHA256SUMS` file.
+
+- **macOS:** open the `.dmg` for your Mac (`macos-arm64` for Apple silicon, `macos-x86_64` for Intel) and drag gameboyem to Applications.
+- **Windows:** run `gameboyem-<version>-windows-x64-setup.exe` (a per-user install, no administrator rights). Or unzip the `-portable.zip` and run `gb.exe`.
+- **Linux:** `chmod +x` the `.AppImage` and run it, or `sudo apt install ./gameboyem-<version>-linux-x86_64.deb`. The `.tar.gz` holds the bare `gb` binary. Needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or newer).
+
+Open a ROM with the dialog that appears when you start the app, or drag a `.gb`, `.gbc` or `.gba` file onto its window. Dragging works on macOS, Windows and X11, not under native Wayland. On Linux the dialog needs a desktop portal (`xdg-desktop-portal` with a GTK or KDE backend) or `zenity`. The Windows installer and the `.deb` also associate `.gb`, `.gbc` and `.gba` files with the app, so opening one starts the ROM. The AppImage, the `.tar.gz` and the portable zip register nothing. On macOS the app is listed under "Open With" but doesn't receive the file yet, so it may just start and ask you to choose a ROM (Finder may also say it can't open that format).
+
+**The builds are unsigned**, so the first launch is blocked by the OS:
+
+- **macOS:** Gatekeeper blocks the first open. Right-click the app, choose Open, then Open again. Or run `xattr -dr com.apple.quarantine /Applications/gameboyem.app`.
+- **Windows:** SmartScreen shows "Windows protected your PC". Click More info, then Run anyway.
+
+### How to make a release
+
+Set `version` under `[workspace.package]` in `Cargo.toml` to the release number, commit it, then push a tag with a leading `v` that matches it:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The Release workflow builds every package and publishes them with `SHA256SUMS` on the Releases page. To try it first, open Actions, pick Release and Run workflow: it builds the same packages and keeps them as workflow artifacts without creating a release. The workflow has optional, off-by-default steps for signing and notarizing once Apple and Windows certificates are added as repository secrets (see the comments in `.github/workflows/release.yml`).
+
 ## Build and run
 
-You need Rust stable. `gb-frontend` needs ≥ 1.88; `emu-common`, `gb-core`, `gba-core` and `gb-test` need ≥ 1.85. The GBA homebrew is the one exception, because it needs a pinned nightly (see Homebrew games).
+You need Rust stable. `gb-frontend` needs ≥ 1.92; `emu-common`, `gb-core`, `gba-core` and `gb-test` need ≥ 1.85. The GBA homebrew is the one exception, because it needs a pinned nightly (see Homebrew games).
 
 **macOS (arm64/x86_64).** No extra system packages are needed.
 
@@ -39,7 +64,9 @@ cargo build --release
 **Command-line options:**
 
 ```
-usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
+usage: gb [options] [--] [rom.gb|rom.gbc|rom.gba]
+
+With no ROM path, a file dialog asks for one. A ROM file can also be dropped onto the window.
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)

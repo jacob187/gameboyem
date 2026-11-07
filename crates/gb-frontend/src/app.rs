@@ -1,6 +1,6 @@
 //! The winit application: window, input, frame pacing and presentation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-use crate::audio::{AudioOutput, ToneGen};
+use crate::audio::{self, AudioOutput, ToneGen};
 use crate::keymap::{Action, InputState, map};
 use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::record::{self, Recorder};
@@ -75,6 +75,10 @@ struct TestMode {
     tone: ToneGen,
 }
 
+/// Builds the core for a ROM file, for the ROM dropped on the window. The
+/// error is a ready-to-print message.
+pub type Loader<C> = Box<dyn FnMut(&Path) -> Result<C, String>>;
+
 /// Where progress is persisted: battery RAM and save-state slots.
 pub struct Storage {
     pub saves: SaveManager,
@@ -115,6 +119,8 @@ pub struct App<C: Core> {
     test: Option<TestMode>,
     shutdown: ShutdownFlag,
     rom_path: PathBuf,
+    /// Powers on a dropped ROM; `None` ignores drops.
+    loader: Option<Loader<C>>,
     recorder: Option<Recorder>,
     /// Emulated frames since power-on (the clock recordings are keyed by).
     frame: u64,
@@ -170,6 +176,7 @@ impl<C: Core> App<C> {
             test,
             shutdown,
             rom_path: PathBuf::from("screenshot.gb"),
+            loader: None,
             recorder: None,
             frame: 0,
             input: InputState::default(),
@@ -187,6 +194,12 @@ impl<C: Core> App<C> {
     /// Screenshots are saved next to this ROM path.
     pub fn with_rom_path(mut self, rom_path: PathBuf) -> Self {
         self.rom_path = rom_path;
+        self
+    }
+
+    /// Power on a ROM dropped onto the window with `loader`.
+    pub fn with_loader(mut self, loader: Loader<C>) -> Self {
+        self.loader = Some(loader);
         self
     }
 
@@ -294,6 +307,59 @@ impl<C: Core> App<C> {
             }
             Err(msg) => self.show_status(msg),
         }
+    }
+
+    /// Power on a ROM dropped onto the window, in place of the running game. On
+    /// failure the running game carries on and the error is shown.
+    fn open_dropped(&mut self, path: PathBuf) {
+        // `--test-pattern` has no game to replace.
+        if self.test.is_some() {
+            return;
+        }
+        let Some(loader) = self.loader.as_mut() else {
+            return;
+        };
+        let mut core = match loader(&path) {
+            Ok(core) => core,
+            Err(msg) => return self.show_status(format!("error: {msg}")),
+        };
+        // The old game's progress is written before anything is replaced.
+        self.saves.flush_final(&self.core);
+        self.stop_recording("another ROM was opened");
+        let rate_check = self.audio.as_ref().map(|a| {
+            core.set_audio_sample_rate(a.sample_rate);
+            audio::check_core_rate(a.sample_rate, core.audio_sample_rate())
+        });
+        if let Some(Err(e)) = rate_check {
+            eprintln!("warning: audio disabled: {e}");
+            self.audio = None;
+        }
+        let mut saves = SaveManager::new(&path, Instant::now());
+        saves.load(&mut core);
+
+        self.core = core;
+        self.saves = saves;
+        self.states = StateSlots::new(&path);
+        self.title = window_title(&self.core.title());
+        self.pacer = FramePacer::new(self.core.native_fps());
+        if self.fast_forward {
+            self.pacer.set_speed(FAST_FORWARD_SPEED);
+        }
+        self.rom_path = path;
+        self.frame = 0;
+        self.paused = false;
+        // The new machine starts with no buttons down; apply the keys held now.
+        for button in Button::ALL {
+            self.set_button(button, self.input.is_down(button));
+        }
+        self.clear_audio();
+        self.reset_clock();
+        self.update_title();
+        self.upload();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        eprintln!("opened {}", self.rom_path.display());
     }
 
     fn toggle_pause(&mut self) {
@@ -548,6 +614,7 @@ impl<C: Core> ApplicationHandler for App<C> {
                 }
             }
             WindowEvent::Occluded(false) => self.reset_clock(),
+            WindowEvent::DroppedFile(path) => self.open_dropped(path),
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     self.on_key(event_loop, code, event.state == ElementState::Pressed);
@@ -687,6 +754,63 @@ mod tests {
         app.toggle_pause();
         assert!(!app.paused);
         assert_eq!(fs::read(&sav).unwrap()[0], 0xAB, "not written on resume");
+    }
+
+    fn titled_rom(title: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x134..0x134 + title.len()].copy_from_slice(title);
+        rom
+    }
+
+    #[test]
+    fn a_dropped_rom_replaces_the_game_after_saving_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.loader = Some(Box::new(
+            |_| Ok(GameBoy::new(titled_rom(b"OTHER")).unwrap()),
+        ));
+        change_ram(&mut app, 0xAB);
+        app.frame = 99;
+        app.paused = true;
+
+        let other = dir.path().join("other.gb");
+        app.open_dropped(other.clone());
+
+        assert_eq!(
+            fs::read(dir.path().join("g.sav")).unwrap()[0],
+            0xAB,
+            "the old game's RAM is written before it is replaced"
+        );
+        assert_eq!(app.rom_path, other);
+        assert_eq!(app.title, "gb - OTHER");
+        assert_eq!((app.frame, app.paused), (0, false));
+    }
+
+    #[test]
+    fn a_dropped_rom_that_fails_to_load_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.loader = Some(Box::new(|_| {
+            Err("cannot read x.gb: file not found".to_owned())
+        }));
+        app.frame = 7;
+        let title = app.title.clone();
+
+        app.open_dropped(dir.path().join("x.gb"));
+
+        assert_eq!(app.rom_path, dir.path().join("g.gb"));
+        assert_eq!((app.title.as_str(), app.frame), (title.as_str(), 7));
+        let (msg, _) = app.status.as_ref().expect("the error is shown");
+        assert!(msg.contains("file not found"), "{msg}");
+    }
+
+    #[test]
+    fn a_drop_without_a_loader_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.open_dropped(dir.path().join("x.gb"));
+        assert_eq!(app.rom_path, dir.path().join("g.gb"));
+        assert!(app.status.is_none());
     }
 
     /// MBC3+RTC+RAM+battery ROM whose program loops: select the D-pad, read
