@@ -28,6 +28,23 @@ impl Button {
         Button::Start,
     ];
 
+    /// The Game Boy button for a cross-console one; `None` for the GBA-only
+    /// `L` and `R`. Index `i` of [`Button::ALL`] is index `i` of
+    /// `emu_common::Button::ALL`.
+    pub const fn from_common(button: emu_common::Button) -> Option<Self> {
+        Some(match button {
+            emu_common::Button::Right => Button::Right,
+            emu_common::Button::Left => Button::Left,
+            emu_common::Button::Up => Button::Up,
+            emu_common::Button::Down => Button::Down,
+            emu_common::Button::A => Button::A,
+            emu_common::Button::B => Button::B,
+            emu_common::Button::Select => Button::Select,
+            emu_common::Button::Start => Button::Start,
+            emu_common::Button::L | emu_common::Button::R => return None,
+        })
+    }
+
     /// (is_action_button, bit in the low nibble)
     const fn line(self) -> (bool, u8) {
         match self {
@@ -146,6 +163,17 @@ impl Joypad {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recordings store a button as its index in `ALL`, so the two lists must
+    /// agree for every Game Boy button, and `L` / `R` must not map.
+    #[test]
+    fn button_order_matches_the_cross_console_type() {
+        for (i, b) in Button::ALL.into_iter().enumerate() {
+            assert_eq!(Button::from_common(emu_common::Button::ALL[i]), Some(b));
+        }
+        assert_eq!(Button::from_common(emu_common::Button::L), None);
+        assert_eq!(Button::from_common(emu_common::Button::R), None);
+    }
 
     #[test]
     fn selected_group_reads_active_low() {

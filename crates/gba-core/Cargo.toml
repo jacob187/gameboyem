@@ -1,0 +1,10 @@
+[package]
+name = "gba-core"
+description = "Platform-independent, deterministic Game Boy Advance emulation core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+emu-common.workspace = true

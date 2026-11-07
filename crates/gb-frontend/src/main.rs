@@ -1,5 +1,5 @@
-//! `gb`: desktop frontend (window, input, audio, saves) for the gb-core emulator.
-//! All platform-specific code lives in this crate; `gb-core` stays pure.
+//! `gb`: desktop frontend (window, input, audio, saves) for the gb-core and gba-core
+//! emulators. All platform-specific code lives in this crate; the cores stay pure.
 #![forbid(unsafe_code)]
 
 mod app;
@@ -17,7 +17,9 @@ mod video;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use emu_common::{Core, System};
 use gb_core::GameBoy;
+use gba_core::Gba;
 use winit::event_loop::EventLoop;
 
 use crate::app::{App, Storage};
@@ -26,6 +28,41 @@ use crate::cli::Command;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
+
+/// A Game Boy core for `rom`, as `--model` asks, and the hash of the ROM it hashed.
+fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), String> {
+    let archive = rom::archive_kind(&rom);
+    let model = opts.model.resolve(&rom);
+    let gb = GameBoy::with_model(rom, model)
+        .map_err(|e| rom::cartridge_message(&opts.rom, &e, archive))?;
+    if !gb.cartridge_header().header_checksum_ok {
+        eprintln!("warning: ROM header checksum is wrong (running anyway)");
+    }
+    let rom_hash = gb.rom_hash();
+    Ok((Box::new(gb), rom_hash))
+}
+
+/// A GBA core for `rom`, booted through `--bios` if given (else the built-in
+/// HLE BIOS, DECISIONS #47), and the hash of the ROM it hashed.
+fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), String> {
+    let archive = rom::archive_kind(&rom);
+    let bios = match &opts.bios {
+        Some(path) => Some(rom::read_bios(path)?),
+        None => None,
+    };
+    let options = gba_core::CartOptions {
+        save: opts.save_type,
+        rtc: opts.rtc,
+    };
+    let mut gba = Gba::with_options(rom, bios, options)
+        .map_err(|e| rom::gba_cartridge_message(&opts.rom, &e, archive))?;
+    // The save is loaded after this and replaces the clock if it carries one.
+    if let Some(start) = opts.rtc_start {
+        gba.set_rtc(start);
+    }
+    let rom_hash = gba.rom_hash();
+    Ok((Box::new(gba), rom_hash))
+}
 
 fn main() -> ExitCode {
     let opts = match cli::parse(std::env::args_os().skip(1)) {
@@ -40,36 +77,44 @@ fn main() -> ExitCode {
         }
     };
 
-    let rom = match rom::read_rom(&opts.rom) {
+    // The file is read once; the system (and so the size cap) comes from the
+    // flag, the name or the header (DECISIONS #46).
+    let (system, rom) = match rom::load_rom(&opts.rom, opts.system) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
-    let archive = rom::archive_kind(&rom);
-    let model = opts.model.resolve(&rom);
-    let rom_hash = gb_core::replay::rom_hash(&rom);
-    let mut gb = match GameBoy::with_model(rom, model) {
-        Ok(gb) => gb,
-        Err(e) => {
-            eprintln!("error: {}", rom::cartridge_message(&opts.rom, &e, archive));
+    match cli::check_system_flags(system, &opts) {
+        Ok(Some(warning)) => eprintln!("warning: {warning}"),
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("error: {msg}\n\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
+    }
+    let built = match system {
+        System::Gb => build_gb(&opts, rom),
+        System::Gba => build_gba(&opts, rom),
+    };
+    // The core hashed the ROM as it was built; the recording header reuses that.
+    let (mut core, rom_hash) = match built {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
-    let header = gb.cartridge_header();
-    if !header.header_checksum_ok {
-        eprintln!("warning: ROM header checksum is wrong (running anyway)");
-    }
 
     let audio = if opts.mute {
         None
     } else {
         match AudioOutput::start() {
             Ok(a) => {
-                gb.set_audio_sample_rate(a.sample_rate);
+                core.set_audio_sample_rate(a.sample_rate);
                 // The core clamps the rate; a mismatch would mean wrong pitch.
-                match audio::check_core_rate(a.sample_rate, gb.audio_sample_rate()) {
+                match audio::check_core_rate(a.sample_rate, core.audio_sample_rate()) {
                     Ok(()) => Some(a),
                     Err(e) => {
                         eprintln!("warning: audio disabled: {e}");
@@ -85,17 +130,13 @@ fn main() -> ExitCode {
     };
 
     let mut saves = SaveManager::new(&opts.rom, Instant::now());
-    saves.load(&mut gb);
+    saves.load(core.as_mut());
 
     // The recording starts from the battery RAM the session actually powered on with.
     let recorder = match &opts.record {
         None => None,
         Some(path) => {
-            let header = gb_core::replay::Header {
-                rom_hash,
-                battery: gb.battery_ram(),
-                model,
-            };
+            let header = record::header_for(core.as_ref(), rom_hash);
             match record::Recorder::create(path, &header) {
                 Ok(r) => {
                     eprintln!("recording inputs to {}", path.display());
@@ -134,7 +175,7 @@ fn main() -> ExitCode {
         states: StateSlots::new(&opts.rom),
     };
     let mut app = App::new(
-        gb,
+        core,
         storage,
         audio,
         opts.palette.colors(),

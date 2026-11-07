@@ -4,27 +4,36 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use emu_common::System;
 use gb_core::{CartridgeHeader, Model};
+use gba_core::{RtcMode, RtcTime, SaveChoice};
 
 use crate::video::PaletteKind;
 
 pub const USAGE: &str = "\
-usage: gb [options] [--] <rom.gb|rom.gbc>
+usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)
   --mute             disable audio output
-  --palette NAME     green (default) or grey (DMG only; colour games use their own colours)
-  --model NAME       auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb
+  --system NAME      gb or gba (default: a .gba file, or a ROM with a GBA header, is a GBA game)
+  --palette NAME     green (default) or grey (Game Boy only; colour games use their own colours)
+  --model NAME       auto (default: Game Boy Color for CGB-flagged ROMs, else DMG), dmg or cgb (Game Boy only)
+  --bios FILE        boot through a real 16 KiB GBA BIOS dump (GBA only; default: built-in HLE BIOS)
+  --save-type NAME   auto (default: from the ROM), none, sram, flash64, flash128, eeprom512 or eeprom8k (GBA only)
+  --rtc NAME         auto (default: on when the game sets up the cartridge clock), on or off (GBA only)
+  --rtc-start TIME   start the GBA cartridge clock at YYYY-MM-DDTHH:MM:SS if the save has none (GBA only; default 2000-01-01, power-loss flag set)
   --test-pattern     show a synthetic test pattern and tone instead of running the core
   --record FILE      record every input to FILE (must not exist) for `gb-test --replay`
   -h, --help         show this help
   --                 end of options; the next argument is the ROM path, even if it starts with `-`
 
 controls:
-  arrows = D-pad    X = A    Z = B    Enter = Start    Backspace / Right Shift = Select
+  arrows or WASD = D-pad    X or E = A    Z = B    Enter = Start    Backspace / Right Shift = Select
+  Q / R = GBA L / R shoulders (no effect on a Game Boy)
   P = pause    Tab (hold) = fast-forward    C = screenshot (marks the frame when recording)
-  S = save state    L = load state    1-9 = state slot (default 1)
+  K = save state    L = load state    1-9 = state slot (default 1)
+  (S used to save a state; WASD now drives the D-pad, so S is D-pad Down)
   Esc = quit";
 
 pub const DEFAULT_SCALE: u32 = 4;
@@ -62,6 +71,23 @@ pub struct Options {
     pub model: ModelChoice,
     pub test_pattern: bool,
     pub record: Option<PathBuf>,
+    /// `--system`: overrides the choice made from the file name and header.
+    pub system: Option<System>,
+    /// `--bios`: a GBA BIOS dump.
+    pub bios: Option<PathBuf>,
+    /// `--save-type`: the GBA backup chip (default: detect from the ROM).
+    pub save_type: SaveChoice,
+    /// `--rtc`: whether the GBA cartridge has a clock.
+    pub rtc: RtcMode,
+    /// `--rtc-start`: the GBA cartridge clock's starting time. The only way real
+    /// time reaches the core (DECISIONS #66): the user states it, so a run is
+    /// reproducible.
+    pub rtc_start: Option<RtcTime>,
+    /// GBA-only flags the user passed, so a Game Boy run can say they are ignored.
+    pub gba_only: Vec<&'static str>,
+    /// Game Boy-only flags the user passed (a flag equal to its default still
+    /// counts), so a GBA run can say they are ignored; see [`check_system_flags`].
+    pub gb_only: Vec<&'static str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,6 +108,13 @@ where
     let mut model = ModelChoice::Auto;
     let mut test_pattern = false;
     let mut record: Option<PathBuf> = None;
+    let mut system: Option<System> = None;
+    let mut bios: Option<PathBuf> = None;
+    let mut save_type = SaveChoice::Auto;
+    let mut rtc = RtcMode::Auto;
+    let mut rtc_start: Option<RtcTime> = None;
+    let mut gba_only: Vec<&'static str> = Vec::new();
+    let mut gb_only: Vec<&'static str> = Vec::new();
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -106,10 +139,50 @@ where
             "--palette" => {
                 let value = option_value("--palette", args.next())?;
                 palette = parse_palette(&value)?;
+                push_unique(&mut gb_only, "--palette");
             }
             "--model" => {
                 let value = option_value("--model", args.next())?;
                 model = parse_model(&value)?;
+                push_unique(&mut gb_only, "--model");
+            }
+            "--system" => {
+                let value = option_value("--system", args.next())?;
+                system = Some(parse_system(&value)?);
+            }
+            "--save-type" => {
+                let value = option_value("--save-type", args.next())?;
+                save_type = parse_save_type(&value)?;
+                push_unique(&mut gba_only, "--save-type");
+            }
+            "--rtc" => {
+                let value = option_value("--rtc", args.next())?;
+                rtc = parse_rtc(&value)?;
+                push_unique(&mut gba_only, "--rtc");
+            }
+            "--rtc-start" => {
+                let value = option_value("--rtc-start", args.next())?;
+                rtc_start = Some(parse_rtc_start(&value)?);
+                push_unique(&mut gba_only, "--rtc-start");
+            }
+            _ if text.starts_with("--save-type=") => {
+                save_type = parse_save_type(&text["--save-type=".len()..])?;
+                push_unique(&mut gba_only, "--save-type");
+            }
+            _ if text.starts_with("--rtc=") => {
+                rtc = parse_rtc(&text["--rtc=".len()..])?;
+                push_unique(&mut gba_only, "--rtc");
+            }
+            _ if text.starts_with("--rtc-start=") => {
+                rtc_start = Some(parse_rtc_start(&text["--rtc-start=".len()..])?);
+                push_unique(&mut gba_only, "--rtc-start");
+            }
+            "--bios" => bios = Some(path_value("--bios", args.next())?),
+            _ if text.starts_with("--bios=") && text.len() > "--bios=".len() => {
+                bios = Some(PathBuf::from(&text["--bios=".len()..]));
+            }
+            _ if text.starts_with("--system=") => {
+                system = Some(parse_system(&text["--system=".len()..])?);
             }
             "--record" => record = Some(path_value("--record", args.next())?),
             _ if text.starts_with("--record=") && text.len() > "--record=".len() => {
@@ -118,8 +191,12 @@ where
             _ if text.starts_with("--scale=") => scale = parse_scale(&text["--scale=".len()..])?,
             _ if text.starts_with("--palette=") => {
                 palette = parse_palette(&text["--palette=".len()..])?;
+                push_unique(&mut gb_only, "--palette");
             }
-            _ if text.starts_with("--model=") => model = parse_model(&text["--model=".len()..])?,
+            _ if text.starts_with("--model=") => {
+                model = parse_model(&text["--model=".len()..])?;
+                push_unique(&mut gb_only, "--model");
+            }
             _ if text.starts_with('-') && text.len() > 1 => {
                 return Err(format!("unknown option `{text}`"));
             }
@@ -139,7 +216,45 @@ where
         model,
         test_pattern,
         record,
+        system,
+        bios,
+        save_type,
+        rtc,
+        rtc_start,
+        gba_only,
+        gb_only,
     }))
+}
+
+/// Record that `flag` was passed, once however often it was (the warning names
+/// each flag one time).
+fn push_unique(flags: &mut Vec<&'static str>, flag: &'static str) {
+    if !flags.contains(&flag) {
+        flags.push(flag);
+    }
+}
+
+/// Check the options that depend on the system, once it is known. `--bios` on a
+/// Game Boy game is an error (a user mistake with no safe meaning). `--model`
+/// and `--palette` on a GBA game, and `--save-type`, `--rtc` and `--rtc-start`
+/// on a Game Boy game, are harmless, so a launcher that always passes them keeps
+/// working: the warning to print (`Ok(Some(..))`) says they are ignored.
+pub fn check_system_flags(system: System, o: &Options) -> Result<Option<String>, String> {
+    match system {
+        System::Gba if !o.gb_only.is_empty() => {
+            Ok(Some(format!("{} ignored for GBA", o.gb_only.join(" and "))))
+        }
+        System::Gba => Ok(None),
+        System::Gb if o.bios.is_some() => Err(
+            "--bios only applies to GBA games (use --system gba to run this as a GBA ROM)"
+                .to_owned(),
+        ),
+        System::Gb if !o.gba_only.is_empty() => Ok(Some(format!(
+            "{} ignored for Game Boy games",
+            o.gba_only.join(" and ")
+        ))),
+        System::Gb => Ok(None),
+    }
 }
 
 /// Like [`option_value`] for a file path: kept as an `OsString` (no lossy UTF-8).
@@ -196,6 +311,70 @@ fn parse_palette(s: &str) -> Result<PaletteKind, String> {
     }
 }
 
+fn parse_system(s: &str) -> Result<System, String> {
+    match s {
+        "gb" => Ok(System::Gb),
+        "gba" => Ok(System::Gba),
+        _ => Err(format!("--system must be `gb` or `gba`, got `{s}`")),
+    }
+}
+
+fn parse_save_type(s: &str) -> Result<SaveChoice, String> {
+    match s {
+        "auto" => Ok(SaveChoice::Auto),
+        "none" => Ok(SaveChoice::None),
+        "sram" => Ok(SaveChoice::Sram),
+        "flash64" => Ok(SaveChoice::Flash64),
+        "flash128" => Ok(SaveChoice::Flash128),
+        "eeprom512" => Ok(SaveChoice::Eeprom512),
+        "eeprom8k" => Ok(SaveChoice::Eeprom8k),
+        _ => Err(format!(
+            "--save-type must be `auto`, `none`, `sram`, `flash64`, `flash128`, `eeprom512` or `eeprom8k`, got `{s}`"
+        )),
+    }
+}
+
+fn parse_rtc(s: &str) -> Result<RtcMode, String> {
+    match s {
+        "auto" => Ok(RtcMode::Auto),
+        "on" => Ok(RtcMode::On),
+        "off" => Ok(RtcMode::Off),
+        _ => Err(format!("--rtc must be `auto`, `on` or `off`, got `{s}`")),
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS`, digits only, a real date in 2000..=2099.
+fn parse_rtc_start(s: &str) -> Result<RtcTime, String> {
+    let bad = || {
+        format!(
+            "--rtc-start must be a date and time like 2024-02-29T13:45:00 (2000..2099), got `{s}`"
+        )
+    };
+    let b = s.as_bytes();
+    let shape_ok = b.len() == 19
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16) || c.is_ascii_digit());
+    if !shape_ok {
+        return Err(bad());
+    }
+    let n = |r: std::ops::Range<usize>| s[r].parse::<u16>().map_err(|_| bad());
+    RtcTime::new(
+        n(0..4)?,
+        n(5..7)? as u8,
+        n(8..10)? as u8,
+        n(11..13)? as u8,
+        n(14..16)? as u8,
+        n(17..19)? as u8,
+    )
+    .map_err(|_| bad())
+}
+
 fn parse_model(s: &str) -> Result<ModelChoice, String> {
     match s {
         "auto" => Ok(ModelChoice::Auto),
@@ -229,6 +408,225 @@ mod tests {
         assert_eq!(o.record, None);
         assert_eq!(o.palette, PaletteKind::Green);
         assert_eq!(o.model, ModelChoice::Auto);
+        assert_eq!((o.system, o.bios.as_deref()), (None, None));
+        assert!(o.gb_only.is_empty());
+    }
+
+    #[test]
+    fn system_flag() {
+        assert_eq!(run(&["--system", "gba", "g.gb"]).system, Some(System::Gba));
+        assert_eq!(run(&["g.gba", "--system=gb"]).system, Some(System::Gb));
+        assert!(p(&["--system", "gbc", "g.gb"]).is_err());
+        assert!(p(&["--system=", "g.gb"]).is_err());
+        assert!(
+            p(&["--system", "--mute", "g.gb"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+    }
+
+    #[test]
+    fn bios_flag() {
+        assert_eq!(
+            run(&["--bios", "b.bin", "g.gba"]).bios,
+            Some(PathBuf::from("b.bin"))
+        );
+        assert_eq!(
+            run(&["g.gba", "--bios=b.bin"]).bios,
+            Some(PathBuf::from("b.bin"))
+        );
+        assert!(
+            p(&["g.gba", "--bios"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+        assert!(p(&["--bios=", "g.gba"]).is_err());
+    }
+
+    #[test]
+    fn save_type_flag() {
+        for (name, want) in [
+            ("auto", SaveChoice::Auto),
+            ("none", SaveChoice::None),
+            ("sram", SaveChoice::Sram),
+            ("flash64", SaveChoice::Flash64),
+            ("flash128", SaveChoice::Flash128),
+            ("eeprom512", SaveChoice::Eeprom512),
+            ("eeprom8k", SaveChoice::Eeprom8k),
+        ] {
+            assert_eq!(run(&["--save-type", name, "g.gba"]).save_type, want);
+            assert_eq!(
+                run(&["g.gba", &format!("--save-type={name}")]).save_type,
+                want
+            );
+        }
+        assert_eq!(run(&["g.gba"]).save_type, SaveChoice::Auto);
+        for bad in ["flash", "FLASH64", "eeprom", "", "sram32"] {
+            let e = p(&["--save-type", bad, "g.gba"]).unwrap_err();
+            assert!(e.contains("--save-type must be"), "{bad}: {e}");
+        }
+        assert!(p(&["--save-type=", "g.gba"]).is_err());
+        assert!(
+            p(&["g.gba", "--save-type"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+        assert!(
+            p(&["--save-type", "--mute", "g.gba"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+    }
+
+    #[test]
+    fn rtc_flags() {
+        assert_eq!(run(&["g.gba"]).rtc, RtcMode::Auto);
+        assert_eq!(run(&["g.gba"]).rtc_start, None);
+        for (name, want) in [
+            ("auto", RtcMode::Auto),
+            ("on", RtcMode::On),
+            ("off", RtcMode::Off),
+        ] {
+            assert_eq!(run(&["--rtc", name, "g.gba"]).rtc, want);
+            assert_eq!(run(&[&format!("--rtc={name}"), "g.gba"]).rtc, want);
+        }
+        assert!(
+            p(&["--rtc", "yes", "g.gba"])
+                .unwrap_err()
+                .contains("--rtc must be")
+        );
+        assert!(p(&["--rtc=", "g.gba"]).is_err());
+        assert!(
+            p(&["g.gba", "--rtc"])
+                .unwrap_err()
+                .contains("missing a value")
+        );
+
+        let t = run(&["--rtc-start", "2024-02-29T13:45:09", "g.gba"])
+            .rtc_start
+            .unwrap();
+        assert_eq!(
+            (
+                t.year(),
+                t.month(),
+                t.day(),
+                t.weekday(),
+                t.hour(),
+                t.minute(),
+                t.second()
+            ),
+            (2024, 2, 29, 4, 13, 45, 9)
+        );
+        assert_eq!(
+            run(&["--rtc-start=2000-01-01T00:00:00", "g.gba"])
+                .rtc_start
+                .unwrap()
+                .weekday(),
+            6
+        );
+        for bad in [
+            "2024-02-30T00:00:00",
+            "2023-02-29T00:00:00",
+            "1999-12-31T23:59:59",
+            "2100-01-01T00:00:00",
+            "2024-13-01T00:00:00",
+            "2024-01-01T24:00:00",
+            "2024-01-01 00:00:00",
+            "2024-01-01T00:00",
+            "2024-1-1T0:0:0",
+            "2024-01-01T00:00:0\u{e9}",
+            "+024-01-01T00:00:00",
+            "now",
+            "",
+        ] {
+            let e = p(&["--rtc-start", bad, "g.gba"]).unwrap_err();
+            assert!(e.contains("--rtc-start must be"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn gba_only_flags_are_ignored_with_a_warning_for_a_game_boy() {
+        for (args, flags) in [
+            (&["--save-type", "sram", "g.gb"][..], "--save-type"),
+            (&["--rtc=off", "g.gb"], "--rtc"),
+            (&["--rtc-start=2024-01-01T00:00:00", "g.gb"], "--rtc-start"),
+            (
+                &["--save-type=none", "--rtc", "on", "g.gb"],
+                "--save-type and --rtc",
+            ),
+        ] {
+            let o = run(args);
+            assert_eq!(
+                check_system_flags(System::Gb, &o),
+                Ok(Some(format!("{flags} ignored for Game Boy games"))),
+                "{args:?}"
+            );
+            assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
+        }
+        // A flag repeated on the command line is named once (code-review K#5).
+        let o = run(&[
+            "--rtc",
+            "on",
+            "--save-type=sram",
+            "--rtc=off",
+            "--rtc",
+            "auto",
+            "g.gb",
+        ]);
+        assert_eq!(
+            check_system_flags(System::Gb, &o),
+            Ok(Some(
+                "--rtc and --save-type ignored for Game Boy games".to_owned()
+            ))
+        );
+        let o = run(&[
+            "--model",
+            "dmg",
+            "--model=cgb",
+            "--palette=grey",
+            "--palette",
+            "green",
+            "g.gba",
+        ]);
+        assert_eq!(
+            check_system_flags(System::Gba, &o),
+            Ok(Some("--model and --palette ignored for GBA".to_owned()))
+        );
+        // --bios on a Game Boy game stays an error, even next to a GBA-only flag.
+        let o = run(&["--bios", "b.bin", "--rtc", "on", "g.gb"]);
+        assert!(check_system_flags(System::Gb, &o).is_err());
+    }
+
+    #[test]
+    fn game_boy_only_flags_are_ignored_with_a_warning_for_a_gba() {
+        for (args, flags) in [
+            (&["--model", "auto", "g.gba"][..], "--model"),
+            (&["--model=dmg", "g.gba"], "--model"),
+            (&["--palette", "green", "g.gba"], "--palette"),
+            (&["--palette=grey", "g.gba"], "--palette"),
+            (
+                &["--model=cgb", "--palette=grey", "g.gba"],
+                "--model and --palette",
+            ),
+        ] {
+            let o = run(args);
+            assert_eq!(
+                check_system_flags(System::Gba, &o),
+                Ok(Some(format!("{flags} ignored for GBA"))),
+                "{args:?}"
+            );
+            assert_eq!(check_system_flags(System::Gb, &o), Ok(None));
+        }
+        let o = run(&["--scale", "2", "--mute", "g.gba"]);
+        assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
+    }
+
+    #[test]
+    fn bios_is_refused_for_a_game_boy() {
+        let o = run(&["--bios", "b.bin", "g.gb"]);
+        let e = check_system_flags(System::Gb, &o).unwrap_err();
+        assert!(e.contains("--bios only applies to GBA"), "{e}");
+        assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
     }
 
     #[test]
@@ -304,6 +702,13 @@ mod tests {
     fn help() {
         assert_eq!(p(&["-h"]).unwrap(), Command::Help);
         assert_eq!(p(&["g.gb", "--help"]).unwrap(), Command::Help);
+    }
+
+    #[test]
+    fn help_says_where_save_state_went() {
+        assert!(USAGE.contains("K = save state    L = load state"));
+        assert!(USAGE.contains("S used to save a state"));
+        assert!(USAGE.contains("S is D-pad Down"));
     }
 
     #[test]

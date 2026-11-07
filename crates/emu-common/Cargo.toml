@@ -1,0 +1,9 @@
+[package]
+name = "emu-common"
+description = "Seams shared by the emulator cores: save-state codec, input-recording codec and the Core trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

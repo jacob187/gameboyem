@@ -1,6 +1,6 @@
 [package]
 name = "gb-test"
-description = "Headless test-ROM harness for gb-core"
+description = "Headless test-ROM harness for gb-core and gba-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,13 @@ publish = false
 
 [dependencies]
 gb-core.workspace = true
+gba-core.workspace = true
 png = "0.18"
 
 [dev-dependencies]
 libtest-mimic = "0.8"
+tempfile.workspace = true
+emu-common.workspace = true
 
 [[test]]
 name = "roms"

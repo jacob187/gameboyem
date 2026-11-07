@@ -9,6 +9,14 @@
 //! performance change can be checked for bit-identical behaviour by comparing
 //! the hashes before and after. Not part of `cargo test`.
 //!
+//! Four GBA ROMs run alongside (DECISIONS #72): FuzzARM `ARM_Any` (CPU), the `moth` and
+//! `grains` homebrew (mode 0 with direct-sound audio; mode 4) and tonc's `m7_demo` (mode 7
+//! affine). Their video hash covers each frame's 240x160 RGB555 buffer (little-endian
+//! halfwords) and there is no serial output; the audio hash is over the host-rate f32
+//! samples at the default 48 kHz. `moth` and `grains` have START held for frames 15..19 so
+//! they leave the title screen and play (the title screen would exercise little); the input
+//! is part of the pinned output.
+//!
 //! The ROMs run on a DMG, except cgb-acid2 and uCity, which run on a CGB in colour
 //! mode (`Model::Cgb`): cgb-acid2 covers the colour renderer, uCity switches to
 //! double speed at about frame 15 and so covers that clocking path. Their video
@@ -16,11 +24,12 @@
 //! row-major order. The serial and audio hashes are computed the same way for all
 //! ROMs. A missing ROM fails the run, whichever ROM it is.
 //!
-//! The "overall" line is the mean speed across all ROMs (total frames over total
-//! emulation time), so it covers the colour renderer and double speed as well as
-//! the DMG path; `--min-speed` compares against it. It is not comparable with
+//! There is one "overall" line per system: the mean speed across that system's ROMs
+//! (total frames over total emulation time). The Game Boy line covers the colour
+//! renderer and double speed as well as the DMG path, and is not comparable with
 //! figures from before cgb-acid2 or uCity joined the set (about 2650-2730 fps over
-//! the four DMG ROMs).
+//! the four DMG ROMs). `--min-speed` compares each system's own overall line against
+//! its own native rate (both are about 59.73 fps), so one floor guards both cores.
 //! The per-ROM lines are unaffected.
 //!
 //! * `--check` compares each ROM against `crates/gb-test/bench-pins.txt` and fails
@@ -28,24 +37,74 @@
 //!   frame count, or if the ROM bytes differ from the pinned build (for example a
 //!   homebrew source change; re-pin in that case).
 //! * `--print-pins` prints pin lines for this run, to paste into the pins file.
-//! * `--min-speed N` fails if the overall speed is below `N` times real time.
+//! * `--min-speed N` fails if either system's overall speed is below `N` times real time.
 //!   CI uses a low floor because shared runners are slow and noisy.
 
 use std::time::{Duration, Instant};
 
 use gb_core::{FRAMES_PER_SECOND, GameBoy, Model};
+use gba_core::{Button, Gba};
 
 use gb_test::{roms_dir, workspace_root};
 
-/// ROMs (relative to the ROMs directory) in the benchmark, with the model each
-/// one runs on.
-const ROMS: [(&str, Model); 6] = [
-    ("test/dmg-acid2/dmg-acid2.gb", Model::Dmg),
-    ("test/blargg/cpu_instrs/cpu_instrs.gb", Model::Dmg),
-    ("homebrew/snake.gb", Model::Dmg),
-    ("homebrew/breakout.gb", Model::Dmg),
-    ("test/cgb-acid2/cgb-acid2.gbc", Model::Cgb),
-    ("corpus/ucity.gb", Model::Cgb),
+/// What a benchmark ROM runs on.
+#[derive(Clone, Copy)]
+enum Target {
+    Gb(Model),
+    /// A GBA ROM; `start` presses START for [`START_FRAMES`] frames from that frame.
+    Gba {
+        start: Option<u32>,
+    },
+}
+
+impl Target {
+    /// This target's index in [`SYSTEMS`]. An exhaustive match, so a new target
+    /// does not compile until it names its slot.
+    fn slot(self) -> usize {
+        match self {
+            Target::Gb(_) => 0,
+            Target::Gba { .. } => 1,
+        }
+    }
+}
+
+/// Frame the GBA benchmark ROMs get START, and for how many frames.
+const START_AT: u32 = 15;
+const START_FRAMES: u32 = 4;
+
+/// ROMs (relative to the ROMs directory) in the benchmark, with what each one
+/// runs on.
+const ROMS: [(&str, Target); 10] = [
+    ("test/dmg-acid2/dmg-acid2.gb", Target::Gb(Model::Dmg)),
+    (
+        "test/blargg/cpu_instrs/cpu_instrs.gb",
+        Target::Gb(Model::Dmg),
+    ),
+    ("homebrew/snake.gb", Target::Gb(Model::Dmg)),
+    ("homebrew/breakout.gb", Target::Gb(Model::Dmg)),
+    ("test/cgb-acid2/cgb-acid2.gbc", Target::Gb(Model::Cgb)),
+    ("corpus/ucity.gb", Target::Gb(Model::Cgb)),
+    ("test/gba/fuzzarm/ARM_Any.gba", Target::Gba { start: None }),
+    (
+        "homebrew/moth.gba",
+        Target::Gba {
+            start: Some(START_AT),
+        },
+    ),
+    (
+        "homebrew/grains.gba",
+        Target::Gba {
+            start: Some(START_AT),
+        },
+    ),
+    ("test/gba/tonc/bin/m7_demo.gba", Target::Gba { start: None }),
+];
+
+/// The systems in `ROMS`, in the order their overall lines print, with the native
+/// frame rate of each (both are about 59.73). Indexed by [`Target::slot`].
+const SYSTEMS: [(&str, f64); 2] = [
+    ("gb", FRAMES_PER_SECOND),
+    ("gba", gba_core::FRAMES_PER_SECOND),
 ];
 
 const DEFAULT_FRAMES: u32 = 3600;
@@ -76,7 +135,45 @@ struct Run {
     audio_hash: u64,
 }
 
-fn run_once(rom: &[u8], model: Model, frames: u32) -> Result<Run, String> {
+fn run_once(rom: &[u8], target: Target, frames: u32) -> Result<Run, String> {
+    match target {
+        Target::Gb(model) => run_gb(rom, model, frames),
+        Target::Gba { start } => run_gba(rom, start, frames),
+    }
+}
+
+fn run_gba(rom: &[u8], start: Option<u32>, frames: u32) -> Result<Run, String> {
+    let mut gba = Gba::new(rom.to_vec(), None).map_err(|e| e.to_string())?;
+    let mut video_hash = FNV_OFFSET;
+    let mut audio_hash = FNV_OFFSET;
+    let mut elapsed = Duration::ZERO;
+    let mut audio = Vec::new();
+    for frame in 0..frames {
+        if let Some(at) = start {
+            if frame == at {
+                gba.set_button(Button::Start, true);
+            } else if frame == at + START_FRAMES {
+                gba.set_button(Button::Start, false);
+            }
+        }
+        let t = Instant::now();
+        gba.step_frame();
+        audio.clear();
+        gba.drain_audio_into(&mut audio);
+        elapsed += t.elapsed();
+        video_hash = fnv_frame16(video_hash, gba.framebuffer());
+        for s in &audio {
+            audio_hash = fnv(audio_hash, &s.to_bits().to_le_bytes());
+        }
+    }
+    Ok(Run {
+        elapsed,
+        video_hash,
+        audio_hash,
+    })
+}
+
+fn run_gb(rom: &[u8], model: Model, frames: u32) -> Result<Run, String> {
     let mut gb = GameBoy::with_model(rom.to_vec(), model).map_err(|e| e.to_string())?;
     let mut video_hash = FNV_OFFSET;
     let mut audio_hash = FNV_OFFSET;
@@ -158,6 +255,18 @@ fn pin_mismatch(pin: Option<&Pin>, actual: &Pin) -> Option<&'static str> {
     }
 }
 
+/// Why a system's overall line and floor check cannot be trusted: not every one of
+/// its ROMs completed (a missing ROM or a load error), including none at all.
+fn incomplete_system(system: &str, expected: usize, completed: u32) -> Option<String> {
+    if completed as usize == expected {
+        None
+    } else {
+        Some(format!(
+            "overall ({system}): only {completed} of {expected} ROMs ran, so no speed (or floor) result"
+        ))
+    }
+}
+
 /// Entry point for `--bench`. `args` are all command-line arguments.
 pub fn run(args: &[String]) -> std::process::ExitCode {
     let check = args.iter().any(|a| a == "--check");
@@ -209,8 +318,9 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         "rom", "frames/s", "realtime", "video+serial hash", "audio hash"
     );
     let mut ok = true;
-    let mut total = Duration::ZERO;
-    for (name, model) in ROMS {
+    // Per system: (ROMs run, total emulation time), in `SYSTEMS` order.
+    let mut totals = [(0u32, Duration::ZERO); SYSTEMS.len()];
+    for (name, target) in ROMS {
         let path = roms_dir().join(name);
         let Ok(rom) = std::fs::read(&path) else {
             println!("{name:<38} missing ({})", path.display());
@@ -219,7 +329,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         };
         let mut best: Option<Run> = None;
         for _ in 0..repeats {
-            match run_once(&rom, model, frames) {
+            match run_once(&rom, target, frames) {
                 Ok(r) => {
                     if let Some(b) = &best {
                         // Emulation is deterministic: every repeat must agree.
@@ -241,7 +351,9 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             }
         }
         let Some(r) = best else { continue };
-        total += r.elapsed;
+        let slot = target.slot();
+        totals[slot].0 += 1;
+        totals[slot].1 += r.elapsed;
         let fps = f64::from(frames) / r.elapsed.as_secs_f64();
         let actual = Pin {
             rom_hash: fnv(FNV_OFFSET, &rom),
@@ -265,7 +377,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         };
         println!(
             "{name:<38} {fps:>10.0} {:>9.1}x  {:016x}  {:016x}{verdict}",
-            fps / FRAMES_PER_SECOND,
+            fps / SYSTEMS[slot].1,
             r.video_hash,
             r.audio_hash
         );
@@ -274,15 +386,30 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             actual.rom_hash, actual.video_hash, actual.audio_hash
         ));
     }
-    let all = f64::from(frames) * ROMS.len() as f64 / total.as_secs_f64();
-    let speed = all / FRAMES_PER_SECOND;
-    println!("{:<38} {all:>10.0} {speed:>9.1}x", "overall");
-    if let Some(floor) = min_speed {
-        if speed < floor {
-            println!("FAIL: overall {speed:.1}x is below the --min-speed floor of {floor}x");
+    for (slot, (&(system, native), &(roms, total))) in SYSTEMS.iter().zip(&totals).enumerate() {
+        let expected = ROMS.iter().filter(|(_, t)| t.slot() == slot).count();
+        if let Some(why) = incomplete_system(system, expected, roms) {
+            // A ROM that was missing or failed already failed the run; say what that
+            // means for this system's speed line, and never skip its floor check.
+            println!("FAIL: {why}");
             ok = false;
-        } else {
-            println!("speed floor {floor}x: ok");
+            continue;
+        }
+        let all = f64::from(frames) * f64::from(roms) / total.as_secs_f64();
+        let speed = all / native;
+        println!(
+            "{:<38} {all:>10.0} {speed:>9.1}x",
+            format!("overall ({system})")
+        );
+        if let Some(floor) = min_speed {
+            if speed < floor {
+                println!(
+                    "FAIL: overall ({system}) {speed:.1}x is below the --min-speed floor of {floor}x"
+                );
+                ok = false;
+            } else {
+                println!("speed floor {floor}x ({system}): ok");
+            }
         }
     }
     if print_pins {
@@ -317,6 +444,29 @@ mod tests {
         assert!(parse_pins("1200 zz 2 3 a.gb").is_err());
         assert!(parse_pins("1200 1 2 3").is_err());
         assert!(parse_pins("x 1 2 3 a.gb").is_err());
+    }
+
+    /// A bare `--bench --check` runs DEFAULT_FRAMES and CI runs 1200: every ROM needs
+    /// a pin at both, or the check fails for want of one.
+    #[test]
+    fn every_rom_is_pinned_at_the_default_and_the_ci_frame_counts() {
+        let text = std::fs::read_to_string(workspace_root().join(PINS_FILE)).unwrap();
+        let pins = parse_pins(&text).unwrap();
+        for (name, _) in ROMS {
+            for frames in [1200, DEFAULT_FRAMES] {
+                assert!(
+                    pins.iter().any(|(f, p, _)| *f == frames && p == name),
+                    "{name} has no pin at {frames} frames"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_system_with_a_missing_rom_or_none_fails_instead_of_skipping() {
+        assert_eq!(incomplete_system("gba", 4, 4), None);
+        assert!(incomplete_system("gba", 4, 3).unwrap().contains("3 of 4"));
+        assert!(incomplete_system("gba", 4, 0).unwrap().contains("0 of 4"));
     }
 
     #[test]

@@ -43,10 +43,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: roms/test
-          key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh') }}
+          key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh', 'scripts/fetch-gba-test-roms.sh') }}
 
       - name: Fetch test ROMs
-        run: ./scripts/fetch-test-roms.sh
+        run: |
+          ./scripts/fetch-test-roms.sh
+          ./scripts/fetch-gba-test-roms.sh
 
       - name: Cache homebrew corpus
         uses: actions/cache@v4
@@ -71,12 +73,49 @@ jobs:
           fi
           make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"
 
+      # GBA homebrew (DECISIONS #49): a separate cargo project on a pinned nightly
+      # (homebrew/gba/rust-toolchain.toml); the workspace itself stays on stable.
+      # The nightly (with rust-src) and the build-std/agb build output are cached, keyed on what
+      # pins them: the toolchain file and the lockfile. The install step stays: it is a no-op on
+      # a hit and fills in anything the cache did not hold.
+      - name: Cache the GBA homebrew nightly
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/nightly-2026-07-22-*
+            ~/.rustup/update-hashes/nightly-2026-07-22-*
+          key: gba-nightly-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('homebrew/gba/rust-toolchain.toml') }}
+
+      - name: Install the GBA homebrew nightly
+        run: rustup toolchain install nightly-2026-07-22 --component rust-src,clippy,rustfmt --profile minimal
+
+      - name: Cache the GBA homebrew build
+        uses: actions/cache@v4
+        with:
+          path: homebrew/gba/target
+          key: gba-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('homebrew/gba/rust-toolchain.toml', 'homebrew/gba/Cargo.lock') }}
+
+      - name: Cache agb-gbafix
+        uses: actions/cache@v4
+        with:
+          path: tools/agb
+          key: agb-gbafix-0.25.0-${{ runner.os }}
+
+      - name: Build GBA homebrew ROMs (agb)
+        run: |
+          if [ ! -x tools/agb/bin/agb-gbafix ]; then
+            cargo install agb-gbafix --version 0.25.0 --locked --root tools/agb
+          fi
+          make -C homebrew gba
+
       - name: Upload homebrew ROMs (consumed by the Windows job)
         if: matrix.name == 'linux-x86_64'
         uses: actions/upload-artifact@v4
         with:
           name: homebrew-roms
-          path: roms/homebrew/*.gb
+          path: |
+            roms/homebrew/*.gb
+            roms/homebrew/*.gba
           if-no-files-found: error
 
       - name: cargo fmt
@@ -92,14 +131,15 @@ jobs:
         run: cargo run -p gb-test --release -- --fail-on-mismatch
 
       # Pinned output hashes (bit-identical emulation on every OS) plus a speed
-      # floor. Dev Macs run ~45x real time; 5x leaves room for slow, noisy runners
-      # while still catching a real regression.
+      # floor, applied to the Game Boy and the GBA ROMs separately. Dev Macs run
+      # ~40x (GB) and ~17-24x (GBA) real time; 5x leaves room for slow, noisy
+      # runners while still catching a real regression.
       - name: Benchmark (pinned hashes + speed floor)
         run: cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5
 
-  # gb-core must stay portable (no std I/O, threads or platform deps).
+  # gb-core, gba-core and emu-common must stay portable (no std I/O, threads or platform deps).
   wasm32:
-    name: gb-core-wasm32
+    name: cores-wasm32
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -108,12 +148,12 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build and lint gb-core for wasm32
+      - name: Build and lint gb-core, gba-core and emu-common for wasm32
         run: |
-          cargo build -p gb-core --target wasm32-unknown-unknown
-          cargo clippy -p gb-core --target wasm32-unknown-unknown -- -D warnings
+          cargo build -p gb-core -p gba-core -p emu-common --target wasm32-unknown-unknown
+          cargo clippy -p gb-core -p gba-core -p emu-common --target wasm32-unknown-unknown -- -D warnings
 
-  # gb-core and gb-test promise the workspace MSRV (gb-frontend needs newer:
+  # gb-core, gba-core, emu-common and gb-test promise the workspace MSRV (gb-frontend needs newer:
   # pixels 0.17 / wgpu 29 want 1.88, so it is not checked here).
   msrv:
     name: msrv-1.85
@@ -122,8 +162,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - name: Check gb-core and gb-test on the MSRV
-        run: cargo check -p gb-core -p gb-test --all-targets
+      - name: Check gb-core, gba-core, emu-common and gb-test on the MSRV
+        run: cargo check -p gb-core -p gba-core -p gb-test -p emu-common --all-targets
 
   # Phase 8. Non-blocking: a Windows failure never fails the workflow.
   # Homebrew ROMs come from the Linux leg (GBDK + make on Windows runners
@@ -149,10 +189,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: roms/test
-          key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh') }}
+          key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh', 'scripts/fetch-gba-test-roms.sh') }}
 
       - name: Fetch test ROMs
-        run: ./scripts/fetch-test-roms.sh
+        run: |
+          ./scripts/fetch-test-roms.sh
+          ./scripts/fetch-gba-test-roms.sh
 
       - name: Cache homebrew corpus
         uses: actions/cache@v4
@@ -179,7 +221,8 @@ jobs:
         run: cargo run -p gb-test --release -- --fail-on-mismatch
 
       # Pinned output hashes (bit-identical emulation on every OS) plus a speed
-      # floor. Dev Macs run ~45x real time; 5x leaves room for slow, noisy runners
-      # while still catching a real regression.
+      # floor, applied to the Game Boy and the GBA ROMs separately. Dev Macs run
+      # ~40x (GB) and ~17-24x (GBA) real time; 5x leaves room for slow, noisy
+      # runners while still catching a real regression.
       - name: Benchmark (pinned hashes + speed floor)
         run: cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5

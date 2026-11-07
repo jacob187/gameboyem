@@ -55,6 +55,11 @@ impl GameBoy {
         self.model
     }
 
+    /// The FNV-1a hash of the ROM image, as `emu_common::replay::rom_hash` computes it.
+    pub fn rom_hash(&self) -> u64 {
+        self.rom_hash
+    }
+
     /// Replace the cartridge and power-cycle the machine (same model).
     ///
     /// Host configuration survives (the audio sample rate set by
@@ -327,6 +332,13 @@ mod tests {
         let mut rom = vec![0u8; 0x8000];
         rom[0x147] = 0x00;
         rom
+    }
+
+    #[test]
+    fn rom_hash_is_the_one_a_recording_stores() {
+        let rom = nop_rom();
+        let gb = GameBoy::new(rom.clone()).unwrap();
+        assert_eq!(gb.rom_hash(), emu_common::replay::rom_hash(&rom));
     }
 
     #[test]

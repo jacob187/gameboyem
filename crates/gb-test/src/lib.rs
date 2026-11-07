@@ -1,9 +1,11 @@
-//! Headless test-ROM harness for `gb-core`.
+//! Headless test-ROM harness for `gb-core` and `gba-core`.
 //!
 //! Never opens a window: runs on macOS, in Docker and in CI. The list of ROMs and
 //! their expected outcomes lives in `expected.txt` (see its header).
 //!
 //! ROMs are looked up under `$GB_ROMS_DIR` if set, else `<workspace>/roms`.
+
+pub mod gba;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -51,6 +53,14 @@ pub enum Kind {
     /// Homebrew `cgbdemo` (CGB only, run with the `-cgb` suffix): per-tile BG palettes and
     /// flips, a bank-1 sprite moved by the D-pad, and A stepping a palette entry.
     PlayCgbdemo,
+    /// jsmolka/gba-tests (`jsmolka-gba`): run to the ROM's idle `b .`; the failed-test register
+    /// (r12, r7 for `thumb.gba`) must be 0. `max_frames` is the budget, in frames of CPU cycles.
+    JsmolkaGba,
+    /// FuzzARM (`fuzzarm-gba`): the EWRAM word at 0x0200_0000 stays 0 and the ROM reaches its idle
+    /// loop within `max_frames` frames.
+    FuzzarmGba,
+    /// GBA smoke test (`smoke-gba`): the framebuffer is not one flat colour after `max_frames` frames.
+    SmokeGba,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +70,8 @@ pub struct Case {
     pub kind: Kind,
     pub expect_pass: bool,
     pub max_frames: u32,
-    /// The console to run on: a `-cgb` suffix on the kind selects [`Model::Cgb`].
+    /// The console to run on: a `-cgb` suffix on the kind selects [`Model::Cgb`]. The `-gba` kinds
+    /// run on `gba-core` and ignore this field.
     pub model: Model,
 }
 
@@ -71,6 +82,7 @@ impl Case {
         let p = p
             .strip_suffix(".gbc")
             .or_else(|| p.strip_suffix(".gb"))
+            .or_else(|| p.strip_suffix(".gba"))
             .unwrap_or(p);
         match self.kind {
             // Same ROM as the smoke case; keep the names unique.
@@ -172,14 +184,21 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "fail" => false,
                 o => panic!("expected.txt:{}: bad expectation {o:?}", n + 1),
             };
-            // `<kind>-cgb` runs <kind> on a CGB. Only the `-cgb` suffix is peeled
-            // off, so `blargg-mem` and friends keep parsing.
+            // `<kind>-cgb` runs <kind> on a CGB; `<kind>-gba` picks the GBA core (see `gba.rs`).
+            // Only these suffixes are peeled off, so `blargg-mem` and friends keep parsing.
             let kind_text = next("kind");
-            let (kind_text, model) = match kind_text.strip_suffix("-cgb") {
-                Some(base) => (base, Model::Cgb),
-                None => (kind_text, Model::Dmg),
+            let (kind_text, model, gba) = match (
+                kind_text.strip_suffix("-cgb"),
+                kind_text.strip_suffix("-gba"),
+            ) {
+                (Some(base), _) => (base, Model::Cgb, false),
+                (None, Some(base)) => (base, Model::Dmg, true),
+                (None, None) => (kind_text, Model::Dmg, false),
             };
             let kind = match kind_text {
+                "jsmolka" if gba => Kind::JsmolkaGba,
+                "fuzzarm" if gba => Kind::FuzzarmGba,
+                "smoke" if gba => Kind::SmokeGba,
                 "blargg" => Kind::Blargg,
                 "blargg-mem" => Kind::BlarggMem,
                 "mooneye" => Kind::Mooneye,
@@ -197,6 +216,11 @@ pub fn parse_manifest(text: &str) -> Vec<Case> {
                 "play-cgbdemo" => Kind::PlayCgbdemo,
                 o => panic!("expected.txt:{}: bad kind {o:?}", n + 1),
             };
+            assert!(
+                !gba || matches!(kind, Kind::JsmolkaGba | Kind::FuzzarmGba | Kind::SmokeGba),
+                "expected.txt:{}: kind {kind_text:?} has no `-gba` variant",
+                n + 1
+            );
             let max_frames = next("max_frames")
                 .parse()
                 .unwrap_or_else(|e| panic!("expected.txt:{}: bad frame count: {e}", n + 1));
@@ -245,6 +269,7 @@ pub fn run_case(case: &Case) -> Outcome {
         Kind::SfxSnake => run_sfx(&rom, model, sfx_snake, frames),
         Kind::SfxBreakout => run_sfx(&rom, model, sfx_breakout, frames),
         Kind::PlayCgbdemo => run_cgbdemo(&rom, model, frames),
+        Kind::JsmolkaGba | Kind::FuzzarmGba | Kind::SmokeGba => gba::run_case(case, rom),
     }
 }
 
@@ -482,15 +507,28 @@ fn decode_screen_png(
 /// Write screen-sized 8-bit `samples` as a PNG of the given colour type, creating parent
 /// directories (for debugging failed comparisons).
 fn save_screen_png(samples: &[u8], color: png::ColorType, path: &Path) -> Result<(), String> {
+    save_sized_png(
+        SCREEN_WIDTH as u32,
+        SCREEN_HEIGHT as u32,
+        samples,
+        color,
+        path,
+    )
+}
+
+/// [`save_screen_png`] for any size (the GBA screen is 240x160).
+fn save_sized_png(
+    width: u32,
+    height: u32,
+    samples: &[u8],
+    color: png::ColorType,
+    path: &Path,
+) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(
-        std::io::BufWriter::new(file),
-        SCREEN_WIDTH as u32,
-        SCREEN_HEIGHT as u32,
-    );
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     enc.set_color(color);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header()

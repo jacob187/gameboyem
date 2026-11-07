@@ -1,21 +1,25 @@
-//! `gb-test --replay REC ROM [--dump F,F,...] [--out DIR]`: play back a
-//! recording made with `gb --record` headlessly and dump frames as PNGs.
+//! `gb-test --replay REC ROM [--bios FILE] [--dump F,F,...] [--out DIR]`: play
+//! back a recording made with `gb --record` headlessly and dump frames as PNGs.
 //!
 //! By default the dumped frames are every marker (screenshot) frame plus the
-//! last frame. `--dump` replaces that with an explicit list. The machine is
-//! the recorded model (a recording carries it; version 1 files are DMG). The
-//! PNGs (greyscale shades, or RGB for a CGB in colour mode) match the
+//! last frame. `--dump` replaces that with an explicit list. The system comes
+//! from the recording. A Game Boy is powered on as the recorded model (version 1
+//! files are DMG); a GBA with the recorded cartridge options, clock start and
+//! BIOS: the built-in one, or the user's own dump (`--bios FILE`), which a
+//! recording made with a real BIOS needs and says so without. The PNGs
+//! (greyscale shades, or RGB for a CGB in colour mode and for a GBA) match the
 //! frontend's screenshots byte for byte.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use gb_core::replay::{Recording, Replayer};
+use gb_core::replay::{Recording, ReplayError, Replayer};
 use gb_core::rgb555_to_rgb888;
+use gb_test::gba::{gba_rgb, save_gba_rgb_png};
 use gb_test::{artifact_dir, save_framebuffer_png, save_rgb_png};
 
-const USAGE: &str = "usage: gb-test --replay REC ROM [--dump F,F,...] [--out DIR]";
+const USAGE: &str = "usage: gb-test --replay REC ROM [--bios FILE] [--dump F,F,...] [--out DIR]";
 
 pub fn run(args: &[String]) -> ExitCode {
     match run_inner(args) {
@@ -30,6 +34,8 @@ pub fn run(args: &[String]) -> ExitCode {
 struct Options {
     recording: PathBuf,
     rom: PathBuf,
+    /// `--bios`: a GBA recording's real BIOS dump.
+    bios: Option<PathBuf>,
     dump: Option<Vec<u64>>,
     out: Option<PathBuf>,
 }
@@ -37,6 +43,7 @@ struct Options {
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut positional = Vec::new();
     let mut dump = None;
+    let mut bios = None;
     let mut out = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -46,6 +53,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 let v = it.next().ok_or("--dump is missing a value")?;
                 dump = Some(parse_frames(v)?);
             }
+            "--bios" => bios = Some(PathBuf::from(it.next().ok_or("--bios is missing a value")?)),
             "--out" => out = Some(PathBuf::from(it.next().ok_or("--out is missing a value")?)),
             s if s.starts_with("--") => return Err(format!("unknown option `{s}`")),
             _ => positional.push(PathBuf::from(a)),
@@ -57,6 +65,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     Ok(Options {
         recording,
         rom,
+        bios,
         dump,
         out,
     })
@@ -80,30 +89,74 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let opts = parse(args)?;
     let bytes = std::fs::read(&opts.recording)
         .map_err(|e| format!("cannot read {}: {e}", opts.recording.display()))?;
-    let rec = Recording::decode(&bytes).map_err(|e| e.to_string())?;
     let rom =
         std::fs::read(&opts.rom).map_err(|e| format!("cannot read {}: {e}", opts.rom.display()))?;
-    let mut gb = rec.power_on(rom).map_err(|e| e.to_string())?;
+    // The Game Boy decoder names a recording of another system; that one is the
+    // GBA's to decode (and to report any damage in).
+    match Recording::decode(&bytes) {
+        Ok(rec) => {
+            if opts.bios.is_some() {
+                return Err("--bios is for GBA recordings".to_owned());
+            }
+            replay_gb(&opts, &rec, rom)
+        }
+        Err(ReplayError::WrongSystem(_)) => {
+            let rec = gba_core::replay::Recording::decode(&bytes).map_err(|e| e.to_string())?;
+            replay_gba(&opts, &rec, rom)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
 
-    let total = rec.frame_count();
-    if rec.end_frame.is_none() {
+/// The frames to dump, validated against [`MAX_FRAMES`]: every marker and the
+/// end unless `--dump` lists them.
+fn targets(
+    opts: &Options,
+    markers: Vec<u64>,
+    total: u64,
+    truncated: bool,
+    has_end: bool,
+) -> Result<BTreeSet<u64>, String> {
+    if !has_end {
         eprintln!(
             "warning: recording has no end record (session cut short); replaying to its last input"
         );
     }
-    if rec.truncated {
+    if truncated {
         eprintln!("warning: recording ends inside a record; the partial record was ignored");
     }
     let targets: BTreeSet<u64> = match &opts.dump {
         Some(list) => list.iter().copied().collect(),
-        None => rec.markers().into_iter().chain([total]).collect(),
+        None => markers.into_iter().chain([total]).collect(),
     };
     let last = targets.last().copied().unwrap_or(total).max(total);
     if last > MAX_FRAMES {
         return Err(format!("refusing to run {last} frames (max {MAX_FRAMES})"));
     }
-    let out = opts.out.unwrap_or_else(|| default_out(&opts.recording));
+    Ok(targets)
+}
+
+fn output_dir(opts: &Options) -> Result<PathBuf, String> {
+    let out = opts
+        .out
+        .clone()
+        .unwrap_or_else(|| default_out(&opts.recording));
     std::fs::create_dir_all(&out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+    Ok(out)
+}
+
+fn replay_gb(opts: &Options, rec: &Recording, rom: Vec<u8>) -> Result<(), String> {
+    let mut gb = rec.power_on(rom).map_err(|e| e.to_string())?;
+
+    let total = rec.frame_count();
+    let targets = targets(
+        opts,
+        rec.markers(),
+        total,
+        rec.truncated,
+        rec.end_frame.is_some(),
+    )?;
+    let out = output_dir(opts)?;
 
     println!(
         "replaying {} ({:?}, {total} frames, {} inputs, markers {:?})",
@@ -112,7 +165,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         rec.records.len() - rec.markers().len(),
         rec.markers()
     );
-    let mut player = Replayer::new(&rec);
+    let mut player = Replayer::new(rec);
     let mut audio = Vec::new();
     for &target in &targets {
         while player.frame() < target {
@@ -134,6 +187,82 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             }
         };
         println!("frame {target}: {} (hash {hash:016x})", path.display());
+    }
+    Ok(())
+}
+
+/// Read a GBA BIOS dump, refusing anything but exactly 16 KiB before reading it.
+fn read_bios(path: &Path) -> Result<Box<[u8]>, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .len();
+    if len != gba_core::BIOS_SIZE as u64 {
+        return Err(format!(
+            "{} is {len} bytes, a GBA BIOS is {}",
+            path.display(),
+            gba_core::BIOS_SIZE
+        ));
+    }
+    std::fs::read(path)
+        .map(Vec::into_boxed_slice)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+fn replay_gba(
+    opts: &Options,
+    rec: &gba_core::replay::Recording,
+    rom: Vec<u8>,
+) -> Result<(), String> {
+    let bios = opts.bios.as_deref().map(read_bios).transpose()?;
+    let mut gba = rec.power_on(rom, bios).map_err(|e| e.to_string())?;
+    if rec.legacy {
+        // deep-review #14: a version 3 GBA recording has no header extension.
+        eprintln!(
+            "warning: this is a version 3 GBA recording, which does not record --save-type, --rtc, \
+             --rtc-start or --bios; replaying with the defaults (any --bios is used unchecked)"
+        );
+    }
+
+    let total = rec.frame_count();
+    let targets = targets(
+        opts,
+        rec.markers(),
+        total,
+        rec.truncated,
+        rec.end_frame.is_some(),
+    )?;
+    let out = output_dir(opts)?;
+
+    let header = &rec.header;
+    println!(
+        "replaying {} (GBA, {} BIOS, save {:?}, rtc {:?}, {total} frames, {} inputs, markers {:?})",
+        opts.recording.display(),
+        if header.bios_hash.is_some() {
+            "real"
+        } else {
+            "built-in"
+        },
+        header.options.save,
+        header.options.rtc,
+        rec.records.len() - rec.markers().len(),
+        rec.markers()
+    );
+    let mut player = gba_core::replay::Replayer::new(rec);
+    let mut audio = Vec::new();
+    for &target in &targets {
+        while player.frame() < target {
+            player.step_frame(&mut gba);
+            audio.clear();
+            gba.drain_audio_into(&mut audio); // keep the core's buffer bounded
+        }
+        let path = out.join(format!("f{target:07}.png"));
+        let rgb = gba_rgb(gba.framebuffer());
+        save_gba_rgb_png(&rgb, &path)?;
+        println!(
+            "frame {target}: {} (hash {:016x})",
+            path.display(),
+            frame_hash(&rgb)
+        );
     }
     Ok(())
 }
@@ -167,8 +296,11 @@ mod tests {
             "1, 20",
             "--out",
             "d",
+            "--bios",
+            "b.bin",
         ]))
         .unwrap();
+        assert_eq!(o.bios, Some(PathBuf::from("b.bin")));
         assert_eq!(o.recording, PathBuf::from("r.gbinput"));
         assert_eq!(o.rom, PathBuf::from("g.gb"));
         assert_eq!(o.dump, Some(vec![1, 20]));
@@ -177,5 +309,6 @@ mod tests {
         assert!(parse(&args(&["--replay", "r", "g", "x"])).is_err());
         assert!(parse(&args(&["--replay", "r", "g", "--dump", "a"])).is_err());
         assert!(parse(&args(&["--replay", "r", "g", "--bogus"])).is_err());
+        assert!(parse(&args(&["--replay", "r", "g", "--bios"])).is_err());
     }
 }

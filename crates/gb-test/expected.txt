@@ -230,3 +230,51 @@ fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/09-wave read while on.gb
 fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/10-wave trigger while on.gb
 fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/11-regs after power.gb
 fail blargg-mem-cgb 600 test/cgb_sound/rom_singles/12-wave.gb
+
+# --- Game Boy Advance (kinds with a `-gba` suffix run on gba-core; DECISIONS #48, #57) ---
+# Run against the full core (CPU, bus, PPU, APU, HLE BIOS). Smoke lines were added only after their
+# frames were checked by eye. Fetched by scripts/fetch-gba-test-roms.sh into roms/test/gba/ (a missing ROM is
+# skipped locally and fails in CI, like the GB ones). Left out on purpose (DECISIONS #48): jsmolka
+# bios.gba (needs the official BIOS) and unsafe.gba (fails on hardware); armwrestler, nba-hw-test and
+# the other tonc demos are screen-only and not wired up yet.
+#   jsmolka-gba: run until PC is on the ROM's single `b .`, failed-test register (r12, r7 for thumb) must
+#     be 0. max_frames is the budget in frames of CPU cycles.
+#   fuzzarm-gba: EWRAM 0x0200_0000 stays 0 and the ROM reaches its idle loop within max_frames frames.
+#   smoke-gba: framebuffer is not one flat colour after max_frames frames.
+pass jsmolka-gba 60 test/gba/jsmolka/arm/arm.gba
+pass jsmolka-gba 60 test/gba/jsmolka/thumb/thumb.gba
+pass jsmolka-gba 60 test/gba/jsmolka/memory/memory.gba
+pass jsmolka-gba 60 test/gba/jsmolka/nes/nes.gba
+pass jsmolka-gba 60 test/gba/jsmolka/save/sram.gba
+pass jsmolka-gba 150 test/gba/jsmolka/save/flash64.gba
+pass jsmolka-gba 150 test/gba/jsmolka/save/flash128.gba
+pass jsmolka-gba 60 test/gba/jsmolka/save/none.gba
+# FuzzARM: 10000 random instruction tests per ROM. Each draws its test number as 8 hex glyphs from
+# ROM (16-bit bus, so 6+ cycles per ARM instruction), and the ROMs reach their idle loop at frames
+# 825.3-827.3, so the budget is 2x that. The flash ROMs need 73.9 frames (64 K fills of the chip a byte at
+# a time through 8-bit SRAM-bus accesses), hence 150.
+pass fuzzarm-gba 1650 test/gba/fuzzarm/ARM_Any.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/ARM_DataProcessing.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/THUMB_Any.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/THUMB_DataProcessing.gba
+pass fuzzarm-gba 1650 test/gba/fuzzarm/FuzzARM.gba
+# Visual-only ROMs: they only prove the PPU draws something. Look at them with
+# `gb-test --dump-gba ROM FRAMES OUT_DIR` before trusting them.
+pass smoke-gba 120 test/gba/jsmolka/ppu/hello.gba
+pass smoke-gba 120 test/gba/jsmolka/ppu/shades.gba
+pass smoke-gba 120 test/gba/jsmolka/ppu/stripes.gba
+pass smoke-gba 120 test/gba/tonc/bin/m3_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/bm_modes.gba
+pass smoke-gba 120 test/gba/tonc/bin/sbb_reg.gba
+pass smoke-gba 120 test/gba/tonc/bin/obj_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/key_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/irq_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/swi_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/swi_vsync.gba
+pass smoke-gba 120 test/gba/tonc/bin/bld_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/m7_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/dma_demo.gba
+pass smoke-gba 120 test/gba/tonc/bin/tmr_demo.gba
+# The HLE BIOS (DECISIONS #64): both agb games use the BIOS IRQ path and VBlankIntrWait.
+pass smoke-gba 700 homebrew/grains.gba
+pass smoke-gba 700 homebrew/moth.gba

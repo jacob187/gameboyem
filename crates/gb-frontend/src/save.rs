@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use gb_core::GameBoy;
+use emu_common::Core;
 
 /// How often battery RAM is compared against what is on disk.
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -55,9 +55,10 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Largest valid save file: 128 KiB of cart RAM (MBC5, RAM code 4) plus the
-/// 48-byte MBC3 RTC footer. Anything bigger cannot be a save for any cartridge.
-/// (The core exports no such constant; a test checks this still covers it.)
+/// Largest valid save file: 128 KiB of cart RAM (MBC5, RAM code 4; also a GBA
+/// 128 KiB Flash chip) plus the 48-byte MBC3 RTC footer. Anything bigger cannot
+/// be a save for any cartridge. (The cores export no such constant; tests check
+/// this still covers the largest of each.)
 const MAX_SAVE_BYTES: u64 = 0x20000 + 48;
 
 /// Read the save at `path`: `Ok(None)` if there is none. Rejects, without
@@ -235,8 +236,11 @@ impl SaveManager {
     }
 
     /// Load an existing save into the cartridge. Problems are logged, never fatal.
-    pub fn load(&mut self, gb: &mut GameBoy) {
-        if gb.battery_ram().is_none() {
+    pub fn load(&mut self, gb: &mut dyn Core) {
+        // Not `battery_ram().is_none()`: a GBA EEPROM has a battery but no image
+        // until it is sized, and its existing save must still be loaded (it sizes
+        // the chip) rather than replaced by the game's first write.
+        if !gb.has_battery() {
             return; // no battery: nothing to load or save
         }
         match read_save(&self.path) {
@@ -277,7 +281,7 @@ impl SaveManager {
     }
 
     /// Periodic check; writes if the cartridge reports a battery change.
-    pub fn tick(&mut self, gb: &GameBoy, now: Instant) {
+    pub fn tick(&mut self, gb: &dyn Core, now: Instant) {
         if now >= self.next_check {
             self.next_check = now + SAVE_INTERVAL;
             self.sync_gb(gb, now, false, false);
@@ -286,21 +290,21 @@ impl SaveManager {
 
     /// Write now if the cartridge reports a battery change (e.g. on pause).
     /// Failures are rate-limited.
-    pub fn flush(&mut self, gb: &GameBoy) {
+    pub fn flush(&mut self, gb: &dyn Core) {
         self.sync_gb(gb, Instant::now(), false, false);
     }
 
     /// Last write before exiting: a failure is always reported, never throttled,
     /// because it means data is being lost. Ignores the generation counter and
     /// always looks at the RAM image, so a free-running RTC is saved on quit.
-    pub fn flush_final(&mut self, gb: &GameBoy) {
+    pub fn flush_final(&mut self, gb: &dyn Core) {
         self.sync_gb(gb, Instant::now(), true, true);
     }
 
     /// Cheap pre-check on the cartridge's battery generation (no RAM clone, no
     /// write while it is unchanged), then [`Self::sync`]. `force` skips the
     /// pre-check.
-    fn sync_gb(&mut self, gb: &GameBoy, now: Instant, urgent: bool, force: bool) {
+    fn sync_gb(&mut self, gb: &dyn Core, now: Instant, urgent: bool, force: bool) {
         let generation = gb.battery_generation();
         if !force && self.last_gen == Some(generation) {
             return;
@@ -378,6 +382,7 @@ enum Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gb_core::GameBoy;
 
     fn sync(m: &mut SaveManager, ram: Option<Vec<u8>>) -> bool {
         m.sync(ram, Instant::now(), false)
@@ -564,7 +569,7 @@ mod tests {
 
     /// Load `contents` as `g.sav`, change RAM, and try every kind of write.
     /// Returns the manager (for inspection) after asserting nothing was written.
-    fn load_then_try_to_save(dir: &Path, gb: &mut GameBoy) -> SaveManager {
+    fn load_then_try_to_save(dir: &Path, gb: &mut dyn Core) -> SaveManager {
         let t0 = Instant::now();
         let mut m = SaveManager::new(&dir.join("g.gb"), t0);
         m.load(gb);
@@ -667,6 +672,148 @@ mod tests {
             assert_eq!(gb.battery_ram().unwrap()[0], 0xAB);
         }
         assert_eq!(cart(0x1B, 0x04).battery_ram().unwrap().len(), 0x20000);
+    }
+
+    /// A GBA ROM image carrying the library ID string `id` (empty: no save chip).
+    fn gba_rom(id: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x200];
+        rom[0x100..0x100 + id.len()].copy_from_slice(id);
+        rom
+    }
+
+    fn gba(id: &[u8]) -> gba_core::Gba {
+        gba_core::Gba::new(gba_rom(id), None).unwrap()
+    }
+
+    #[test]
+    fn a_128_kib_flash_save_with_an_rtc_footer_fits_the_cap_and_loads() {
+        // 128 KiB of chip plus a hand-built footer (DECISIONS #67): magic, control,
+        // 2024-01-01 00:00:00 with weekday 1 (BCD), zero sub-second, reserved.
+        let mut ram = vec![0xFF; 128 * 1024];
+        ram.extend_from_slice(b"AGBRTC01");
+        ram.extend_from_slice(&[0x42, 0x24, 0x01, 0x01, 1, 0, 0, 0]);
+        ram.extend_from_slice(&[0; 8]);
+        assert_eq!(ram.len(), 128 * 1024 + gba_core::cart::RTC_FOOTER_LEN);
+        assert!(ram.len() as u64 <= MAX_SAVE_BYTES);
+        let opts = gba_core::CartOptions::default();
+        let mut g = gba_core::Gba::with_options(gba_rom(b"FLASH1M_V"), None, opts).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("g.sav"), &ram).unwrap();
+        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        m.load(&mut g);
+        assert!(!m.write_blocked, "a save with a footer is accepted");
+        assert_eq!(
+            Core::battery_ram(&g).unwrap(),
+            ram,
+            "and written back as it was"
+        );
+        // A corrupt footer is refused like any bad save: the file is backed up and ignored.
+        let mut bad = ram.clone();
+        let n = bad.len();
+        bad[n - gba_core::cart::RTC_FOOTER_LEN] = b'X';
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("g.sav"), &bad).unwrap();
+        let mut g = gba_core::Gba::with_options(gba_rom(b"FLASH1M_V"), None, opts).unwrap();
+        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        m.load(&mut g);
+        assert!(
+            dir.path().join("g.sav.bak").exists(),
+            "the bad file was backed up"
+        );
+    }
+
+    #[test]
+    fn a_128_kib_flash_save_fits_the_cap_and_loads() {
+        let mut g = gba(b"FLASH1M_V");
+        let mut ram = Core::battery_ram(&g).expect("flash");
+        assert_eq!(ram.len(), 128 * 1024);
+        assert!(ram.len() as u64 <= MAX_SAVE_BYTES);
+        ram[0] = 0xAB;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("g.sav"), &ram).unwrap();
+        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        m.load(&mut g);
+        assert!(!m.write_blocked);
+        assert_eq!(Core::battery_ram(&g).unwrap()[0], 0xAB);
+    }
+
+    #[test]
+    fn an_existing_eeprom_save_is_loaded_even_though_its_size_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = dir.path().join("g.gba");
+        let mut save = vec![0x5A; 8192];
+        save[1] = 1;
+        fs::write(dir.path().join("g.sav"), &save).unwrap();
+
+        let mut g = gba(b"EEPROM_V");
+        assert_eq!(Core::battery_ram(&g), None, "size unknown until used");
+        let mut m = SaveManager::new(&rom, Instant::now());
+        m.load(&mut g);
+        assert_eq!(Core::battery_ram(&g), Some(save.clone()));
+        // The loaded image is the baseline: nothing is rewritten.
+        m.flush(&g);
+        m.flush_final(&g);
+        assert_eq!(fs::read(dir.path().join("g.sav")).unwrap(), save);
+        assert_eq!(dir_names(dir.path()).len(), 1, "no backup, no temp file");
+    }
+
+    #[test]
+    fn an_unsized_eeprom_with_no_save_file_is_quiet_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = gba(b"EEPROM_V");
+        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        m.load(&mut g);
+        let base = Instant::now();
+        for i in 1..=4 {
+            m.tick(&g, secs(base, 10 * i));
+        }
+        m.flush(&g);
+        m.flush_final(&g);
+        assert!(
+            dir_names(dir.path()).is_empty(),
+            "no .sav until the game saves"
+        );
+    }
+
+    #[test]
+    fn a_wrong_size_gba_save_is_reported_backed_up_and_skipped() {
+        for (id, bad) in [
+            (&b"EEPROM_V"[..], 100),
+            (b"SRAM_V", 100),
+            (b"FLASH_V", 128 * 1024),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("g.sav"), vec![3u8; bad]).unwrap();
+            let mut g = gba(id);
+            let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+            m.load(&mut g); // must print the core's error and carry on
+            assert!(!m.write_blocked);
+            assert_eq!(
+                fs::read(dir.path().join("g.sav.bak")).unwrap(),
+                vec![3u8; bad],
+                "{}",
+                String::from_utf8_lossy(id)
+            );
+            assert_ne!(Core::battery_ram(&g), Some(vec![3u8; bad]));
+            m.flush(&g); // and still runs
+        }
+    }
+
+    #[test]
+    fn a_gba_rom_without_a_save_chip_ignores_a_stray_sav() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("g.sav"), b"stray").unwrap();
+        let mut g = gba(b"");
+        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        m.load(&mut g);
+        m.flush_final(&g);
+        assert!(!m.write_blocked);
+        assert_eq!(
+            dir_names(dir.path()),
+            vec![OsString::from("g.sav")],
+            "no .bak"
+        );
+        assert_eq!(fs::read(dir.path().join("g.sav")).unwrap(), b"stray");
     }
 
     #[test]

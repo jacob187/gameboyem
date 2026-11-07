@@ -5,8 +5,11 @@
 //! `-- --bench [FRAMES] [REPEATS] [--check] [--min-speed N] [--print-pins]` instead runs the
 //! speed benchmark (`bench.rs`).
 //!
-//! `-- --replay REC ROM [--dump F,F,...] [--out DIR]` instead plays back a
-//! recording made with `gb --record` (`replay.rs`).
+//! `-- --replay REC ROM [--bios FILE] [--dump F,F,...] [--out DIR]` instead plays back a
+//! recording made with `gb --record` (`replay.rs`); `--bios` is a GBA recording's real BIOS dump.
+//!
+//! `-- --dump-gba ROM FRAMES OUT_DIR` runs a GBA ROM headlessly and writes PNGs of the listed
+//! frames (`gba.rs`).
 //!
 //! Exit status is nonzero with `--fail-on-mismatch` if any result differs from
 //! `expected.txt` (or a ROM is missing in CI).
@@ -30,6 +33,9 @@ fn main() -> ExitCode {
     }
     if args.iter().any(|a| a == "--replay") {
         return replay::run(&args);
+    }
+    if args.iter().any(|a| a == "--dump-gba") {
+        return gb_test::gba::dump_main(&args);
     }
     let cases: Vec<Case> = load_manifest()
         .into_iter()

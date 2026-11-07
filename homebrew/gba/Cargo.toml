@@ -1,0 +1,36 @@
+cargo-features = ["trim-paths"]
+
+[package]
+name = "gba-homebrew"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Two original GBA homebrew games (agb) used as emulator smoke tests"
+
+# Not a member of the repo's root workspace: this needs nightly + build-std.
+[workspace]
+
+[dependencies]
+agb = { version = "=0.25.0", default-features = false, features = ["testing"] }
+
+[[bin]]
+name = "grains"
+path = "src/bin/grains.rs"
+
+[[bin]]
+name = "moth"
+path = "src/bin/moth.rs"
+
+[profile.dev]
+opt-level = 3
+debug = true
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+trim-paths = "all"
+opt-level = 3
+lto = "fat"
+debug = true

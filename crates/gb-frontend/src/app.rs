@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gb_core::replay::{Event, Record};
-use gb_core::{Button, FRAMES_PER_SECOND, Framebuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use emu_common::replay::{Event, Record};
+use emu_common::{Button, Core, FrameRef, Pixels as FramePixels};
+use gb_core::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -21,7 +22,7 @@ use crate::record::{self, Recorder};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
-use crate::video::{Palette, blit, blit_cgb, test_pattern};
+use crate::video::{Palette, present, test_pattern};
 
 /// Speed multiplier while Tab is held.
 const FAST_FORWARD_SPEED: f64 = 4.0;
@@ -33,6 +34,38 @@ const STATUS_DURATION: Duration = Duration::from_secs(2);
 /// drawable area (minimised: a zero dimension makes wgpu panic or error).
 fn surface_extent(width: u32, height: u32) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
+}
+
+/// What `upload` does about the pixel buffer for a frame of a given size.
+#[derive(Debug, PartialEq, Eq)]
+enum BufferPlan {
+    /// The buffer already has the frame's size.
+    Present,
+    /// Resize the buffer first.
+    Resize,
+    /// A resize failed earlier: leave the picture alone rather than retry (and
+    /// warn) every frame.
+    Skip,
+}
+
+fn buffer_plan(frame: (u32, u32), buffer: (u32, u32), resize_failed: bool) -> BufferPlan {
+    if frame == buffer {
+        BufferPlan::Present
+    } else if resize_failed {
+        BufferPlan::Skip
+    } else {
+        BufferPlan::Resize
+    }
+}
+
+/// The window title: the program name, then the game's title if it has one.
+/// Both systems use `gb` (the binary's name), so a GBA game is `gb - <title>`.
+fn window_title(game: &str) -> String {
+    if game.is_empty() {
+        "gb".to_owned()
+    } else {
+        format!("gb - {game}")
+    }
 }
 
 /// State for `--test-pattern`: the core is bypassed.
@@ -48,8 +81,23 @@ pub struct Storage {
     pub states: StateSlots,
 }
 
-pub struct App {
-    gb: GameBoy,
+/// The picture to show: the test pattern if that mode is on, else the core's.
+fn frame_of<'a>(test: Option<&'a TestMode>, core: &'a impl Core) -> FrameRef<'a> {
+    match test {
+        Some(t) => FrameRef {
+            width: SCREEN_WIDTH,
+            height: SCREEN_HEIGHT,
+            pixels: FramePixels::Shades(&t.fb[..]),
+        },
+        None => core.frame(),
+    }
+}
+
+/// Window, input, pacing and presentation for any [`Core`]. `main` uses
+/// `App<Box<dyn Core>>` (the system is chosen at run time); tests use a
+/// concrete machine to reach its debug hooks.
+pub struct App<C: Core> {
+    core: C,
     saves: SaveManager,
     states: StateSlots,
     audio: Option<AudioOutput>,
@@ -58,6 +106,10 @@ pub struct App {
     palette: Palette,
     scale: u32,
     title: String,
+    /// Size of the `pixels` buffer; follows the core's frame size.
+    buffer_size: (u32, u32),
+    /// A buffer resize failed (and was reported once); see [`BufferPlan::Skip`].
+    resize_failed: bool,
     /// Save-state feedback shown in the title until the given instant.
     status: Option<(String, Instant)>,
     test: Option<TestMode>,
@@ -81,9 +133,9 @@ pub struct App {
     pub error: Option<String>,
 }
 
-impl App {
+impl<C: Core> App<C> {
     pub fn new(
-        gb: GameBoy,
+        core: C,
         Storage { saves, states }: Storage,
         audio: Option<AudioOutput>,
         palette: Palette,
@@ -91,24 +143,20 @@ impl App {
         test_pattern: bool,
         shutdown: ShutdownFlag,
     ) -> Self {
-        let name = gb.cartridge_header().title.trim().to_owned();
-        let title = if name.is_empty() {
-            "gb".to_owned()
-        } else {
-            format!("gb - {name}")
-        };
+        let title = window_title(&core.title());
+        let fps = core.native_fps();
         let test = test_pattern.then(|| TestMode {
             frame: 0,
             fb: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
             tone: ToneGen::new(
                 audio
                     .as_ref()
-                    .map_or(gb.audio_sample_rate(), |a| a.sample_rate),
-                FRAMES_PER_SECOND,
+                    .map_or(core.audio_sample_rate(), |a| a.sample_rate),
+                fps,
             ),
         });
         Self {
-            gb,
+            core,
             saves,
             states,
             audio,
@@ -116,6 +164,8 @@ impl App {
             palette,
             scale,
             title,
+            buffer_size: (SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32),
+            resize_failed: false,
             status: None,
             test,
             shutdown,
@@ -123,7 +173,7 @@ impl App {
             recorder: None,
             frame: 0,
             input: InputState::default(),
-            pacer: FramePacer::new(FRAMES_PER_SECOND),
+            pacer: FramePacer::new(fps),
             last_tick: Instant::now(),
             paused: false,
             fast_forward: false,
@@ -218,12 +268,12 @@ impl App {
     }
 
     fn save_state(&mut self) {
-        let msg = self.states.save(&self.gb).unwrap_or_else(|e| e);
+        let msg = self.states.save(&self.core).unwrap_or_else(|e| e);
         self.show_status(msg);
     }
 
     fn load_state(&mut self) {
-        match self.states.load(&mut self.gb) {
+        match self.states.load(&mut self.core) {
             Ok(msg) => {
                 // The state replaces the machine (and the frame it is on), so
                 // the replay of a recording that goes on would diverge.
@@ -250,7 +300,7 @@ impl App {
         self.paused = !self.paused;
         if self.paused {
             // The periodic save tick doesn't run while paused; persist now.
-            self.saves.flush(&self.gb);
+            self.saves.flush(&self.core);
         }
         self.clear_audio();
         self.reset_clock();
@@ -268,8 +318,13 @@ impl App {
     }
 
     /// Every joypad change goes through here so recordings see all of them.
+    /// A button the console lacks (L/R on a Game Boy) is dropped here, so it
+    /// never reaches a recording the system's decoder would then reject.
     fn set_button(&mut self, button: Button, pressed: bool) {
-        self.gb.set_button(button, pressed);
+        if !self.core.system().has_button(button) {
+            return;
+        }
+        self.core.set_button(button, pressed);
         if let Some(r) = self.recorder.as_mut() {
             r.record(Record {
                 frame: self.frame,
@@ -315,11 +370,8 @@ impl App {
     /// Save the picture on screen next to the ROM and mark the frame.
     fn screenshot(&mut self) {
         let path = record::screenshot_path(&self.rom_path, self.frame);
-        let picture = match &self.test {
-            Some(t) => record::Picture::Shades(&t.fb),
-            None => record::Picture::of(&self.gb),
-        };
-        match record::write_png(picture, &path) {
+        let frame = frame_of(self.test.as_ref(), &self.core);
+        match record::write_png(frame, &path) {
             Ok(()) => eprintln!("screenshot: {} (frame {})", path.display(), self.frame),
             Err(e) => eprintln!("warning: cannot write screenshot {}: {e}", path.display()),
         }
@@ -361,11 +413,20 @@ impl App {
                 self.pacer.period()
             }
             None => {
-                self.gb.step_frame();
+                self.core.step_frame();
                 self.frame += 1;
                 // Always drain so the core's buffer cannot grow unbounded.
-                self.gb.drain_audio_into(&mut self.audio_buf);
-                audio_seconds(self.audio_buf.len(), self.gb.audio_sample_rate())
+                self.core.drain_audio_into(&mut self.audio_buf);
+                let seconds = audio_seconds(self.audio_buf.len(), self.core.audio_sample_rate());
+                // A step that drained no samples still covered a frame: without
+                // this the pacer would see zero time pass and run flat out. Both
+                // shipped cores always emit samples, so this only guards a core
+                // that stops doing so.
+                if seconds > 0.0 {
+                    seconds
+                } else {
+                    self.pacer.period()
+                }
             }
         };
         if !self.fast_forward
@@ -387,20 +448,31 @@ impl App {
     }
 
     fn upload(&mut self) {
+        let frame = frame_of(self.test.as_ref(), &self.core);
+        let size = (frame.width as u32, frame.height as u32);
         let Some(p) = self.pixels.as_mut() else {
             return;
         };
-        match &self.test {
-            Some(t) => blit(&t.fb, &self.palette, p.frame_mut()),
-            None => match self.gb.cgb_framebuffer() {
-                Some(fb) => blit_cgb(fb, p.frame_mut()),
-                None => blit(self.gb.framebuffer(), &self.palette, p.frame_mut()),
+        match buffer_plan(size, self.buffer_size, self.resize_failed) {
+            BufferPlan::Present => {}
+            BufferPlan::Skip => return,
+            BufferPlan::Resize => match p.resize_buffer(size.0, size.1) {
+                Ok(()) => self.buffer_size = size,
+                Err(e) => {
+                    self.resize_failed = true;
+                    eprintln!(
+                        "warning: cannot resize the frame buffer to {}x{}: {e}; the picture stops updating",
+                        size.0, size.1
+                    );
+                    return;
+                }
             },
         }
+        present(&frame, &self.palette, p.frame_mut());
     }
 }
 
-impl Steps for App {
+impl<C: Core> Steps for App<C> {
     fn pacer(&mut self) -> &mut FramePacer {
         &mut self.pacer
     }
@@ -410,18 +482,19 @@ impl Steps for App {
     }
 }
 
-impl ApplicationHandler for App {
+impl<C: Core> ApplicationHandler for App<C> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
+        // The window and the pixel buffer follow the first frame's size.
+        let first = frame_of(self.test.as_ref(), &self.core);
+        let (width, height) = (first.width as u32, first.height as u32);
+        self.buffer_size = (width, height);
         let attrs = Window::default_attributes()
             .with_title(self.title.as_str())
-            .with_inner_size(LogicalSize::new(
-                SCREEN_WIDTH as u32 * self.scale,
-                SCREEN_HEIGHT as u32 * self.scale,
-            ))
-            .with_min_inner_size(LogicalSize::new(SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32));
+            .with_inner_size(LogicalSize::new(width * self.scale, height * self.scale))
+            .with_min_inner_size(LogicalSize::new(width, height));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => return self.fail(event_loop, format!("cannot create window: {e}")),
@@ -430,7 +503,7 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let surface =
             SurfaceTexture::new(size.width.max(1), size.height.max(1), Arc::clone(&window));
-        let mut pixels = match Pixels::new(SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32, surface) {
+        let mut pixels = match Pixels::new(width, height, surface) {
             Ok(p) => p,
             Err(e) => return self.fail(event_loop, format!("cannot initialise graphics: {e}")),
         };
@@ -442,6 +515,9 @@ impl ApplicationHandler for App {
         self.update_title();
         self.upload();
         self.reset_clock();
+        if self.test.is_none() && self.core.system() == emu_common::System::Gb {
+            eprintln!("{}", crate::keymap::SAVE_KEY_NOTICE);
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -520,7 +596,7 @@ impl ApplicationHandler for App {
         {
             w.request_redraw();
         }
-        self.saves.tick(&self.gb, now);
+        self.saves.tick(&self.core, now);
 
         // Never sleep past the next frame deadline (saves are checked once per wake).
         let wait = self.pacer.time_until_next().max(Duration::from_micros(200));
@@ -528,7 +604,7 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.saves.flush_final(&self.gb);
+        self.saves.flush_final(&self.core);
         if let Some(r) = self.recorder.as_mut() {
             r.finish(self.frame);
         }
@@ -538,8 +614,21 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gb_core::{M_CYCLES_PER_FRAME, Model};
+    use emu_common::System;
+    use gb_core::{FRAMES_PER_SECOND, GameBoy, M_CYCLES_PER_FRAME, Model};
+    use gba_core::Gba;
     use std::fs;
+
+    #[test]
+    fn a_failed_buffer_resize_is_not_retried() {
+        let (old, new) = ((160, 144), (240, 160));
+        assert_eq!(buffer_plan(old, old, false), BufferPlan::Present);
+        assert_eq!(buffer_plan(new, old, false), BufferPlan::Resize);
+        // After a failure the new size is skipped every frame, not retried...
+        assert_eq!(buffer_plan(new, old, true), BufferPlan::Skip);
+        // ...and a frame that fits the old buffer still shows.
+        assert_eq!(buffer_plan(old, old, true), BufferPlan::Present);
+    }
 
     #[test]
     fn zero_sized_surface_is_not_drawable() {
@@ -552,14 +641,14 @@ mod tests {
 
     /// A headless `App` (no window, graphics or audio) on a battery cartridge,
     /// saving next to `dir/g.gb`.
-    fn headless_app(dir: &std::path::Path) -> App {
+    fn headless_app(dir: &std::path::Path) -> App<GameBoy> {
         let mut rom = vec![0u8; 0x8000];
         rom[0x147] = 0x03; // MBC1+RAM+BATTERY
         rom[0x149] = 0x02; // 8 KiB
         headless_app_with(dir, GameBoy::new(rom).unwrap())
     }
 
-    fn headless_app_with(dir: &std::path::Path, mut gb: GameBoy) -> App {
+    fn headless_app_with(dir: &std::path::Path, mut gb: GameBoy) -> App<GameBoy> {
         let mut saves = SaveManager::new(&dir.join("g.gb"), Instant::now());
         saves.load(&mut gb); // no .sav yet: the blank RAM is the baseline
         App::new(
@@ -577,10 +666,10 @@ mod tests {
         .with_rom_path(dir.join("g.gb"))
     }
 
-    fn change_ram(app: &mut App, first_byte: u8) {
-        let mut ram = app.gb.battery_ram().unwrap();
+    fn change_ram(app: &mut App<GameBoy>, first_byte: u8) {
+        let mut ram = app.core.battery_ram().unwrap();
         ram[0] = first_byte;
-        app.gb.load_battery_ram(&ram).unwrap();
+        app.core.load_battery_ram(&ram).unwrap();
     }
 
     #[test]
@@ -619,7 +708,7 @@ mod tests {
     }
 
     /// Run `n` emulated frames, as the pacer would.
-    fn run_frames(app: &mut App, n: u32) {
+    fn run_frames(app: &mut App<GameBoy>, n: u32) {
         for _ in 0..n {
             app.step_once();
         }
@@ -627,8 +716,8 @@ mod tests {
 
     /// An `App` that records to `dir/s.gbinput`, powered on as `model` with
     /// whatever `dir/g.sav` holds (the header gets the RAM the save left).
-    fn recording_app(dir: &std::path::Path, rom: &[u8], model: Model) -> (App, PathBuf) {
-        use gb_core::replay::{Header, rom_hash};
+    fn recording_app(dir: &std::path::Path, rom: &[u8], model: Model) -> (App<GameBoy>, PathBuf) {
+        use emu_common::replay::rom_hash;
 
         let rom_path = dir.join("g.gb");
         let mut gb = GameBoy::with_model(rom.to_vec(), model).unwrap();
@@ -636,11 +725,8 @@ mod tests {
         let mut saves = SaveManager::new(&rom_path, Instant::now());
         saves.load(&mut gb);
         let rec_path = dir.join("s.gbinput");
-        let header = Header {
-            rom_hash: rom_hash(rom),
-            battery: gb.battery_ram(),
-            model,
-        };
+        let header = record::header_for(&gb, rom_hash(rom));
+        assert_eq!(header.variant, u8::from(model == Model::Cgb));
         let recorder = Recorder::create(&rec_path, &header).unwrap();
         let app = App::new(
             gb,
@@ -663,7 +749,7 @@ mod tests {
     /// one frame, a focus-loss release with two buttons held, then a screenshot.
     /// Returns the screenshot's frame and the total frames run; the recording
     /// is finished.
-    fn play_session(app: &mut App) -> (u64, u64) {
+    fn play_session(app: &mut App<GameBoy>) -> (u64, u64) {
         use winit::keyboard::KeyCode;
 
         run_frames(app, 2);
@@ -691,7 +777,7 @@ mod tests {
         dir: &std::path::Path,
         rec_path: &std::path::Path,
         rom: Vec<u8>,
-        app: &App,
+        app: &App<GameBoy>,
         (marker, total): (u64, u64),
     ) -> gb_core::replay::Recording {
         use gb_core::replay::{Recording, Replayer};
@@ -705,10 +791,10 @@ mod tests {
             "7 button changes + 1 marker: {:?}",
             rec.records
         );
-        assert_eq!(rec.header.model, app.gb.model());
+        assert_eq!(rec.header.model, app.core.model());
 
         let mut gb = rec.power_on(rom).unwrap();
-        assert_eq!(gb.model(), app.gb.model());
+        assert_eq!(gb.model(), app.core.model());
         gb.set_audio_sample_rate(44_100); // output rate must not affect state
         let mut player = Replayer::new(&rec);
         let mut audio = Vec::new();
@@ -722,29 +808,29 @@ mod tests {
         step(&mut gb, &mut player, marker);
         let shot = fs::read(record::screenshot_path(&dir.join("g.gb"), marker)).unwrap();
         let replayed = dir.join("replayed.png");
-        record::write_png(record::Picture::of(&gb), &replayed).unwrap();
+        record::write_png(gb.frame(), &replayed).unwrap();
         assert_eq!(
             fs::read(&replayed).unwrap(),
             shot,
             "screenshot == replayed frame"
         );
         step(&mut gb, &mut player, total);
-        assert_eq!(gb.mcycles(), app.gb.mcycles());
-        assert_eq!(gb.cpu_registers(), app.gb.cpu_registers());
+        assert_eq!(gb.mcycles(), app.core.mcycles());
+        assert_eq!(gb.cpu_registers(), app.core.cpu_registers());
         assert_eq!(
             gb.peek(0xFF0F),
-            app.gb.peek(0xFF0F),
+            app.core.peek(0xFF0F),
             "IF (joypad IRQ) matches"
         );
-        assert_eq!(gb.framebuffer()[..], app.gb.framebuffer()[..]);
+        assert_eq!(gb.framebuffer()[..], app.core.framebuffer()[..]);
         assert_eq!(
             gb.cgb_framebuffer().map(|f| f.to_vec()),
-            app.gb.cgb_framebuffer().map(|f| f.to_vec()),
+            app.core.cgb_framebuffer().map(|f| f.to_vec()),
             "colour frame matches"
         );
         assert_eq!(
             gb.battery_ram(),
-            app.gb.battery_ram(),
+            app.core.battery_ram(),
             "cart RAM + RTC match"
         );
         rec
@@ -766,14 +852,14 @@ mod tests {
 
         let (mut app, rec_path) = recording_app(dir.path(), &rom, Model::Dmg);
         assert_eq!(
-            app.gb.battery_ram().unwrap()[..0x8000],
+            app.core.battery_ram().unwrap()[..0x8000],
             sav[..0x8000],
             "save loaded"
         );
         let session = play_session(&mut app);
         assert_replays_identically(dir.path(), &rec_path, rom, &app, session);
         assert_eq!(
-            app.gb.framebuffer()[0],
+            app.core.framebuffer()[0],
             2,
             "Right held: shade follows the joypad"
         );
@@ -809,18 +895,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rom = joypad_to_cgb_palette_rom();
         let (mut app, rec_path) = recording_app(dir.path(), &rom, Model::Cgb);
-        let first = *app.gb.cgb_framebuffer().expect("colour mode")[..]
+        let first = *app.core.cgb_framebuffer().expect("colour mode")[..]
             .first()
             .unwrap();
         let session = play_session(&mut app);
         let rec = assert_replays_identically(dir.path(), &rec_path, rom.clone(), &app, session);
 
         assert_eq!(rec.header.model, Model::Cgb);
-        let live = app.gb.cgb_framebuffer().expect("colour mode");
+        let live = app.core.cgb_framebuffer().expect("colour mode");
         assert_ne!(live[0], first, "the colour frame follows the joypad");
         assert_eq!(live[0] & 0x0F, 0x0E, "Right held: D-pad nibble 1110");
         assert!(
-            app.gb.framebuffer().iter().all(|&s| s == 0),
+            app.core.framebuffer().iter().all(|&s| s == 0),
             "shades unused"
         );
         // The same file as a DMG would not even be in colour mode.
@@ -872,6 +958,362 @@ mod tests {
         );
     }
 
+    /// L and R exist only on the GBA. Pressing them in a Game Boy session must
+    /// neither reach the core nor the recording (whose 8-button decoder would
+    /// reject index 8 or 9 and make the whole file unreadable).
+    #[test]
+    fn l_and_r_never_reach_a_game_boy_recording() {
+        use gb_core::replay::Recording;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        let (mut app, rec_path) = recording_app(dir.path(), &rom, Model::Dmg);
+        run_frames(&mut app, 1);
+        let before = app.core.save_state();
+        app.set_button(Button::L, true);
+        app.set_button(Button::R, true);
+        app.set_button(Button::A, true);
+        app.set_button(Button::L, false);
+        app.release_all_buttons();
+        assert_eq!(app.core.save_state().len(), before.len());
+        app.recorder.as_mut().unwrap().finish(app.frame);
+
+        let rec = Recording::decode(&fs::read(&rec_path).unwrap()).expect("still decodable");
+        assert_eq!(
+            rec.records.iter().map(|r| r.event).collect::<Vec<_>>(),
+            vec![Event::Button {
+                button: Button::A,
+                pressed: true
+            }],
+            "only the A press was recorded"
+        );
+    }
+
+    #[test]
+    fn the_window_title_is_gb_then_the_game() {
+        assert_eq!(window_title("TETRIS"), "gb - TETRIS");
+        assert_eq!(window_title(""), "gb");
+    }
+
+    /// A GBA ROM that spins on `b .`, titled `GBATEST`, with a Flash ID string.
+    fn gba_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x200];
+        rom[..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        rom[0xA0..0xA7].copy_from_slice(b"GBATEST");
+        rom[0x100..0x109].copy_from_slice(b"FLASH1M_V");
+        rom
+    }
+
+    /// A headless `App` (no window, graphics or audio) on any core, saving next
+    /// to `dir/g.gba`.
+    fn gba_app<C: Core>(dir: &std::path::Path, mut core: C) -> App<C> {
+        let mut saves = SaveManager::new(&dir.join("g.gba"), Instant::now());
+        saves.load(&mut core);
+        App::new(
+            core,
+            Storage {
+                saves,
+                states: StateSlots::new(&dir.join("g.gba")),
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(dir.join("g.gba"))
+    }
+
+    /// The path `main` takes: a GBA core held as `Box<dyn Core>`, stepped through
+    /// the trait, with a title, a 240x160 colour frame and a paced step.
+    #[test]
+    fn a_gba_runs_through_the_app_as_a_boxed_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let core: Box<dyn Core> = Box::new(Gba::new(gba_rom(), None).unwrap());
+        let mut app = gba_app(dir.path(), core);
+        assert_eq!(app.title, "gb - GBATEST");
+        assert_eq!(app.pacer.period(), 1.0 / gba_core::FRAMES_PER_SECOND);
+        for _ in 0..3 {
+            let emulated = app.step_once();
+            assert!(emulated > 0.0, "a step always covers time: {emulated}");
+        }
+        assert_eq!(app.frame, 3);
+        let f = frame_of(None, &app.core);
+        assert_eq!((f.width, f.height), (240, 160));
+        assert!(matches!(f.pixels, FramePixels::Rgb555(p) if p.len() == 240 * 160));
+        // The upload converts any size: the whole frame fits an RGBA buffer.
+        let mut rgba = vec![0u8; 240 * 160 * 4];
+        present(&f, &app.palette, &mut rgba);
+    }
+
+    /// K and L on a GBA, held as the `Box<dyn Core>` `main` builds, write a slot
+    /// file and restore from it: a state taken at one frame comes back after the
+    /// machine has run on.
+    #[test]
+    fn save_state_keys_on_a_gba_round_trip_through_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let core: Box<dyn Core> = Box::new(Gba::new(gba_rom(), None).unwrap());
+        let mut app = gba_app(dir.path(), core);
+        app.step_once();
+        let snap = app.core.save_state();
+        app.save_state();
+        assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
+        let slot = fs::read(dir.path().join("g.ss1")).unwrap();
+        assert_eq!(slot, snap);
+        assert!(slot.len() <= gba_core::MAX_STATE_BYTES);
+        for _ in 0..4 {
+            app.step_once();
+        }
+        assert_ne!(app.core.save_state(), snap);
+        app.load_state();
+        assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
+        assert_eq!(app.core.save_state(), snap);
+    }
+
+    /// A state of a GBA session started with other options or another BIOS says
+    /// what to match, and a corrupt slot leaves the machine as it was.
+    #[test]
+    fn a_gba_state_load_failure_names_the_cause_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = Gba::with_options(
+            gba_rom(),
+            None,
+            gba_core::CartOptions {
+                save: gba_core::SaveChoice::Sram,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::write(dir.path().join("g.ss1"), other.save_state()).unwrap();
+        let mut app = gba_app(dir.path(), Gba::new(gba_rom(), None).unwrap());
+        app.step_once();
+        let before = app.core.save_state();
+        app.load_state();
+        let msg = app.status.as_ref().unwrap().0.clone();
+        assert!(
+            msg.contains("--bios") && msg.contains("--save-type"),
+            "{msg}"
+        );
+        assert_eq!(app.core.save_state(), before);
+
+        let mut bad = before.clone();
+        bad.truncate(bad.len() / 2);
+        fs::write(dir.path().join("g.ss1"), bad).unwrap();
+        app.load_state();
+        assert!(app.status.as_ref().unwrap().0.contains("truncated"));
+        assert_eq!(app.core.save_state(), before);
+    }
+
+    /// A GBA ROM that copies KEYINPUT into palette entry 0 forever: with no layer
+    /// enabled the backdrop shows it, so the picture follows the buttons.
+    fn gba_keypad_rom() -> Vec<u8> {
+        const AL: u32 = 0xE000_0000;
+        let imm = |v: u32| -> u32 {
+            (0..16)
+                .find_map(|rot| {
+                    let r = v.rotate_left(rot * 2);
+                    (r <= 0xFF).then_some(rot << 8 | r)
+                })
+                .expect("encodable immediate")
+        };
+        let mov = |rd: u32, v: u32| AL | 1 << 25 | 13 << 21 | rd << 12 | imm(v);
+        let add = |rd: u32, rn: u32, v: u32| AL | 1 << 25 | 4 << 21 | rn << 16 | rd << 12 | imm(v);
+        let half = |load: u32, rd: u32, rn: u32| {
+            AL | 1 << 24 | 1 << 23 | 1 << 22 | load << 20 | rn << 16 | rd << 12 | 0xB0
+        };
+        let words = [
+            mov(0, 0x0400_0000),
+            add(0, 0, 0x130), // KEYINPUT
+            mov(1, 0x0500_0000),
+            half(1, 2, 0),                // loop: ldrh r2, [r0]
+            half(0, 2, 1),                //       strh r2, [r1]
+            AL | 0x0A00_0000 | 0xFF_FFFC, //       b loop (-4 words + 8)
+        ];
+        let mut rom = vec![0u8; 0x400];
+        for (i, w) in words.iter().enumerate() {
+            rom[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        rom
+    }
+
+    /// The whole loop for a GBA: play with `--record` (cartridge options, a clock
+    /// start and a screenshot included), then replay with `gba_core::replay` and
+    /// get the identical machine, the identical screenshot bytes, and the same PNG
+    /// `gb-test --replay` writes for that frame.
+    #[test]
+    fn a_gba_recording_replays_to_the_identical_state_and_screenshot() {
+        use emu_common::replay::rom_hash;
+        use gba_core::replay::{Recording, Replayer};
+        use gba_core::{CartOptions, RtcMode, RtcTime, SaveChoice};
+        use winit::keyboard::KeyCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom_path = dir.path().join("g.gba");
+        let rom = gba_keypad_rom();
+        let options = CartOptions {
+            save: SaveChoice::Sram,
+            rtc: RtcMode::On,
+        };
+        let start = RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap();
+        let mut gba = Gba::with_options(rom.clone(), None, options).unwrap();
+        gba.set_rtc(start);
+        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        saves.load(&mut gba);
+        let rec_path = dir.path().join("s.gbinput");
+        let header = record::header_for(&gba, rom_hash(&rom));
+        assert!(!header.ext.is_empty(), "a GBA header carries its options");
+        let mut app = App::new(
+            gba,
+            Storage {
+                saves,
+                states: StateSlots::new(&rom_path),
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(rom_path.clone())
+        .with_recorder(Some(Recorder::create(&rec_path, &header).unwrap()));
+
+        let frames = |app: &mut App<Gba>, n: u32| (0..n).for_each(|_| _ = app.step_once());
+        frames(&mut app, 2);
+        app.on_key_input(KeyCode::ArrowRight, true);
+        frames(&mut app, 3);
+        app.on_key_input(KeyCode::ArrowLeft, true); // press and release in one frame
+        app.on_key_input(KeyCode::ArrowLeft, false);
+        frames(&mut app, 2);
+        app.on_key_input(KeyCode::KeyR, true); // the R shoulder
+        frames(&mut app, 1);
+        app.release_all_buttons();
+        app.on_key_input(KeyCode::ArrowRight, true);
+        frames(&mut app, 1);
+        app.on_key_input(KeyCode::KeyC, true); // screenshot + marker
+        let marker = app.frame;
+        frames(&mut app, 4);
+        let total = app.frame;
+        app.recorder.as_mut().unwrap().finish(total);
+
+        let rec = Recording::decode(&fs::read(&rec_path).unwrap()).unwrap();
+        assert_eq!(rec.end_frame, Some(total));
+        assert_eq!(rec.markers(), vec![marker]);
+        assert_eq!(rec.header.options, options);
+        assert_eq!(rec.header.rtc_start, Some(start));
+        assert_eq!(rec.header.bios_hash, None);
+
+        let mut gba = rec.power_on(rom, None).unwrap();
+        let mut player = Replayer::new(&rec);
+        let mut audio = Vec::new();
+        let mut step = |gba: &mut Gba, to: u64| {
+            while player.frame() < to {
+                player.step_frame(gba);
+                audio.clear();
+                gba.drain_audio_into(&mut audio);
+            }
+        };
+        step(&mut gba, marker);
+        let shot = fs::read(record::screenshot_path(&rom_path, marker)).unwrap();
+        let replayed = dir.path().join("replayed.png");
+        record::write_png(Core::frame(&gba), &replayed).unwrap();
+        assert_eq!(
+            fs::read(&replayed).unwrap(),
+            shot,
+            "screenshot == replayed frame"
+        );
+        let tool = dir.path().join("gb-test.png");
+        gb_test::gba::save_gba_png(gba.framebuffer(), &tool).unwrap();
+        assert_eq!(
+            fs::read(&tool).unwrap(),
+            shot,
+            "gb-test's PNG == the frontend's screenshot, byte for byte"
+        );
+        step(&mut gba, total);
+        assert_eq!(gba.cycles(), app.core.cycles());
+        assert_eq!(gba.cpu_registers(), app.core.cpu_registers());
+        assert_eq!(gba.framebuffer()[..], app.core.framebuffer()[..]);
+        assert_eq!(gba.save_state(), app.core.save_state(), "the whole machine");
+        assert_eq!(
+            gba.framebuffer()[0] & 0x3FF,
+            0x3FF & !0x010,
+            "Right held: the palette followed KEYINPUT"
+        );
+    }
+
+    /// L and R (Q and R on the keyboard) reach a GBA and its recording, which
+    /// its 10-button decoder reads back, with a 128 KiB flash save in the header.
+    #[test]
+    fn l_and_r_reach_a_gba_and_its_recording() {
+        use emu_common::replay::{decode_header, decode_records, rom_hash};
+        use winit::keyboard::KeyCode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom_path = dir.path().join("g.gba");
+        let rom = gba_rom();
+        let mut gba = Gba::new(rom.clone(), None).unwrap();
+        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        saves.load(&mut gba);
+        let rec_path = dir.path().join("s.gbinput");
+        let header = record::header_for(&gba, rom_hash(&rom));
+        assert_eq!(header.system, System::Gba);
+        assert_eq!(header.battery.as_ref().map(Vec::len), Some(128 * 1024));
+        let mut app = App::new(
+            gba,
+            Storage {
+                saves,
+                states: StateSlots::new(&rom_path),
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            false,
+            ShutdownFlag::default(),
+        )
+        .with_rom_path(rom_path)
+        .with_recorder(Some(Recorder::create(&rec_path, &header).unwrap()));
+
+        const KEYINPUT: u32 = 0x0400_0130;
+        app.step_once();
+        app.on_key_input(KeyCode::KeyQ, true);
+        app.on_key_input(KeyCode::KeyR, true);
+        app.step_once();
+        assert_eq!(!app.core.peek16(KEYINPUT) & 0x3FF, 0x300, "L and R down");
+        app.on_key_input(KeyCode::KeyQ, false);
+        app.release_all_buttons();
+        assert_eq!(app.core.peek16(KEYINPUT) & 0x3FF, 0x3FF);
+        let total = app.frame;
+        app.recorder.as_mut().unwrap().finish(total);
+
+        let bytes = fs::read(&rec_path).unwrap();
+        let (h, rest) = decode_header(&bytes).unwrap();
+        assert_eq!((h.system, h.variant), (System::Gba, 0));
+        assert_eq!(h.battery.map(|b| b.len()), Some(128 * 1024));
+        let recs = decode_records(rest, System::Gba.button_count()).unwrap();
+        assert_eq!(recs.end_frame, Some(total));
+        let events: Vec<_> = recs.records.iter().map(|r| r.event).collect();
+        assert_eq!(
+            events,
+            vec![
+                Event::Button {
+                    button: Button::L,
+                    pressed: true
+                },
+                Event::Button {
+                    button: Button::R,
+                    pressed: true
+                },
+                Event::Button {
+                    button: Button::L,
+                    pressed: false
+                },
+                Event::Button {
+                    button: Button::R,
+                    pressed: false
+                },
+            ]
+        );
+    }
+
     #[test]
     fn a_normal_step_covers_one_frame_of_emulated_time() {
         let dir = tempfile::tempdir().unwrap();
@@ -880,7 +1322,7 @@ mod tests {
         app.step_once(); // the first frame starts mid-frame after the boot state
         let total: f64 = (0..120).map(|_| app.step_once()).sum();
         // Samples are whole, so the total is within a sample of 120 periods.
-        let rate = f64::from(app.gb.audio_sample_rate());
+        let rate = f64::from(app.core.audio_sample_rate());
         assert!((total - 120.0 * period).abs() < 2.0 / rate, "{total}");
     }
 
@@ -910,16 +1352,16 @@ mod tests {
         let mut app = headless_app_with(dir.path(), make());
         let m_per_s = f64::from(M_CYCLES_PER_FRAME) * FRAMES_PER_SECOND;
         let period = app.pacer.period();
-        let rate = f64::from(app.gb.audio_sample_rate());
+        let rate = f64::from(app.core.audio_sample_rate());
         for _ in 0..4 {
-            let start = app.gb.mcycles();
-            let was_double = app.gb.double_speed();
+            let start = app.core.mcycles();
+            let was_double = app.core.double_speed();
             let emulated = app.step_once();
-            if was_double || !app.gb.double_speed() {
+            if was_double || !app.core.double_speed() {
                 continue;
             }
             // Pre-switch cycles take 1/1048576 s each, the rest half that.
-            let end = app.gb.mcycles();
+            let end = app.core.mcycles();
             let real = ((switch_at - start) as f64 + (end - switch_at) as f64 / 2.0) / m_per_s;
             assert!((emulated - real).abs() < 3.0 / rate, "{emulated} vs {real}");
             // Not vacuous: counting every M-cycle at the normal rate is far off.
@@ -935,18 +1377,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
         assert!(!app.run_due(), "nothing owed yet");
-        let before = app.gb.mcycles();
+        let before = app.core.mcycles();
         app.pacer
             .advance(Duration::from_secs_f64(2.5 * app.pacer.period()));
         assert!(app.run_due());
-        let frames = (app.gb.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
+        let frames = (app.core.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
         assert!((1.9..=3.1).contains(&frames), "{frames}");
         assert!(!app.pacer.frame_due(), "the debt is paid");
         // A long stall is bounded by the catch-up cap.
         app.pacer.advance(Duration::from_secs(60));
-        let before = app.gb.mcycles();
+        let before = app.core.mcycles();
         assert!(app.run_due());
-        let frames = (app.gb.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
+        let frames = (app.core.mcycles() - before) as f64 / f64::from(M_CYCLES_PER_FRAME);
         assert!(
             frames <= f64::from(crate::pacer::MAX_CATCHUP_FRAMES) + 1.1,
             "{frames}"
@@ -957,8 +1399,8 @@ mod tests {
     fn save_and_load_state_keys_restore_the_machine() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
-        app.gb.step_frame();
-        let snap = app.gb.save_state();
+        app.core.step_frame();
+        let snap = app.core.save_state();
         app.save_state();
         assert!(dir.path().join("g.ss1").is_file());
         assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
@@ -967,7 +1409,7 @@ mod tests {
             app.step_once();
         }
         app.load_state();
-        assert_eq!(app.gb.save_state(), snap);
+        assert_eq!(app.core.save_state(), snap);
         assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
     }
 
@@ -975,10 +1417,10 @@ mod tests {
     fn failed_state_load_keeps_the_machine() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
-        app.gb.step_frame();
-        let before = app.gb.save_state();
+        app.core.step_frame();
+        let before = app.core.save_state();
         app.load_state(); // slot 1 doesn't exist
-        assert_eq!(app.gb.save_state(), before);
+        assert_eq!(app.core.save_state(), before);
         assert!(app.status.as_ref().unwrap().0.contains("empty"));
     }
 
