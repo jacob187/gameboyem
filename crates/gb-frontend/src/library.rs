@@ -238,6 +238,29 @@ pub struct Entry {
     /// game whose file is missing for now (a drive that is not mounted, a bundled
     /// ROM of an app that moved) stays listed, with its saves, and cannot be played.
     pub available: bool,
+    /// For a bundled game: the size and modification time of the ROM file when it was
+    /// last read, so a start can skip reading a file that has not changed.
+    pub(crate) stamp: Option<RomStamp>,
+}
+
+/// A cheap fingerprint of a file: if it is the same as last time, so is the content
+/// (for the purpose of not reading the ROM again). Any value is harmless in the
+/// index: a stamp that does not match just means the file is read again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RomStamp {
+    size: u64,
+    mtime_ns: u64,
+}
+
+impl RomStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        let since_epoch = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self {
+            size: meta.len(),
+            mtime_ns: u64::try_from(since_epoch.as_nanos()).ok()?,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +508,12 @@ struct Record {
     added: u64,
     #[serde(default)]
     last_played: Option<u64>,
+    /// Bundled games: size and mtime (nanoseconds since the epoch) of the ROM file
+    /// when it was last read. Absent in older indexes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rom_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rom_mtime_ns: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -528,6 +557,8 @@ impl Record {
             hash: format!("{:016x}", entry.id.hash()),
             added: entry.added,
             last_played: entry.last_played,
+            rom_size: entry.stamp.map(|s| s.size),
+            rom_mtime_ns: entry.stamp.map(|s| s.mtime_ns),
         }
     }
 
@@ -557,7 +588,12 @@ impl Record {
             }
         };
         let title = clean_title(&self.title);
+        let stamp = match (source, self.rom_size, self.rom_mtime_ns) {
+            (Source::Bundled, Some(size), Some(mtime_ns)) => Some(RomStamp { size, mtime_ns }),
+            _ => None,
+        };
         Ok(Entry {
+            stamp,
             available: rom_path.is_file(),
             thumbnail: existing_thumbnail(data, &id),
             id,
@@ -722,6 +758,7 @@ fn adopt_orphans(data: &DataDir, entries: &mut Vec<Entry>) -> usize {
             rom_path: canonical,
             added: added_at,
             last_played: None,
+            stamp: None,
             id,
         });
         added += 1;
@@ -879,6 +916,7 @@ impl Library {
             rom_path: dest.clone(),
             added: now_secs(),
             last_played: None,
+            stamp: None,
             id,
         };
         self.entries.push(entry.clone());
@@ -948,8 +986,10 @@ impl Library {
     /// games, without copying them. Safe to call at every start: a game already
     /// listed is left as it is (its path is updated if the app moved), one the
     /// player imported themselves stays imported, and a bundled game whose ROM is
-    /// not in `dir` is unlisted (its saves stay), so an entry from another folder, a
-    /// development build's say, does not linger. Unusable files are skipped and logged.
+    /// not in `dir` is unlisted (its saves stay), so an entry from another folder,
+    /// a development build's say, does not linger. A ROM whose path, size and
+    /// modification time match its entry is not read again. Unusable files are
+    /// skipped and logged.
     pub fn register_bundled(&mut self, dir: &Path) -> Result<BundledReport, String> {
         let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
         let dir = dir.as_path();
@@ -963,11 +1003,25 @@ impl Library {
         files.sort();
         self.refresh();
         let mut report = BundledReport::default();
+        // Entries whose stamp changed without the report showing it.
+        let mut restamped = false;
         let mut seen: Vec<GameId> = Vec::new();
         // Files that are there but could not be read this time.
         let mut unreadable: Vec<PathBuf> = Vec::new();
         for file in files {
             let path = std::path::absolute(&file).unwrap_or_else(|_| file.clone());
+            // Taken before the read: a file that changes meanwhile is read again next time.
+            let stamp = RomStamp::of(&file);
+            if stamp.is_some()
+                && let Some(entry) = self
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.source == Source::Bundled && e.rom_path == path && e.stamp == stamp)
+            {
+                entry.available = true;
+                seen.push(entry.id.clone());
+                continue;
+            }
             let probe = match Probe::read(&file) {
                 Ok(p) => p,
                 Err(why) => {
@@ -986,6 +1040,10 @@ impl Library {
                         entry.rom_path = path;
                         report.updated += 1;
                     }
+                    if entry.stamp != stamp {
+                        entry.stamp = stamp;
+                        restamped = true;
+                    }
                 }
                 Some(_) => {} // the player already has this game; their copy stays
                 None => {
@@ -998,6 +1056,7 @@ impl Library {
                         rom_path: path,
                         added: now_secs(),
                         last_played: None,
+                        stamp,
                         id,
                     });
                     report.added += 1;
@@ -1011,8 +1070,10 @@ impl Library {
             e.source != Source::Bundled || seen.contains(&e.id) || unreadable.contains(&e.rom_path)
         });
         report.removed = before - self.entries.len();
-        if report != BundledReport::default() {
+        if report != BundledReport::default() || restamped {
             self.save_index()?;
+        }
+        if report != BundledReport::default() {
             log::info!(
                 "bundled games: {} added, {} moved, {} removed, {} skipped",
                 report.added,
@@ -1179,6 +1240,20 @@ fn remove_with_prefix(dir: &Path, prefix: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn mtime_of(path: &Path) -> SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    fn set_mtime(path: &Path, time: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
 
     /// A Game Boy ROM: ROM-only cartridge with `title` in the header.
     fn gb_rom(title: &str, fill: u8) -> Vec<u8> {
@@ -1834,6 +1909,84 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_bundled_rom_is_not_read_again() {
+        let f = fixture();
+        let dir = bundle_dir(&f);
+        let rom = write_rom(&dir, "one.gb", &gb_rom("ONE", 0));
+        let mut lib = Library::open(&f.data);
+        lib.register_bundled(&dir).unwrap();
+        let snapshot = lib.entries().to_vec();
+        assert!(snapshot[0].stamp.is_some());
+
+        // Different content of the same size and mtime: a file that was read again
+        // would be a different game (added and removed); one that was not, is still ONE.
+        let mtime = mtime_of(&rom);
+        fs::write(&rom, gb_rom("TWO", 0)).unwrap();
+        set_mtime(&rom, mtime);
+        assert_eq!(
+            lib.register_bundled(&dir).unwrap(),
+            BundledReport::default()
+        );
+        assert_eq!(lib.entries(), snapshot);
+        // The stamp is in the index: a new process skips the read too.
+        let mut again = Library::open(&f.data);
+        assert_eq!(again.entries(), snapshot);
+        assert_eq!(
+            again.register_bundled(&dir).unwrap(),
+            BundledReport::default()
+        );
+        assert_eq!(again.entries(), snapshot);
+    }
+
+    #[test]
+    fn a_bundled_rom_with_a_new_mtime_or_size_is_read_again() {
+        let f = fixture();
+        let dir = bundle_dir(&f);
+        let rom = write_rom(&dir, "one.gb", &gb_rom("ONE", 0));
+        let mut lib = Library::open(&f.data);
+        lib.register_bundled(&dir).unwrap();
+        let mtime = mtime_of(&rom);
+
+        // Same content, newer file: read again, nothing changes, the new stamp is kept.
+        set_mtime(&rom, mtime + Duration::from_secs(60));
+        let before = lib.entries()[0].clone();
+        assert_eq!(
+            lib.register_bundled(&dir).unwrap(),
+            BundledReport::default()
+        );
+        assert_ne!(lib.entries()[0].stamp, before.stamp);
+        assert_eq!(Library::open(&f.data).entries(), lib.entries());
+
+        // A change of size is noticed too.
+        fs::write(&rom, b"junk").unwrap();
+        let report = lib.register_bundled(&dir).unwrap();
+        assert_eq!(report.skipped, 1);
+    }
+
+    #[test]
+    fn an_index_without_stamps_still_loads_and_gets_them() {
+        let f = fixture();
+        let dir = bundle_dir(&f);
+        write_rom(&dir, "one.gb", &gb_rom("ONE", 0));
+        let mut lib = Library::open(&f.data);
+        lib.register_bundled(&dir).unwrap();
+        let text = fs::read_to_string(f.data.index_file()).unwrap();
+        let mut index: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for game in index["games"].as_array_mut().unwrap() {
+            game.as_object_mut().unwrap().remove("rom_size");
+            game.as_object_mut().unwrap().remove("rom_mtime_ns");
+        }
+        fs::write(f.data.index_file(), index.to_string()).unwrap();
+        let mut old = Library::open(&f.data);
+        assert_eq!(old.entries().len(), 1);
+        assert!(old.entries()[0].stamp.is_none());
+        let report = old.register_bundled(&dir).unwrap();
+        assert_eq!(report, BundledReport::default());
+        assert!(old.entries()[0].stamp.is_some());
+        assert!(Library::open(&f.data).entries()[0].stamp.is_some());
+    }
+
+    #[test]
     fn a_bundled_game_from_another_folder_is_unlisted_even_if_its_file_exists() {
         let f = fixture();
         let dev = f.roms.parent().unwrap().join("roms-homebrew");
@@ -1863,6 +2016,8 @@ mod tests {
         lib.register_bundled(&dir).unwrap();
         let old = lib.entries()[0].id.clone();
         fs::write(&rom, gb_rom("ONE", 9)).unwrap();
+        // Same size: only the time tells the file changed (it can tie on a coarse clock).
+        set_mtime(&rom, SystemTime::now() + Duration::from_secs(60));
         let report = lib.register_bundled(&dir).unwrap();
         assert_eq!((report.added, report.removed), (1, 1));
         assert!(lib.get(&old).is_none());
