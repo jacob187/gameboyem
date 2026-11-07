@@ -71,7 +71,8 @@ bb727d59fa81915a5f5c609f4befb64872d3a3d830bc6ae0149e26410e648f85  unsafe/unsafe.
 EOF
 
 # FuzzARM (DenSinH, GPL-3.0). Fetched only, never committed or redistributed. Pinned to the
-# last commit (2022-06-14). Pass protocol: the EWRAM word at 0x0200_0000 stays 0 (DECISIONS #48).
+# last commit (2022-06-14). Pass protocol: the EWRAM word at 0x0200_0000 stays 0;
+# a failure writes 'AAAA' or 'TTTT' plus the got and expected registers there.
 FUZZARM_REV=a675329cd57da48e3e406216ba2d79dd7e09ee20
 F="https://raw.githubusercontent.com/DenSinH/FuzzARM/$FUZZARM_REV"
 while read -r sum name; do

@@ -26,7 +26,7 @@ build output. Cargo must run inside this directory (that is where rustup and `.c
 for manual work: `cd homebrew/gba && cargo build --release --locked`, `cargo clippy --release`, `cargo fmt --check`.
 `check-header.sh` validates ROM headers and is run by the Makefile target.
 
-Sizes and sha256 with the pinned toolchain (the same on any machine and any `CARGO_HOME`, see DECISIONS #49):
+Sizes and sha256 with the pinned toolchain (the same on any machine and any `CARGO_HOME`, because `trim-paths` strips the checkout and `~/.cargo` paths from the panic locations):
 
 | ROM | Bytes | sha256 |
 |-----|-------|--------|
