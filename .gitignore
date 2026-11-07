@@ -16,3 +16,8 @@ homebrew/**/*.noi
 homebrew/**/*.ihx
 homebrew/**/*.asm
 !homebrew/**/src/*.asm
+
+# local agent notes, not tracked
+DECISIONS.md
+PROGRESS.md
+REVIEW_NOTES.md

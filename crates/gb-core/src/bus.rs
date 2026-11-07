@@ -90,7 +90,7 @@ pub struct Bus {
     pub(crate) slow: bool,
     /// Whether the cartridge needs a per-M-cycle tick (only an MBC3 RTC does).
     pub(crate) cart_ticks: bool,
-    // ---- CGB additions (DECISIONS #31, #33); VBK lives in the PPU ----
+    // ---- CGB additions; VBK lives in the PPU ----
     /// The machine variant. Read by the IO paths in `mmu.rs`, by construction
     /// (`Bus::with_model`, `post_boot_registers`, `wram_len`), by `stop` (speed
     /// switch) and by the save-state layout here and in `gameboy.rs`.

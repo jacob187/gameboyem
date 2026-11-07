@@ -1,5 +1,5 @@
 //! CGB clocking on the bus: the KEY1 speed switch, double speed and the HDMA
-//! stall (Pan Docs "KEY1", "LCD VRAM DMA Transfers"; DECISIONS #38, #40).
+//! stall (Pan Docs "KEY1", "LCD VRAM DMA Transfers").
 //!
 //! All of it is `Hw::Cgb` only. A DMG, and a CGB in compatibility mode, never
 //! set [`Bus::slow`], so [`Bus::tick_components`] never leaves its plain path.
@@ -34,8 +34,7 @@
 //! never spans a `step_instruction` boundary.
 //!
 //! The pause is a lot longer than Pan Docs' "2050 M-cycles"; the hardware
-//! evidence above and SameBoy (0x20008 T-cycles) agree with each other
-//! (DECISIONS #38).
+//! evidence above and SameBoy (0x20008 T-cycles) agree with each other.
 //!
 //! # HDMA
 //!
@@ -71,7 +70,7 @@ use crate::hdma::{BLOCK_BYTES, Start};
 /// CPU M-cycles (of the new speed) a speed switch pauses the CPU for, after the
 /// DIV reset: 2^17 system-counter steps. Pan Docs says 2050 M-cycles; the AGE
 /// `spsw-div` and `spsw-tima` ROMs (hardware-verified) and SameBoy's 0x20008
-/// T-cycles say this (DECISIONS #38).
+/// T-cycles say this.
 pub(crate) const SPEED_SWITCH_MCYCLES: u32 = 32768;
 
 impl Bus {

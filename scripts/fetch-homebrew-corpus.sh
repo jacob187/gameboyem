@@ -31,7 +31,7 @@
 # Extra Boom (GB Oracles asset packs, no stated terms). The first seven
 # corpus games are DMG-compatible (CGB flag 0x143 = 0x00).
 #
-# CGB corpus (run on a Game Boy Color by the `smoke-cgb` cases; DECISIONS #39). All six are
+# CGB corpus (run on a Game Boy Color by the `smoke-cgb` cases). All six are
 # from the Homebrew Hub pin below; none has a prebuilt release for the same build.
 #
 # | File                     | Game (source repository)                              | License    | CGB (0x143) | Cart type (0x147)     | ROM / RAM      |

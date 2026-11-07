@@ -42,7 +42,7 @@ fn system_without_reading(path: &Path, forced: Option<System>) -> Option<System>
     })
 }
 
-/// Read the ROM at `path` once and say which system it is for (DECISIONS #46):
+/// Read the ROM at `path` once and say which system it is for:
 /// `--system`, else a `.gba` name, else GBA if the header looks like one, else
 /// Game Boy. When the flag or name decides, the file is read with that system's
 /// size cap. Otherwise it is read with the largest cap (GBA's), the system is
@@ -73,7 +73,7 @@ pub fn load_rom(path: &Path, forced: Option<System>) -> Result<(System, Vec<u8>)
 /// Reading stops one byte past that, so a huge file cannot exhaust memory.
 ///
 /// The official image's hash is not checked: the frontend has no hash crate
-/// and the dump cannot be shipped to take an FNV from (DECISIONS #62), so a
+/// and the dump cannot be shipped to take an FNV from, so a
 /// wrong-but-16 KiB file boots and misbehaves like any other bad BIOS.
 pub fn read_bios(path: &Path) -> Result<Box<[u8]>, String> {
     let data =
@@ -199,7 +199,8 @@ pub fn cartridge_message(path: &Path, e: &CartridgeError, archive: Option<&str>)
         format!(" (this looks like a {kind} archive; extract the ROM first)")
     });
     // Detection falls back to the Game Boy when a GBA header's checksum is wrong
-    // (DECISIONS #46), so a refusal that says "not a Game Boy ROM" names the way out.
+    // (the header byte 0x96 at 0xB2 and its complement checksum at 0xBD must both
+    // hold), so a refusal that says "not a Game Boy ROM" names the way out.
     let gba_hint = if archive.is_none()
         && matches!(
             e,

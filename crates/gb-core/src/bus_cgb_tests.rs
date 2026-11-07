@@ -1,4 +1,4 @@
-//! KEY1 speed switch, double speed and HDMA/GDMA tests (DECISIONS #38, #40).
+//! KEY1 speed switch, double speed and HDMA/GDMA tests.
 //! The ROM sets the CGB flag so the machine runs in CGB mode (`Hw::Cgb`).
 
 use super::*;

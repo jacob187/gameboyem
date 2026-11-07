@@ -260,7 +260,8 @@ fn mode3_len_with_sprites(xs: &[u8], scx: u8, obj: bool) -> u16 {
 fn sprite_penalty_table() {
     // Per sprite: 6 dots, plus `5 - x % 8` (floored at 0) for the first sprite
     // in each BG tile (x = OAM X + SCX); the sum is then reduced by 3. These
-    // are the values the mooneye-validated model (DECISIONS.md #20) produces.
+    // are the values the mooneye-validated model produces (the fit was only
+    // checked with SCX = 0 and no window).
     const BASE: u16 = 172;
     let table: [(&[u8], u8, u16); 13] = [
         // One sprite per alignment: 11, 10, 9, 8, 7, 6 (clamp), 6, 6 minus 3.

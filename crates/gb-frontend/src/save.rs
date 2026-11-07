@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn a_128_kib_flash_save_with_an_rtc_footer_fits_the_cap_and_loads() {
-        // 128 KiB of chip plus a hand-built footer (DECISIONS #67): magic, control,
+        // 128 KiB of chip plus a hand-built 24-byte RTC footer: magic, control,
         // 2024-01-01 00:00:00 with weekday 1 (BCD), zero sub-second, reserved.
         let mut ram = vec![0xFF; 128 * 1024];
         ram.extend_from_slice(b"AGBRTC01");

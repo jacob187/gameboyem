@@ -80,8 +80,8 @@ pub struct Options {
     /// `--rtc`: whether the GBA cartridge has a clock.
     pub rtc: RtcMode,
     /// `--rtc-start`: the GBA cartridge clock's starting time. The only way real
-    /// time reaches the core (DECISIONS #66): the user states it, so a run is
-    /// reproducible.
+    /// time reaches the core: the user states it (the core reads no host
+    /// clock), so a run is reproducible.
     pub rtc_start: Option<RtcTime>,
     /// GBA-only flags the user passed, so a Game Boy run can say they are ignored.
     pub gba_only: Vec<&'static str>,
@@ -563,7 +563,7 @@ mod tests {
             );
             assert_eq!(check_system_flags(System::Gba, &o), Ok(None));
         }
-        // A flag repeated on the command line is named once (code-review K#5).
+        // A flag repeated on the command line is named once.
         let o = run(&[
             "--rtc",
             "on",

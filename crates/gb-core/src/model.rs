@@ -1,4 +1,6 @@
-//! Hardware model selection (DECISIONS #31, #33).
+//! Hardware model selection: the host picks the console; a CGB then picks
+//! CGB mode or DMG-compatibility mode from the cartridge header, as the boot
+//! ROM does.
 
 use crate::cartridge::{Cartridge, CartridgeHeader};
 

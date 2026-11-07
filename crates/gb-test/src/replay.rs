@@ -216,7 +216,7 @@ fn replay_gba(
     let bios = opts.bios.as_deref().map(read_bios).transpose()?;
     let mut gba = rec.power_on(rom, bios).map_err(|e| e.to_string())?;
     if rec.legacy {
-        // deep-review #14: a version 3 GBA recording has no header extension.
+        // A version 3 GBA recording has no header extension.
         eprintln!(
             "warning: this is a version 3 GBA recording, which does not record --save-type, --rtc, \
              --rtc-start or --bios; replaying with the defaults (any --bios is used unchecked)"

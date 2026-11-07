@@ -34,7 +34,7 @@ with no dependency on `common/`. It runs only on a Game Boy Color (or `Model::Cg
   different tile at the same number, so a sprite that ignores its bank bit looks wrong.
 * A writes BCPS with auto-increment set and then two BCPD bytes (low, high) in VBlank.
 
-The headless case `play-cgbdemo-cgb` (`crates/gb-test`, kind suffix `-cgb`, DECISIONS #37) runs it as a
+The headless case `play-cgbdemo-cgb` (`crates/gb-test`, kind suffix `-cgb`) runs it as a
 CGB and reads `cgb_framebuffer()` (RGB555): at least 31 distinct colours; the whole frame equal, pixel for
 pixel, to the card derived from the tile data and palettes (every swatch, every flip variant, the backdrop and
 the sprite); the sprite's 6x6 core found by colour and moved by whole steps of 2 px along the held

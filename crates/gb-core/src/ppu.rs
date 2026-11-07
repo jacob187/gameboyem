@@ -36,7 +36,7 @@
 //!
 //! On a CGB in colour mode (`Hw::Cgb`) the line is drawn by `render_cgb` into RGB555
 //! frames instead ([`Ppu::cgb_framebuffer`]); the shade buffer stays zero. In
-//! DMG-compatibility mode the DMG renderer runs unchanged (DECISIONS #36).
+//! DMG-compatibility mode the DMG renderer runs unchanged.
 //!
 //! Rendering goes to a back buffer that is swapped to the front on entering
 //! VBlank, so [`Ppu::framebuffer`] never shows a half-drawn frame.
@@ -63,7 +63,8 @@ const LCD_ON_LINE_DOT: u16 = 4;
 /// Dot of line 153 at the first cartridge instruction (see [`Ppu::new`]).
 const POST_BOOT_LINE_DOT: u16 = 356;
 /// CGB hand-off: line 144 (LY = 0x90, the only value on record, from whichboot.gb
-/// on a mainline CGB boot ROM), at an arbitrary dot (DECISIONS #34).
+/// on a mainline CGB boot ROM), at an arbitrary dot: Pan Docs says LY / STAT at
+/// hand-off depend on the header and inputs, and no test ROM pins them.
 const CGB_POST_BOOT_LINE: u8 = VBLANK_LINE;
 const CGB_POST_BOOT_LINE_DOT: u16 = 100;
 
@@ -152,7 +153,7 @@ pub struct Ppu {
     back: Box<Framebuffer>,
     front: Box<Framebuffer>,
     frame_ready: bool,
-    // ---- CGB additions (DECISIONS #31) ----
+    // ---- CGB additions ----
     /// CGB hardware (bank 1 exists and is saved), in either CGB mode or
     /// DMG-compatibility mode.
     cgb: bool,
@@ -268,7 +269,7 @@ impl Ppu {
     ///
     /// Palette RAM is white (the boot ROM clears it; SameBoy randomises it before
     /// the boot ROM runs, Pan Docs leaves the OBJ half undefined): both halves
-    /// are 0xFF so the state is deterministic. DECISIONS #36.
+    /// are 0xFF so the state is deterministic.
     pub(crate) fn new_cgb(colour: bool) -> Self {
         Self {
             ly: CGB_POST_BOOT_LINE,
@@ -288,7 +289,7 @@ impl Ppu {
 
     /// CGB colour mode (`Hw::Cgb`): the colour renderer, palette RAM and OPRI
     /// exist. False on a DMG and in DMG-compatibility mode, whose output is the
-    /// DMG one (DECISIONS #36). Derived from the RGB555 frames, which exist
+    /// DMG one. Derived from the RGB555 frames, which exist
     /// exactly then.
     fn colour(&self) -> bool {
         self.cgb_back.is_some()
@@ -431,7 +432,7 @@ impl Ppu {
 
     /// Advance the PPU by one CPU M-cycle in double speed (2 dots). The PPU
     /// keeps its real-time rate, so a CPU cycle is half as many dots
-    /// (DECISIONS #38).
+    /// (the "mode as it was one CPU M-cycle ago" lag is then 2 dots, an assumption).
     pub(crate) fn tick_mcycle_double(&mut self, interrupts: &mut Interrupts) {
         self.tick_dots::<2>(interrupts);
     }
@@ -582,7 +583,7 @@ impl Ppu {
     }
 
     /// The last completed frame as shades. In CGB colour mode this is all zero:
-    /// the frame is [`Ppu::cgb_framebuffer`] (DECISIONS #36).
+    /// the frame is [`Ppu::cgb_framebuffer`].
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.front
     }
@@ -699,7 +700,7 @@ impl Ppu {
                 // DMG quirk (Pan Docs "STAT"): the write behaves as if $FF
                 // were written for one M-cycle before the real value, so any
                 // source that is currently true raises the line. A CGB (in
-                // either mode) does not have it (SameBoy, DECISIONS #36).
+                // either mode) does not have it (SameBoy).
                 if !self.cgb
                     && self.lcd_on()
                     && !self.stat_line
@@ -853,8 +854,8 @@ impl Ppu {
         w.bool(self.lyc_flag);
         w.u8(self.vis_mode);
         w.bool(self.stat_line);
-        // In colour mode the shade frames are all zero by design (DECISIONS
-        // #36), so they are not saved; the RGB555 frames below carry the picture.
+        // In colour mode the shade frames are all zero by design, so they are
+        // not saved; the RGB555 frames below carry the picture.
         if !self.colour() {
             w.bytes(&self.back[..]);
             w.bytes(&self.front[..]);

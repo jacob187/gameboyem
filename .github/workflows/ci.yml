@@ -73,8 +73,9 @@ jobs:
           fi
           make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"
 
-      # GBA homebrew (DECISIONS #49): a separate cargo project on a pinned nightly
-      # (homebrew/gba/rust-toolchain.toml); the workspace itself stays on stable.
+      # GBA homebrew: a separate cargo project on a pinned nightly (the target has no
+      # prebuilt std, so it needs -Zbuild-std; homebrew/gba/rust-toolchain.toml pins the
+      # date so the ROM bytes do not drift); the workspace itself stays on stable.
       # The nightly (with rust-src) and the build-std/agb build output are cached, keyed on what
       # pins them: the toolchain file and the lockfile. The install step stays: it is a no-op on
       # a hit and fills in anything the cache did not hold.
