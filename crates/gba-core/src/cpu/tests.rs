@@ -169,7 +169,7 @@ fn msr_in_user_mode_only_changes_the_flags() {
 /// MSR can set the state bit (as the SingleStepTests reference does; ARMv4T
 /// calls it UNPREDICTABLE) and nothing refills the pipeline, so the next step
 /// runs the ARM words already fetched as Thumb. That used to panic in
-/// `THUMB[op >> 6]` (code-review ST#9, correcting P1-CPU C#3); the opcode is
+/// `THUMB[op >> 6]`; the opcode is
 /// now masked to 16 bits. Guest code must never be able to panic the host.
 #[test]
 fn msr_setting_the_thumb_bit_does_not_panic() {

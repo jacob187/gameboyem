@@ -1,5 +1,8 @@
-//! The BIOS: either the built-in high-level emulation (the default, DECISIONS #47,
-//! #64, #65) or a user-supplied 16 KiB dump.
+//! The BIOS: either the built-in high-level emulation (the default; Nintendo's BIOS
+//! cannot be shipped and CI must run without it) or a user-supplied 16 KiB dump
+//! (`gb --bios`, with BIOS read protection emulated). By default the cartridge
+//! starts in the state the BIOS leaves behind (System mode, PC 0x0800_0000, the
+//! documented stack pointers), skipping the boot logo.
 //!
 //! **Contract:** [`Bios`], [`Bios::read8`], and [`swi`], which the bus's
 //! `CpuBus::swi` forwards to.
@@ -31,7 +34,7 @@ pub enum Bios {
 
 impl Bios {
     /// BIOS byte at `addr` (0..0x4000), with no read protection (the bus applies
-    /// that: DECISIONS #52).
+    /// that).
     pub fn read8(&self, addr: u32) -> u8 {
         match self {
             Bios::Hle => image::byte(addr),
@@ -40,18 +43,20 @@ impl Bios {
     }
 }
 
-// ---- timing model (DECISIONS #65) ---------------------------------------------
+// ---- timing model ---------------------------------------------
 //
 // Memory traffic is charged by the bus, access by access, with the widths the
 // real BIOS uses. On top of that every call pays `SWI_OVERHEAD` (exception
 // entry, dispatch table and return in BIOS code; paid again on every retry of a
 // waiting call so a wait loop always advances time) and the compute cost below.
+// The figures are plausible magnitudes, not hardware measurements; GBATEK gives
+// only that DivArm is 3 cycles slower than Div.
 
 /// The most clock cycles one memory-moving SWI (CpuSet, CpuFastSet, Bg/ObjAffineSet,
 /// BitUnPack, the decompressors and unfilters) may spend: 16 frames. A call runs
 /// inside one instruction step, so nothing else can interrupt it; a loop that
-/// reaches the budget stops, keeping what it has written and charging only that
-/// (DECISIONS #68). Real hardware would grind through such a call, taking just as
+/// reaches the budget stops, keeping what it has written and charging only that.
+/// Real hardware would grind through such a call, taking just as
 /// long on a hostile count; the cap protects the host, not the timing. It leaves
 /// room for the largest honest call (a 256 KiB LZ77 into EWRAM costs about 3M
 /// cycles).
@@ -80,8 +85,8 @@ const RESET_FLAG: u32 = 0x0300_7FFA;
 const HALTCNT: u32 = 0x300;
 const SOUNDBIAS: u32 = 0x88;
 
-/// The state the BIOS leaves behind when the cartridge starts (DECISIONS #47,
-/// #64). Called by `Gba::new` for [`Bios::Hle`]; charges no time. The CPU part
+/// The state the BIOS leaves behind when the cartridge starts (we start after the BIOS has
+/// run). Called by `Gba::new` for [`Bios::Hle`]; charges no time. The CPU part
 /// is `Cpu::post_bios`; the PPU already starts with BG2/BG3 PA and PD at 0x100.
 ///
 /// * POSTFLG = 1 ("the BIOS has run").
@@ -298,7 +303,7 @@ fn register_ram_reset(bus: &mut Bus, flags: u32) {
     if flags & 0x20 != 0 {
         // SIO: general purpose mode (RCNT bit 15), everything else zero. KEYINPUT
         // and KEYCNT (0x130..0x134) sit inside the range but are the keypad's,
-        // reset by flag 0x80 (deep-review #8).
+        // reset by flag 0x80, not by this SIO reset.
         for off in (0x120..0x130).step_by(2).chain((0x134..0x160).step_by(2)) {
             bus.write_io16(off, 0, 0xFFFF);
         }

@@ -174,7 +174,7 @@ fn length_clocks_at_256_hz() {
 }
 
 /// The APU hands each PSG control write the parity of the sequencer step that
-/// runs next, so the length quirks fire on an odd one (deep-review #73).
+/// runs next, so the length quirks fire on an odd one (the AGB PSG keeps the GB length quirks).
 #[test]
 fn length_quirks_follow_the_sequencer_step() {
     let mut a = on();
@@ -198,7 +198,7 @@ fn length_quirks_follow_the_sequencer_step() {
 /// A named corruption of an `Apu`.
 type Case = (&'static str, fn(&mut Apu));
 
-/// The APU-level `load_state` refusals, each on its own field (deep-review #74);
+/// The APU-level `load_state` refusals, each on its own field;
 /// the square channels' own are tested in their module.
 #[test]
 fn a_state_with_an_impossible_apu_field_is_refused() {

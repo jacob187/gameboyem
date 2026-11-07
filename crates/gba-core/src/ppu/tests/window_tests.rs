@@ -144,7 +144,7 @@ fn obj_pixel_colour() -> u16 {
 
 #[test]
 fn obj_window_lines_keep_their_marks_when_no_other_sprite_is_on_the_line() {
-    // The review item: a line whose only sprites are OBJ-window sprites used to be
+    // A line whose only sprites are OBJ-window sprites used to be
     // treated as "no sprite", wiping the window marks.
     let mut rig = two_bgs();
     rig.hide_all_sprites();

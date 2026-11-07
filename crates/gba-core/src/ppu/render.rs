@@ -1,5 +1,5 @@
 //! Line rendering: decode the registers, fill one line buffer per layer, then
-//! composite them into the back buffer (DECISIONS #56).
+//! composite them into the back buffer.
 //!
 //! The layer buffers:
 //!

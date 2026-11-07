@@ -87,7 +87,7 @@ pub struct Dma {
 
 impl Dma {
     /// All four channels with both the visible registers and the internal latched
-    /// ones, the active set and the bus latch (DECISIONS #73).
+    /// ones, the active set and the bus latch.
     pub(crate) fn save_state(&self, w: &mut StateWriter) {
         for c in &self.ch {
             w.u32(c.sad);
@@ -260,7 +260,7 @@ impl Bus {
 
     fn is_fifo(&self, n: usize) -> bool {
         let c = &self.dma.ch[n];
-        // Same test as `Dma::trigger` uses to start it (code-review S#5).
+        // Same test as `Dma::trigger` uses to start it, so the two cannot disagree.
         matches!(n, 1 | 2) && c.timing() == 3 && (c.dst == FIFO_A || c.dst == FIFO_B)
     }
 

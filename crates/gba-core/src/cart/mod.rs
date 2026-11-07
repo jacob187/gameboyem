@@ -4,10 +4,14 @@
 //! **Contract:** [`Cart::from_rom`], [`Cart::title`], [`CartError`], and the
 //! region accessors the bus calls.
 //!
-//! **Save image (DECISIONS #67).** `.sav` = the backup chip's bytes, optionally
+//! **Save image.** `.sav` = the backup chip's bytes, optionally
 //! followed by a 24-byte RTC footer ([`RTC_FOOTER_LEN`], `rtc.rs`). A file with no
 //! footer (every save made before P3-CART, or by a cartridge without a clock)
 //! loads as before; a footer that is present but invalid rejects the whole file.
+//! The footer holds the clock's fields at the cycle the save was taken plus the
+//! sub-second count in emulated cycles, and no host timestamp, so a load is
+//! exact; another emulator's footer is not understood. A cart with no chip
+//! refuses a footer.
 
 mod detect;
 mod eeprom;
@@ -271,7 +275,7 @@ impl Cart {
 
     /// ROM byte at `offset` (0..0x0200_0000). Beyond the image the cartridge bus
     /// floats and returns the address-derived value `(offset / 2) & 0xFFFF` per
-    /// halfword (GBATEK "GBA Cart ROM"; DECISIONS #52).
+    /// halfword (GBATEK "GBA Cart ROM").
     #[inline]
     pub fn read_rom8(&self, offset: u32) -> u8 {
         match self.rom.get(offset as usize) {
@@ -282,7 +286,7 @@ impl Cart {
 
     /// ROM halfword at the even `offset`. An odd-length image ends mid-halfword:
     /// the last real byte is kept and the floating bus supplies the other, as
-    /// [`Cart::read_rom8`] does (deep-review #11).
+    /// [`Cart::read_rom8`] does.
     #[inline]
     pub fn read_rom16(&self, offset: u32) -> u16 {
         let o = offset as usize;
@@ -448,7 +452,7 @@ impl Cart {
     }
 
     /// Start the clock at `t` at master-clock cycle `now` (the host's one entry
-    /// point for real time; DECISIONS #66). It only sets the time: the save
+    /// point for real time). It only sets the time: the save
     /// image gains no footer until the game uses the clock.
     pub fn set_rtc(&mut self, t: RtcTime, now: u64) {
         self.gpio.rtc_mut().set_time(t, now);
@@ -533,7 +537,7 @@ mod tests {
     }
 
     /// An image of odd length ends mid-halfword: its last real byte shows at every
-    /// width, and the other half of that halfword floats (deep-review #11).
+    /// width, and the other half of that halfword floats.
     #[test]
     fn the_last_byte_of_an_odd_length_image_reads_the_same_at_every_width() {
         let mut rom = vec![0; 0x201];

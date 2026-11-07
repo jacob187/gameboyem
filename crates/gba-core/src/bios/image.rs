@@ -1,4 +1,4 @@
-//! The built-in BIOS image: our own ARM code for the HLE BIOS (DECISIONS #64).
+//! The built-in BIOS image: our own ARM code for the HLE BIOS.
 //!
 //! It is assembled at compile time by a tiny `const fn` assembler (every
 //! immediate that cannot be encoded is a compile error). Nothing here is

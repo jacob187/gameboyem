@@ -812,7 +812,7 @@ fn specific_impossible_fields_are_refused() {
 
 /// A timer whose `start` does not match its pending overflow event would, on the
 /// next timer-register write, replay every period since `start` in one call: a
-/// hang for a state taken late in a session (deep-review #2).
+/// hang for a state taken late in a session.
 #[test]
 fn a_timer_start_that_disagrees_with_its_pending_overflow_is_refused() {
     let mut a = busy_machine(b"FLASH_V");
@@ -932,7 +932,7 @@ fn the_state_size_is_fixed_per_chip_and_fits_the_cap() {
     assert_eq!(fixed_size(&g), sizes[3]);
 }
 
-/// code-review ST#1: a failed load must not depend on this machine's own state
+/// A failed load must not depend on this machine's own state
 /// passing the loader's validators (the old rollback re-loaded a snapshot of it
 /// and `expect`ed that to succeed). Here the live machine holds a DMA control
 /// value the loader would refuse; a bad load leaves it exactly as it was, and a
@@ -995,7 +995,7 @@ fn a_thumb_state_with_arm_opcodes_in_the_pipeline_runs() {
 
 #[test]
 fn the_clock_start_is_part_of_the_state() {
-    // code-review ST#8: a loaded machine reports the start its state came from,
+    // A loaded machine reports the start its state came from,
     // so a recording header made after a load matches the machine.
     let rom = flash_rom();
     let t = RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap();

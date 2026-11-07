@@ -5,7 +5,9 @@
 //! byte format (header framing, records, decoding) is shared with the other
 //! cores and lives in [`emu_common::replay`]; this module adds what is GBA
 //! specific: the header's system extension, the 10-button limit, the battery
-//! size cap and powering a [`Gba`] on from a recording (DECISIONS #74).
+//! size cap and powering a [`Gba`] on from a recording. A GBA run is not reproduced by the ROM and battery alone:
+//! `--save-type`, `--rtc`, `--bios` and `--rtc-start` all change what the machine
+//! does, so a version 4 header carries them.
 //!
 //! Extension layout (version 4 headers; all fields fixed width):
 //!
@@ -22,7 +24,7 @@
 //! only if the session used those defaults, and the file cannot say. Because it
 //! does not say which BIOS it used either, [`Recording::power_on`] takes a BIOS
 //! dump for it without being able to check it. Callers should warn when
-//! `legacy` is set (deep-review #14).
+//! `legacy` is set.
 //!
 //! A real-BIOS recording stores the dump's hash, never the dump (it cannot be
 //! shipped); replaying it needs the user's own dump, and says so otherwise.
@@ -435,7 +437,7 @@ mod tests {
     /// A version 3 file cannot say which BIOS or options its session used: it is
     /// flagged so a caller can warn, and (unlike a version 4 file of a built-in
     /// BIOS session) it takes a BIOS dump, unchecked, so a session made with
-    /// `--bios` can still be replayed (deep-review #14).
+    /// `--bios` can still be replayed.
     #[test]
     fn a_version_3_recording_is_flagged_and_takes_a_bios_unchecked() {
         let rom = rom(b"");
