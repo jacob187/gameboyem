@@ -120,6 +120,8 @@ pub struct App<C: Core> {
     status: Option<(String, Instant)>,
     test: Option<TestMode>,
     shutdown: ShutdownFlag,
+    /// Always shown in the window title, e.g. that there is no data folder.
+    notice: Option<String>,
     /// Where the running game's screenshots go (its saves are in `saves`/`states`).
     paths: GamePaths,
     /// Powers on a dropped ROM; `None` ignores drops.
@@ -183,6 +185,7 @@ impl<C: Core> App<C> {
             test,
             shutdown,
             paths,
+            notice: None,
             loader: None,
             recorder: None,
             frame: 0,
@@ -196,6 +199,12 @@ impl<C: Core> App<C> {
             pixels: None,
             error: None,
         }
+    }
+
+    /// Show `notice` in the window title for the whole session.
+    pub fn with_notice(mut self, notice: Option<String>) -> Self {
+        self.notice = notice;
+        self
     }
 
     /// Power on a ROM dropped onto the window with `loader`.
@@ -244,11 +253,15 @@ impl<C: Core> App<C> {
                 ""
             };
             let paused = if self.paused { " [paused]" } else { "" };
+            let notice = self
+                .notice
+                .as_ref()
+                .map_or(String::new(), |n| format!(" [{n}]"));
             let status = self
                 .status
                 .as_ref()
                 .map_or(String::new(), |(msg, _)| format!(" - {msg}"));
-            w.set_title(&format!("{}{rec}{paused}{status}", self.title));
+            w.set_title(&format!("{}{notice}{rec}{paused}{status}", self.title));
         }
     }
 

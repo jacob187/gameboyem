@@ -116,11 +116,12 @@ fn power_on(opts: &cli::Options, path: &Path) -> Result<(Box<dyn Core>, u64), Po
 }
 
 /// [`power_on`] the ROM at `path` and find the files its player data lives in: the
-/// app folder, keyed by the ROM's content, after importing any save next to the ROM.
-/// The ROM is not added to the library.
+/// app folder, keyed by the ROM's content, after importing any save next to the ROM
+/// (next to the ROM itself if there is no app folder). The ROM is not added to the
+/// library.
 fn open_game(
     opts: &cli::Options,
-    data: &DataDir,
+    data: Option<&DataDir>,
     path: &Path,
 ) -> Result<(Box<dyn Core>, u64, GamePaths), PowerOnError> {
     let (core, rom_hash) = power_on(opts, path)?;
@@ -129,15 +130,21 @@ fn open_game(
 }
 
 /// The first lines of a log: what ran, on what, and where its data is.
-fn log_startup(data: &DataDir) {
+fn log_startup(data: Option<&DataDir>) {
     log::info!(
         "gameboyem {} on {} {}; data folder {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
-        data.root().display()
+        data.map_or_else(
+            || "unavailable".to_owned(),
+            |d| d.root().display().to_string()
+        )
     );
 }
+
+/// Shown in the window title when the data folder could not be used.
+const NO_DATA_NOTICE: &str = "no data folder: saves next to the ROM";
 
 fn new_event_loop() -> Result<EventLoop<()>, ExitCode> {
     EventLoop::new().map_err(|e| {
@@ -161,30 +168,30 @@ fn main() -> ExitCode {
 
     // Everything the player makes lives in the app folder, whichever way the ROM is
     // opened. Help and usage errors above do not create it.
-    let data = match DataDir::locate() {
-        Ok(d) => d,
-        Err(e) => {
-            logging::init(None, logging::level_from_env());
-            log::error!("{e}");
-            return ExitCode::FAILURE;
-        }
+    // If there is no usable folder the game still runs: saves, states and
+    // screenshots go next to the ROM as in older versions, with a warning.
+    let (data, data_problem) = match DataDir::prepare() {
+        Ok(d) => (Some(d), None),
+        Err(e) => (None, Some(e)),
     };
-    let created = data.create();
-    let log_file = data.log_file();
     logging::init(
-        created.is_ok().then_some(log_file.as_path()),
+        data.as_ref().map(DataDir::log_file).as_deref(),
         logging::level_from_env(),
     );
-    if let Err(e) = created {
+    if let Some(problem) = &data_problem {
         log::warn!(
-            "cannot create the data folder {}: {e}; saves and the log may not be written",
-            data.root().display()
+            "{problem}; saves, save states and screenshots go next to the ROM instead, \
+             and there is no log file or library"
         );
     }
-    log_startup(&data);
+    log_startup(data.as_ref());
 
     if opts.add {
-        return add_to_library(&data, opts.rom.take());
+        let Some(data) = &data else {
+            log::error!("--add needs the data folder, which is unavailable");
+            return ExitCode::FAILURE;
+        };
+        return add_to_library(data, opts.rom.take());
     }
 
     // Started from a launcher there is no command line: ask for the ROM. When it
@@ -217,7 +224,7 @@ fn main() -> ExitCode {
     let opts = Arc::new(opts);
 
     // The core hashed the ROM as it was built; the recording header reuses that.
-    let (mut core, rom_hash, paths) = match open_game(&opts, &data, &rom_path) {
+    let (mut core, rom_hash, paths) = match open_game(&opts, data.as_ref(), &rom_path) {
         Ok(c) => c,
         Err(PowerOnError::Usage(msg)) => {
             log::error!("{msg}");
@@ -309,12 +316,13 @@ fn main() -> ExitCode {
         opts.test_pattern,
         shutdown,
     )
+    .with_notice(data_problem.map(|_| NO_DATA_NOTICE.to_owned()))
     .with_recorder(recorder)
     .with_loader({
         let opts = Arc::clone(&opts);
         let data = data.clone();
         Box::new(move |path| {
-            open_game(&opts, &data, path)
+            open_game(&opts, data.as_ref(), path)
                 .map(|(core, _, paths)| (core, paths))
                 .map_err(PowerOnError::message)
         })

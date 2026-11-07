@@ -281,11 +281,20 @@ impl GamePaths {
         PathBuf::from(name)
     }
 
-    /// The old layout, for tests: `dir/game.sav`, `dir/game.ss1`, `dir/game-f0000001.png`
-    /// for the ROM `dir/game.gb`.
-    #[cfg(test)]
+    /// The layout older versions used, for when there is no app folder:
+    /// `dir/game.sav`, `dir/game.ss1`..`.ss9` and `dir/game-<time>-f0000001.png` for the
+    /// ROM `dir/game.gb`. A ROM named like one of those files keeps its whole name as
+    /// the stem, so a save can never be the ROM itself.
     pub fn beside(rom: &Path) -> Self {
-        let stem = rom.with_extension("");
+        let named_like_a_slot = rom.extension().is_some_and(|e| {
+            let e = e.to_string_lossy().to_ascii_lowercase();
+            matches!(e.as_bytes(), [b's', b's', b'1'..=b'9'])
+        });
+        let stem = if named_like_a_slot {
+            rom.to_owned()
+        } else {
+            rom.with_extension("")
+        };
         Self {
             sav: save_path(rom),
             state_prefix: stem.clone(),
@@ -297,8 +306,18 @@ impl GamePaths {
 /// The files for a ROM opened directly (a path on the command line, a drop on
 /// the window), which is not added to the library: its [`GamePaths`], after
 /// copying in any `.sav` / `.ss1`..`.ss9` that sit next to the ROM
-/// ([`import_beside_rom`]). `title` and `hash` are the core's.
-pub fn paths_for_opened_rom(data: &DataDir, rom_path: &Path, title: &str, hash: u64) -> GamePaths {
+/// ([`import_beside_rom`]). `title` and `hash` are the core's. With no app folder
+/// (`data` is `None`) the files stay next to the ROM, as before, and nothing is
+/// imported.
+pub fn paths_for_opened_rom(
+    data: Option<&DataDir>,
+    rom_path: &Path,
+    title: &str,
+    hash: u64,
+) -> GamePaths {
+    let Some(data) = data else {
+        return GamePaths::beside(rom_path);
+    };
     let paths = GamePaths::new(data, &GameId::new(title, hash));
     import_beside_rom(rom_path, &paths);
     paths
@@ -1996,17 +2015,48 @@ mod tests {
         let rom = write_rom(&f.roms, "moth.gb", &gb_rom("MOTH", 0));
         fs::write(f.roms.join("moth.sav"), b"old").unwrap();
         let hash = rom_hash(&fs::read(&rom).unwrap());
-        let paths = paths_for_opened_rom(&f.data, &rom, "MOTH", hash);
+        let paths = paths_for_opened_rom(Some(&f.data), &rom, "MOTH", hash);
         assert!(paths.sav.starts_with(f.data.saves()));
         assert_eq!(fs::read(&paths.sav).unwrap(), b"old");
         // Moving the ROM keeps the same files.
         let moved = write_rom(&f.roms, "elsewhere.gb", &fs::read(&rom).unwrap());
-        assert_eq!(paths_for_opened_rom(&f.data, &moved, "MOTH", hash), paths);
+        assert_eq!(
+            paths_for_opened_rom(Some(&f.data), &moved, "MOTH", hash),
+            paths
+        );
         // And the library gives a ROM added later the same ones.
         let mut lib = Library::open(&f.data);
         let e = lib.add_rom(&moved).unwrap().entry;
         assert_eq!(lib.paths_for(&e.id), paths);
         assert_eq!(lib.entries().len(), 1);
+    }
+
+    #[test]
+    fn with_no_app_folder_the_files_stay_beside_the_rom() {
+        let f = fixture();
+        let rom = write_rom(&f.roms, "moth.gb", &gb_rom("MOTH", 0));
+        fs::write(f.roms.join("moth.sav"), b"old").unwrap();
+        let paths = paths_for_opened_rom(None, &rom, "MOTH", 1);
+        assert_eq!(paths.sav, f.roms.join("moth.sav"));
+        assert_eq!(paths.state(3), f.roms.join("moth.ss3"));
+        assert!(paths.screenshot(1_700_000_000, 7).starts_with(&f.roms));
+        assert_eq!(
+            fs::read(&paths.sav).unwrap(),
+            b"old",
+            "nothing is copied or changed"
+        );
+        assert_eq!(fs::read_dir(&f.roms).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn the_beside_layout_never_names_the_rom_itself() {
+        for name in ["g.sav", "g.ss1", "g.SS9", "g.ss5", "noext", "g.gb"] {
+            let rom = PathBuf::from("d").join(name);
+            let p = GamePaths::beside(&rom);
+            let mut all = vec![p.sav.clone(), p.screenshot(0, 1)];
+            all.extend((1..=9).map(|n| p.state(n)));
+            assert!(all.iter().all(|f| *f != rom), "{name}: {all:?}");
+        }
     }
 
     #[test]

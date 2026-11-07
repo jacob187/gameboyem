@@ -80,6 +80,24 @@ impl DataDir {
         }
     }
 
+    /// [`DataDir::locate`] and [`DataDir::create`] in one step: the folder, ready to
+    /// use, or why it cannot be. The caller carries on without it (saves go next to
+    /// the ROM) rather than stopping.
+    pub fn prepare() -> Result<Self, String> {
+        Self::locate()?.created()
+    }
+
+    /// `self` after making the folders, or the reason that failed.
+    pub fn created(self) -> Result<Self, String> {
+        match self.create() {
+            Ok(()) => Ok(self),
+            Err(e) => Err(format!(
+                "cannot create the data folder {}: {e}",
+                self.root.display()
+            )),
+        }
+    }
+
     /// Make the folder and every subfolder. Existing ones are left alone.
     pub fn create(&self) -> io::Result<()> {
         for dir in [
@@ -183,6 +201,16 @@ mod tests {
         for dir in [d.games(), d.saves(), d.states(), d.screenshots(), d.logs()] {
             assert!(dir.is_dir(), "{}", dir.display());
         }
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_created_is_an_error_not_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("in-the-way");
+        fs::write(&file, b"x").unwrap();
+        let e = DataDir::at(file.join("app")).created().unwrap_err();
+        assert!(e.contains("cannot create the data folder"), "{e}");
+        assert!(DataDir::at(tmp.path().join("ok")).created().is_ok());
     }
 
     #[test]
