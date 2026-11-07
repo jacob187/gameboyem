@@ -6,7 +6,10 @@
 # from its pin, so any change to emulation behaviour (including a "pure"
 # optimisation) shows up here. A ROM-hash mismatch means the ROM itself changed,
 # e.g. a homebrew source edit; rebuild, re-run with --print-pins and replace
-# the lines below. Homebrew builds are byte-identical on macOS and Linux GBDK.
+# the lines below. The GBDK builds are byte-identical on macOS and Linux. The agb
+# GBA homebrew (homebrew/*.gba) is not: CI builds it on Linux and gets different
+# code from the macOS build these pins came from, so its ROM hash is only
+# informational and its video and audio hashes are what is checked.
 1200 135a93076059053c ce76cae962320e7e d9333912336b6d65 test/dmg-acid2/dmg-acid2.gb
 1200 9bc9250d7f185f9d 94d57173ba276d05 e3db61b1d8a1a7c5 test/blargg/cpu_instrs/cpu_instrs.gb
 1200 712444458c1dd6ba 9029ec196d701ee5 af5f058ad29285e5 homebrew/snake.gb
