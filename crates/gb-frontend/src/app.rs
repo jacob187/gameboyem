@@ -830,7 +830,6 @@ impl<C: Core> App<C> {
             return;
         }
         self.set_mode(self.mode.resume());
-        self.next_resume = Instant::now() + RESUME_INTERVAL;
         self.ui_wake = None;
         self.reset_ui();
         for button in Button::ALL {
