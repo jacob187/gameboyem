@@ -134,11 +134,11 @@ cargo run -p gb-test --release -- --bench 1200 3 --check --min-speed 5   # speed
 scripts/docker-linux-test.sh [amd64|arm64]   # the Linux CI job in Docker; builds homebrew with Linux GBDK (tools/gbdk-linux/), needs roms/test + roms/corpus
 ```
 
-The benchmark runs six Game Boy ROMs and four GBA ROMs (FuzzARM `ARM_Any`, `moth`, `grains` and tonc `m7_demo`) and compares each ROM's video, serial and audio hashes against `crates/gb-test/bench-pins.txt`. That catches any behaviour change, including from a "pure" optimisation. If a homebrew ROM is rebuilt from changed source, re-pin with `--print-pins`. CI also fails if the emulator drops below 5× real time, checked separately for each system against its own overall rate. On a dev Mac the Game Boy ROMs run at about 40× real time and the GBA ROMs at about 17–24× depending on machine load (DECISIONS #72), so the floor is at most about a third of the GBA figure. cgb-acid2 and uCity run on a CGB in colour mode (their video hashes cover the RGB555 frame; uCity switches to double speed), so the "overall" speed that `--min-speed` checks includes the colour renderer and double speed.
+The benchmark runs six Game Boy ROMs and four GBA ROMs (FuzzARM `ARM_Any`, `moth`, `grains` and tonc `m7_demo`) and compares each ROM's video, serial and audio hashes against `crates/gb-test/bench-pins.txt`. That catches any behaviour change, including from a "pure" optimisation. If a homebrew ROM is rebuilt from changed source, re-pin with `--print-pins`. CI also fails if the emulator drops below 5× real time, checked separately for each system against its own overall rate. On a dev Mac the Game Boy ROMs run at about 40× real time and the GBA ROMs at about 17–24× depending on machine load, so the floor is at most about a third of the GBA figure. cgb-acid2 and uCity run on a CGB in colour mode (their video hashes cover the RGB555 frame; uCity switches to double speed), so the "overall" speed that `--min-speed` checks includes the colour renderer and double speed.
 
 `crates/gb-test/expected.txt` is a ratchet. A case fails if its outcome changes in either direction, so a regression or an unrecorded fix both break the build.
 
-cgb-acid2 (`acid2-cgb` in the manifest) runs on a Game Boy Color and compares the RGB555 frame, widened to 8 bits per channel with no colour correction, to its reference image. It passes (DECISIONS #35, #36).
+cgb-acid2 (`acid2-cgb` in the manifest) runs on a Game Boy Color and compares the RGB555 frame, widened to 8 bits per channel with no colour correction, to its reference image. It passes.
 
 ### Test-ROM results
 
@@ -170,7 +170,7 @@ These are the results at the head of `feat/gba` (`bd6ce54`), from `cargo run -p 
 
 The GBA rows are 30 of the 202. Four things about them. First, the visual ROMs only prove that the PPU draws something, not that the picture is right (`gb-test --dump-gba ROM FRAMES OUT_DIR` writes PNGs for looking at them). Second, SingleStepTests/ARM7TDMI, which checks the CPU per instruction down to the bus transactions, runs under `cargo test -p gba-core` and isn't in this table. It needs `--with-sst` (about 900 MB) and is skipped without the files, in CI as well as locally, because CI never fetches the set (see Known gaps). Third, jsmolka `bios.gba` (the official BIOS's open-bus values) runs only when `GBA_BIOS` points at a real dump, so it is skipped in CI, and `unsafe.gba` fails on real hardware and is left out. Last, the mGBA test suite isn't run (see Known gaps).
 
-The Mooneye CGB cases (`boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C`, `boot_div-cgbABCDE`, `ppu/vblank_stat_intr-C`) all pass. The ten failing cases are expected failures in `expected.txt`, each with a note: four AGE speed-switch ROMs (DIV-reset edges of the fast timers, LCD / APU phase across a switch; DECISIONS #38), and six `cgb_sound` ROMs (CGB APU differences). Some PPU timing is fitted to mooneye rather than derived from hardware (see DECISIONS #20).
+The Mooneye CGB cases (`boot_regs-cgb`, `boot_hwio-C`, `unused_hwio-C`, `boot_div-cgbABCDE`, `ppu/vblank_stat_intr-C`) all pass. The ten failing cases are expected failures in `expected.txt`, each with a note: four AGE speed-switch ROMs (DIV-reset edges of the fast timers, LCD / APU phase across a switch), and six `cgb_sound` ROMs (CGB APU differences). Some PPU timing is fitted to mooneye rather than derived from hardware: the STAT mode bits lag the internal mode by one M-cycle, LCD-on line 0 starts at dot 4, the summed sprite penalty is cut by 3 dots, and the sprite fit was only checked with SCX = 0 and no window.
 
 ## Cartridges
 
@@ -252,42 +252,40 @@ They stand in for commercial games in the harness. All 13 boot, and 3 of the DMG
   - model-specific zombie variants
 - **STOP.** Like hardware, it wakes only on a selected joypad line. Unlike hardware, the LCD and timer keep running during STOP.
 - **Game Boy Color.** Supported: VRAM and WRAM banking, the KEY1 speed switch and double speed, GDMA / HDMA, the colour PPU (palette RAM, BG attributes, CGB sprite priority, OPRI) with RGB555 output, FF72-FF75 scratch registers and PCM12/PCM34. Still missing:
-  - Speed-switch edge cases: the LCD and APU phase across a switch and the DIV-reset edges of the fast timer rates are not exact (AGE `speed-switch` 2 / 6; DECISIONS #38). CGB APU differences fail 6 Blargg `cgb_sound` ROMs.
+  - Speed-switch edge cases: the LCD and APU phase across a switch and the DIV-reset edges of the fast timer rates are not exact (AGE `speed-switch` 2 / 6). The switch pause is 32768 M-cycles with the timer running, which is what AGE `spsw-tima` and `spsw-div` pin, but the immediate TIMA increments the DIV reset causes at 262 / 65 / 16 kHz land one M-cycle off. CGB APU differences fail 6 Blargg `cgb_sound` ROMs.
   - No colourisation of DMG games: a flag-less cartridge on a forced `--model cgb` runs in DMG-compatibility mode in the `--palette` shades, because the boot ROM's compatibility palettes aren't modelled.
   - No infrared port (RP, FF56).
-  - CGB-mode post-boot timing is approximate. The DIV and serial phase and the PPU line and dot at hand-off are the compat-mode calibration or a guess, because no test ROM pins them (DECISIONS #33, #34). The CGB boot ROM's clearing of wave RAM isn't modelled either. The palette-port lock timing reuses the VRAM lock timing and is unverified (DECISIONS #36).
+  - CGB-mode post-boot timing is approximate. The DIV and serial phase and the PPU line and dot at hand-off are the compat-mode calibration or a guess, because no test ROM pins them. The CGB boot ROM's clearing of wave RAM isn't modelled either. The palette-port lock timing reuses the VRAM lock timing and is unverified.
 - **No boot ROM.** The emulator starts in the documented post-boot state.
 
 ### Game Boy Advance
 
-Everything here is a deliberate approximation or an unimplemented feature. The decision numbers point to the reasoning in `DECISIONS.md`.
+Everything here is a deliberate approximation or an unimplemented feature.
 
 - **Commercial games are untested by CI.** No commercial ROM is committed or fetched, so the emulator is checked only against test ROMs and our own homebrew. Whether a given game runs well is for you to find out. Open-bus values, odd DMA corners, and games that depend on exact timing are where problems are most likely to show.
-- **The mGBA test suite isn't run.** It has no prebuilt ROM and needs devkitARM to build, which means Docker, and Docker is off by default here (DECISIONS #48). The visual test ROMs are smoke checks only, and `armwrestler` and the nba-emu `hw-test` ROMs aren't wired up.
-- **CI doesn't run the CPU SingleStepTests (DECISIONS #57).** The ARM7TDMI SingleStepTests set is about 900 MB and only `./scripts/fetch-gba-test-roms.sh --with-sst` fetches it, which CI doesn't run. So all 45 SST tests skip and pass on every CI leg without checking anything. CI still runs jsmolka `arm`, `thumb` and `memory` and FuzzARM, but a CPU bug only SST would catch (the N/S kind of a load/store-multiple bus transaction, say) shows up only when you run `cargo test -p gba-core` with the set fetched. A populated set with a missing file does fail under `CI`.
-- **HLE BIOS (DECISIONS #64, #65, #68).**
+- **The mGBA test suite isn't run.** It has no prebuilt ROM and needs devkitARM to build, which means Docker, and Docker isn't used by default in this project. The visual test ROMs are smoke checks only, and `armwrestler` and the nba-emu `hw-test` ROMs aren't wired up.
+- **CI doesn't run the CPU SingleStepTests.** The ARM7TDMI SingleStepTests set is about 900 MB and only `./scripts/fetch-gba-test-roms.sh --with-sst` fetches it, which CI doesn't run. So all 45 SST tests skip and pass on every CI leg without checking anything. CI still runs jsmolka `arm`, `thumb` and `memory` and FuzzARM, but a CPU bug only SST would catch (the N/S kind of a load/store-multiple bus transaction, say) shows up only when you run `cargo test -p gba-core` with the set fetched. A populated set with a missing file does fail under `CI`.
+- **HLE BIOS.**
   - The sound-driver calls (`SoundDriverInit`, `Mode`, `Main`, `VSync`, `VSyncOff`, `VSyncOn`, `SoundChannelClear`, the undocumented 0x20-0x24 and `SoundGetJumpList`) do nothing and return. Most commercial games link their own driver, but one that calls the BIOS's gets no sound from it.
   - `ArcTan`, `ArcTan2` and the sine table behind `BgAffineSet` and `ObjAffineSet` are written from the documented algorithm, not from a real BIOS, and nothing checks them against one. Only tan(1.0) = 0x2000 is pinned. `BgAffineSet` / `ObjAffineSet` rounding may differ by one LSB, and `MidiKey2Freq` and some `RegisterRamReset` resets are approximated.
   - The cycle cost of each call is a plausible magnitude, not a measurement. `MultiBoot` always reports failure. A memory-moving call (`CpuSet`, decompression, affine sets) stops at a 16-frame cycle budget, which protects the host from hostile arguments and does not match hardware.
   - The real BIOS comparison needs a dump: the `GBA_BIOS` test cases are skipped in CI, and `--bios` is the way to avoid all of the above.
-- **Bus timing (DECISIONS #52, #54, #70, #71).**
+- **Bus timing.**
   - DMA runs exclusively of the CPU, so CPU and DMA bus contention isn't modelled. The one-cycle palette / VRAM / OAM access penalty while the PPU is reading, the 1210-cycle per-line sprite budget and the DISPCNT enable-bit write delay aren't modelled either.
   - Components are caught up after each instruction, so a timer overflow, DMA start or interrupt can be late by up to one instruction. The 1 to 2 cycle offset between a status flag and its IF bit isn't modelled.
   - The prefetch buffer follows GBATEK, but its behaviour on a branch or a data access while a halfword is in flight (no wait, and a data access keeps the buffer) is unverified against hardware. A pure-ROM, bus-bound loop costs exactly the classic wait-state timing.
   - Open bus returns the last fetched opcode, not the real pipeline-dependent value. IRQ entry is charged like an SWI, and the exact figure isn't known.
-- **Timers fast enough to storm are slow.** A timer is only scheduled when something observes it, so unobserved ones cost nothing. A timer with its interrupt enabled that overflows every few cycles costs an event each time: ten emulated frames of that took 0.47 s in a release build on a dev Mac, well below real time (DECISIONS #69). That slows such a game and never the host.
-- **Cartridge clock (DECISIONS #66, #67).** The alarm and the per-minute interrupt are not implemented. Alarm 1, alarm 2 and the free register read 0xFF and drop what is written to them, and control bit 3 (the per-minute interrupt) is stored and does nothing. The sizes of registers 5 and 7 are a guess. The `--rtc auto` rule is a heuristic: a non-RTC game that stores a small value at the clock port wakes it, which is harmless. Real time never enters the core unless you pass `--rtc-start`.
-- **Saves (DECISIONS #53, #67).** Flash erase and program are instant. A game with no library ID string gets no save unless you pass `--save-type`. A driver that bit-bangs the EEPROM with the CPU instead of DMA can get the wrong size guess (GBATEK says it doesn't work on hardware); `--save-type` fixes it.
-- **PPU (DECISIONS #55, #59, #71).**
+- **Timers fast enough to storm are slow.** A timer is only scheduled when something observes it, so unobserved ones cost nothing. A timer with its interrupt enabled that overflows every few cycles costs an event each time: ten emulated frames of that took 0.47 s in a release build on a dev Mac, well below real time. That slows such a game and never the host.
+- **Cartridge clock.** The alarm and the per-minute interrupt are not implemented. Alarm 1, alarm 2 and the free register read 0xFF and drop what is written to them, and control bit 3 (the per-minute interrupt) is stored and does nothing. The sizes of registers 5 and 7 are a guess. The `--rtc auto` rule is a heuristic: a non-RTC game that stores a small value at the clock port wakes it, which is harmless. Real time never enters the core unless you pass `--rtc-start`.
+- **Saves.** Flash erase and program are instant. A game with no library ID string gets no save unless you pass `--save-type`. A driver that bit-bangs the EEPROM with the CPU instead of DMA can get the wrong size guess (GBATEK says it doesn't work on hardware); `--save-type` fixes it.
+- **PPU.**
   - Each line is drawn at once at cycle 960. Mid-line effects finer than a line, and a register write between dot 240 and the HBlank flag at cycle 1006 landing on the next line, are the price. A DISPSTAT or LYC write that makes the VCount match true mid-line raises no interrupt, because neither GBATEK nor the hw-test says what hardware does.
   - Windows and blending follow GBATEK with two deviations or guesses: a window whose right (bottom) edge is below its left (top) edge wraps, as Tonc and mGBA draw it, and the window's colour-effect bit also switches off a semi-transparent sprite's blend, which is undocumented either way.
   - OBJ mosaic is an approximation: it quantises the sprite's screen position instead of reproducing the hardware's per-line counter, so block alignment can differ.
-- **APU (DECISIONS #60).** SOUNDBIAS's resolution bits (6 to 9-bit, 262 to 32 kHz) are stored and read back but not modelled, so the output isn't quantised. A FIFO pop can be applied one instruction late after a register access synced the APU past it. A full FIFO drops the newest bytes, which hardware doesn't document.
+- **APU.** SOUNDBIAS's resolution bits (6 to 9-bit, 262 to 32 kHz) are stored and read back but not modelled, so the output isn't quantised. A FIFO pop can be applied one instruction late after a register access synced the APU past it. A full FIFO drops the newest bytes, which hardware doesn't document.
 - **Serial and link port.** Not emulated. The registers exist and save in states, but nothing connects to them, so link cable, multiplayer, Wireless Adapter and multiboot don't work.
 - **Frontend.** The picture is RGB555 widened to 8 bits per channel with no LCD colour correction. The GBA window and audio haven't been checked by the build, only by headless tests: the visual check is pending the user, as on the Game Boy.
 
 ### Both
 
 - **Not supported:** debugger, rewind and shaders, and for the Game Boy, the link cable.
-
-Design decisions are in `DECISIONS.md`, status in `PROGRESS.md`, and deferred review findings in `REVIEW_NOTES.md`.
