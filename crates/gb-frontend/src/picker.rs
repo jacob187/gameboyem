@@ -1,5 +1,5 @@
-//! Choosing a ROM when `gb` is started without one, as it is from Finder, the
-//! Start menu or a desktop launcher, where there is no command line.
+//! Choosing ROMs with the native file dialog, and what to do when `gb` is started without
+//! one, as it is from Finder, the Start menu or a desktop launcher: show the library.
 
 use std::path::PathBuf;
 
@@ -15,29 +15,30 @@ const FILTER_NAME: &str = "Game Boy and Game Boy Advance ROMs";
 pub enum Startup {
     /// A path was given: use it, with no dialog.
     Given(PathBuf),
-    /// No path and an interactive run: ask with a file dialog.
-    Ask,
+    /// No path and an interactive run: show the game library.
+    Library,
     /// No path in a mode that cannot ask (`--test-pattern`): a usage error.
     Missing,
 }
 
-/// Decide how to get the ROM. `--test-pattern` never opens a dialog, so a
-/// scripted run does not hang waiting for a click.
+/// Decide how to get the ROM. `--test-pattern` has no library to show, so a
+/// scripted run does not wait for a click.
 pub fn startup(rom: Option<PathBuf>, test_pattern: bool) -> Startup {
     match rom {
         Some(path) => Startup::Given(path),
         None if test_pattern => Startup::Missing,
-        None => Startup::Ask,
+        None => Startup::Library,
     }
 }
 
-/// Show the native open dialog. `None` when it is cancelled (or no dialog
-/// backend is available; the library cannot tell the two apart).
-pub fn pick_rom() -> Option<PathBuf> {
+/// Show the native open dialog for any number of ROMs. Empty when it is cancelled (or no
+/// dialog backend is available; the library cannot tell the two apart).
+pub fn pick_roms() -> Vec<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Open a ROM")
+        .set_title("Add games")
         .add_filter(FILTER_NAME, &ROM_EXTENSIONS)
-        .pick_file()
+        .pick_files()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -55,8 +56,8 @@ mod tests {
     }
 
     #[test]
-    fn no_path_asks_unless_the_mode_cannot() {
-        assert_eq!(startup(None, false), Startup::Ask);
+    fn no_path_shows_the_library_unless_the_mode_cannot() {
+        assert_eq!(startup(None, false), Startup::Library);
         assert_eq!(startup(None, true), Startup::Missing);
     }
 

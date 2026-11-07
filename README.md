@@ -21,7 +21,7 @@ The builds aren't code-signed yet, so the first launch needs one extra step:
 - **macOS:** right-click the app, choose **Open**, then **Open** again.
 - **Windows:** at "Windows protected your PC", click **More info**, then **Run anyway**.
 
-Start the app, then pick a ROM (`.gb`, `.gbc` or `.gba`) in the dialog or drag one onto the window. No games are included; see [Legal](#legal).
+Start the app and click **Add game** to pick ROMs (`.gb`, `.gbc` or `.gba`), or drag one onto the window. Your games are listed in the library; click one to play. No games are included; see [Legal](#legal).
 
 ## Controls
 
@@ -33,7 +33,8 @@ Start the app, then pick a ROM (`.gb`, `.gbc` or `.gba`) in the dialog or drag o
 | Start / Select | Enter / Backspace |
 | Save / load state | K / L (slots 1-9) |
 | Pause / fast-forward | P / hold Tab |
-| Screenshot / quit | C / Esc |
+| Screenshot | C |
+| Pause menu (resume, states, back to library, help) | Esc or P (Esc quits from the library) |
 
 ## Saves
 

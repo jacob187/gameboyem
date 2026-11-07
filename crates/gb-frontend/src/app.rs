@@ -16,13 +16,15 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use crate::audio::{self, AudioOutput, ToneGen};
+use crate::gui::{Gui, Screen};
 use crate::keymap::{Action, InputState, map};
-use crate::library::GamePaths;
+use crate::library::{GameId, GamePaths, Library, RemoveSaves};
 use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::record::{self, Recorder};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
+use crate::ui::{EscapeEffect, Mode, ThumbnailTrigger, Toasts, UiAction, escape_effect};
 use crate::video::{Palette, present, test_pattern};
 
 /// Speed multiplier while Tab is held.
@@ -30,6 +32,17 @@ const FAST_FORWARD_SPEED: f64 = 4.0;
 
 /// How long a save-state message stays in the window title.
 const STATUS_DURATION: Duration = Duration::from_secs(2);
+
+/// The window's size, in logical pixels, while the library is shown.
+const LIBRARY_WINDOW: (u32, u32) = (880, 640);
+
+/// What a key press or a click asks of the event loop.
+#[derive(Debug, PartialEq, Eq)]
+enum Effect {
+    None,
+    /// Close the program (saves are written as the loop exits).
+    Exit,
+}
 
 /// The size to configure the surface with, or `None` while the window has no
 /// drawable area (minimised: a zero dimension makes wgpu panic or error).
@@ -133,10 +146,22 @@ pub struct App<C: Core> {
     input: InputState,
     pacer: FramePacer,
     last_tick: Instant,
+    /// The emulator is stopped: any mode but `Playing`. Kept in step by `set_mode`.
     paused: bool,
+    mode: Mode,
     fast_forward: bool,
     /// False while the window has a zero-sized surface (minimized).
     surface_ok: bool,
+
+    /// The game list; `None` when there is no data folder to keep one in.
+    library: Option<Library>,
+    /// The library game running, if it is one (the key its thumbnail is stored by).
+    game_id: Option<GameId>,
+    thumbnail: ThumbnailTrigger,
+    toasts: Toasts,
+    /// When egui asked to be drawn again by itself (an animation).
+    ui_wake: Option<Instant>,
+    gui: Option<Gui>,
 
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
@@ -193,8 +218,15 @@ impl<C: Core> App<C> {
             pacer: FramePacer::new(fps),
             last_tick: Instant::now(),
             paused: false,
+            mode: Mode::Playing,
             fast_forward: false,
             surface_ok: true,
+            library: None,
+            game_id: None,
+            thumbnail: ThumbnailTrigger::default(),
+            toasts: Toasts::default(),
+            ui_wake: None,
+            gui: None,
             window: None,
             pixels: None,
             error: None,
@@ -217,6 +249,60 @@ impl<C: Core> App<C> {
     pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
         self.recorder = recorder;
         self
+    }
+
+    /// Keep the game list. `None`: there is no data folder to keep one in, and the
+    /// library screen only offers to play a ROM.
+    pub fn with_library(mut self, library: Option<Library>) -> Self {
+        self.library = library;
+        self
+    }
+
+    /// Start on the game list; the core given to [`App::new`] is a placeholder that
+    /// is never stepped.
+    pub fn in_library(mut self) -> Self {
+        self.set_mode(Mode::Library);
+        self.title = window_title("");
+        self
+    }
+
+    /// The running game is the library game `id` (if it is listed): it is marked as
+    /// played, and gets a thumbnail once it has run a while if it has none.
+    pub fn with_game(mut self, id: Option<GameId>) -> Self {
+        self.set_game(id);
+        self
+    }
+
+    fn set_game(&mut self, id: Option<GameId>) {
+        // `Some(wanted)` for a listed game: wanted when it has no thumbnail yet.
+        let listed = match (&id, self.library.as_ref()) {
+            (Some(id), Some(library)) => library.get(id).map(|e| e.thumbnail.is_none()),
+            _ => None,
+        };
+        self.thumbnail = ThumbnailTrigger::new(listed == Some(true));
+        self.game_id = listed.and(id);
+        if let (Some(id), Some(library)) = (&self.game_id, self.library.as_mut())
+            && let Err(e) = library.touch_played(id)
+        {
+            log::warn!("{e}");
+        }
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.paused = !mode.runs_emulation();
+    }
+
+    fn request_redraw(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Show `text` in a toast for a few seconds.
+    fn toast(&mut self, level: log::Level, text: impl Into<String>) {
+        self.toasts.push(level, text, Instant::now());
+        self.request_redraw();
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, msg: String) {
@@ -252,7 +338,11 @@ impl<C: Core> App<C> {
             } else {
                 ""
             };
-            let paused = if self.paused { " [paused]" } else { "" };
+            let paused = if self.paused && self.mode != Mode::Library {
+                " [paused]"
+            } else {
+                ""
+            };
             let notice = self
                 .notice
                 .as_ref()
@@ -266,9 +356,14 @@ impl<C: Core> App<C> {
     }
 
     /// Report a result in the log, at `level` so failures show up as warnings and
-    /// errors, and, briefly, in the title (an error with its `error: ` prefix).
+    /// errors, and, briefly, in the title (an error with its `error: ` prefix). Problems
+    /// also get a toast, and so does everything while a menu is up: its buttons have no
+    /// other way to answer.
     fn show_status(&mut self, level: log::Level, msg: String) {
         log::log!(level, "{msg}");
+        if level <= log::Level::Warn || self.mode.menu_visible() {
+            self.toast(level, msg.clone());
+        }
         let shown = if level == log::Level::Error {
             format!("error: {msg}")
         } else {
@@ -331,17 +426,42 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// Power on a ROM dropped onto the window, in place of the running game. On
-    /// failure the running game carries on and the error is shown.
+    /// A ROM dropped onto the window: add it to the library, if there is one, and play
+    /// it, in place of the running game. On failure the running game carries on and the
+    /// error is shown.
     fn open_dropped(&mut self, path: PathBuf) {
-        // `--test-pattern` has no game to replace.
-        if self.test.is_some() {
+        // `--test-pattern` has no game to replace, and without a loader nothing can play.
+        if self.test.is_some() || self.loader.is_none() {
             return;
         }
+        if self.library.is_none() {
+            return self.open_rom(&path, None);
+        }
+        let Some(library) = self.library.as_mut() else {
+            return;
+        };
+        match library.add_rom(&path) {
+            Ok(added) => {
+                let name = &added.entry.title;
+                let msg = if added.duplicate {
+                    format!("{name} is already in the library")
+                } else {
+                    format!("Added {name}")
+                };
+                self.toast(log::Level::Info, msg);
+                self.open_rom(&added.entry.rom_path, Some(added.entry.id.clone()));
+            }
+            Err(msg) => self.show_status(log::Level::Error, msg),
+        }
+    }
+
+    /// Power on the ROM at `path` in place of the running game, as library game `id`
+    /// if it is one. On failure the running game carries on and the error is shown.
+    fn open_rom(&mut self, path: &Path, id: Option<GameId>) {
         let Some(loader) = self.loader.as_mut() else {
             return;
         };
-        let (mut core, paths) = match loader(&path) {
+        let (mut core, paths) = match loader(path) {
             Ok(loaded) => loaded,
             Err(msg) => return self.show_status(log::Level::Error, msg),
         };
@@ -369,7 +489,9 @@ impl<C: Core> App<C> {
             self.pacer.set_speed(FAST_FORWARD_SPEED);
         }
         self.frame = 0;
-        self.paused = false;
+        self.set_mode(self.mode.play());
+        self.reset_ui();
+        self.set_game(id);
         // The new machine starts with no buttons down; apply the keys held now.
         for button in Button::ALL {
             self.set_button(button, self.input.is_down(button));
@@ -378,21 +500,116 @@ impl<C: Core> App<C> {
         self.reset_clock();
         self.update_title();
         self.upload();
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.fit_window();
+        self.request_redraw();
         log::info!("opened {} ({})", path.display(), self.core.title());
     }
 
+    /// Size the window for what is shown: the game at the chosen scale, or the library.
+    fn fit_window(&self) {
+        let Some(w) = &self.window else {
+            return;
+        };
+        let (width, height) = if self.mode == Mode::Library {
+            LIBRARY_WINDOW
+        } else {
+            let frame = frame_of(self.test.as_ref(), &self.core);
+            (
+                frame.width as u32 * self.scale,
+                frame.height as u32 * self.scale,
+            )
+        };
+        // The window manager may answer with another size; that is its right.
+        let _ = w.request_inner_size(LogicalSize::new(width, height));
+    }
+
+    fn reset_ui(&mut self) {
+        if let Some(gui) = self.gui.as_mut() {
+            gui.reset_view();
+        }
+    }
+
+    /// P toggles the pause menu, like Esc does.
     fn toggle_pause(&mut self) {
-        self.paused = !self.paused;
-        if self.paused {
-            // The periodic save tick doesn't run while paused; persist now.
-            self.saves.flush(&self.core);
+        match self.mode {
+            Mode::Playing => self.pause(),
+            Mode::Paused => self.resume(),
+            Mode::Library => {}
+        }
+    }
+
+    /// Stop the game and show the pause menu.
+    fn pause(&mut self) {
+        if self.mode != Mode::Playing {
+            return;
+        }
+        self.set_mode(self.mode.pause());
+        // The periodic save tick doesn't run while paused; persist now.
+        self.saves.flush(&self.core);
+        // Keys keep being tracked in the menu but no longer reach the game, so let go
+        // of what is held now; `resume` presses again what still is.
+        for button in Button::ALL {
+            if self.input.is_down(button) {
+                self.set_button(button, false);
+            }
         }
         self.clear_audio();
         self.reset_clock();
         self.update_title();
+        self.request_redraw();
+    }
+
+    /// Close the pause menu and carry on.
+    fn resume(&mut self) {
+        if self.mode != Mode::Paused {
+            return;
+        }
+        self.set_mode(self.mode.resume());
+        self.reset_ui();
+        for button in Button::ALL {
+            if self.input.is_down(button) {
+                self.set_button(button, true);
+            }
+        }
+        self.clear_audio();
+        self.reset_clock();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Leave the game for the library: its progress is written as when quitting.
+    fn back_to_library(&mut self) {
+        self.saves.flush_final(&self.core);
+        self.stop_recording("returned to the library");
+        // The core stays parked: nothing steps it and its saves are written.
+        self.set_mode(self.mode.back_to_library());
+        self.game_id = None;
+        self.thumbnail = ThumbnailTrigger::default();
+        self.title = window_title("");
+        self.set_fast_forward(false);
+        self.reset_ui();
+        self.clear_audio();
+        self.reset_clock();
+        self.update_title();
+        self.fit_window();
+        self.request_redraw();
+    }
+
+    /// What Esc does now.
+    fn escape(&mut self) -> Effect {
+        let overlay = self.gui.as_ref().is_some_and(Gui::overlay_open);
+        match escape_effect(self.mode, overlay) {
+            EscapeEffect::Quit => return Effect::Exit,
+            EscapeEffect::Pause => self.pause(),
+            EscapeEffect::Resume => self.resume(),
+            EscapeEffect::CloseOverlay => {
+                if let Some(gui) = self.gui.as_mut() {
+                    gui.close_overlay();
+                }
+                self.request_redraw();
+            }
+        }
+        Effect::None
     }
 
     fn set_fast_forward(&mut self, on: bool) {
@@ -421,33 +638,44 @@ impl<C: Core> App<C> {
         }
     }
 
-    fn on_key(&mut self, event_loop: &ActiveEventLoop, key: winit::keyboard::KeyCode, down: bool) {
+    /// A key went down or up (not a repeat). Keys are always tracked, so one still held
+    /// when a menu closes is pressed in the game; but only while the game is running do
+    /// they reach it. Esc belongs to the app in every mode.
+    fn on_key(&mut self, key: winit::keyboard::KeyCode, down: bool) -> Effect {
         self.on_key_input(key, down);
         match map(key) {
-            Some(Action::Menu) if down => event_loop.exit(),
+            Some(Action::Menu) if down => return self.escape(),
             Some(Action::Pause) if down => self.toggle_pause(),
-            Some(Action::FastForward) => self.set_fast_forward(down),
+            // A Tab released over a menu must still end fast-forward.
+            Some(Action::FastForward) => self.set_fast_forward(down && self.mode.game_input()),
             // States need the core, which `--test-pattern` bypasses.
-            _ if !down || self.test.is_some() => {}
+            _ if !down || self.test.is_some() || !self.mode.game_input() => {}
             Some(Action::SaveState) => self.save_state(),
             Some(Action::LoadState) => self.load_state(),
-            Some(Action::SelectSlot(slot)) => {
-                self.states.select(slot);
-                self.show_status(
-                    log::Level::Info,
-                    format!("state slot {}", self.states.slot()),
-                );
-            }
+            Some(Action::SelectSlot(slot)) => self.select_slot(slot),
             _ => {}
         }
+        Effect::None
     }
 
-    /// The part of key handling that needs no event loop (joypad, screenshot).
+    fn select_slot(&mut self, slot: u8) {
+        self.states.select(slot);
+        self.show_status(
+            log::Level::Info,
+            format!("state slot {}", self.states.slot()),
+        );
+    }
+
+    /// The part of key handling that needs no event loop: the joypad and the screenshot
+    /// key, which only act while the game is running.
     fn on_key_input(&mut self, key: winit::keyboard::KeyCode, down: bool) {
-        if let Some((button, pressed)) = self.input.key(key, down) {
+        let running = self.mode.game_input();
+        if let Some((button, pressed)) = self.input.key(key, down)
+            && running
+        {
             self.set_button(button, pressed);
         }
-        if down && map(key) == Some(Action::Screenshot) {
+        if down && running && map(key) == Some(Action::Screenshot) {
             self.screenshot();
         }
     }
@@ -465,8 +693,16 @@ impl<C: Core> App<C> {
             .screenshot(crate::library::now_secs(), self.frame);
         let frame = frame_of(self.test.as_ref(), &self.core);
         match record::write_png(frame, &path) {
-            Ok(()) => log::info!("screenshot: {} (frame {})", path.display(), self.frame),
-            Err(e) => log::warn!("cannot write screenshot {}: {e}", path.display()),
+            Ok(()) => {
+                log::info!("screenshot: {} (frame {})", path.display(), self.frame);
+                if self.mode.menu_visible() {
+                    self.toast(log::Level::Info, "Screenshot saved");
+                }
+            }
+            Err(e) => self.show_status(
+                log::Level::Warn,
+                format!("cannot write screenshot {}: {e}", path.display()),
+            ),
         }
         if let Some(r) = self.recorder.as_mut() {
             r.record(Record {
@@ -508,6 +744,9 @@ impl<C: Core> App<C> {
             None => {
                 self.core.step_frame();
                 self.frame += 1;
+                if self.thumbnail.frame() {
+                    self.save_thumbnail();
+                }
                 // Always drain so the core's buffer cannot grow unbounded.
                 self.core.drain_audio_into(&mut self.audio_buf);
                 let seconds = audio_seconds(self.audio_buf.len(), self.core.audio_sample_rate());
@@ -538,6 +777,26 @@ impl<C: Core> App<C> {
             self.upload();
         }
         ran > 0
+    }
+
+    /// Make the picture on screen the library thumbnail of the running game.
+    fn save_thumbnail(&mut self) {
+        let (Some(id), Some(library)) = (self.game_id.clone(), self.library.as_mut()) else {
+            return;
+        };
+        let png = match record::encode_png(self.core.frame()) {
+            Ok(png) => png,
+            Err(e) => return log::warn!("cannot make a thumbnail of {id}: {e}"),
+        };
+        match library.set_thumbnail(&id, &png) {
+            Ok(path) => {
+                log::info!("thumbnail of {id}: {}", path.display());
+                if let Some(gui) = self.gui.as_mut() {
+                    gui.forget_thumbnail(&id);
+                }
+            }
+            Err(e) => log::warn!("cannot save the thumbnail of {id}: {e}"),
+        }
     }
 
     fn upload(&mut self) {
@@ -576,18 +835,199 @@ impl<C: Core> Steps for App<C> {
     }
 }
 
+impl<C: Core> App<C> {
+    /// Draw the window: just the game's picture while playing, as before, or the
+    /// screens (and toasts) over or instead of it.
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.surface_ok {
+            return;
+        }
+        self.toasts.expire(Instant::now());
+        let show_ui = self.mode.menu_visible() || !self.toasts.is_empty();
+        let (Some(window), Some(pixels)) = (self.window.as_ref(), self.pixels.as_ref()) else {
+            return;
+        };
+        let gui = match self.gui.as_mut() {
+            Some(gui) if show_ui => gui,
+            _ => {
+                if let Err(e) = pixels.render() {
+                    self.fail(event_loop, format!("render failed: {e}"));
+                }
+                return;
+            }
+        };
+        let game_title = self.core.title();
+        let screen = Screen {
+            mode: self.mode,
+            library: self.library.as_ref(),
+            data_dir: self.library.as_ref().map(|l| l.data_dir().root()),
+            game_title: &game_title,
+            slot: self.states.slot(),
+            toasts: &self.toasts,
+        };
+        let drawn = match gui.draw(window, pixels, &screen) {
+            Ok(drawn) => drawn,
+            Err(e) => return self.fail(event_loop, format!("render failed: {e}")),
+        };
+        self.ui_wake = drawn
+            .repaint_after
+            .filter(|d| !d.is_zero())
+            .map(|d| Instant::now() + d);
+        if drawn.repaint_after.is_some_and(|d| d.is_zero()) {
+            self.request_redraw();
+        }
+        for action in drawn.actions {
+            if self.perform(action) == Effect::Exit {
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// Carry out what the player asked for on a screen.
+    fn perform(&mut self, action: UiAction) -> Effect {
+        match action {
+            UiAction::Play(id) => self.play_library_game(&id),
+            UiAction::AddGames => self.add_games(),
+            UiAction::Remove { id, delete_saves } => self.remove_game(&id, delete_saves),
+            UiAction::OpenDataFolder => self.open_data_folder(),
+            UiAction::Resume => self.resume(),
+            UiAction::SelectSlot(slot) => self.select_slot(slot),
+            UiAction::SaveState if self.test.is_none() => self.save_state(),
+            UiAction::LoadState if self.test.is_none() => self.load_state(),
+            UiAction::SaveState | UiAction::LoadState => {}
+            UiAction::Screenshot => self.screenshot(),
+            UiAction::BackToLibrary => self.back_to_library(),
+            UiAction::Quit => return Effect::Exit,
+        }
+        // What was done may have changed the screen.
+        self.request_redraw();
+        Effect::None
+    }
+
+    fn play_library_game(&mut self, id: &GameId) {
+        let Some(entry) = self.library.as_ref().and_then(|l| l.get(id)) else {
+            return;
+        };
+        if !entry.available {
+            let msg = format!(
+                "{} is missing. Add its ROM again to bring it back.",
+                entry.title
+            );
+            return self.toast(log::Level::Warn, msg);
+        }
+        let path = entry.rom_path.clone();
+        self.open_rom(&path, Some(id.clone()));
+    }
+
+    /// The Add game button: choose ROMs and add them to the library (or, with no
+    /// library, play the first).
+    fn add_games(&mut self) {
+        let paths = crate::picker::pick_roms();
+        // A dialog can stay open for minutes; do not run them over as catch-up.
+        self.reset_clock();
+        if self.library.is_none() {
+            if let Some(first) = paths.into_iter().next() {
+                self.open_rom(&first, None);
+            }
+            return;
+        }
+        for path in paths {
+            let Some(library) = self.library.as_mut() else {
+                return;
+            };
+            match library.add_rom(&path) {
+                Ok(added) if added.duplicate => self.toast(
+                    log::Level::Info,
+                    format!("{} is already in the library", added.entry.title),
+                ),
+                Ok(added) => self.toast(log::Level::Info, format!("Added {}", added.entry.title)),
+                Err(msg) => self.show_status(log::Level::Error, msg),
+            }
+        }
+    }
+
+    fn remove_game(&mut self, id: &GameId, delete_saves: bool) {
+        let Some(library) = self.library.as_mut() else {
+            return;
+        };
+        let saves = if delete_saves {
+            RemoveSaves::Delete
+        } else {
+            RemoveSaves::Keep
+        };
+        match library.remove(id, saves) {
+            Ok(entry) => {
+                if let Some(gui) = self.gui.as_mut() {
+                    gui.forget_thumbnail(id);
+                }
+                self.toast(
+                    log::Level::Info,
+                    format!("Removed {} from the library", entry.title),
+                );
+            }
+            Err(msg) => self.show_status(log::Level::Error, msg),
+        }
+    }
+
+    fn open_data_folder(&mut self) {
+        let Some(root) = self
+            .library
+            .as_ref()
+            .map(|l| l.data_dir().root().to_owned())
+        else {
+            return;
+        };
+        if let Err(e) = opener::open(&root) {
+            self.show_status(
+                log::Level::Error,
+                format!("cannot open {}: {e}", root.display()),
+            );
+        }
+    }
+
+    /// Hand a window event to egui when a screen (or its pointer tracking) needs it.
+    /// Returns whether egui wants a redraw.
+    fn forward_to_egui(&mut self, event: &WindowEvent) -> bool {
+        let wanted = match event {
+            // Esc is the app's; every other key reaches egui only over a menu, so
+            // egui never sees a game key.
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.mode.menu_visible()
+                    && event.physical_key != PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
+            }
+            WindowEvent::ModifiersChanged(_) => self.mode.menu_visible(),
+            WindowEvent::DroppedFile(_)
+            | WindowEvent::HoveredFile(_)
+            | WindowEvent::HoveredFileCancelled
+            | WindowEvent::RedrawRequested
+            | WindowEvent::CloseRequested => false,
+            _ => true,
+        };
+        match (wanted, self.gui.as_mut(), self.window.as_ref()) {
+            (true, Some(gui), Some(window)) => gui.event(window, event),
+            _ => false,
+        }
+    }
+}
+
 impl<C: Core> ApplicationHandler for App<C> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
-        // The window and the pixel buffer follow the first frame's size.
+        // The window and the pixel buffer follow the first frame's size; the library
+        // has its own window size.
         let first = frame_of(self.test.as_ref(), &self.core);
         let (width, height) = (first.width as u32, first.height as u32);
         self.buffer_size = (width, height);
+        let (inner_width, inner_height) = if self.mode == Mode::Library {
+            LIBRARY_WINDOW
+        } else {
+            (width * self.scale, height * self.scale)
+        };
         let attrs = Window::default_attributes()
             .with_title(self.title.as_str())
-            .with_inner_size(LogicalSize::new(width * self.scale, height * self.scale))
+            .with_inner_size(LogicalSize::new(inner_width, inner_height))
             .with_min_inner_size(LogicalSize::new(width, height));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -604,20 +1044,28 @@ impl<C: Core> ApplicationHandler for App<C> {
         pixels.clear_color(pixels::wgpu::Color::BLACK);
         // The window may already be minimised (zero-sized) when it is created.
         self.surface_ok = surface_extent(size.width, size.height).is_some();
+        self.gui = Some(Gui::new(&window, &pixels));
         self.window = Some(window);
         self.pixels = Some(pixels);
         self.update_title();
         self.upload();
         self.reset_clock();
-        if self.test.is_none() && self.core.system() == emu_common::System::Gb {
+        if self.test.is_none()
+            && self.mode == Mode::Playing
+            && self.core.system() == emu_common::System::Gb
+        {
             log::info!("{}", crate::keymap::SAVE_KEY_NOTICE);
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        if let Some(notice) = self.notice.clone() {
+            self.toast(log::Level::Warn, notice);
         }
+        self.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if self.forward_to_egui(&event) && self.mode.menu_visible() {
+            self.request_redraw();
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -629,9 +1077,7 @@ impl<C: Core> ApplicationHandler for App<C> {
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
                     self.resize(size.width, size.height);
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_redraw();
             }
             WindowEvent::Focused(focused) => {
                 if focused {
@@ -644,20 +1090,13 @@ impl<C: Core> ApplicationHandler for App<C> {
             WindowEvent::Occluded(false) => self.reset_clock(),
             WindowEvent::DroppedFile(path) => self.open_dropped(path),
             WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    self.on_key(event_loop, code, event.state == ElementState::Pressed);
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                if !self.surface_ok {
-                    return;
-                }
-                if let Some(p) = &self.pixels
-                    && let Err(e) = p.render()
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && self.on_key(code, event.state == ElementState::Pressed) == Effect::Exit
                 {
-                    self.fail(event_loop, format!("render failed: {e}"));
+                    event_loop.exit();
                 }
             }
+            WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
         }
     }
@@ -677,12 +1116,31 @@ impl<C: Core> ApplicationHandler for App<C> {
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
         let status_until = self.expire_status(now);
+        let had_toasts = !self.toasts.is_empty();
+        let toast_until = self.toasts.expire(now);
+        if had_toasts && self.toasts.is_empty() {
+            // The last toast ran out: draw the window without it.
+            self.request_redraw();
+        }
 
-        if self.paused {
-            // Wake once more to clear a status message from the title.
-            event_loop
-                .set_control_flow(status_until.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+        if self.paused || !self.mode.runs_emulation() {
+            // A menu is up (or the library): nothing runs. Wake once more for egui's
+            // own animations and to clear a status message or a toast.
+            if self.ui_wake.is_some_and(|at| now >= at) {
+                self.ui_wake = None;
+                self.request_redraw();
+            }
+            let wake = [status_until, toast_until, self.ui_wake]
+                .into_iter()
+                .flatten()
+                .min();
+            event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
             return;
+        }
+        // While playing egui is not drawn (a toast aside), so what it gathered from the
+        // pointer would only pile up.
+        if let (Some(gui), Some(window)) = (self.gui.as_mut(), self.window.as_ref()) {
+            gui.discard_input(window);
         }
         self.pacer.advance(dt);
         if self.run_due()
@@ -1654,5 +2112,381 @@ mod tests {
         let mut app = headless_app(dir.path());
         app.toggle_pause();
         assert!(!dir.path().join("g.sav").exists());
+    }
+
+    // --- screens: modes, Esc, menus, the library -------------------------------------
+
+    use winit::keyboard::KeyCode;
+
+    /// The joypad events a finished recording holds.
+    fn button_events(app: &mut App<GameBoy>, rec_path: &Path) -> Vec<(Button, bool)> {
+        use gb_core::replay::Recording;
+
+        app.recorder.as_mut().unwrap().finish(app.frame);
+        let rec = Recording::decode(&fs::read(rec_path).unwrap()).unwrap();
+        rec.records
+            .iter()
+            .filter_map(|r| match r.event {
+                Event::Button { button, pressed } => Some((button, pressed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn esc_quits_from_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.set_mode(Mode::Library);
+        assert_eq!(app.on_key(KeyCode::Escape, true), Effect::Exit);
+        // The release of the key does nothing.
+        assert_eq!(app.on_key(KeyCode::Escape, false), Effect::None);
+    }
+
+    #[test]
+    fn esc_pauses_a_running_game_and_resumes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        assert_eq!(app.mode, Mode::Playing);
+        assert_eq!(app.on_key(KeyCode::Escape, true), Effect::None);
+        assert_eq!((app.mode, app.paused), (Mode::Paused, true));
+        assert_eq!(app.on_key(KeyCode::Escape, true), Effect::None);
+        assert_eq!((app.mode, app.paused), (Mode::Playing, false));
+    }
+
+    #[test]
+    fn p_opens_and_closes_the_same_menu_and_does_nothing_in_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.on_key(KeyCode::KeyP, true);
+        assert_eq!(app.mode, Mode::Paused);
+        app.on_key(KeyCode::KeyP, true);
+        assert_eq!(app.mode, Mode::Playing);
+        app.set_mode(Mode::Library);
+        app.on_key(KeyCode::KeyP, true);
+        assert_eq!(app.mode, Mode::Library);
+    }
+
+    #[test]
+    fn game_input_does_not_reach_the_core_while_a_menu_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        let (mut app, rec_path) = recording_app(dir.path(), &rom, Model::Dmg);
+        app.on_key(KeyCode::Escape, true);
+        assert_eq!(app.mode, Mode::Paused);
+
+        // In the pause menu: a button, a state key, a slot key and the screenshot key.
+        for key in [
+            KeyCode::ArrowRight,
+            KeyCode::KeyK,
+            KeyCode::Digit3,
+            KeyCode::KeyC,
+        ] {
+            app.on_key(key, true);
+        }
+        assert_eq!(app.states.slot(), 1, "the slot key is not for the menu");
+        assert!(
+            !dir.path().join("g.ss1").exists(),
+            "K does not save a state over the menu"
+        );
+        assert!(
+            fs::read_dir(dir.path()).unwrap().all(|e| e
+                .unwrap()
+                .path()
+                .extension()
+                .is_none_or(|x| x != "png")),
+            "C does not take a screenshot over the menu"
+        );
+        // Nor does the Library take them.
+        app.set_mode(Mode::Library);
+        app.on_key(KeyCode::KeyZ, true);
+
+        assert_eq!(button_events(&mut app, &rec_path), vec![]);
+    }
+
+    #[test]
+    fn a_key_held_through_the_menu_is_pressed_again_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        let (mut app, rec_path) = recording_app(dir.path(), &rom, Model::Dmg);
+        app.on_key(KeyCode::ArrowLeft, true); // held before the menu
+        app.on_key(KeyCode::Escape, true);
+        app.on_key(KeyCode::ArrowLeft, false); // let go over the menu
+        app.on_key(KeyCode::ArrowRight, true); // pressed over the menu
+        app.on_key(KeyCode::Escape, true);
+        assert_eq!(app.mode, Mode::Playing);
+        assert_eq!(
+            button_events(&mut app, &rec_path),
+            vec![
+                (Button::Left, true),
+                (Button::Left, false), // let go when the menu opened
+                (Button::Right, true), // still held when it closed
+            ]
+        );
+    }
+
+    #[test]
+    fn fast_forward_ends_when_tab_is_released_over_a_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.on_key(KeyCode::Tab, true);
+        assert!(app.fast_forward);
+        app.on_key(KeyCode::Escape, true);
+        app.on_key(KeyCode::Tab, false);
+        assert!(!app.fast_forward);
+        app.on_key(KeyCode::Tab, true);
+        assert!(!app.fast_forward, "Tab over a menu does not start it");
+    }
+
+    #[test]
+    fn back_to_library_writes_the_save_and_leaves_the_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let sav = dir.path().join("g.sav");
+        let mut app = headless_app(dir.path());
+        app.on_key(KeyCode::Escape, true);
+        change_ram(&mut app, 0xAB); // since the pause wrote the save
+        app.perform(UiAction::BackToLibrary);
+        assert_eq!(fs::read(&sav).unwrap()[0], 0xAB);
+        assert_eq!((app.mode, app.paused), (Mode::Library, true));
+        assert_eq!(app.title, "gb");
+        assert!(app.game_id.is_none());
+    }
+
+    #[test]
+    fn problems_are_toasted_and_so_is_everything_over_a_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.show_status(log::Level::Info, "state slot 2".into());
+        assert!(app.toasts.is_empty(), "plain feedback stays in the title");
+        app.show_status(log::Level::Warn, "cannot write state".into());
+        app.show_status(log::Level::Error, "bad ROM".into());
+        assert_eq!(app.toasts.iter().count(), 2);
+        app.on_key(KeyCode::Escape, true);
+        app.show_status(log::Level::Info, "saved state 1".into());
+        assert!(app.toasts.iter().any(|t| t.text == "saved state 1"));
+    }
+
+    /// A library in `dir` holding one game, `ONE`, and its id.
+    fn library_with_a_game(dir: &Path) -> (Library, GameId, PathBuf) {
+        use crate::paths::DataDir;
+
+        let data = DataDir::at(dir.join("data")).created().unwrap();
+        let mut library = Library::open(&data);
+        let rom = dir.join("one.gb");
+        fs::write(&rom, titled_rom(b"ONE")).unwrap();
+        let added = library.add_rom(&rom).unwrap();
+        (library, added.entry.id, rom)
+    }
+
+    #[test]
+    fn a_game_gets_its_thumbnail_once_after_ten_seconds() {
+        use crate::ui::THUMBNAIL_FRAMES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (library, id, _) = library_with_a_game(dir.path());
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_game(Some(id.clone()));
+        let thumbnail = |app: &App<GameBoy>| {
+            app.library
+                .as_ref()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .thumbnail
+                .clone()
+        };
+
+        run_frames(&mut app, (THUMBNAIL_FRAMES - 1) as u32);
+        assert!(thumbnail(&app).is_none(), "not yet");
+        run_frames(&mut app, 1);
+        let path = thumbnail(&app).expect("taken at the threshold");
+        let png = fs::read(&path).unwrap();
+        assert_eq!(
+            png,
+            app.library.as_ref().unwrap().read_thumbnail(&id).unwrap()
+        );
+
+        // Once only: a later change to the file is not overwritten.
+        fs::write(&path, b"kept").unwrap();
+        run_frames(&mut app, (THUMBNAIL_FRAMES * 2) as u32);
+        assert_eq!(fs::read(&path).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn a_game_that_has_a_thumbnail_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut library, id, _) = library_with_a_game(dir.path());
+        let existing = {
+            let frame = FrameRef {
+                width: 2,
+                height: 2,
+                pixels: FramePixels::Shades(&[0, 1, 2, 3]),
+            };
+            record::encode_png(frame).unwrap()
+        };
+        library.set_thumbnail(&id, &existing).unwrap();
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_game(Some(id.clone()));
+        run_frames(&mut app, 700);
+        assert_eq!(
+            app.library.as_ref().unwrap().read_thumbnail(&id).unwrap(),
+            existing
+        );
+    }
+
+    #[test]
+    fn a_game_not_in_the_library_has_no_thumbnail_and_no_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, _, _) = library_with_a_game(dir.path());
+        let other = GameId::new("OTHER", 7);
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_game(Some(other));
+        assert!(app.game_id.is_none());
+        run_frames(&mut app, 700);
+        assert!(
+            app.library.as_ref().unwrap().entries()[0]
+                .thumbnail
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn playing_a_library_game_marks_it_played() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, id, _) = library_with_a_game(dir.path());
+        let mut app = headless_app(dir.path()).with_library(Some(library));
+        assert!(
+            app.library
+                .as_ref()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .last_played
+                .is_none()
+        );
+        app.loader = Some(Box::new(|path| {
+            Ok((
+                GameBoy::new(titled_rom(b"ONE")).unwrap(),
+                GamePaths::beside(path),
+            ))
+        }));
+        app.set_mode(Mode::Library);
+
+        app.perform(UiAction::Play(id.clone()));
+
+        assert_eq!((app.mode, app.paused), (Mode::Playing, false));
+        assert_eq!(app.game_id.as_ref(), Some(&id));
+        assert!(
+            app.library
+                .as_ref()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .last_played
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_dropped_rom_is_added_to_the_library_and_played_from_its_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, _, _) = library_with_a_game(dir.path());
+        let mut app = headless_app(dir.path()).with_library(Some(library));
+        app.loader = Some(Box::new(|path| {
+            Ok((
+                GameBoy::new(titled_rom(b"TWO")).unwrap(),
+                GamePaths::beside(path),
+            ))
+        }));
+        app.set_mode(Mode::Library);
+        let dropped = dir.path().join("two.gb");
+        fs::write(&dropped, titled_rom(b"TWO")).unwrap();
+
+        app.open_dropped(dropped.clone());
+
+        let library = app.library.as_ref().unwrap();
+        assert_eq!(library.entries().len(), 2);
+        assert_eq!(app.mode, Mode::Playing);
+        let id = app
+            .game_id
+            .clone()
+            .expect("the dropped game is a library game");
+        let entry = library.get(&id).unwrap();
+        assert_eq!(entry.title, "TWO");
+        assert_ne!(entry.rom_path, dropped, "played from the library copy");
+        assert!(entry.last_played.is_some());
+        assert!(app.toasts.iter().any(|t| t.text == "Added TWO"));
+
+        // The same file again is reported, not added twice.
+        app.set_mode(Mode::Library);
+        app.open_dropped(dropped);
+        assert_eq!(app.library.as_ref().unwrap().entries().len(), 2);
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text == "TWO is already in the library")
+        );
+    }
+
+    #[test]
+    fn a_bad_drop_from_the_library_stays_in_the_library_with_a_toast() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, _, _) = library_with_a_game(dir.path());
+        let mut app = headless_app(dir.path()).with_library(Some(library));
+        app.loader = Some(Box::new(|_| Err("unused".to_owned())));
+        app.set_mode(Mode::Library);
+        let bad = dir.path().join("bad.gb");
+        fs::write(&bad, b"not a ROM").unwrap();
+
+        app.open_dropped(bad);
+
+        assert_eq!(app.mode, Mode::Library);
+        assert_eq!(app.library.as_ref().unwrap().entries().len(), 1);
+        assert!(app.toasts.iter().any(|t| t.level == log::Level::Error));
+    }
+
+    #[test]
+    fn a_game_whose_file_is_missing_is_not_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, id, _) = library_with_a_game(dir.path());
+        let rom = library.get(&id).unwrap().rom_path.clone();
+        fs::remove_file(rom).unwrap();
+        // A fresh read of the folder sees the file gone.
+        let library = Library::open(library.data_dir());
+        let mut app = headless_app(dir.path()).with_library(Some(library));
+        app.loader = Some(Box::new(|_| panic!("a missing game must not be loaded")));
+        app.set_mode(Mode::Library);
+        app.perform(UiAction::Play(id));
+        assert_eq!(app.mode, Mode::Library);
+        assert!(app.toasts.iter().any(|t| t.text.contains("missing")));
+    }
+
+    #[test]
+    fn removing_a_game_keeps_its_saves_unless_asked() {
+        for delete_saves in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (library, id, _) = library_with_a_game(dir.path());
+            let sav = library.paths_for(&id).sav;
+            fs::write(&sav, b"progress").unwrap();
+            let mut app = headless_app(dir.path()).with_library(Some(library));
+            app.set_mode(Mode::Library);
+
+            app.perform(UiAction::Remove { id, delete_saves });
+
+            assert!(app.library.as_ref().unwrap().entries().is_empty());
+            assert_eq!(sav.exists(), !delete_saves, "delete_saves = {delete_saves}");
+        }
+    }
+
+    #[test]
+    fn quit_from_a_menu_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        assert_eq!(app.perform(UiAction::Quit), Effect::Exit);
+        assert_eq!(app.perform(UiAction::SelectSlot(4)), Effect::None);
+        assert_eq!(app.states.slot(), 4);
     }
 }

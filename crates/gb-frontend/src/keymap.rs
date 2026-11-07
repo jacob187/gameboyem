@@ -64,19 +64,43 @@ const fn bind(key: KeyCode, label: &'static str, action: Action) -> Binding {
 pub const BINDINGS: &[Binding] = &[
     bind(KeyCode::ArrowUp, "Up arrow", Action::Button(Button::Up)),
     bind(KeyCode::KeyW, "W", Action::Button(Button::Up)),
-    bind(KeyCode::ArrowDown, "Down arrow", Action::Button(Button::Down)),
+    bind(
+        KeyCode::ArrowDown,
+        "Down arrow",
+        Action::Button(Button::Down),
+    ),
     bind(KeyCode::KeyS, "S", Action::Button(Button::Down)),
-    bind(KeyCode::ArrowLeft, "Left arrow", Action::Button(Button::Left)),
+    bind(
+        KeyCode::ArrowLeft,
+        "Left arrow",
+        Action::Button(Button::Left),
+    ),
     bind(KeyCode::KeyA, "A", Action::Button(Button::Left)),
-    bind(KeyCode::ArrowRight, "Right arrow", Action::Button(Button::Right)),
+    bind(
+        KeyCode::ArrowRight,
+        "Right arrow",
+        Action::Button(Button::Right),
+    ),
     bind(KeyCode::KeyD, "D", Action::Button(Button::Right)),
     bind(KeyCode::KeyX, "X", Action::Button(Button::A)),
     bind(KeyCode::KeyE, "E", Action::Button(Button::A)),
     bind(KeyCode::KeyZ, "Z", Action::Button(Button::B)),
     bind(KeyCode::Enter, "Enter", Action::Button(Button::Start)),
-    bind(KeyCode::NumpadEnter, "Numpad Enter", Action::Button(Button::Start)),
-    bind(KeyCode::Backspace, "Backspace", Action::Button(Button::Select)),
-    bind(KeyCode::ShiftRight, "Right Shift", Action::Button(Button::Select)),
+    bind(
+        KeyCode::NumpadEnter,
+        "Numpad Enter",
+        Action::Button(Button::Start),
+    ),
+    bind(
+        KeyCode::Backspace,
+        "Backspace",
+        Action::Button(Button::Select),
+    ),
+    bind(
+        KeyCode::ShiftRight,
+        "Right Shift",
+        Action::Button(Button::Select),
+    ),
     // GBA shoulders; a Game Boy has neither and the app drops them.
     bind(KeyCode::KeyQ, "Q", Action::Button(Button::L)),
     bind(KeyCode::KeyR, "R", Action::Button(Button::R)),
@@ -391,7 +415,11 @@ mod tests {
                 .iter()
                 .find(|r| r.what == b.action.label())
                 .unwrap_or_else(|| panic!("no help row for {}", b.label));
-            assert!(row.keys.contains(&b.label), "{} is missing from its row", b.label);
+            assert!(
+                row.keys.contains(&b.label),
+                "{} is missing from its row",
+                b.label
+            );
             listed += 1;
         }
         assert_eq!(rows.iter().map(|r| r.keys.len()).sum::<usize>(), listed);

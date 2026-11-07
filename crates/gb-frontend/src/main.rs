@@ -5,6 +5,7 @@
 mod app;
 mod audio;
 mod cli;
+mod gui;
 mod keymap;
 mod library;
 mod logging;
@@ -16,6 +17,7 @@ mod rom;
 mod save;
 mod shutdown;
 mod state;
+mod ui;
 mod video;
 
 use std::path::Path;
@@ -31,7 +33,7 @@ use winit::event_loop::EventLoop;
 use crate::app::{App, Storage};
 use crate::audio::AudioOutput;
 use crate::cli::Command;
-use crate::library::{GamePaths, Library};
+use crate::library::{GameId, GamePaths, Library};
 use crate::paths::DataDir;
 use crate::picker::Startup;
 use crate::save::SaveManager;
@@ -129,6 +131,14 @@ fn open_game(
     Ok((core, rom_hash, paths))
 }
 
+/// The placeholder core of a run that starts on the library, before a game is chosen:
+/// a blank cartridge with no battery, so it never writes a save.
+fn idle_core() -> Result<Box<dyn Core>, String> {
+    GameBoy::new(vec![0; 0x8000])
+        .map(|gb| Box::new(gb) as Box<dyn Core>)
+        .map_err(|e| format!("cannot start without a game: {e}"))
+}
+
 /// The first lines of a log: what ran, on what, and where its data is.
 fn log_startup(data: Option<&DataDir>) {
     log::info!(
@@ -194,53 +204,61 @@ fn main() -> ExitCode {
         return add_to_library(data, opts.rom.take());
     }
 
-    // Started from a launcher there is no command line: ask for the ROM. When it
-    // will ask, the event loop is built first: on macOS winit creates the
-    // application object there and sets up its launch handling, and the dialog
-    // should run against that. Otherwise it is built after the ROM loads, so a bad
-    // path is reported without needing a display.
-    let mut event_loop = None;
+    // The game list the UI shows, when there is a data folder to keep it in.
+    // (Registering the games bundled with the app belongs right here, after the library
+    // is opened and before the window is built.)
+    let library = data.as_ref().map(Library::open);
+
+    // Started from a launcher there is no command line, so no ROM: the window opens on
+    // the library and the player picks a game there.
     let rom_path = match picker::startup(opts.rom.take(), opts.test_pattern) {
-        Startup::Given(path) => path,
-        Startup::Ask => {
-            event_loop = match new_event_loop() {
-                Ok(l) => Some(l),
-                Err(code) => return code,
-            };
-            match picker::pick_rom() {
-                Some(path) => path,
-                None => {
-                    log::info!("no ROM chosen");
-                    return ExitCode::SUCCESS;
-                }
-            }
-        }
+        Startup::Given(path) => Some(path),
+        Startup::Library => None,
         Startup::Missing => {
             log::error!("missing ROM path");
             eprintln!("\n{}", cli::USAGE);
             return ExitCode::from(2);
         }
     };
+    if rom_path.is_none() && opts.record.is_some() {
+        log::error!("--record needs a ROM path");
+        eprintln!("\n{}", cli::USAGE);
+        return ExitCode::from(2);
+    }
     let opts = Arc::new(opts);
 
-    // The core hashed the ROM as it was built; the recording header reuses that.
-    let (mut core, rom_hash, paths) = match open_game(&opts, data.as_ref(), &rom_path) {
-        Ok(c) => c,
-        Err(PowerOnError::Usage(msg)) => {
-            log::error!("{msg}");
-            eprintln!("\n{}", cli::USAGE);
-            return ExitCode::from(2);
+    // The core hashed the ROM as it was built; the recording header reuses that. With
+    // no ROM the core is a blank cartridge that the library screen never runs.
+    let (mut core, rom_hash, paths, game_id) = match &rom_path {
+        Some(rom_path) => {
+            let (core, rom_hash, paths) = match open_game(&opts, data.as_ref(), rom_path) {
+                Ok(c) => c,
+                Err(PowerOnError::Usage(msg)) => {
+                    log::error!("{msg}");
+                    eprintln!("\n{}", cli::USAGE);
+                    return ExitCode::from(2);
+                }
+                Err(PowerOnError::Load(msg)) => {
+                    log::error!("{msg}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            log::info!(
+                "ROM {} (title {:?}, hash {rom_hash:016x})",
+                rom_path.display(),
+                core.title()
+            );
+            let id = GameId::new(&core.title(), rom_hash);
+            (core, rom_hash, paths, Some(id))
         }
-        Err(PowerOnError::Load(msg)) => {
-            log::error!("{msg}");
-            return ExitCode::FAILURE;
-        }
+        None => match idle_core() {
+            Ok(core) => (core, 0, GamePaths::beside(Path::new("library")), None),
+            Err(e) => {
+                log::error!("{e}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
-    log::info!(
-        "ROM {} (title {:?}, hash {rom_hash:016x})",
-        rom_path.display(),
-        core.title()
-    );
 
     let audio = if opts.mute {
         None
@@ -285,7 +303,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let event_loop = match event_loop.map_or_else(new_event_loop, Ok) {
+    let event_loop = match new_event_loop() {
         Ok(l) => l,
         Err(code) => return code,
     };
@@ -318,6 +336,8 @@ fn main() -> ExitCode {
     )
     .with_notice(data_problem.map(|_| NO_DATA_NOTICE.to_owned()))
     .with_recorder(recorder)
+    .with_library(library)
+    .with_game(game_id)
     .with_loader({
         let opts = Arc::clone(&opts);
         let data = data.clone();
@@ -327,6 +347,9 @@ fn main() -> ExitCode {
                 .map_err(PowerOnError::message)
         })
     });
+    if rom_path.is_none() {
+        app = app.in_library();
+    }
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {
         log::error!("{e}");
