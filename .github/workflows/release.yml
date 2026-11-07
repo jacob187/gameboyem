@@ -25,8 +25,8 @@ permissions:
 
 jobs:
   # The bundled games: Snake, Breakout and cgbdemo (GBDK-2020), GRAINS and MOTH (agb on a
-  # pinned nightly). The steps and pinned versions are copied from the test job in ci.yml;
-  # change them there and here together. The ROMs leave as the `bundled-games` artifact.
+  # pinned nightly). The steps and pinned versions are copied from the test job in ci.yml:
+  # keep these pins in sync with ci.yml. The ROMs leave as the `bundled-games` artifact.
   # (Not named gameboyem-*: the publish job collects that pattern as release files.)
   games:
     name: bundled games

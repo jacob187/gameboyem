@@ -73,6 +73,7 @@ jobs:
           fi
           make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"
 
+      # Keep these pins in sync with release.yml (its `games` job builds the same ROMs).
       # GBA homebrew: a separate cargo project on a pinned nightly (the target has no
       # prebuilt std, so it needs -Zbuild-std; homebrew/gba/rust-toolchain.toml pins the
       # date so the ROM bytes do not drift); the workspace itself stays on stable.
