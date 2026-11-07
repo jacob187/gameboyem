@@ -54,6 +54,15 @@ icons = [
   "../../assets/icon/512x512.png",
 ]
 
+# The bundled homebrew games. CI downloads the five ROMs and LICENSE.txt into <repo>/games
+# (gitignored) before packaging; if the folder is missing the packager bundles nothing and
+# says nothing, so release.yml checks it first. The target puts the files in a `games` folder
+# inside the packager's resources folder: macOS Contents/Resources/games; Windows (NSIS)
+# games next to gb.exe; Linux .deb and AppImage usr/lib/gb/games (the packager uses
+# usr/lib/<binary name>). bundled.rs finds them at run time. The portable zip and .tar.gz are
+# not made by the packager; release.yml puts `games` beside the binary.
+resources = [{ src = "../../games", target = "games" }]
+
 # macOS: CFBundleDocumentTypes ("Open With"; Finder passes the file as an Apple event, which
 # `gb` does not handle, so it starts and asks with the dialog). Windows: the installer
 # registers the extensions and passes the path as an argument. Linux: MimeType in the .desktop
