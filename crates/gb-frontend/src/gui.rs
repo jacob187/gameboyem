@@ -49,6 +49,10 @@ pub struct Screen<'a> {
     pub game_title: &'a str,
     /// The selected save-state slot.
     pub slot: u8,
+    /// The running game has a real core: states and screenshots mean something.
+    pub can_save: bool,
+    /// There is a library to go back to.
+    pub can_return: bool,
     pub toasts: &'a Toasts,
 }
 
@@ -78,9 +82,21 @@ pub struct Gui {
     state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
     view: View,
-    /// Thumbnail textures by game. `None`: the game has none (or it cannot be read);
-    /// not tried again until [`Gui::forget_thumbnail`].
-    thumbs: HashMap<GameId, Option<TextureHandle>>,
+    thumbs: Thumbs,
+}
+
+/// How long a thumbnail that failed to load is left alone before the next try (seconds).
+const THUMBNAIL_RETRY_SECS: f64 = 10.0;
+
+/// Thumbnail textures by game. A game with none listed is not cached at all; one that
+/// is listed but could not be read is tried again after a while and whenever the
+/// screens are reset (the library is entered again).
+type Thumbs = HashMap<GameId, Thumb>;
+
+enum Thumb {
+    Loaded(TextureHandle),
+    /// Failed at this egui time (seconds).
+    Failed(f64),
 }
 
 impl Gui {
@@ -142,6 +158,7 @@ impl Gui {
     /// Close every pop-up (the screen changed).
     pub fn reset_view(&mut self) {
         self.view = View::default();
+        self.thumbs.retain(|_, t| matches!(t, Thumb::Loaded(_)));
     }
 
     /// Forget the cached thumbnail of `id` (it was set or the game removed).
@@ -277,7 +294,7 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<([usize; 2], Vec<u8>)> {
 fn build(
     ui: &mut egui::Ui,
     view: &mut View,
-    thumbs: &mut HashMap<GameId, Option<TextureHandle>>,
+    thumbs: &mut Thumbs,
     screen: &Screen<'_>,
     actions: &mut Vec<UiAction>,
 ) {
@@ -299,7 +316,7 @@ fn build(
 fn library_screen(
     ui: &mut egui::Ui,
     view: &mut View,
-    thumbs: &mut HashMap<GameId, Option<TextureHandle>>,
+    thumbs: &mut Thumbs,
     screen: &Screen<'_>,
     actions: &mut Vec<UiAction>,
 ) {
@@ -373,28 +390,40 @@ fn empty_library(ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
     });
 }
 
-/// The texture for `entry`'s thumbnail, loading it the first time it is needed.
+/// The texture for `entry`'s thumbnail, loading it the first time it is needed (and again
+/// some time after a failure).
 fn thumbnail<'a>(
     ctx: &egui::Context,
-    thumbs: &'a mut HashMap<GameId, Option<TextureHandle>>,
+    thumbs: &'a mut Thumbs,
     library: &Library,
     entry: &Entry,
 ) -> Option<&'a TextureHandle> {
-    thumbs
-        .entry(entry.id.clone())
-        .or_insert_with(|| {
-            let bytes = entry
-                .thumbnail
-                .as_ref()
-                .and_then(|_| library.read_thumbnail(&entry.id))?;
-            let (size, rgba) = decode_thumbnail(&bytes)?;
-            Some(ctx.load_texture(
-                format!("thumbnail-{}", entry.id),
-                egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
-                TextureOptions::NEAREST,
-            ))
-        })
-        .as_ref()
+    if entry.thumbnail.is_none() {
+        thumbs.remove(&entry.id);
+        return None;
+    }
+    let now = ctx.input(|i| i.time);
+    if matches!(thumbs.get(&entry.id), Some(Thumb::Failed(at)) if now - *at >= THUMBNAIL_RETRY_SECS)
+    {
+        thumbs.remove(&entry.id);
+    }
+    let loaded = thumbs.entry(entry.id.clone()).or_insert_with(|| {
+        let texture = library
+            .read_thumbnail(&entry.id)
+            .and_then(|bytes| decode_thumbnail(&bytes))
+            .map(|(size, rgba)| {
+                ctx.load_texture(
+                    format!("thumbnail-{}", entry.id),
+                    egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
+                    TextureOptions::NEAREST,
+                )
+            });
+        texture.map_or(Thumb::Failed(now), Thumb::Loaded)
+    });
+    match loaded {
+        Thumb::Loaded(texture) => Some(texture),
+        Thumb::Failed(_) => None,
+    }
 }
 
 fn card(
@@ -530,32 +559,34 @@ fn pause_modal(
         if menu_button(ui, "Resume") {
             actions.push(UiAction::Resume);
         }
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("State slot");
-            for slot in crate::state::FIRST_SLOT..=crate::state::LAST_SLOT {
-                if ui
-                    .selectable_label(screen.slot == slot, slot.to_string())
-                    .clicked()
-                {
-                    actions.push(UiAction::SelectSlot(slot));
+        if screen.can_save {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("State slot");
+                for slot in crate::state::FIRST_SLOT..=crate::state::LAST_SLOT {
+                    if ui
+                        .selectable_label(screen.slot == slot, slot.to_string())
+                        .clicked()
+                    {
+                        actions.push(UiAction::SelectSlot(slot));
+                    }
                 }
+            });
+            if menu_button(ui, &format!("Save state (slot {})", screen.slot)) {
+                actions.push(UiAction::SaveState);
             }
-        });
-        if menu_button(ui, &format!("Save state (slot {})", screen.slot)) {
-            actions.push(UiAction::SaveState);
+            if menu_button(ui, &format!("Load state (slot {})", screen.slot)) {
+                actions.push(UiAction::LoadState);
+            }
+            if menu_button(ui, "Screenshot") {
+                actions.push(UiAction::Screenshot);
+            }
+            ui.separator();
         }
-        if menu_button(ui, &format!("Load state (slot {})", screen.slot)) {
-            actions.push(UiAction::LoadState);
-        }
-        if menu_button(ui, "Screenshot") {
-            actions.push(UiAction::Screenshot);
-        }
-        ui.separator();
         if menu_button(ui, "Help") {
             view.help = true;
         }
-        if menu_button(ui, "Back to library") {
+        if screen.can_return && menu_button(ui, "Back to library") {
             actions.push(UiAction::BackToLibrary);
         }
         if menu_button(ui, "Quit") {
@@ -624,8 +655,9 @@ fn help_modal(
 fn help_text(ui: &mut egui::Ui, screen: &Screen<'_>, actions: &mut Vec<UiAction>) {
     ui.strong("Adding games");
     ui.label(
-        "Click Add game and choose .gb, .gbc or .gba files, or drag a ROM onto the window \
-         at any time. It is copied into your library and starts playing.",
+        "Click Add game and choose .gb, .gbc or .gba files to put them in your library. \
+         Or drag a ROM onto the window at any time: it starts playing and is added to \
+         the library.",
     );
     ui.add_space(6.0);
 
@@ -787,6 +819,8 @@ mod tests {
             data_dir: Some(data.root()),
             game_title: "ONE",
             slot: 2,
+            can_save: true,
+            can_return: true,
             toasts: &toasts,
         };
 
@@ -833,8 +867,42 @@ mod tests {
             data_dir: None,
             game_title: "",
             slot: 1,
+            can_save: false,
+            can_return: false,
             toasts: &toasts,
         };
         assert!(run(&screen, &mut View::default()).is_empty());
+    }
+
+    #[test]
+    fn a_thumbnail_that_failed_to_load_is_tried_again_when_the_library_is_entered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = DataDir::at(tmp.path().join("data")).created().unwrap();
+        let mut library = Library::open(&data);
+        let path = tmp.path().join("one.gb");
+        fs::write(&path, rom("ONE")).unwrap();
+        let id = library.add_rom(&path).unwrap().entry.id;
+        let shades = vec![1u8; 160 * 144];
+        let png = encode_png(FrameRef {
+            width: 160,
+            height: 144,
+            pixels: FramePixels::Shades(&shades),
+        })
+        .unwrap();
+        let file = library.set_thumbnail(&id, &png).unwrap();
+        let entry = library.get(&id).unwrap().clone();
+
+        fs::write(&file, b"junk").unwrap();
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbs::new();
+        assert!(thumbnail(&ctx, &mut thumbs, &library, &entry).is_none());
+        fs::write(&file, &png).unwrap();
+        assert!(
+            thumbnail(&ctx, &mut thumbs, &library, &entry).is_none(),
+            "left alone for a while"
+        );
+        // Entering the library again clears the failure.
+        thumbs.retain(|_, t| matches!(t, Thumb::Loaded(_)));
+        assert!(thumbnail(&ctx, &mut thumbs, &library, &entry).is_some());
     }
 }

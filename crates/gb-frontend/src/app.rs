@@ -1,5 +1,6 @@
 //! The winit application: window, input, frame pacing and presentation.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,7 +25,9 @@ use crate::record::{self, Recorder};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
-use crate::ui::{EscapeEffect, Mode, ThumbnailTrigger, Toasts, UiAction, escape_effect};
+use crate::ui::{
+    EscapeEffect, Mode, ThumbnailTrigger, Toasts, UiAction, escape_effect, frame_is_uniform,
+};
 use crate::video::{Palette, present, test_pattern};
 
 /// Speed multiplier while Tab is held.
@@ -117,8 +120,11 @@ fn frame_of<'a>(test: Option<&'a TestMode>, core: &'a impl Core) -> FrameRef<'a>
 /// concrete machine to reach its debug hooks.
 pub struct App<C: Core> {
     core: C,
-    saves: SaveManager,
-    states: StateSlots,
+    /// The running game's saves, state slots and screenshot folder; `None` when no game
+    /// is loaded (the library), so nothing can write on a game's behalf then.
+    storage: Option<Storage>,
+    /// Builds the core that stands in while no game is loaded; `None` keeps the last one.
+    idle: Option<Box<dyn Fn() -> Option<C>>>,
     audio: Option<AudioOutput>,
     /// Reused every frame to carry samples from the core to the ring.
     audio_buf: Vec<f32>,
@@ -135,8 +141,6 @@ pub struct App<C: Core> {
     shutdown: ShutdownFlag,
     /// Always shown in the window title, e.g. that there is no data folder.
     notice: Option<String>,
-    /// Where the running game's screenshots go (its saves are in `saves`/`states`).
-    paths: GamePaths,
     /// Powers on a dropped ROM; `None` ignores drops.
     loader: Option<Loader<C>>,
     recorder: Option<Recorder>,
@@ -144,6 +148,11 @@ pub struct App<C: Core> {
     frame: u64,
 
     input: InputState,
+    /// The buttons the core has been told are down. Recordings and releases follow this,
+    /// not the keys, so nothing is released or pressed twice.
+    core_held: HashSet<Button>,
+    /// The frame size the window was last sized for, `None` while it has the library's.
+    fitted: Option<(u32, u32)>,
     pacer: FramePacer,
     last_tick: Instant,
     /// The emulator is stopped: any mode but `Playing`. Kept in step by `set_mode`.
@@ -172,11 +181,7 @@ pub struct App<C: Core> {
 impl<C: Core> App<C> {
     pub fn new(
         core: C,
-        Storage {
-            saves,
-            states,
-            paths,
-        }: Storage,
+        storage: Storage,
         audio: Option<AudioOutput>,
         palette: Palette,
         scale: u32,
@@ -197,8 +202,8 @@ impl<C: Core> App<C> {
         });
         Self {
             core,
-            saves,
-            states,
+            storage: Some(storage),
+            idle: None,
             audio,
             audio_buf: Vec::new(),
             palette,
@@ -209,12 +214,13 @@ impl<C: Core> App<C> {
             status: None,
             test,
             shutdown,
-            paths,
             notice: None,
             loader: None,
             recorder: None,
             frame: 0,
             input: InputState::default(),
+            core_held: HashSet::new(),
+            fitted: None,
             pacer: FramePacer::new(fps),
             last_tick: Instant::now(),
             paused: false,
@@ -258,12 +264,45 @@ impl<C: Core> App<C> {
         self
     }
 
+    /// The core that stands in while no game is loaded (the library).
+    pub fn with_idle(mut self, idle: Box<dyn Fn() -> Option<C>>) -> Self {
+        self.idle = Some(idle);
+        self
+    }
+
     /// Start on the game list; the core given to [`App::new`] is a placeholder that
-    /// is never stepped.
+    /// is never stepped, and its storage is dropped unused.
     pub fn in_library(mut self) -> Self {
+        self.detach_game();
         self.set_mode(Mode::Library);
         self.title = window_title("");
         self
+    }
+
+    /// Let go of the running game: its saves, states and screenshot folder, and, if
+    /// there is a stand-in, its core. Nothing can act on the game afterwards.
+    fn detach_game(&mut self) {
+        self.storage = None;
+        if let Some(core) = self.idle.as_ref().and_then(|idle| idle()) {
+            self.core = core;
+        }
+        self.game_id = None;
+        self.thumbnail = ThumbnailTrigger::default();
+        self.core_held.clear();
+        self.frame = 0;
+    }
+
+    /// The selected save-state slot (the first one when no game is loaded).
+    fn slot(&self) -> u8 {
+        self.storage
+            .as_ref()
+            .map_or(crate::state::FIRST_SLOT, |s| s.states.slot())
+    }
+
+    /// The running game's files, if a game is loaded.
+    #[cfg(test)]
+    fn game_paths(&self) -> Option<&GamePaths> {
+        self.storage.as_ref().map(|s| &s.paths)
     }
 
     /// The running game is the library game `id` (if it is listed): it is marked as
@@ -396,14 +435,20 @@ impl<C: Core> App<C> {
     }
 
     fn save_state(&mut self) {
-        match self.states.save(&self.core) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        match storage.states.save(&self.core) {
             Ok(msg) => self.show_status(log::Level::Info, msg),
             Err(msg) => self.show_status(log::Level::Warn, msg),
         }
     }
 
     fn load_state(&mut self) {
-        match self.states.load(&mut self.core) {
+        let Some(storage) = self.storage.as_mut() else {
+            return;
+        };
+        match storage.states.load(&mut self.core) {
             Ok(msg) => {
                 // The state replaces the machine (and the frame it is on), so
                 // the replay of a recording that goes on would diverge.
@@ -426,16 +471,16 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// A ROM dropped onto the window: add it to the library, if there is one, and play
-    /// it, in place of the running game. On failure the running game carries on and the
-    /// error is shown.
+    /// A ROM dropped onto the window: play it, in place of the running game, and add it
+    /// to the library, if there is one, once it has powered on. On failure the running
+    /// game carries on, the library is untouched and the error is shown.
     fn open_dropped(&mut self, path: PathBuf) {
         // `--test-pattern` has no game to replace, and without a loader nothing can play.
         if self.test.is_some() || self.loader.is_none() {
             return;
         }
-        if self.library.is_none() {
-            return self.open_rom(&path, None);
+        if !self.open_rom(&path, None) {
+            return;
         }
         let Some(library) = self.library.as_mut() else {
             return;
@@ -448,25 +493,34 @@ impl<C: Core> App<C> {
                 } else {
                     format!("Added {name}")
                 };
+                self.set_game(Some(added.entry.id.clone()));
                 self.toast(log::Level::Info, msg);
-                self.open_rom(&added.entry.rom_path, Some(added.entry.id.clone()));
             }
-            Err(msg) => self.show_status(log::Level::Error, msg),
+            Err(msg) => self.show_status(
+                log::Level::Warn,
+                format!("playing, but not added to the library: {msg}"),
+            ),
         }
     }
 
     /// Power on the ROM at `path` in place of the running game, as library game `id`
-    /// if it is one. On failure the running game carries on and the error is shown.
-    fn open_rom(&mut self, path: &Path, id: Option<GameId>) {
+    /// if it is one. Returns whether it started; if not, the running game carries on
+    /// and the error is shown.
+    fn open_rom(&mut self, path: &Path, id: Option<GameId>) -> bool {
         let Some(loader) = self.loader.as_mut() else {
-            return;
+            return false;
         };
         let (mut core, paths) = match loader(path) {
             Ok(loaded) => loaded,
-            Err(msg) => return self.show_status(log::Level::Error, msg),
+            Err(msg) => {
+                self.show_status(log::Level::Error, msg);
+                return false;
+            }
         };
         // The old game's progress is written before anything is replaced.
-        self.saves.flush_final(&self.core);
+        if let Some(storage) = self.storage.as_mut() {
+            storage.saves.flush_final(&self.core);
+        }
         self.stop_recording("another ROM was opened");
         let rate_check = self.audio.as_ref().map(|a| {
             core.set_audio_sample_rate(a.sample_rate);
@@ -480,9 +534,11 @@ impl<C: Core> App<C> {
         saves.load(&mut core);
 
         self.core = core;
-        self.saves = saves;
-        self.states = StateSlots::new(paths.clone());
-        self.paths = paths;
+        self.storage = Some(Storage {
+            saves,
+            states: StateSlots::new(paths.clone()),
+            paths,
+        });
         self.title = window_title(&self.core.title());
         self.pacer = FramePacer::new(self.core.native_fps());
         if self.fast_forward {
@@ -490,9 +546,11 @@ impl<C: Core> App<C> {
         }
         self.frame = 0;
         self.set_mode(self.mode.play());
+        self.ui_wake = None;
         self.reset_ui();
         self.set_game(id);
         // The new machine starts with no buttons down; apply the keys held now.
+        self.core_held.clear();
         for button in Button::ALL {
             self.set_button(button, self.input.is_down(button));
         }
@@ -503,24 +561,30 @@ impl<C: Core> App<C> {
         self.fit_window();
         self.request_redraw();
         log::info!("opened {} ({})", path.display(), self.core.title());
+        true
     }
 
-    /// Size the window for what is shown: the game at the chosen scale, or the library.
-    fn fit_window(&self) {
-        let Some(w) = &self.window else {
+    /// The logical window size to ask for now, or `None` to leave the window as it is:
+    /// it is sized for a game when the picture changes size or when it has had the
+    /// library's size, and otherwise left alone, as the player may have resized it.
+    fn fit_request(&mut self) -> Option<(u32, u32)> {
+        let frame = frame_of(self.test.as_ref(), &self.core);
+        let size = (frame.width as u32, frame.height as u32);
+        if self.fitted == Some(size) {
+            return None;
+        }
+        self.fitted = Some(size);
+        Some((size.0 * self.scale, size.1 * self.scale))
+    }
+
+    fn fit_window(&mut self) {
+        let Some((width, height)) = self.fit_request() else {
             return;
         };
-        let (width, height) = if self.mode == Mode::Library {
-            LIBRARY_WINDOW
-        } else {
-            let frame = frame_of(self.test.as_ref(), &self.core);
-            (
-                frame.width as u32 * self.scale,
-                frame.height as u32 * self.scale,
-            )
-        };
-        // The window manager may answer with another size; that is its right.
-        let _ = w.request_inner_size(LogicalSize::new(width, height));
+        if let Some(w) = &self.window {
+            // The window manager may answer with another size; that is its right.
+            let _ = w.request_inner_size(LogicalSize::new(width, height));
+        }
     }
 
     fn reset_ui(&mut self) {
@@ -545,14 +609,13 @@ impl<C: Core> App<C> {
         }
         self.set_mode(self.mode.pause());
         // The periodic save tick doesn't run while paused; persist now.
-        self.saves.flush(&self.core);
-        // Keys keep being tracked in the menu but no longer reach the game, so let go
-        // of what is held now; `resume` presses again what still is.
-        for button in Button::ALL {
-            if self.input.is_down(button) {
-                self.set_button(button, false);
-            }
+        if let Some(storage) = self.storage.as_mut() {
+            storage.saves.flush(&self.core);
         }
+        // Keys keep being tracked in the menu but no longer reach the game, so let go
+        // of what the game holds now; `resume` presses again what still is held.
+        self.release_core_buttons();
+        self.ui_wake = None;
         self.clear_audio();
         self.reset_clock();
         self.update_title();
@@ -565,9 +628,10 @@ impl<C: Core> App<C> {
             return;
         }
         self.set_mode(self.mode.resume());
+        self.ui_wake = None;
         self.reset_ui();
         for button in Button::ALL {
-            if self.input.is_down(button) {
+            if self.input.is_down(button) && !self.core_held.contains(&button) {
                 self.set_button(button, true);
             }
         }
@@ -577,28 +641,45 @@ impl<C: Core> App<C> {
         self.request_redraw();
     }
 
-    /// Leave the game for the library: its progress is written as when quitting.
+    /// Release every button the game is holding, and only those.
+    fn release_core_buttons(&mut self) {
+        for button in Button::ALL {
+            if self.core_held.contains(&button) {
+                self.set_button(button, false);
+            }
+        }
+    }
+
+    /// Leave the game for the library: its progress is written as when quitting, then
+    /// the game is let go of, so no later tick, flush or screenshot reaches it.
     fn back_to_library(&mut self) {
-        self.saves.flush_final(&self.core);
+        if let Some(storage) = self.storage.as_mut() {
+            storage.saves.flush_final(&self.core);
+        }
         self.stop_recording("returned to the library");
-        // The core stays parked: nothing steps it and its saves are written.
+        self.release_core_buttons();
+        self.detach_game();
         self.set_mode(self.mode.back_to_library());
-        self.game_id = None;
-        self.thumbnail = ThumbnailTrigger::default();
         self.title = window_title("");
         self.set_fast_forward(false);
+        self.ui_wake = None;
         self.reset_ui();
         self.clear_audio();
         self.reset_clock();
         self.update_title();
-        self.fit_window();
         self.request_redraw();
+    }
+
+    /// Whether Esc may open the pause menu: not for `--test-pattern`, which has no game
+    /// to pause, where Esc quits as it always did.
+    fn can_pause(&self) -> bool {
+        self.test.is_none()
     }
 
     /// What Esc does now.
     fn escape(&mut self) -> Effect {
         let overlay = self.gui.as_ref().is_some_and(Gui::overlay_open);
-        match escape_effect(self.mode, overlay) {
+        match escape_effect(self.mode, overlay, self.can_pause()) {
             EscapeEffect::Quit => return Effect::Exit,
             EscapeEffect::Pause => self.pause(),
             EscapeEffect::Resume => self.resume(),
@@ -630,6 +711,11 @@ impl<C: Core> App<C> {
             return;
         }
         self.core.set_button(button, pressed);
+        if pressed {
+            self.core_held.insert(button);
+        } else {
+            self.core_held.remove(&button);
+        }
         if let Some(r) = self.recorder.as_mut() {
             r.record(Record {
                 frame: self.frame,
@@ -659,11 +745,12 @@ impl<C: Core> App<C> {
     }
 
     fn select_slot(&mut self, slot: u8) {
-        self.states.select(slot);
-        self.show_status(
-            log::Level::Info,
-            format!("state slot {}", self.states.slot()),
-        );
+        let Some(storage) = self.storage.as_mut() else {
+            return;
+        };
+        storage.states.select(slot);
+        let msg = format!("state slot {}", storage.states.slot());
+        self.show_status(log::Level::Info, msg);
     }
 
     /// The part of key handling that needs no event loop: the joypad and the screenshot
@@ -682,13 +769,18 @@ impl<C: Core> App<C> {
 
     fn release_all_buttons(&mut self) {
         for button in self.input.release_all() {
-            self.set_button(button, false);
+            if self.core_held.contains(&button) {
+                self.set_button(button, false);
+            }
         }
     }
 
     /// Save the picture on screen in the game's screenshots and mark the frame.
     fn screenshot(&mut self) {
-        let path = self
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        let path = storage
             .paths
             .screenshot(crate::library::now_secs(), self.frame);
         let frame = frame_of(self.test.as_ref(), &self.core);
@@ -744,8 +836,9 @@ impl<C: Core> App<C> {
             None => {
                 self.core.step_frame();
                 self.frame += 1;
-                if self.thumbnail.frame() {
-                    self.save_thumbnail();
+                // Only at normal speed: fast-forward would shorten the ten seconds.
+                if !self.fast_forward && self.thumbnail.frame() {
+                    self.try_thumbnail();
                 }
                 // Always drain so the core's buffer cannot grow unbounded.
                 self.core.drain_audio_into(&mut self.audio_buf);
@@ -777,6 +870,16 @@ impl<C: Core> App<C> {
             self.upload();
         }
         ran > 0
+    }
+
+    /// Take the thumbnail now, unless the screen is a single colour (a fade, a loading
+    /// screen): then the trigger asks again a little later, up to its limit.
+    fn try_thumbnail(&mut self) {
+        if frame_is_uniform(&self.core.frame()) {
+            return;
+        }
+        self.thumbnail.done();
+        self.save_thumbnail();
     }
 
     /// Make the picture on screen the library thumbnail of the running game.
@@ -836,6 +939,23 @@ impl<C: Core> Steps for App<C> {
 }
 
 impl<C: Core> App<C> {
+    /// The periodic battery save check; nothing without a game.
+    fn tick_saves(&mut self, now: Instant) {
+        if let Some(storage) = self.storage.as_mut() {
+            storage.saves.tick(&self.core, now);
+        }
+    }
+
+    /// The last writes, as the program exits.
+    fn finish(&mut self) {
+        if let Some(storage) = self.storage.as_mut() {
+            storage.saves.flush_final(&self.core);
+        }
+        if let Some(r) = self.recorder.as_mut() {
+            r.finish(self.frame);
+        }
+    }
+
     /// Draw the window: just the game's picture while playing, as before, or the
     /// screens (and toasts) over or instead of it.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -847,6 +967,9 @@ impl<C: Core> App<C> {
         let (Some(window), Some(pixels)) = (self.window.as_ref(), self.pixels.as_ref()) else {
             return;
         };
+        let slot = self.slot();
+        let can_save = self.storage.is_some() && self.test.is_none();
+        let can_return = self.library.is_some() && self.test.is_none();
         let gui = match self.gui.as_mut() {
             Some(gui) if show_ui => gui,
             _ => {
@@ -862,7 +985,9 @@ impl<C: Core> App<C> {
             library: self.library.as_ref(),
             data_dir: self.library.as_ref().map(|l| l.data_dir().root()),
             game_title: &game_title,
-            slot: self.states.slot(),
+            slot,
+            can_save,
+            can_return,
             toasts: &self.toasts,
         };
         let drawn = match gui.draw(window, pixels, &screen) {
@@ -1020,6 +1145,9 @@ impl<C: Core> ApplicationHandler for App<C> {
         let first = frame_of(self.test.as_ref(), &self.core);
         let (width, height) = (first.width as u32, first.height as u32);
         self.buffer_size = (width, height);
+        if self.mode != Mode::Library {
+            self.fitted = Some((width, height));
+        }
         let (inner_width, inner_height) = if self.mode == Mode::Library {
             LIBRARY_WINDOW
         } else {
@@ -1149,7 +1277,7 @@ impl<C: Core> ApplicationHandler for App<C> {
         {
             w.request_redraw();
         }
-        self.saves.tick(&self.core, now);
+        self.tick_saves(now);
 
         // Never sleep past the next frame deadline (saves are checked once per wake).
         let wait = self.pacer.time_until_next().max(Duration::from_micros(200));
@@ -1157,10 +1285,7 @@ impl<C: Core> ApplicationHandler for App<C> {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.saves.flush_final(&self.core);
-        if let Some(r) = self.recorder.as_mut() {
-            r.finish(self.frame);
-        }
+        self.finish();
     }
 }
 
@@ -1218,6 +1343,7 @@ mod tests {
             false,
             ShutdownFlag::default(),
         )
+        .with_idle(Box::new(|| GameBoy::new(vec![0u8; 0x8000]).ok()))
     }
 
     fn change_ram(app: &mut App<GameBoy>, first_byte: u8) {
@@ -1271,7 +1397,7 @@ mod tests {
             0xAB,
             "the old game's RAM is written before it is replaced"
         );
-        assert_eq!(app.paths, GamePaths::beside(&other));
+        assert_eq!(app.game_paths(), Some(&GamePaths::beside(&other)));
         assert_eq!(app.title, "gb - OTHER");
         assert_eq!((app.frame, app.paused), (0, false));
     }
@@ -1288,7 +1414,10 @@ mod tests {
 
         app.open_dropped(dir.path().join("x.gb"));
 
-        assert_eq!(app.paths, GamePaths::beside(&dir.path().join("g.gb")));
+        assert_eq!(
+            app.game_paths(),
+            Some(&GamePaths::beside(&dir.path().join("g.gb")))
+        );
         assert_eq!((app.title.as_str(), app.frame), (title.as_str(), 7));
         let (msg, _) = app.status.as_ref().expect("the error is shown");
         assert!(msg.contains("file not found"), "{msg}");
@@ -1300,7 +1429,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
         app.open_dropped(dir.path().join("x.gb"));
-        assert_eq!(app.paths, GamePaths::beside(&dir.path().join("g.gb")));
+        assert_eq!(
+            app.game_paths(),
+            Some(&GamePaths::beside(&dir.path().join("g.gb")))
+        );
         assert!(app.status.is_none());
     }
 
@@ -1588,10 +1720,10 @@ mod tests {
         assert!(app.recorder.is_some(), "saving a state keeps recording");
 
         // A failed load (empty slot) changes nothing and keeps recording.
-        app.states.select(2);
+        app.storage.as_mut().unwrap().states.select(2);
         app.load_state();
         assert!(app.recorder.is_some());
-        app.states.select(1);
+        app.storage.as_mut().unwrap().states.select(1);
 
         let frame_at_load = app.frame;
         app.load_state();
@@ -2184,7 +2316,7 @@ mod tests {
         ] {
             app.on_key(key, true);
         }
-        assert_eq!(app.states.slot(), 1, "the slot key is not for the menu");
+        assert_eq!(app.slot(), 1, "the slot key is not for the menu");
         assert!(
             !dir.path().join("g.ss1").exists(),
             "K does not save a state over the menu"
@@ -2278,29 +2410,41 @@ mod tests {
         (library, added.entry.id, rom)
     }
 
+    /// A ROM that keeps writing a line of tile data, so the screen is not one colour.
+    fn drawing_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x103].copy_from_slice(&[0xC3, 0x50, 0x01]); // JP 0x0150
+        rom[0x150..0x157].copy_from_slice(&[
+            0x3E, 0xFF, // LD A,0xFF
+            0xEA, 0x00, 0x80, // LD (0x8000),A
+            0x18, 0xF9, // JR 0x0150
+        ]);
+        rom
+    }
+
+    fn thumbnail_of(app: &App<GameBoy>, id: &GameId) -> Option<PathBuf> {
+        app.library.as_ref()?.get(id)?.thumbnail.clone()
+    }
+
+    fn drawing_app(dir: &Path) -> (App<GameBoy>, GameId) {
+        let (library, id, _) = library_with_a_game(dir);
+        let app = headless_app_with(dir, GameBoy::new(drawing_rom()).unwrap())
+            .with_library(Some(library))
+            .with_game(Some(id.clone()));
+        (app, id)
+    }
+
     #[test]
     fn a_game_gets_its_thumbnail_once_after_ten_seconds() {
         use crate::ui::THUMBNAIL_FRAMES;
 
         let dir = tempfile::tempdir().unwrap();
-        let (library, id, _) = library_with_a_game(dir.path());
-        let mut app = headless_app(dir.path())
-            .with_library(Some(library))
-            .with_game(Some(id.clone()));
-        let thumbnail = |app: &App<GameBoy>| {
-            app.library
-                .as_ref()
-                .unwrap()
-                .get(&id)
-                .unwrap()
-                .thumbnail
-                .clone()
-        };
+        let (mut app, id) = drawing_app(dir.path());
 
         run_frames(&mut app, (THUMBNAIL_FRAMES - 1) as u32);
-        assert!(thumbnail(&app).is_none(), "not yet");
+        assert!(thumbnail_of(&app, &id).is_none(), "not yet");
         run_frames(&mut app, 1);
-        let path = thumbnail(&app).expect("taken at the threshold");
+        let path = thumbnail_of(&app, &id).expect("taken at the threshold");
         let png = fs::read(&path).unwrap();
         assert_eq!(
             png,
@@ -2311,6 +2455,34 @@ mod tests {
         fs::write(&path, b"kept").unwrap();
         run_frames(&mut app, (THUMBNAIL_FRAMES * 2) as u32);
         assert_eq!(fs::read(&path).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn fast_forward_does_not_count_towards_the_thumbnail() {
+        use crate::ui::THUMBNAIL_FRAMES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id) = drawing_app(dir.path());
+        app.fast_forward = true;
+        run_frames(&mut app, (THUMBNAIL_FRAMES * 2) as u32);
+        assert!(thumbnail_of(&app, &id).is_none());
+        app.fast_forward = false;
+        run_frames(&mut app, THUMBNAIL_FRAMES as u32);
+        assert!(thumbnail_of(&app, &id).is_some());
+    }
+
+    #[test]
+    fn a_blank_screen_gets_no_thumbnail_and_the_tries_stop() {
+        use crate::ui::THUMBNAIL_GIVE_UP;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (library, id, _) = library_with_a_game(dir.path());
+        // The blank cartridge draws nothing but one colour.
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_game(Some(id.clone()));
+        run_frames(&mut app, (THUMBNAIL_GIVE_UP + 100) as u32);
+        assert!(thumbnail_of(&app, &id).is_none());
     }
 
     #[test]
@@ -2326,7 +2498,7 @@ mod tests {
             record::encode_png(frame).unwrap()
         };
         library.set_thumbnail(&id, &existing).unwrap();
-        let mut app = headless_app(dir.path())
+        let mut app = headless_app_with(dir.path(), GameBoy::new(drawing_rom()).unwrap())
             .with_library(Some(library))
             .with_game(Some(id.clone()));
         run_frames(&mut app, 700);
@@ -2416,7 +2588,7 @@ mod tests {
             .expect("the dropped game is a library game");
         let entry = library.get(&id).unwrap();
         assert_eq!(entry.title, "TWO");
-        assert_ne!(entry.rom_path, dropped, "played from the library copy");
+        assert_ne!(entry.rom_path, dropped, "listed by its library copy");
         assert!(entry.last_played.is_some());
         assert!(app.toasts.iter().any(|t| t.text == "Added TWO"));
 
@@ -2432,20 +2604,44 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_drop_from_the_library_stays_in_the_library_with_a_toast() {
+    fn a_drop_that_does_not_power_on_is_not_added_to_the_library() {
         let dir = tempfile::tempdir().unwrap();
         let (library, _, _) = library_with_a_game(dir.path());
         let mut app = headless_app(dir.path()).with_library(Some(library));
-        app.loader = Some(Box::new(|_| Err("unused".to_owned())));
+        app.loader = Some(Box::new(|_| Err("not a ROM".to_owned())));
         app.set_mode(Mode::Library);
-        let bad = dir.path().join("bad.gb");
-        fs::write(&bad, b"not a ROM").unwrap();
+        let dropped = dir.path().join("new.gb");
+        fs::write(&dropped, titled_rom(b"NEW")).unwrap();
 
-        app.open_dropped(bad);
+        app.open_dropped(dropped);
 
         assert_eq!(app.mode, Mode::Library);
         assert_eq!(app.library.as_ref().unwrap().entries().len(), 1);
         assert!(app.toasts.iter().any(|t| t.level == log::Level::Error));
+    }
+
+    #[test]
+    fn a_drop_that_plays_but_cannot_be_added_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, _, _) = library_with_a_game(dir.path());
+        let mut app = headless_app(dir.path()).with_library(Some(library));
+        // The loader takes it; the library's own checks do not.
+        app.loader = Some(Box::new(|path| {
+            Ok((
+                GameBoy::new(titled_rom(b"ODD")).unwrap(),
+                GamePaths::beside(path),
+            ))
+        }));
+        app.set_mode(Mode::Library);
+        let dropped = dir.path().join("odd.gb");
+        fs::write(&dropped, b"too small").unwrap();
+
+        app.open_dropped(dropped);
+
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(app.game_id.is_none());
+        assert_eq!(app.library.as_ref().unwrap().entries().len(), 1);
+        assert!(app.toasts.iter().any(|t| t.level == log::Level::Warn));
     }
 
     #[test]
@@ -2487,6 +2683,116 @@ mod tests {
         let mut app = headless_app(dir.path());
         assert_eq!(app.perform(UiAction::Quit), Effect::Exit);
         assert_eq!(app.perform(UiAction::SelectSlot(4)), Effect::None);
-        assert_eq!(app.states.slot(), 4);
+        assert_eq!(app.slot(), 4);
+    }
+
+    // --- review fixes ---------------------------------------------------------------
+
+    #[test]
+    fn esc_quits_the_test_pattern_instead_of_pausing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.test = Some(TestMode {
+            frame: 0,
+            fb: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
+            tone: ToneGen::new(48_000, 60.0),
+        });
+        assert_eq!(app.on_key(KeyCode::Escape, true), Effect::Exit);
+        assert_eq!(app.mode, Mode::Playing);
+    }
+
+    #[test]
+    fn back_to_library_lets_go_of_the_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let sav = dir.path().join("g.sav");
+        let mut app = headless_app(dir.path());
+        app.on_key(KeyCode::Escape, true);
+        change_ram(&mut app, 0xAB); // since the pause wrote the save
+        app.perform(UiAction::BackToLibrary);
+        assert_eq!(fs::read(&sav).unwrap()[0], 0xAB, "written on the way out");
+
+        assert!(app.storage.is_none());
+        assert!(app.core.battery_ram().is_none(), "an idle core stands in");
+        // Nothing writes for the old game any more: not the timer, not the exit flush,
+        // not a screenshot.
+        fs::remove_file(&sav).unwrap();
+        app.tick_saves(Instant::now() + crate::save::SAVE_INTERVAL * 2);
+        app.finish();
+        app.screenshot();
+        app.save_state();
+        assert!(
+            fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with('g')),
+            "no file of the old game appeared"
+        );
+        assert!(!sav.exists());
+    }
+
+    #[test]
+    fn a_menu_opened_twice_with_nothing_held_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        let (mut app, rec_path) = recording_app(dir.path(), &rom, Model::Dmg);
+        for _ in 0..2 {
+            app.on_key(KeyCode::Escape, true);
+            app.on_key(KeyCode::Escape, true);
+        }
+        assert_eq!(button_events(&mut app, &rec_path), vec![]);
+    }
+
+    #[test]
+    fn losing_focus_over_a_menu_does_not_release_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        let (mut app, rec_path) = recording_app(dir.path(), &rom, Model::Dmg);
+        app.on_key(KeyCode::ArrowLeft, true);
+        app.on_key(KeyCode::Escape, true); // released to the game here
+        app.release_all_buttons(); // focus lost over the menu
+        app.on_key(KeyCode::Escape, true);
+        assert_eq!(
+            button_events(&mut app, &rec_path),
+            vec![(Button::Left, true), (Button::Left, false)]
+        );
+    }
+
+    #[test]
+    fn the_window_is_resized_only_when_the_picture_size_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.scale = 3;
+        // Started on the library, the window has its size: the first game fits it.
+        assert_eq!(app.fit_request(), Some((480, 432)));
+        // Another game of the same size, or a trip through the library, leaves it alone.
+        assert_eq!(app.fit_request(), None);
+        app.perform(UiAction::BackToLibrary);
+        assert_eq!(app.fit_request(), None);
+        // A different picture size does resize it.
+        app.fitted = Some((240, 160));
+        assert_eq!(app.fit_request(), Some((480, 432)));
+    }
+
+    #[test]
+    fn a_stale_animation_wake_is_dropped_when_the_screen_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.loader = Some(Box::new(|path| {
+            Ok((
+                GameBoy::new(titled_rom(b"OTHER")).unwrap(),
+                GamePaths::beside(path),
+            ))
+        }));
+        let soon = Some(Instant::now());
+        app.ui_wake = soon;
+        app.toggle_pause();
+        assert!(app.ui_wake.is_none(), "pause");
+        app.ui_wake = soon;
+        app.toggle_pause();
+        assert!(app.ui_wake.is_none(), "resume");
+        app.ui_wake = soon;
+        app.open_dropped(dir.path().join("other.gb"));
+        assert!(app.ui_wake.is_none(), "open");
     }
 }

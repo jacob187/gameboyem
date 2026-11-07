@@ -33,7 +33,7 @@ use winit::event_loop::EventLoop;
 use crate::app::{App, Storage};
 use crate::audio::AudioOutput;
 use crate::cli::Command;
-use crate::library::{GameId, GamePaths, Library};
+use crate::library::{GamePaths, Library};
 use crate::paths::DataDir;
 use crate::picker::Startup;
 use crate::save::SaveManager;
@@ -204,10 +204,9 @@ fn main() -> ExitCode {
         return add_to_library(data, opts.rom.take());
     }
 
-    // The game list the UI shows, when there is a data folder to keep it in.
-    // (Registering the games bundled with the app belongs right here, after the library
-    // is opened and before the window is built.)
-    let library = data.as_ref().map(Library::open);
+    // A run that starts on a given ROM may leave records of itself (a recording, a
+    // scripted test pattern) and then must not touch the library at all.
+    let interactive = !opts.test_pattern && opts.record.is_none();
 
     // Started from a launcher there is no command line, so no ROM: the window opens on
     // the library and the player picks a game there.
@@ -226,6 +225,15 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let opts = Arc::new(opts);
+
+    // The game list the UI shows, when there is a data folder to keep it in. (Registering
+    // the games bundled with the app belongs right here, after the library is opened and
+    // before the window is built.) With a ROM on the command line it is only opened for
+    // an interactive run, and kept only if that ROM is already in it (below).
+    let mut library = match &data {
+        Some(data) if rom_path.is_none() || interactive => Some(Library::open(data)),
+        _ => None,
+    };
 
     // The core hashed the ROM as it was built; the recording header reuses that. With
     // no ROM the core is a blank cartridge that the library screen never runs.
@@ -248,8 +256,16 @@ fn main() -> ExitCode {
                 rom_path.display(),
                 core.title()
             );
-            let id = GameId::new(&core.title(), rom_hash);
-            (core, rom_hash, paths, Some(id))
+            // A ROM from the command line is not added to the library, and is marked as
+            // played and given a thumbnail only if it is a game already in it.
+            let id = library
+                .as_ref()
+                .and_then(|l| l.find_by_hash(rom_hash))
+                .map(|e| e.id.clone());
+            if id.is_none() {
+                library = None;
+            }
+            (core, rom_hash, paths, id)
         }
         None => match idle_core() {
             Ok(core) => (core, 0, GamePaths::beside(Path::new("library")), None),
@@ -338,6 +354,7 @@ fn main() -> ExitCode {
     .with_recorder(recorder)
     .with_library(library)
     .with_game(game_id)
+    .with_idle(Box::new(|| idle_core().ok()))
     .with_loader({
         let opts = Arc::clone(&opts);
         let data = data.clone();

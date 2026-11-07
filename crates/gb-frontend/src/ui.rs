@@ -17,6 +17,8 @@
 
 use std::time::{Duration, Instant};
 
+use emu_common::{FrameRef, Pixels};
+
 use crate::library::{Entry, GameId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,13 +89,16 @@ pub enum EscapeEffect {
 }
 
 /// The effect of Esc in `mode`, with a help screen or confirmation open or not.
-pub fn escape_effect(mode: Mode, overlay_open: bool) -> EscapeEffect {
+/// `can_pause` is false where there is no game to pause (`--test-pattern`): Esc quits
+/// there, as it always did.
+pub fn escape_effect(mode: Mode, overlay_open: bool, can_pause: bool) -> EscapeEffect {
     if overlay_open && mode.menu_visible() {
         return EscapeEffect::CloseOverlay;
     }
     match mode {
         Mode::Library => EscapeEffect::Quit,
-        Mode::Playing => EscapeEffect::Pause,
+        Mode::Playing if can_pause => EscapeEffect::Pause,
+        Mode::Playing => EscapeEffect::Quit,
         Mode::Paused => EscapeEffect::Resume,
     }
 }
@@ -137,12 +142,19 @@ pub fn library_order(entries: &[Entry]) -> Vec<usize> {
     sort_order(&keys)
 }
 
-/// Emulated frames a game runs before its picture becomes its thumbnail (10 s at
-/// 60 frames a second).
+/// Emulated frames, at normal speed, before the first try at a thumbnail (10 s at 60
+/// frames a second).
 pub const THUMBNAIL_FRAMES: u64 = 600;
 
-/// Decides when to take the library thumbnail of the running game: once, when it has
-/// run [`THUMBNAIL_FRAMES`] frames and has none yet.
+/// Frames between tries when the screen was a single colour.
+pub const THUMBNAIL_RETRY: u64 = 30;
+
+/// Frames after which no more tries are made (a minute): some games never show more.
+pub const THUMBNAIL_GIVE_UP: u64 = 3600;
+
+/// Decides when to try for the library thumbnail of the running game: from
+/// [`THUMBNAIL_FRAMES`] on, every [`THUMBNAIL_RETRY`] frames until the app has taken
+/// one ([`ThumbnailTrigger::done`]) or [`THUMBNAIL_GIVE_UP`] is reached.
 #[derive(Debug, Default)]
 pub struct ThumbnailTrigger {
     armed: bool,
@@ -159,18 +171,32 @@ impl ThumbnailTrigger {
         }
     }
 
-    /// Count one emulated frame. True exactly once: on the frame that reaches the
-    /// threshold.
+    /// Count one emulated frame at normal speed. True when the app should try now.
     pub fn frame(&mut self) -> bool {
         if !self.armed {
             return false;
         }
         self.frames += 1;
-        if self.frames >= THUMBNAIL_FRAMES {
+        if self.frames > THUMBNAIL_GIVE_UP {
             self.armed = false;
-            return true;
+            return false;
         }
-        false
+        self.frames >= THUMBNAIL_FRAMES
+            && (self.frames - THUMBNAIL_FRAMES).is_multiple_of(THUMBNAIL_RETRY)
+    }
+
+    /// The thumbnail was taken: no more tries.
+    pub fn done(&mut self) {
+        self.armed = false;
+    }
+}
+
+/// Is the whole picture one colour? Such a frame (a black screen between scenes) makes
+/// a poor thumbnail.
+pub fn frame_is_uniform(frame: &FrameRef<'_>) -> bool {
+    match frame.pixels {
+        Pixels::Shades(px) => px.windows(2).all(|w| w[0] & 3 == w[1] & 3),
+        Pixels::Rgb555(px) => px.windows(2).all(|w| w[0] & 0x7FFF == w[1] & 0x7FFF),
     }
 }
 
@@ -311,19 +337,45 @@ mod tests {
 
     #[test]
     fn esc_depends_on_where_the_app_is() {
-        assert_eq!(escape_effect(Mode::Library, false), EscapeEffect::Quit);
-        assert_eq!(escape_effect(Mode::Playing, false), EscapeEffect::Pause);
-        assert_eq!(escape_effect(Mode::Paused, false), EscapeEffect::Resume);
+        assert_eq!(
+            escape_effect(Mode::Library, false, true),
+            EscapeEffect::Quit
+        );
+        assert_eq!(
+            escape_effect(Mode::Playing, false, true),
+            EscapeEffect::Pause
+        );
+        assert_eq!(
+            escape_effect(Mode::Paused, false, true),
+            EscapeEffect::Resume
+        );
+    }
+
+    #[test]
+    fn esc_quits_where_there_is_no_game_to_pause() {
+        assert_eq!(
+            escape_effect(Mode::Playing, false, false),
+            EscapeEffect::Quit
+        );
+        assert_eq!(
+            escape_effect(Mode::Library, false, false),
+            EscapeEffect::Quit
+        );
+        // An open menu is still closed by Esc.
+        assert_eq!(
+            escape_effect(Mode::Paused, false, false),
+            EscapeEffect::Resume
+        );
     }
 
     #[test]
     fn esc_closes_the_help_or_a_confirmation_before_anything_else() {
         assert_eq!(
-            escape_effect(Mode::Library, true),
+            escape_effect(Mode::Library, true, true),
             EscapeEffect::CloseOverlay
         );
         assert_eq!(
-            escape_effect(Mode::Paused, true),
+            escape_effect(Mode::Paused, true, true),
             EscapeEffect::CloseOverlay
         );
     }
@@ -362,21 +414,50 @@ mod tests {
     }
 
     #[test]
-    fn the_thumbnail_is_taken_once_at_the_threshold() {
+    fn the_first_try_is_at_the_threshold() {
         let mut t = ThumbnailTrigger::new(true);
         for frame in 1..THUMBNAIL_FRAMES {
-            assert!(!t.frame(), "fired early at frame {frame}");
+            assert!(!t.frame(), "tried early at frame {frame}");
         }
-        assert!(t.frame(), "fires on frame {THUMBNAIL_FRAMES}");
-        for _ in 0..(THUMBNAIL_FRAMES * 2) {
+        assert!(t.frame(), "tries on frame {THUMBNAIL_FRAMES}");
+    }
+
+    #[test]
+    fn it_captures_once_and_then_stops() {
+        let mut t = ThumbnailTrigger::new(true);
+        for _ in 1..THUMBNAIL_FRAMES {
+            t.frame();
+        }
+        assert!(t.frame());
+        t.done();
+        for _ in 0..(THUMBNAIL_GIVE_UP * 2) {
             assert!(!t.frame(), "fires only once");
         }
     }
 
     #[test]
+    fn a_failed_try_is_repeated_until_the_limit() {
+        let mut t = ThumbnailTrigger::new(true);
+        let mut tries = Vec::new();
+        for frame in 1..=(THUMBNAIL_GIVE_UP + 100) {
+            if t.frame() {
+                tries.push(frame);
+            }
+        }
+        assert_eq!(tries[0], THUMBNAIL_FRAMES);
+        assert_eq!(tries[1], THUMBNAIL_FRAMES + THUMBNAIL_RETRY);
+        assert!(tries.iter().all(|&f| f <= THUMBNAIL_GIVE_UP));
+        assert_eq!(
+            *tries.last().unwrap(),
+            THUMBNAIL_FRAMES
+                + (THUMBNAIL_GIVE_UP - THUMBNAIL_FRAMES) / THUMBNAIL_RETRY * THUMBNAIL_RETRY
+        );
+    }
+
+    #[test]
     fn a_game_with_a_thumbnail_never_fires() {
         let mut t = ThumbnailTrigger::new(false);
-        for _ in 0..(THUMBNAIL_FRAMES * 2) {
+        for _ in 0..(THUMBNAIL_GIVE_UP * 2) {
             assert!(!t.frame());
         }
         assert!(!ThumbnailTrigger::default().frame());
@@ -385,6 +466,31 @@ mod tests {
     #[test]
     fn the_threshold_is_about_ten_seconds() {
         assert_eq!(THUMBNAIL_FRAMES, 600);
+    }
+
+    #[test]
+    fn a_single_colour_frame_is_uniform() {
+        let flat = [2u8; 160 * 144];
+        let frame = |px| FrameRef {
+            width: 160,
+            height: 144,
+            pixels: px,
+        };
+        assert!(frame_is_uniform(&frame(Pixels::Shades(&flat))));
+        let mut busy = flat;
+        busy[160 * 144 - 1] = 1;
+        assert!(!frame_is_uniform(&frame(Pixels::Shades(&busy))));
+
+        let flat = [0x1234u16; 240 * 160];
+        let wide = |px| FrameRef {
+            width: 240,
+            height: 160,
+            pixels: px,
+        };
+        assert!(frame_is_uniform(&wide(Pixels::Rgb555(&flat))));
+        let mut busy = flat;
+        busy[7] = 0x1235;
+        assert!(!frame_is_uniform(&wide(Pixels::Rgb555(&busy))));
     }
 
     #[test]
