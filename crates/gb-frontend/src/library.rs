@@ -868,6 +868,8 @@ impl Library {
     /// player imported themselves stays imported, and a bundled game whose ROM is
     /// gone from `dir` is unlisted. Unusable files are skipped and logged.
     pub fn register_bundled(&mut self, dir: &Path) -> Result<BundledReport, String> {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let dir = dir.as_path();
         let listing = fs::read_dir(dir)
             .map_err(|e| format!("cannot read the bundled games in {}: {e}", dir.display()))?;
         let mut files: Vec<PathBuf> = listing
