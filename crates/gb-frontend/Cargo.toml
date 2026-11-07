@@ -4,7 +4,7 @@ description = "Desktop frontend (window, input, audio) for the gb emulator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version = "1.88" # pixels 0.17 (wgpu 29) needs 1.88; workspace MSRV stays 1.85 for gb-core
+rust-version = "1.92" # rfd 0.18 needs 1.92 (pixels 0.17 / wgpu 29 need 1.88); workspace MSRV stays 1.85 for gb-core
 
 [[bin]]
 name = "gb"
@@ -19,6 +19,9 @@ pixels.workspace = true
 cpal.workspace = true
 ctrlc.workspace = true
 png = "0.18"
+# Native file-open dialog. On Linux the xdg-portal backend: no GTK build dependency
+# (libdbus is loaded at run time, with zenity as the fallback).
+rfd = { version = "=0.18.0", default-features = false, features = ["xdg-portal"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -17,7 +17,7 @@ A cycle-accurate-enough original Game Boy (DMG) emulator with Game Boy Color (CG
 
 ## Build and run
 
-You need Rust stable. `gb-frontend` needs ≥ 1.88; `emu-common`, `gb-core`, `gba-core` and `gb-test` need ≥ 1.85. The GBA homebrew is the one exception, because it needs a pinned nightly (see Homebrew games).
+You need Rust stable. `gb-frontend` needs ≥ 1.92; `emu-common`, `gb-core`, `gba-core` and `gb-test` need ≥ 1.85. The GBA homebrew is the one exception, because it needs a pinned nightly (see Homebrew games).
 
 **macOS (arm64/x86_64).** No extra system packages are needed.
 
@@ -39,7 +39,9 @@ cargo build --release
 **Command-line options:**
 
 ```
-usage: gb [options] [--] <rom.gb|rom.gbc|rom.gba>
+usage: gb [options] [--] [rom.gb|rom.gbc|rom.gba]
+
+With no ROM path, a file dialog asks for one. A ROM file can also be dropped onto the window.
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)

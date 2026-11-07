@@ -7,6 +7,7 @@ mod audio;
 mod cli;
 mod keymap;
 mod pacer;
+mod picker;
 mod record;
 mod rom;
 mod save;
@@ -14,7 +15,9 @@ mod shutdown;
 mod state;
 mod video;
 
+use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use emu_common::{Core, System};
@@ -25,16 +28,21 @@ use winit::event_loop::EventLoop;
 use crate::app::{App, Storage};
 use crate::audio::AudioOutput;
 use crate::cli::Command;
+use crate::picker::Startup;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
 use crate::state::StateSlots;
 
 /// A Game Boy core for `rom`, as `--model` asks, and the hash of the ROM it hashed.
-fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), String> {
+fn build_gb(
+    opts: &cli::Options,
+    path: &Path,
+    rom: Vec<u8>,
+) -> Result<(Box<dyn Core>, u64), String> {
     let archive = rom::archive_kind(&rom);
     let model = opts.model.resolve(&rom);
-    let gb = GameBoy::with_model(rom, model)
-        .map_err(|e| rom::cartridge_message(&opts.rom, &e, archive))?;
+    let gb =
+        GameBoy::with_model(rom, model).map_err(|e| rom::cartridge_message(path, &e, archive))?;
     if !gb.cartridge_header().header_checksum_ok {
         eprintln!("warning: ROM header checksum is wrong (running anyway)");
     }
@@ -44,7 +52,11 @@ fn build_gb(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), S
 
 /// A GBA core for `rom`, booted through `--bios` if given (else the built-in
 /// HLE BIOS, which needs no copyrighted dump), and the hash of the ROM it hashed.
-fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), String> {
+fn build_gba(
+    opts: &cli::Options,
+    path: &Path,
+    rom: Vec<u8>,
+) -> Result<(Box<dyn Core>, u64), String> {
     let archive = rom::archive_kind(&rom);
     let bios = match &opts.bios {
         Some(path) => Some(rom::read_bios(path)?),
@@ -55,7 +67,7 @@ fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), 
         rtc: opts.rtc,
     };
     let mut gba = Gba::with_options(rom, bios, options)
-        .map_err(|e| rom::gba_cartridge_message(&opts.rom, &e, archive))?;
+        .map_err(|e| rom::gba_cartridge_message(path, &e, archive))?;
     // The save is loaded after this and replaces the clock if it carries one.
     if let Some(start) = opts.rtc_start {
         gba.set_rtc(start);
@@ -64,8 +76,42 @@ fn build_gba(opts: &cli::Options, rom: Vec<u8>) -> Result<(Box<dyn Core>, u64), 
     Ok((Box::new(gba), rom_hash))
 }
 
+/// Why a ROM could not be powered on.
+enum PowerOnError {
+    /// The options do not fit this ROM's system: a usage error (exit status 2).
+    Usage(String),
+    /// The file could not be read or the core refused it.
+    Load(String),
+}
+
+impl PowerOnError {
+    fn message(self) -> String {
+        match self {
+            PowerOnError::Usage(m) | PowerOnError::Load(m) => m,
+        }
+    }
+}
+
+/// Read the ROM at `path` and build its core: system detection, the size caps
+/// and the option checks. Used at startup and for a ROM dropped on the window.
+fn power_on(opts: &cli::Options, path: &Path) -> Result<(Box<dyn Core>, u64), PowerOnError> {
+    // The file is read once; the system (and so the size cap) comes from the
+    // flag, the name or the header.
+    let (system, rom) = rom::load_rom(path, opts.system).map_err(PowerOnError::Load)?;
+    match cli::check_system_flags(system, opts) {
+        Ok(Some(warning)) => eprintln!("warning: {warning}"),
+        Ok(None) => {}
+        Err(msg) => return Err(PowerOnError::Usage(msg)),
+    }
+    match system {
+        System::Gb => build_gb(opts, path, rom),
+        System::Gba => build_gba(opts, path, rom),
+    }
+    .map_err(PowerOnError::Load)
+}
+
 fn main() -> ExitCode {
-    let opts = match cli::parse(std::env::args_os().skip(1)) {
+    let mut opts = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Run(o)) => o,
         Ok(Command::Help) => {
             println!("{}", cli::USAGE);
@@ -77,31 +123,41 @@ fn main() -> ExitCode {
         }
     };
 
-    // The file is read once; the system (and so the size cap) comes from the
-    // flag, the name or the header.
-    let (system, rom) = match rom::load_rom(&opts.rom, opts.system) {
-        Ok(r) => r,
-        Err(msg) => {
-            eprintln!("error: {msg}");
+    // Before any dialog: on macOS winit creates the application object here, so
+    // the dialog then runs against the app winit set up.
+    let event_loop = match EventLoop::new() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: cannot start the windowing system: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match cli::check_system_flags(system, &opts) {
-        Ok(Some(warning)) => eprintln!("warning: {warning}"),
-        Ok(None) => {}
-        Err(msg) => {
+
+    // Started from a launcher there is no command line: ask for the ROM.
+    let rom_path = match picker::startup(opts.rom.take(), opts.test_pattern) {
+        Startup::Given(path) => path,
+        Startup::Ask => match picker::pick_rom() {
+            Some(path) => path,
+            None => {
+                eprintln!("no ROM chosen");
+                return ExitCode::SUCCESS;
+            }
+        },
+        Startup::Missing => {
+            eprintln!("error: missing ROM path\n\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+    let opts = Arc::new(opts);
+
+    // The core hashed the ROM as it was built; the recording header reuses that.
+    let (mut core, rom_hash) = match power_on(&opts, &rom_path) {
+        Ok(c) => c,
+        Err(PowerOnError::Usage(msg)) => {
             eprintln!("error: {msg}\n\n{}", cli::USAGE);
             return ExitCode::from(2);
         }
-    }
-    let built = match system {
-        System::Gb => build_gb(&opts, rom),
-        System::Gba => build_gba(&opts, rom),
-    };
-    // The core hashed the ROM as it was built; the recording header reuses that.
-    let (mut core, rom_hash) = match built {
-        Ok(c) => c,
-        Err(msg) => {
+        Err(PowerOnError::Load(msg)) => {
             eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
@@ -129,7 +185,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut saves = SaveManager::new(&opts.rom, Instant::now());
+    let mut saves = SaveManager::new(&rom_path, Instant::now());
     saves.load(core.as_mut());
 
     // The recording starts from the battery RAM the session actually powered on with.
@@ -150,13 +206,6 @@ fn main() -> ExitCode {
         }
     };
 
-    let event_loop = match EventLoop::new() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: cannot start the windowing system: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let shutdown = ShutdownFlag::default();
     {
         let flag = shutdown.clone();
@@ -172,7 +221,7 @@ fn main() -> ExitCode {
     }
     let storage = Storage {
         saves,
-        states: StateSlots::new(&opts.rom),
+        states: StateSlots::new(&rom_path),
     };
     let mut app = App::new(
         core,
@@ -183,8 +232,16 @@ fn main() -> ExitCode {
         opts.test_pattern,
         shutdown,
     )
-    .with_rom_path(opts.rom.clone())
-    .with_recorder(recorder);
+    .with_rom_path(rom_path)
+    .with_recorder(recorder)
+    .with_loader({
+        let opts = Arc::clone(&opts);
+        Box::new(move |path| {
+            power_on(&opts, path)
+                .map(|(core, _)| core)
+                .map_err(PowerOnError::message)
+        })
+    });
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {
         eprintln!("error: {e}");
