@@ -80,11 +80,13 @@ impl RotatingFile {
     pub fn write_record(&mut self, text: &str) -> io::Result<()> {
         let text = truncate_at_boundary(text, MAX_RECORD_BYTES);
         let len = text.len() as u64 + 1;
-        if self.size > 0 && self.size + len > self.max_bytes && self.retry_after == 0 {
-            if let Err(e) = self.rotate() {
-                self.retry_after = self.max_bytes.max(1);
-                self.rotation_error = Some(e);
-            }
+        if self.size > 0
+            && self.size + len > self.max_bytes
+            && self.retry_after == 0
+            && let Err(e) = self.rotate()
+        {
+            self.retry_after = self.max_bytes.max(1);
+            self.rotation_error = Some(e);
         }
         self.retry_after = self.retry_after.saturating_sub(len);
         if self.file.is_none() {
