@@ -18,6 +18,10 @@ winit.workspace = true
 pixels.workspace = true
 cpal.workspace = true
 ctrlc.workspace = true
+directories.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 png = "0.18"
 # Native file-open dialog. On Linux the xdg-portal backend: no GTK build dependency
 # (libdbus is loaded at run time, with zenity as the fallback).

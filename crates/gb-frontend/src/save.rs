@@ -59,7 +59,7 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
 /// 128 KiB Flash chip) plus the 48-byte MBC3 RTC footer. Anything bigger cannot
 /// be a save for any cartridge. (The cores export no such constant; tests check
 /// this still covers the largest of each.)
-const MAX_SAVE_BYTES: u64 = 0x20000 + 48;
+pub(crate) const MAX_SAVE_BYTES: u64 = 0x20000 + 48;
 
 /// Read the save at `path`: `Ok(None)` if there is none. Rejects, without
 /// reading the contents, anything that is not a regular file (a FIFO would block

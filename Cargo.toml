@@ -17,6 +17,10 @@ pixels = "0.17.2"
 cpal = "0.18.2"
 tempfile = "3"
 ctrlc = { version = "3", features = ["termination"] }
+directories = "=6.0.0"
+log = { version = "=0.4.35", features = ["std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
 
 # The emulator core is hot; keep it optimized even in debug/test builds so the
 # test-ROM harness runs at a useful speed.

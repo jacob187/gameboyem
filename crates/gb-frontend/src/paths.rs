@@ -1,0 +1,199 @@
+//! The per-user app data folder and the layout inside it.
+//!
+//! ```text
+//! <data dir>/
+//!   games/        ROM copies (`<id>.gb|gbc|gba`), thumbnails (`<id>.png`), `library.json`
+//!   saves/        battery saves (`<id>.sav`)
+//!   states/       save-state slots (`<id>.ss1` ... `<id>.ss9`)
+//!   screenshots/  `<id>-fNNNNNNN.png`
+//!   logs/         `gameboyem.log` and its rotated files
+//! ```
+//!
+//! The folder is the one the OS keeps application data in (see [`DataDir::locate`]),
+//! or the one named by `GAMEBOYEM_DATA_DIR`. Resolving never touches the disk; only
+//! [`DataDir::create`] does.
+
+#![allow(dead_code, reason = "wired into main in the next commit")]
+
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// Environment variable that replaces the OS data folder (tests, portable installs).
+pub const ENV_DATA_DIR: &str = "GAMEBOYEM_DATA_DIR";
+
+const QUALIFIER: &str = "io.github";
+const ORGANIZATION: &str = "jacob187";
+const APPLICATION: &str = "gameboyem";
+
+const GAMES: &str = "games";
+const SAVES: &str = "saves";
+const STATES: &str = "states";
+const SCREENSHOTS: &str = "screenshots";
+const LOGS: &str = "logs";
+
+/// File name of the library index inside `games/`.
+pub const INDEX_FILE: &str = "library.json";
+/// File name of the current log inside `logs/`.
+pub const LOG_FILE: &str = "gameboyem.log";
+
+/// The app data folder. Cheap to clone; holds only the root path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataDir {
+    root: PathBuf,
+}
+
+impl DataDir {
+    /// A data folder rooted at `root`, as is.
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The data folder for this process: `GAMEBOYEM_DATA_DIR` if set and not
+    /// empty, else the OS location (macOS `~/Library/Application Support/io.github.jacob187.gameboyem`,
+    /// Windows `%APPDATA%\jacob187\gameboyem\data`, Linux `$XDG_DATA_HOME/gameboyem` or
+    /// `~/.local/share/gameboyem`).
+    pub fn locate() -> Result<Self, String> {
+        let os_default = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+            .map(|d| d.data_dir().to_path_buf());
+        Self::resolve(std::env::var_os(ENV_DATA_DIR), os_default)
+    }
+
+    /// Pick the folder from the override and the OS default. A relative override
+    /// is made absolute against the current directory so a later `chdir` cannot
+    /// move the data.
+    pub fn resolve(
+        override_dir: Option<OsString>,
+        os_default: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        match override_dir.filter(|v| !v.is_empty()) {
+            Some(dir) => std::path::absolute(&dir).map(Self::at).map_err(|e| {
+                format!(
+                    "{ENV_DATA_DIR} is set to {}, which is not a usable path: {e}",
+                    Path::new(&dir).display()
+                )
+            }),
+            None => os_default.map(Self::at).ok_or_else(|| {
+                format!(
+                    "cannot tell where to keep game data (no home folder); set {ENV_DATA_DIR} to a folder"
+                )
+            }),
+        }
+    }
+
+    /// Make the folder and every subfolder. Existing ones are left alone.
+    pub fn create(&self) -> io::Result<()> {
+        for dir in [
+            self.games(),
+            self.saves(),
+            self.states(),
+            self.screenshots(),
+            self.logs(),
+        ] {
+            fs::create_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn games(&self) -> PathBuf {
+        self.root.join(GAMES)
+    }
+
+    pub fn saves(&self) -> PathBuf {
+        self.root.join(SAVES)
+    }
+
+    pub fn states(&self) -> PathBuf {
+        self.root.join(STATES)
+    }
+
+    pub fn screenshots(&self) -> PathBuf {
+        self.root.join(SCREENSHOTS)
+    }
+
+    pub fn logs(&self) -> PathBuf {
+        self.root.join(LOGS)
+    }
+
+    /// The library index.
+    pub fn index_file(&self) -> PathBuf {
+        self.games().join(INDEX_FILE)
+    }
+
+    /// The current log file.
+    pub fn log_file(&self) -> PathBuf {
+        self.logs().join(LOG_FILE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_override_wins_over_the_os_default() {
+        let d = DataDir::resolve(
+            Some("/data/gb".into()),
+            Some(PathBuf::from("/home/u/.local/share/gameboyem")),
+        )
+        .unwrap();
+        assert_eq!(d.root(), Path::new("/data/gb"));
+    }
+
+    #[test]
+    fn an_empty_override_is_ignored() {
+        let d = DataDir::resolve(Some("".into()), Some(PathBuf::from("/os/default"))).unwrap();
+        assert_eq!(d.root(), Path::new("/os/default"));
+    }
+
+    #[test]
+    fn a_relative_override_becomes_absolute() {
+        let d = DataDir::resolve(Some("rel/dir".into()), None).unwrap();
+        assert!(d.root().is_absolute());
+        assert!(d.root().ends_with("rel/dir"));
+    }
+
+    #[test]
+    fn no_override_and_no_home_is_an_error_naming_the_variable() {
+        let e = DataDir::resolve(None, None).unwrap_err();
+        assert!(e.contains(ENV_DATA_DIR), "{e}");
+    }
+
+    #[test]
+    fn the_layout_is_fixed() {
+        let d = DataDir::at("/r");
+        assert_eq!(d.games(), Path::new("/r/games"));
+        assert_eq!(d.saves(), Path::new("/r/saves"));
+        assert_eq!(d.states(), Path::new("/r/states"));
+        assert_eq!(d.screenshots(), Path::new("/r/screenshots"));
+        assert_eq!(d.logs(), Path::new("/r/logs"));
+        assert_eq!(d.index_file(), Path::new("/r/games/library.json"));
+        assert_eq!(d.log_file(), Path::new("/r/logs/gameboyem.log"));
+    }
+
+    #[test]
+    fn create_makes_every_folder_and_is_repeatable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = DataDir::at(tmp.path().join("new/app"));
+        d.create().unwrap();
+        d.create().unwrap();
+        for dir in [d.games(), d.saves(), d.states(), d.screenshots(), d.logs()] {
+            assert!(dir.is_dir(), "{}", dir.display());
+        }
+    }
+
+    #[test]
+    fn the_os_default_is_inside_a_gameboyem_folder() {
+        // Whatever the platform, the OS location must name the app (or be absent
+        // on a machine with no home folder).
+        let d = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION);
+        if let Some(d) = d {
+            assert!(d.data_dir().to_string_lossy().contains("gameboyem"));
+        }
+    }
+}
