@@ -748,7 +748,8 @@ mod tests {
 
     #[test]
     fn errors() {
-        assert!(p(&[]).is_err());
+        // No arguments is valid: the file dialog asks for a ROM.
+        assert!(matches!(p(&[]), Ok(Command::Run(o)) if o.rom.is_none()));
         assert!(p(&["--scale", "0", "g.gb"]).is_err());
         assert!(p(&["--scale", "9", "g.gb"]).is_err());
         assert!(p(&["--scale", "x", "g.gb"]).is_err());
