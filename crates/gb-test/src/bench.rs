@@ -35,7 +35,9 @@
 //! * `--check` compares each ROM against `crates/gb-test/bench-pins.txt` and fails
 //!   if the emulation output differs from the pin, if no pin exists for this
 //!   frame count, or if the ROM bytes differ from the pinned build (for example a
-//!   homebrew source change; re-pin in that case).
+//!   homebrew source change; re-pin in that case). The one exception is the agb-built
+//!   GBA homebrew (`homebrew/*.gba`), whose ROM-hash pin is informational; see
+//!   [`rom_hash_is_informational`].
 //! * `--print-pins` prints pin lines for this run, to paste into the pins file.
 //! * `--min-speed N` fails if either system's overall speed is below `N` times real time.
 //!   CI uses a low floor because shared runners are slow and noisy.
@@ -241,16 +243,34 @@ fn parse_pins(text: &str) -> Result<Vec<(u32, String, Pin)>, String> {
     Ok(pins)
 }
 
-/// Why a ROM's run doesn't match its pin, or `None` if it does.
-fn pin_mismatch(pin: Option<&Pin>, actual: &Pin) -> Option<&'static str> {
+/// Whether a ROM's bytes are allowed to differ from the pinned build while its video
+/// and audio hashes still have to match.
+///
+/// The GBDK ROMs are byte-identical on every OS, so their ROM hash is binding: it
+/// catches a source edit that was not re-pinned. The GBA homebrew is built by a
+/// pinned nightly with build-std and fat LTO, and the same sources and toolchain
+/// date produce different machine code on Linux x86_64 (CI) than on macOS arm64 (where
+/// the pins were taken): the panic-site strings and the code size differ, while the
+/// paths in them are identical. The ROM bytes therefore depend on the build host,
+/// and only what the emulator does with them can be pinned across hosts.
+fn rom_hash_is_informational(name: &str) -> bool {
+    name.starts_with("homebrew/") && name.ends_with(".gba")
+}
+
+/// Why a ROM's run doesn't match its pin, or `None` if it does. `name` is the ROM's
+/// path relative to the ROMs directory.
+fn pin_mismatch(name: &str, pin: Option<&Pin>, actual: &Pin) -> Option<&'static str> {
+    let output_differs =
+        |p: &Pin| (p.video_hash, p.audio_hash) != (actual.video_hash, actual.audio_hash);
     match pin {
         None => Some("no pin for this frame count (add one with --print-pins)"),
-        Some(p) if p.rom_hash != actual.rom_hash => {
+        Some(p) if p.rom_hash != actual.rom_hash && !rom_hash_is_informational(name) => {
             Some("ROM differs from the pinned build (rebuilt or edited?); re-pin with --print-pins")
         }
-        Some(p) if (p.video_hash, p.audio_hash) != (actual.video_hash, actual.audio_hash) => {
-            Some("emulation output differs from the pin")
-        }
+        Some(p) if output_differs(p) && p.rom_hash != actual.rom_hash => Some(
+            "emulation output differs from the pin, and so do the ROM bytes (rebuilt, or built on another host)",
+        ),
+        Some(p) if output_differs(p) => Some("emulation output differs from the pin"),
         Some(_) => None,
     }
 }
@@ -365,10 +385,13 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
                 .iter()
                 .find(|(f, p, _)| *f == frames && p == name)
                 .map(|(_, _, pin)| pin);
-            match pin_mismatch(pin, &actual) {
+            match pin_mismatch(name, pin, &actual) {
                 Some(why) => {
                     ok = false;
                     format!("  MISMATCH: {why}")
+                }
+                None if pin.is_some_and(|p| p.rom_hash != actual.rom_hash) => {
+                    "  pinned (ROM bytes differ from the pin; video and audio match)".to_string()
                 }
                 None => "  pinned".to_string(),
             }
@@ -471,11 +494,12 @@ mod tests {
 
     #[test]
     fn mismatch_reasons_are_distinct() {
-        assert_eq!(pin_mismatch(Some(&PIN), &PIN), None);
-        assert!(pin_mismatch(None, &PIN).unwrap().contains("no pin"));
+        let gb = "homebrew/snake.gb";
+        assert_eq!(pin_mismatch(gb, Some(&PIN), &PIN), None);
+        assert!(pin_mismatch(gb, None, &PIN).unwrap().contains("no pin"));
         let rom = Pin { rom_hash: 9, ..PIN };
         assert!(
-            pin_mismatch(Some(&PIN), &rom)
+            pin_mismatch(gb, Some(&PIN), &rom)
                 .unwrap()
                 .contains("ROM differs")
         );
@@ -484,9 +508,29 @@ mod tests {
             ..PIN
         };
         assert!(
-            pin_mismatch(Some(&PIN), &out)
+            pin_mismatch(gb, Some(&PIN), &out)
                 .unwrap()
                 .contains("output differs")
         );
+    }
+
+    #[test]
+    fn gba_homebrew_rom_bytes_may_differ_but_its_output_may_not() {
+        let gba = "homebrew/moth.gba";
+        let rom = Pin { rom_hash: 9, ..PIN };
+        assert_eq!(pin_mismatch(gba, Some(&PIN), &rom), None);
+        let both = Pin {
+            rom_hash: 9,
+            video_hash: 9,
+            ..PIN
+        };
+        assert!(
+            pin_mismatch(gba, Some(&PIN), &both)
+                .unwrap()
+                .contains("output differs")
+        );
+        assert!(pin_mismatch(gba, None, &rom).unwrap().contains("no pin"));
+        assert!(!rom_hash_is_informational("homebrew/snake.gb"));
+        assert!(!rom_hash_is_informational("test/gba/fuzzarm/ARM_Any.gba"));
     }
 }
