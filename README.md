@@ -21,7 +21,7 @@ The builds aren't code-signed yet, so the first launch needs one extra step:
 - **macOS:** right-click the app, choose **Open**, then **Open** again.
 - **Windows:** at "Windows protected your PC", click **More info**, then **Run anyway**.
 
-The five homebrew games from `homebrew/` (Snake, Breakout, cgbdemo, GRAINS and MOTH) come bundled and appear in the library on first launch.
+The five homebrew games from `homebrew/` (Snake, Breakout, cgbdemo, GRAINS and MOTH) come bundled and appear in the library on first launch, as long as the app has its data folder (a normal install does). If you use the portable zip or the `.tar.gz`, keep the `games` folder next to the program.
 
 Start the app, then pick a ROM (`.gb`, `.gbc` or `.gba`) in the dialog or drag one onto the window. No commercial games are included; see [Legal](#legal).
 
@@ -88,7 +88,7 @@ cargo build --release
 ./target/release/gb path/to/game.gba
 ```
 
-A build run from `target/` has no bundled games (it does not use `roms/homebrew`). To try them, build the homebrew (see `homebrew/README.md`) and set `GAMEBOYEM_BUNDLED_DIR=roms/homebrew`.
+A build run from `target/` has no bundled games (it does not use `roms/homebrew`). To try them, build the homebrew (see `homebrew/README.md`) and set `GAMEBOYEM_BUNDLED_DIR=roms/homebrew` (a developer override; it must be an existing folder, otherwise it is ignored with a warning).
 
 The code is split into small crates:
 - `gb-core` and `gba-core`: emulation only, with no platform code.
