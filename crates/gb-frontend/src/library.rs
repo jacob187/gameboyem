@@ -302,6 +302,9 @@ pub fn paths_for_opened_rom(data: &DataDir, rom_path: &Path, title: &str, hash: 
 /// Copy the save and save-state slots that sit next to `rom` (`game.sav`,
 /// `game.ss1`..`game.ss9`, where older versions kept them) into the app folder,
 /// for each one that does not exist there yet. The originals are never changed.
+/// A file already in the app folder always wins over the one beside the ROM, even if
+/// that one is newer: progress made here is never overwritten, and the atomic writes
+/// make a half-written app copy unlikely.
 /// A file that is oversized or unreadable is skipped with a warning. Returns
 /// the files copied, as (from, to).
 pub fn import_beside_rom(rom: &Path, paths: &GamePaths) -> Vec<(PathBuf, PathBuf)> {
@@ -936,20 +939,24 @@ impl Library {
         self.refresh();
         let mut report = BundledReport::default();
         let mut seen: Vec<GameId> = Vec::new();
+        // Files that are there but could not be read this time.
+        let mut unreadable: Vec<PathBuf> = Vec::new();
         for file in files {
+            let path = std::path::absolute(&file).unwrap_or_else(|_| file.clone());
             let probe = match Probe::read(&file) {
                 Ok(p) => p,
                 Err(why) => {
                     log::warn!("bundled game not used: {why}");
                     report.skipped += 1;
+                    unreadable.push(path);
                     continue;
                 }
             };
-            let path = std::path::absolute(&file).unwrap_or_else(|_| file.clone());
             let id = probe.id();
             seen.push(id.clone());
             match self.entries.iter_mut().find(|e| e.id == id) {
                 Some(entry) if entry.source == Source::Bundled => {
+                    entry.available = true;
                     if entry.rom_path != path {
                         entry.rom_path = path;
                         report.updated += 1;
@@ -972,10 +979,13 @@ impl Library {
                 }
             }
         }
+        // A bundled game goes only when its file is gone from `dir` (or now holds
+        // another game). One whose file is there but failed to read this once stays.
         let before = self.entries.len();
         self.entries.retain(|e| {
             e.source != Source::Bundled
                 || seen.contains(&e.id)
+                || unreadable.contains(&e.rom_path)
                 || (e.rom_path.is_file() && !e.rom_path.starts_with(dir))
         });
         report.removed = before - self.entries.len();
@@ -1008,6 +1018,7 @@ impl Library {
     /// side; it is decoded to check it). Returns the file it was written to.
     pub fn set_thumbnail(&mut self, id: &GameId, png: &[u8]) -> Result<PathBuf, String> {
         check_png(png)?;
+        self.refresh();
         let index = self
             .entries
             .iter()
@@ -1736,6 +1747,69 @@ mod tests {
         assert!(lib.get(&one).is_none());
         assert_eq!(fs::read(lib.paths_for(&one).sav).unwrap(), b"progress");
         assert!(lib.register_bundled(&f.roms.join("no/such/dir")).is_err());
+    }
+
+    #[test]
+    fn a_bundled_game_whose_file_fails_to_read_once_stays_listed() {
+        let f = fixture();
+        let dir = bundle_dir(&f);
+        let rom = write_rom(&dir, "one.gb", &gb_rom("ONE", 0));
+        write_rom(&dir, "two.gb", &gb_rom("TWO", 0));
+        let mut lib = Library::open(&f.data);
+        lib.register_bundled(&dir).unwrap();
+        let one = lib
+            .entries()
+            .iter()
+            .find(|e| e.title == "ONE")
+            .unwrap()
+            .clone();
+
+        // The file is there but unreadable as a ROM (a partial update, say).
+        fs::write(&rom, b"junk").unwrap();
+        let report = lib.register_bundled(&dir).unwrap();
+        assert_eq!((report.skipped, report.removed), (1, 0));
+        assert_eq!(lib.get(&one.id), Some(&one));
+
+        // Once the file is gone from the directory the game goes.
+        fs::remove_file(&rom).unwrap();
+        let report = lib.register_bundled(&dir).unwrap();
+        assert_eq!((report.skipped, report.removed), (0, 1));
+        assert!(lib.get(&one.id).is_none());
+        assert_eq!(lib.entries().len(), 1);
+    }
+
+    #[test]
+    fn a_bundled_game_replaced_in_place_by_another_one_is_swapped() {
+        let f = fixture();
+        let dir = bundle_dir(&f);
+        let rom = write_rom(&dir, "one.gb", &gb_rom("ONE", 0));
+        let mut lib = Library::open(&f.data);
+        lib.register_bundled(&dir).unwrap();
+        let old = lib.entries()[0].id.clone();
+        fs::write(&rom, gb_rom("ONE", 9)).unwrap();
+        let report = lib.register_bundled(&dir).unwrap();
+        assert_eq!((report.added, report.removed), (1, 1));
+        assert!(lib.get(&old).is_none());
+    }
+
+    #[test]
+    fn a_thumbnail_can_be_set_for_a_game_another_instance_added() {
+        let f = fixture();
+        let mut first = Library::open(&f.data);
+        let mut second = Library::open(&f.data);
+        let e = second
+            .add_rom(&write_rom(&f.roms, "a.gb", &gb_rom("MOTH", 0)))
+            .unwrap()
+            .entry;
+        // `first` was opened before the game existed; it re-reads the index.
+        assert!(first.get(&e.id).is_none());
+        let path = first.set_thumbnail(&e.id, &tiny_png()).unwrap();
+        assert!(path.is_file());
+        assert!(first.get(&e.id).unwrap().thumbnail.is_some());
+        // An id nobody has is still refused, and nothing is written for it.
+        let nobody = GameId::new("nobody", 7);
+        assert!(first.set_thumbnail(&nobody, &tiny_png()).is_err());
+        assert!(!thumbnail_path(&f.data, &nobody).exists());
     }
 
     #[test]
