@@ -275,6 +275,64 @@ jobs:
           esac
           ls -l release
 
+      # Fails the job if a package is missing any bundled game. Each listing is grepped for
+      # all five ROMs and LICENSE.txt under games/.
+      - name: Check the packages hold the bundled games
+        run: |
+          stem="gameboyem-$VERSION-${{ matrix.name }}"
+          names="snake.gb breakout.gb cgbdemo.gb grains.gba moth.gba LICENSE.txt"
+          # check <label> <listing file>: every name must appear as games/<name> (either slash).
+          check() {
+            for n in $names; do
+              if ! grep -Eq "games[\\/]$n" "$2"; then
+                echo "::error::$1 has no games/$n"
+                cat "$2"
+                exit 1
+              fi
+            done
+            echo "$1: bundled games present"
+          }
+          list="$RUNNER_TEMP/listing.txt"
+          case "$RUNNER_OS" in
+            macOS)
+              mnt="$RUNNER_TEMP/dmg"
+              mkdir "$mnt"
+              hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "release/$stem.dmg"
+              trap 'hdiutil detach "$mnt" -force || true' EXIT
+              ls -d "$mnt"/*.app
+              ls "$mnt"/*.app/Contents/Resources/games > "$list"
+              # The listing has bare names; prefix them so check() sees games/<name>.
+              sed 's|^|games/|' "$list" > "$list.2"
+              check "dmg (Contents/Resources/games)" "$list.2"
+              ;;
+            Windows)
+              pwsh -NoProfile -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::OpenRead((Resolve-Path 'release/$stem-portable.zip')).Entries | ForEach-Object FullName" > "$list"
+              check "portable zip" "$list"
+              # The NSIS installer is not run (it would install and may start the app). Its
+              # script, if the packager left it in dist/, names every installed file.
+              nsi=$(find dist -name installer.nsi | head -n 1)
+              if [ -n "$nsi" ]; then
+                check "installer script ($nsi)" "$nsi"
+              else
+                echo "::warning::installer.nsi not found under dist/: the NSIS layout (games next to gb.exe) is unverified"
+              fi
+              ;;
+            Linux)
+              tar tzf "release/$stem.tar.gz" > "$list"
+              check "tar.gz" "$list"
+              dpkg-deb -c "release/$stem.deb" > "$list"
+              check "deb (usr/lib/gb/games)" "$list"
+              grep -Eq "usr/lib/gb/games/snake.gb" "$list"
+              # Unpack the AppImage in a scratch folder (no FUSE needed) and list its games.
+              scratch="$RUNNER_TEMP/appimage"
+              mkdir "$scratch"
+              (cd "$scratch" && "$GITHUB_WORKSPACE/release/$stem.AppImage" --appimage-extract > /dev/null)
+              (cd "$scratch/squashfs-root" && find usr/lib -path '*/games/*') > "$list"
+              check "AppImage" "$list"
+              grep -Eq "usr/lib/gb/games/snake.gb" "$list"
+              ;;
+          esac
+
       - uses: actions/upload-artifact@v4
         with:
           name: gameboyem-${{ matrix.name }}
