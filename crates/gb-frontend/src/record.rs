@@ -86,15 +86,15 @@ impl Recorder {
     }
 }
 
-/// Write the raw frame as a PNG at its own size: greyscale for shades, which
+/// Encode the raw frame as a PNG at its own size: greyscale for shades, which
 /// map exactly as `gb-test` dumps them (0xFF, 0xAA, 0x55, 0x00), and RGB for an
 /// RGB555 frame, widened with no colour correction (as `video::blit_rgb555` and
 /// `gb-test` do). A screenshot and the replayed frame compare byte for byte.
-pub fn write_png(frame: FrameRef<'_>, path: &Path) -> Result<(), String> {
+pub fn encode_png(frame: FrameRef<'_>) -> Result<Vec<u8>, String> {
     let width = u32::try_from(frame.width).map_err(|e| e.to_string())?;
     let height = u32::try_from(frame.height).map_err(|e| e.to_string())?;
-    let file = File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width, height);
     enc.set_depth(png::BitDepth::Eight);
     let samples: Vec<u8> = match frame.pixels {
         Pixels::Shades(fb) => {
@@ -108,7 +108,14 @@ pub fn write_png(frame: FrameRef<'_>, path: &Path) -> Result<(), String> {
     };
     enc.write_header()
         .and_then(|mut w| w.write_image_data(&samples))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// Write the frame to `path` as a PNG ([`encode_png`]).
+pub fn write_png(frame: FrameRef<'_>, path: &Path) -> Result<(), String> {
+    let png = encode_png(frame)?;
+    std::fs::write(path, png).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -129,6 +136,26 @@ mod tests {
         let dec = png::Decoder::new(std::io::BufReader::new(File::open(&path).unwrap()));
         let reader = dec.read_info().unwrap();
         assert_eq!((reader.info().width, reader.info().height), (240, 160));
+    }
+
+    #[test]
+    fn encoded_png_matches_the_file_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.png");
+        let shades: Vec<u8> = (0..160 * 144).map(|i| (i % 4) as u8).collect();
+        let frame = || FrameRef {
+            width: 160,
+            height: 144,
+            pixels: Pixels::Shades(&shades),
+        };
+        write_png(frame(), &path).unwrap();
+        let bytes = encode_png(frame()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let reader = png::Decoder::new(std::io::Cursor::new(&bytes))
+            .read_info()
+            .unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (160, 144));
+        assert_eq!(reader.info().color_type, png::ColorType::Grayscale);
     }
 
     #[test]

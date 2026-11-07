@@ -21,9 +21,7 @@ The builds aren't code-signed yet, so the first launch needs one extra step:
 - **macOS:** right-click the app, choose **Open**, then **Open** again.
 - **Windows:** at "Windows protected your PC", click **More info**, then **Run anyway**.
 
-The five homebrew games from `homebrew/` (Snake, Breakout, cgbdemo, GRAINS and MOTH) come bundled and appear in the library on first launch, as long as the app has its data folder (a normal install does). If you use the portable zip or the `.tar.gz`, keep the `games` folder next to the program.
-
-Start the app, then pick a ROM (`.gb`, `.gbc` or `.gba`) in the dialog or drag one onto the window. No commercial games are included; see [Legal](#legal).
+The app opens on your game library. The five homebrew games from `homebrew/` (Snake, Breakout, cgbdemo, GRAINS and MOTH) come bundled and are already there on first launch (with the portable zip or the `.tar.gz`, keep the `games` folder next to the program). Click **Add game** to add your own ROMs (`.gb`, `.gbc` or `.gba`), or drag one onto the window; click a game to play and press **Esc** for the menu. No commercial games are included; see [Legal](#legal).
 
 ## Controls
 
@@ -35,7 +33,8 @@ Start the app, then pick a ROM (`.gb`, `.gbc` or `.gba`) in the dialog or drag o
 | Start / Select | Enter / Backspace |
 | Save / load state | K / L (slots 1-9) |
 | Pause / fast-forward | P / hold Tab |
-| Screenshot / quit | C / Esc |
+| Screenshot | C |
+| Pause menu (resume, states, back to library, help) | Esc or P (Esc quits from the library) |
 
 ## Saves
 
