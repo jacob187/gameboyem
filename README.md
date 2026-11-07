@@ -37,8 +37,21 @@ Start the app, then pick a ROM (`.gb`, `.gbc` or `.gba`) in the dialog or drag o
 
 ## Saves
 
-- **In-game saves** are written next to the ROM as `<rom>.sav` every few seconds and on quit.
-- **Save states** snapshot the whole game at any moment: **K** saves, **L** loads, **1-9** pick a slot. They're stored as `<rom>.ss1`…`.ss9`.
+Everything you produce is kept in one folder per user, never next to the ROM:
+
+| OS | Folder |
+|----|--------|
+| macOS | `~/Library/Application Support/io.github.jacob187.gameboyem` |
+| Windows | `%APPDATA%\jacob187\gameboyem\data` |
+| Linux | `~/.local/share/gameboyem` (or `$XDG_DATA_HOME/gameboyem`) |
+
+Set `GAMEBOYEM_DATA_DIR` to use another folder. Inside it, `saves/`, `states/` and `screenshots/` hold your files, `games/` holds the game library, and `logs/gameboyem.log` is the log (three files of up to 1 MB).
+
+- **In-game saves** are written to `saves/` every few seconds and on quit.
+- **Save states** snapshot the whole game at any moment: **K** saves, **L** loads, **1-9** pick a slot. They go in `states/`, screenshots (**C**) in `screenshots/`.
+- Files are named after the game and a hash of the ROM's contents, so renaming or moving a ROM keeps its saves.
+- **Existing saves are imported once.** The first time a ROM is opened, a `<rom>.sav` or `<rom>.ss1`…`.ss9` next to it is copied into the folder if there isn't one there yet. The originals are left alone.
+- `gb game.gb` plays that file without adding it to the library; `gb --add game.gb` copies a ROM into the library and exits.
 - **Games with a clock** (Pokémon Ruby/Sapphire/Emerald, MBC3 games) keep time in emulated time. To start a new GBA game's clock at today's date, run `gb --rtc-start "$(date +%Y-%m-%dT%H:%M:%S)" game.gba`.
 
 ## Command line
@@ -53,6 +66,7 @@ gb [options] [rom]
   --bios FILE       boot through your own GBA BIOS dump (optional)
   --save-type NAME  force the GBA save chip if a game saves wrongly
   --record FILE     record your inputs for exact replay
+  --add             copy the ROM into the game library and exit
 ```
 
 Run `gb --help` for the full list.
