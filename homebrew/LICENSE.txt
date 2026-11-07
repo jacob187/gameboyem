@@ -1,0 +1,9 @@
+Bundled games: Snake, Breakout, cgbdemo, GRAINS and MOTH
+
+These five games are part of the gameboyem project and are released under the
+MIT licence, Copyright (c) 2026 Jacob Cohen. The full text is in the LICENSE file
+of the source repository: https://github.com/jacob187/gameboyem
+
+They are built with GBDK-2020 (Snake, Breakout, cgbdemo) and agb (GRAINS, MOTH);
+the runtime libraries linked into the ROMs keep their own licences (agb is
+MPL-2.0). No commercial or Nintendo games are included.

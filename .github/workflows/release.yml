@@ -4,6 +4,9 @@ name: Release
 # SHA256SUMS file, as a GitHub Release. A manual run (Actions > Release > Run workflow)
 # builds the same packages and keeps them as workflow artifacts only: nothing is released.
 #
+# The five homebrew games (homebrew/) are built once, in the `games` job, and every package
+# job puts them in a `games/` folder that the packager installs as app resources.
+#
 # The packages are unsigned. The optional signing steps below turn on by themselves when
 # the matching repository secrets exist; see "Optional signing" in each job.
 
@@ -21,8 +24,87 @@ permissions:
   contents: read
 
 jobs:
+  # The bundled games: Snake, Breakout and cgbdemo (GBDK-2020), GRAINS and MOTH (agb on a
+  # pinned nightly). The steps and pinned versions are copied from the test job in ci.yml;
+  # change them there and here together. The ROMs leave as the `bundled-games` artifact.
+  # (Not named gameboyem-*: the publish job collects that pattern as release files.)
+  games:
+    name: bundled games
+    runs-on: ubuntu-latest
+    env:
+      GBDK_VERSION: "4.5.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache GBDK
+        uses: actions/cache@v4
+        with:
+          path: tools/gbdk
+          key: gbdk-${{ env.GBDK_VERSION }}-gbdk-linux64.tar.gz
+
+      - name: Build homebrew ROMs (GBDK-2020)
+        run: |
+          if [ ! -x tools/gbdk/bin/lcc ]; then
+            mkdir -p tools
+            curl -fsSL "https://github.com/gbdk-2020/gbdk-2020/releases/download/${GBDK_VERSION}/gbdk-linux64.tar.gz" | tar -xz -C tools
+          fi
+          make -C homebrew GBDK_HOME="$PWD/tools/gbdk/"
+
+      - name: Cache the GBA homebrew nightly
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/nightly-2026-07-22-*
+            ~/.rustup/update-hashes/nightly-2026-07-22-*
+          key: gba-nightly-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('homebrew/gba/rust-toolchain.toml') }}
+
+      - name: Install the GBA homebrew nightly
+        run: rustup toolchain install nightly-2026-07-22 --component rust-src,clippy,rustfmt --profile minimal
+
+      - name: Cache the GBA homebrew build
+        uses: actions/cache@v4
+        with:
+          path: homebrew/gba/target
+          key: gba-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('homebrew/gba/rust-toolchain.toml', 'homebrew/gba/Cargo.lock') }}
+
+      - name: Cache agb-gbafix
+        uses: actions/cache@v4
+        with:
+          path: tools/agb
+          key: agb-gbafix-0.25.0-${{ runner.os }}
+
+      - name: Build GBA homebrew ROMs (agb)
+        run: |
+          if [ ! -x tools/agb/bin/agb-gbafix ]; then
+            cargo install agb-gbafix --version 0.25.0 --locked --root tools/agb
+          fi
+          make -C homebrew gba
+
+      # games/ is what the packager installs: the five ROMs and the licence note.
+      - name: Collect the games
+        run: |
+          mkdir games
+          cp roms/homebrew/*.gb roms/homebrew/*.gba games/
+          cp homebrew/LICENSE.txt games/LICENSE.txt
+          ls -l games
+          count=$(ls games/*.gb games/*.gba | wc -l)
+          if [ "$count" -ne 5 ]; then
+            echo "::error::expected 5 homebrew ROMs, found $count"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundled-games
+          path: games/*
+          if-no-files-found: error
+          retention-days: 14
+
   build:
     name: ${{ matrix.name }}
+    needs: games
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -67,6 +149,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # The packager installs this folder as app resources (see
+      # [package.metadata.packager] resources in crates/gb-frontend/Cargo.toml).
+      - name: Download the bundled games
+        uses: actions/download-artifact@v4
+        with:
+          name: bundled-games
+          path: games
+
+      - name: Check the bundled games
+        run: |
+          ls -l games
+          count=$(ls games/*.gb games/*.gba | wc -l)
+          if [ "$count" -ne 5 ] || [ ! -f games/LICENSE.txt ]; then
+            echo "::error::games/ must hold 5 ROMs and LICENSE.txt"
+            exit 1
+          fi
 
       - name: Resolve the version
         run: |
@@ -162,7 +261,7 @@ jobs:
               ;;
             Windows)
               cp dist/*-setup.exe "release/$stem-setup.exe"
-              pwsh -NoProfile -Command "Compress-Archive -Path target/release/gb.exe -DestinationPath release/$stem-portable.zip"
+              pwsh -NoProfile -Command "Compress-Archive -Path target/release/gb.exe, games -DestinationPath release/$stem-portable.zip"
               ;;
             Linux)
               cp dist/*.AppImage "release/$stem.AppImage"
@@ -170,6 +269,7 @@ jobs:
               cp dist/*.deb "release/$stem.deb"
               mkdir "$stem"
               cp target/release/gb "$stem/"
+              cp -r games "$stem/"
               tar -czf "release/$stem.tar.gz" "$stem"
               ;;
           esac
