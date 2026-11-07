@@ -30,7 +30,7 @@ pub(crate) fn ram_window_offset(addr: u16) -> usize {
 
 /// The memory-bank controller interface every cartridge implements.
 ///
-/// # Contract (frozen; propose changes to the orchestrator)
+/// # Interface
 ///
 /// * `read_rom`/`write_rom` receive CPU addresses `0x0000..=0x7FFF`.
 ///   Writes to this range are MBC register writes.

@@ -1,12 +1,12 @@
-//! The Game Pak: ROM, header, the save backend (SRAM / Flash / EEPROM) and, from
-//! P3-CART, the GPIO port with its S-3511 real-time clock.
+//! The Game Pak: ROM, header, the save backend (SRAM / Flash / EEPROM) and
+//! the GPIO port with its S-3511 real-time clock.
 //!
-//! **Contract:** [`Cart::from_rom`], [`Cart::title`], [`CartError`], and the
-//! region accessors the bus calls.
+//! The bus uses [`Cart::from_rom`], [`Cart::title`], [`CartError`] and the
+//! region accessors.
 //!
 //! **Save image.** `.sav` = the backup chip's bytes, optionally
 //! followed by a 24-byte RTC footer ([`RTC_FOOTER_LEN`], `rtc.rs`). A file with no
-//! footer (every save made before P3-CART, or by a cartridge without a clock)
+//! footer (an older save, or one from a cartridge without a clock)
 //! loads as before; a footer that is present but invalid rejects the whole file.
 //! The footer holds the clock's fields at the cycle the save was taken plus the
 //! sub-second count in emulated cycles, and no host timestamp, so a load is

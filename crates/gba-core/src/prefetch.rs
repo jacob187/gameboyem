@@ -1,4 +1,4 @@
-//! The GamePak prefetch buffer (WAITCNT bit 14), P3-TIMING.
+//! The GamePak prefetch buffer (WAITCNT bit 14).
 //!
 //! The model is lazily evaluated from the master clock, not per cycle: the head
 //! address, the halfwords buffered (0..8), when the halfword being read completes

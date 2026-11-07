@@ -1,6 +1,6 @@
-//! The ARM7TDMI (ARMv4T: ARM + Thumb). Owned by P1-CPU.
+//! The ARM7TDMI (ARMv4T: ARM + Thumb).
 //!
-//! **Contract:** [`Cpu::reset`], [`Cpu::post_bios`], [`Cpu::step`],
+//! Public API: [`Cpu::reset`], [`Cpu::post_bios`], [`Cpu::step`],
 //! [`Cpu::registers`] and [`Registers`]. The CPU is generic over
 //! [`CpuBus`](crate::bus::CpuBus), charges every access through it with the right
 //! [`Access`](crate::bus::Access) kind, and checks `bus.irq_line()` (plus CPSR.I)

@@ -10,7 +10,7 @@
 #
 # Each line is one `cargo test -p gb-test --test roms` case. A case FAILS when
 # the actual outcome differs from `expect` in either direction, so flipping a
-# line from `fail` to `pass` is how a phase records progress, and regressions
+# line from `fail` to `pass` is how progress is recorded, and regressions
 # are caught. Paths may contain spaces (path is the rest of the line).
 
 # --- Blargg (serial output "Passed"/"Failed") ---

@@ -1,4 +1,4 @@
-//! I/O register dispatch (0x0400_0000..0x0400_0400). Owned by P1-SYS.
+//! I/O register dispatch (0x0400_0000..0x0400_0400).
 //!
 //! Registers are 16-bit with a byte-lane write mask; 8-bit accesses use one lane
 //! and 32-bit accesses are two halfword accesses, low half first (so a 32-bit
@@ -63,7 +63,7 @@ impl Bus {
     pub fn read_io16(&self, off: u32) -> u16 {
         match off {
             0x000..=0x05F => self.ppu.read_io(off),
-            // P2-APU: the sound registers live in the APU (it applies the read masks).
+            // The sound registers live in the APU (it applies the read masks).
             0x060..=0x09F => self.apu.read_reg(off),
             0x0A0..=0x0A7 => 0, // FIFOs are write-only
             0x0B0..=0x0DF => self.dma.read_reg(off - 0xB0),
@@ -92,7 +92,7 @@ impl Bus {
     pub fn write_io16(&mut self, off: u32, v: u16, mask: u16) {
         match off {
             0x000..=0x05F => self.ppu.write_io(off, v, mask),
-            // P2-APU: sync the APU to the clock, then write.
+            // Sync the APU to the clock, then write.
             0x060..=0x09F => {
                 self.apu.advance_to(self.sched.now());
                 self.apu.write_reg(off, v, mask);
@@ -244,7 +244,7 @@ impl Bus {
                 self.irq.raise(Interrupt::timer(n));
             }
             if n < 2 && self.timers.sound[n] {
-                // P2-APU: the FIFO pop lands at the overflow's own time.
+                // The FIFO pop lands at the overflow's own time.
                 self.apu.advance_to(at);
                 let req = self.apu.on_timer_overflow(n);
                 if req.a {

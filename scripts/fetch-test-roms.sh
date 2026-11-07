@@ -82,7 +82,7 @@ fetch "$ACID2_REF_URL" dmg-acid2/reference-dmg.png "$ACID2_REF_SHA256"
 fetch "$CGB_ACID2_URL" cgb-acid2/cgb-acid2.gbc "$CGB_ACID2_SHA256"
 fetch "$CGB_ACID2_REF_URL" cgb-acid2/reference.png "$CGB_ACID2_REF_SHA256"
 
-# --- CGB: speed switch, double speed, HDMA (phase P2) ---
+# --- CGB: speed switch, double speed, HDMA ---
 # Blargg cgb_sound (same retrio mirror commit as above; memory protocol like dmg_sound).
 # These go in their own directory: roms/test/blargg may be a symlink to another checkout.
 fetch "$B/cgb_sound/cgb_sound.gb" cgb_sound/cgb_sound.gb

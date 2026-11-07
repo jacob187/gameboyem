@@ -18,9 +18,7 @@
 //! Direct Sound FIFOs), `bios/` (the high-level BIOS), `cart/` (ROM, backup
 //! chips, the GPIO port and its clock); the system pieces `bus`, `memory`, `io`,
 //! `dma`, `timer`, `irq`, `keypad`, `prefetch` and `scheduler`; and `gba` (the
-//! whole machine) with its `replay` and save-state (`state`) support. The types
-//! and functions marked **Contract** are frozen; changing one is a contract
-//! change.
+//! whole machine) with its `replay` and save-state (`state`) support.
 #![forbid(unsafe_code)]
 
 pub mod apu;

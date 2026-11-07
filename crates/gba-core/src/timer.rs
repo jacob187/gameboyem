@@ -1,5 +1,4 @@
-//! The four timers (0x0400_0100..0x0400_0110), prescalers and cascade. Owned by
-//! P1-SYS. GBATEK "GBA Timers".
+//! The four timers (0x0400_0100..0x0400_0110), prescalers and cascade. GBATEK "GBA Timers".
 //!
 //! Nothing is ticked. A running timer remembers the time `start` at which its
 //! `counter` was valid and counts `(now - start) >> shift` prescaled ticks since;

@@ -1,7 +1,7 @@
 //! The system bus: the memory interface the CPU codes against ([`CpuBus`]) and
 //! the concrete [`Bus`] that owns every other component.
 //!
-//! # Contract (frozen; propose changes to the orchestrator)
+//! # Interface
 //!
 //! * Every [`CpuBus::read`] / [`CpuBus::write`] costs exactly **one M-cycle**
 //!   (4 T-cycles), and the rest of the machine is advanced by that M-cycle

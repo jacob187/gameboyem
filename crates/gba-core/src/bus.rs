@@ -1,8 +1,8 @@
 //! The system bus: wait-state accounting, event dispatch and the [`CpuBus`] impl.
 //!
-//! [`CpuBus`], [`Access`] and [`SwiResult`] are the **Contract** between the CPU
+//! [`CpuBus`], [`Access`] and [`SwiResult`] are the interface between the CPU
 //! and everything else; the CPU is generic over `CpuBus`, so its tests can use a
-//! flat-memory stub. [`Bus`] itself is owned by the system agent. The memory map
+//! flat-memory stub. The memory map
 //! (region reads/writes) lives in `memory.rs`, the I/O registers in `io.rs`.
 //!
 //! # How time is charged
@@ -59,7 +59,7 @@ pub enum SwiResult {
     WaitThenRetry,
 }
 
-/// The CPU's view of the bus. **Contract.**
+/// The CPU's view of the bus.
 ///
 /// Addresses arrive as the CPU computed them; the bus aligns them down to the
 /// access width (`addr & !1` / `addr & !3`). Rotating a misaligned load result is
@@ -178,7 +178,7 @@ pub struct Bus {
     pub fetching_bios: bool,
     /// POSTFLG (0x0400_0300, low byte).
     pub postflg: u8,
-    /// P2-BIOS: an HLE IntrWait/VBlankIntrWait is waiting, with the interrupt
+    /// An HLE IntrWait/VBlankIntrWait is waiting, with the interrupt
     /// flags it waits for. Save-state data.
     pub intr_wait: Option<u16>,
     /// FIFO A/B words being assembled from halfword/byte writes.
@@ -209,7 +209,7 @@ impl Bus {
             prefetch: Prefetch::default(),
             open_bus: 0,
             // What the BIOS leaves behind after startup (GBATEK "BIOS Memory
-            // Protection"); P2-BIOS refines it.
+            // Protection").
             bios_latch: 0xE129_F000,
             fetching_bios: false,
             postflg: 0,
@@ -218,7 +218,7 @@ impl Bus {
             sio_regs: [0; 0x20],
         };
         bus.ppu.start(&mut bus.sched);
-        // P2-APU: the sound clock pump (see `Apu::advance_to`).
+        // The sound clock pump (see `Apu::advance_to`).
         bus.sched
             .schedule(Event::ApuSample, crate::apu::PUMP_CYCLES);
         bus
@@ -362,7 +362,7 @@ impl Bus {
                     }
                 }
                 Event::TimerOverflow(n) => self.timer_overflow(usize::from(n), at),
-                // P2-APU: bring the APU up to date and re-arm the pump from its
+                // Bring the APU up to date and re-arm the pump from its
                 // own timestamp. The APU is exact without it (it also syncs on
                 // register writes, FIFO timer overflows and drains); the pump just
                 // bounds how stale its flags and buffered samples can get.

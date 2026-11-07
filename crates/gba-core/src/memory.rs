@@ -1,5 +1,4 @@
-//! The memory map: region reads and writes by address and width. Owned by
-//! P1-SYS. GBATEK "GBA Memory Map".
+//! The memory map: region reads and writes by address and width. GBATEK "GBA Memory Map".
 //!
 //! Decode is on `addr >> 24`; RAM regions are direct little-endian slice accesses
 //! on the width-aligned offset, never per-byte composition. Wait-state costs are
@@ -57,7 +56,7 @@ impl Bus {
         if w == Width::H && self.cart.eeprom_at(addr) {
             return u32::from(self.cart.eeprom_read());
         }
-        // P2-APU: a sound register or wave RAM read sees the
+        // A sound register or wave RAM read sees the
         // APU at the current cycle, not at the last sync. `peek*` stays pure.
         if addr >> 24 == 4 && (0x60..0xA0).contains(&(addr & 0x00FF_FFFF)) {
             self.apu.advance_to(self.sched.now());
@@ -120,7 +119,7 @@ impl Bus {
     pub(crate) fn read_rom(&self, addr: u32, w: Width) -> u32 {
         let off = addr & 0x01FF_FFFF;
         if self.cart.gpio_reads() {
-            // P3-CART: the GPIO port overlays ROM at 0xC4..0xC9 once enabled.
+            // The GPIO port overlays ROM at 0xC4..0xC9 once enabled.
             if let Some(v) = self.cart.gpio_read(off, w) {
                 return v;
             }
@@ -176,7 +175,7 @@ impl Bus {
             0x0D if w == Width::H && self.cart.eeprom_at(addr) => {
                 self.cart.eeprom_write(v as u16);
             }
-            // P3-CART: stores to the GPIO registers (0xC4..0xC9 of ROM space).
+            // Stores to the GPIO registers (0xC4..0xC9 of ROM space).
             0x08..=0x0D if (0xC4..0xCA).contains(&(addr & 0x01FF_FFFF)) => {
                 let now = self.sched.now();
                 if self.cart.gpio_write(addr & 0x01FF_FFFF, v, w, now) {

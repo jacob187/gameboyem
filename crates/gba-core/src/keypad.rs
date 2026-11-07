@@ -1,5 +1,4 @@
-//! Keypad: KEYINPUT (0x0400_0130, active-low) and KEYCNT (0x0400_0132). Owned by
-//! P1-SYS; [`Button`] is a **Contract**.
+//! Keypad: KEYINPUT (0x0400_0130, active-low) and KEYCNT (0x0400_0132).
 
 use crate::state::{StateError, check};
 use emu_common::state::{StateReader, StateWriter};

@@ -120,7 +120,7 @@ impl GameBoy {
 
     /// Execute one CPU step (instruction, interrupt dispatch or halted cycle).
     /// A CGB speed-switch `STOP` is one step too, and advances the clock by up to
-    /// `32768 + 2` M-cycles (see `Cpu`'s contract).
+    /// `32768 + 2` M-cycles (see the `Cpu` docs).
     pub fn step_instruction(&mut self) {
         self.cpu.step(&mut self.bus);
     }

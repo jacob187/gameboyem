@@ -1,12 +1,11 @@
-//! The PPU: display timing, the LCD I/O registers and rendering. Owned by the PPU
-//! agent; the items marked **Contract** are frozen.
+//! The PPU: display timing, the LCD I/O registers and rendering.
 //!
-//! Memory contract: the bus owns access semantics (mirroring, 8-bit write rules,
+//! Memory: the bus owns access semantics (mirroring, 8-bit write rules,
 //! wait states) and reads/writes `palette`, `vram` and `oam` directly. The PPU
 //! only reads them while rendering. I/O 0x000..0x05F (DISPCNT..BLDY) goes through
 //! [`Ppu::read_io`] / [`Ppu::write_io`] at 16-bit granularity with a byte-lane mask.
 //!
-//! Timing contract: [`Ppu::start`] schedules the first events; the bus hands every
+//! Timing: [`Ppu::start`] schedules the first events; the bus hands every
 //! PPU event (`PpuFirstLine`, `PpuRender`, `PpuHBlank`, `PpuLineEnd`) to
 //! [`Ppu::on_event`], which reschedules the next ones and returns the
 //! [`PpuSignals`] for the bus to apply.
@@ -47,7 +46,7 @@ const STAT_WRITE_MASK: u16 = 0xFF38;
 const VBLANK_FIRST_LINE: u16 = 160;
 const VBLANK_LAST_FLAG_LINE: u16 = 226;
 
-/// What the bus must do after a PPU event. **Contract.**
+/// What the bus must do after a PPU event.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PpuSignals {
     /// IF bits to raise (VBlank / HBlank / VCount, already gated by DISPSTAT).
@@ -61,11 +60,11 @@ pub struct PpuSignals {
 }
 
 pub struct Ppu {
-    /// 1 KiB palette RAM (BG 0x000..0x200, OBJ 0x200..0x400). **Contract.**
+    /// 1 KiB palette RAM (BG 0x000..0x200, OBJ 0x200..0x400).
     pub palette: Box<[u8; 0x400]>,
-    /// 96 KiB VRAM. **Contract.**
+    /// 96 KiB VRAM.
     pub vram: Box<[u8; 0x1_8000]>,
-    /// 1 KiB OAM. **Contract.**
+    /// 1 KiB OAM.
     pub oam: Box<[u8; 0x400]>,
     /// The I/O registers 0x000..0x060 as halfwords, exactly as written (reads
     /// apply per-register masks, see [`Ppu::read_io`]).
@@ -167,7 +166,7 @@ impl Ppu {
     }
 
     /// Schedule the first line's events, relative to the current clock (line 0
-    /// starts now). **Contract.**
+    /// starts now).
     pub fn start(&mut self, sched: &mut Scheduler) {
         sched.schedule(Event::PpuFirstLine, 0);
         sched.schedule(Event::PpuRender, u64::from(RENDER_CYCLES));
@@ -175,7 +174,7 @@ impl Ppu {
         sched.schedule(Event::PpuLineEnd, u64::from(CYCLES_PER_LINE));
     }
 
-    /// Handle a PPU event that fell due at `at`. **Contract.**
+    /// Handle a PPU event that fell due at `at`.
     pub fn on_event(&mut self, event: Event, at: u64, sched: &mut Scheduler) -> PpuSignals {
         let mut sig = PpuSignals::default();
         let stat = self.io[STAT_INDEX];
@@ -227,7 +226,7 @@ impl Ppu {
         sig
     }
 
-    /// Read I/O halfword at offset `off` (even, 0x000..0x05F). **Contract.**
+    /// Read I/O halfword at offset `off` (even, 0x000..0x05F).
     ///
     /// Write-only registers (scroll, affine parameters, window sizes, MOSAIC,
     /// BLDY) read as 0.
@@ -259,7 +258,7 @@ impl Ppu {
         }
     }
 
-    /// Write I/O halfword at `off`; `mask` selects the byte lanes. **Contract.**
+    /// Write I/O halfword at `off`; `mask` selects the byte lanes.
     pub fn write_io(&mut self, off: u32, v: u16, mask: u16) {
         let i = (off as usize >> 1) % self.io.len();
         let mask = if i == STAT_INDEX {
@@ -314,12 +313,12 @@ impl Ppu {
         }
     }
 
-    /// DISPCNT (the bus needs the BG mode for VRAM 8-bit write rules). **Contract.**
+    /// DISPCNT (the bus needs the BG mode for VRAM 8-bit write rules).
     pub fn dispcnt(&self) -> u16 {
         self.io[0]
     }
 
-    /// The last completed frame. **Contract.**
+    /// The last completed frame.
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.front
     }

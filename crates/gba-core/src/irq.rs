@@ -1,5 +1,5 @@
 //! Interrupt controller: IE (0x0400_0200), IF (0x0400_0202), IME (0x0400_0208).
-//! **Contract.** GBATEK "GBA Interrupt Control".
+//! GBATEK "GBA Interrupt Control".
 
 use crate::state::{StateError, check};
 use emu_common::state::{StateReader, StateWriter};

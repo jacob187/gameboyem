@@ -1,6 +1,7 @@
 //! Sound: four PSG channels, Direct Sound FIFO A/B, and the SOUNDCNT/SOUNDBIAS
-//! mixer (GBATEK "GBA Sound Controller"). Built in phase P2 (P2-APU).
-//! **Contract** for the bus: FIFO writes (0x0400_00A0 / 0x0400_00A4) and
+//! mixer (GBATEK "GBA Sound Controller").
+//!
+//! The bus drives it through FIFO writes (0x0400_00A0 / 0x0400_00A4) and
 //! [`Apu::on_timer_overflow`].
 //!
 //! # Timing and resampling
@@ -266,7 +267,7 @@ impl Apu {
     }
 
     /// Timer `n` (0 or 1) overflowed: FIFOs clocked by it pop a sample, and any
-    /// that fall to 16 bytes or fewer request a refill. **Contract.** The bus
+    /// that fall to 16 bytes or fewer request a refill. The bus
     /// calls [`Apu::advance_to`] with the overflow's time first.
     pub fn on_timer_overflow(&mut self, n: usize) -> FifoRequest {
         let cnt_h = self.regs[Self::index(SOUNDCNT_H)];
@@ -291,14 +292,14 @@ impl Apu {
     }
 
     /// A 32-bit write to FIFO A (`b = false`) or B: four signed 8-bit samples,
-    /// lowest byte first. **Contract.**
+    /// lowest byte first.
     pub fn write_fifo(&mut self, b: bool, value: u32) {
         self.fifo[usize::from(b)].push_word(value);
     }
 
     /// Append the stereo samples produced since the last call, interleaved
     /// `[l, r, l, r, ...]` in -1.0..=1.0 at [`Apu::sample_rate`], the same
-    /// format as `gb-core`. **Contract.** The stream covers the time the APU
+    /// format as `gb-core`. The stream covers the time the APU
     /// has been run to; [`crate::Gba::drain_audio_into`] syncs it to the
     /// clock first. 0.0 is the SOUNDBIAS centre (0x200): silence with the
     /// default bias.
@@ -306,12 +307,12 @@ impl Apu {
         out.append(&mut self.samples);
     }
 
-    /// Host output rate in Hz. **Contract.**
+    /// Host output rate in Hz.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
-    /// Set the host output rate (clamped to 8 kHz..=192 kHz). **Contract.**
+    /// Set the host output rate (clamped to 8 kHz..=192 kHz).
     /// Applies to the cycles run after this call: sync with [`Apu::advance_to`]
     /// first (`Gba::set_audio_sample_rate` does). The sample phase carries over
     /// as a fraction of a sample, so the total count across a change is

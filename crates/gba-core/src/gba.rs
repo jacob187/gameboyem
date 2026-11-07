@@ -1,4 +1,4 @@
-//! The public emulator facade and the run loop. Owned by P1-SYS.
+//! The public emulator facade and the run loop.
 
 use crate::bios::Bios;
 use crate::bus::Bus;
@@ -87,7 +87,7 @@ impl Gba {
         let hle = matches!(bios, Bios::Hle);
         let mut bus = Bus::new(cart, bios);
         if hle {
-            // P2-BIOS: the I/O and IWRAM state the BIOS leaves (POSTFLG, SOUNDBIAS, the zeroed top of IWRAM).
+            // The I/O and IWRAM state the BIOS leaves (POSTFLG, SOUNDBIAS, the zeroed top of IWRAM).
             crate::bios::post_boot(&mut bus);
         }
         Ok(Self {
@@ -133,7 +133,7 @@ impl Gba {
         }
         // Dispatch only when something is due, or while halted (the wake check at
         // the end of `process_events` is what ends a halt). Most instructions
-        // cross no event, and the call is not free (P3-TIMING).
+        // cross no event, and the call is not free.
         let now = self.bus.sched.now();
         if self.bus.halted || self.bus.sched.next_at().is_some_and(|t| t <= now) {
             self.bus.process_events();
@@ -161,8 +161,8 @@ impl Gba {
     /// Append the audio produced since the last call (interleaved stereo f32,
     /// see `Apu::drain_samples`).
     pub fn drain_audio_into(&mut self, out: &mut Vec<f32>) {
-        // P2-APU: run the APU up to the clock first, so the audio covers exactly
-        // the emulated time elapsed (signature and contract unchanged).
+        // Run the APU up to the clock first, so the audio covers exactly the
+        // emulated time elapsed.
         self.bus.apu.advance_to(self.bus.sched.now());
         self.bus.apu.drain_samples(out);
     }
@@ -172,7 +172,7 @@ impl Gba {
     }
 
     pub fn set_audio_sample_rate(&mut self, hz: u32) {
-        // P2-APU: cycles already elapsed are accounted at the
+        // Cycles already elapsed are accounted at the
         // old rate; the new one applies from now on.
         self.bus.apu.advance_to(self.bus.sched.now());
         self.bus.apu.set_sample_rate(hz);
@@ -447,7 +447,7 @@ mod tests {
     }
 
     /// `step_once(false)` without the dispatch gate: events are processed after
-    /// every step, as the run loop did before P3-TIMING.
+    /// every step, whether or not anything is due.
     fn step_ungated(g: &mut Gba) {
         if g.bus.dma.active_channel().is_some() {
             g.bus.run_dma();

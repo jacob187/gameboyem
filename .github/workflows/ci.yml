@@ -166,7 +166,7 @@ jobs:
       - name: Check gb-core, gba-core, emu-common and gb-test on the MSRV
         run: cargo check -p gb-core -p gba-core -p gb-test -p emu-common --all-targets
 
-  # Phase 8. Non-blocking: a Windows failure never fails the workflow.
+  # Non-blocking: a Windows failure never fails the workflow.
   # Homebrew ROMs come from the Linux leg (GBDK + make on Windows runners
   # would add a second toolchain path for no extra coverage of our code).
   windows:

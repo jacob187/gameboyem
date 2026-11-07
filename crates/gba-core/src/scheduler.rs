@@ -1,12 +1,9 @@
-//! The master clock and the cycle-stamped event queue. **Contract.**
+//! The master clock and the cycle-stamped event queue.
 //!
 //! Components never tick per cycle. They schedule an [`Event`] at an absolute
 //! timestamp and the bus dispatches it once the clock reaches that time (after the
 //! instruction or DMA unit that crossed it). Ties are broken by insertion order, so
 //! dispatch order is deterministic.
-//!
-//! Adding a variant to [`Event`] is allowed (additive); changing the API is a
-//! contract change.
 
 use crate::state::{MAX_CLOCK, StateError, check};
 use emu_common::state::{StateReader, StateWriter};

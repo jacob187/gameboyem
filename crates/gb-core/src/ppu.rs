@@ -1,7 +1,7 @@
 //! Pixel processing unit (Pan Docs: "Rendering", "LCD Control", "LCD Status",
 //! "Scrolling", "Palettes", "OAM", "STAT" / "STAT interrupt").
 //!
-//! # Contract (frozen; propose changes to the orchestrator)
+//! # Interface
 //!
 //! * [`Ppu::new`] creates the PPU in the DMG post-boot state ([`Ppu::new_cgb`]:
 //!   the CGB one).

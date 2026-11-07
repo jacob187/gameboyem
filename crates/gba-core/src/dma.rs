@@ -1,8 +1,8 @@
-//! The four DMA channels (0x0400_00B0..0x0400_00E0). Owned by P1-SYS. GBATEK
+//! The four DMA channels (0x0400_00B0..0x0400_00E0). GBATEK
 //! "GBA DMA Transfers".
 //!
-//! **Contract:** [`DmaTrigger`] and [`Dma::trigger`] — the PPU's signals and the
-//! APU's FIFO requests reach DMA only through them (via the bus). The bus runs an
+//! The PPU's signals and the APU's FIFO requests reach DMA only through
+//! [`DmaTrigger`] and [`Dma::trigger`] (via the bus). The bus runs an
 //! active transfer instead of the CPU ([`Bus::run_dma`]), one unit at a time:
 //! each unit is a read then a write, charged N for the first unit of a transfer
 //! and S for the rest. The 2-cycle start delay (4 when both ends are cartridge
@@ -13,7 +13,7 @@ use crate::irq::Interrupt;
 use crate::state::{StateError, check};
 use emu_common::state::{StateReader, StateWriter};
 
-/// Why a DMA might start. **Contract.**
+/// Why a DMA might start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmaTrigger {
     /// Start timing 0 (immediately, after the 2-cycle start delay).
@@ -143,7 +143,7 @@ impl Dma {
         Ok(())
     }
 
-    /// Start every enabled channel whose start timing matches `t`. **Contract.**
+    /// Start every enabled channel whose start timing matches `t`.
     pub fn trigger(&mut self, t: DmaTrigger) {
         for n in 0..4 {
             let c = &mut self.ch[n];

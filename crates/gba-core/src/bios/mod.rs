@@ -4,8 +4,8 @@
 //! starts in the state the BIOS leaves behind (System mode, PC 0x0800_0000, the
 //! documented stack pointers), skipping the boot logo.
 //!
-//! **Contract:** [`Bios`], [`Bios::read8`], and [`swi`], which the bus's
-//! `CpuBus::swi` forwards to.
+//! The bus uses [`Bios`], [`Bios::read8`] and [`swi`] (which `CpuBus::swi`
+//! forwards to).
 //!
 //! With [`Bios::Hle`], most SWIs finish in Rust ([`swi`] returns `Done` or
 //! `WaitThenRetry`). SoftReset and HardReset change PC and the banked registers,

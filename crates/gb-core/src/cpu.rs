@@ -1,7 +1,7 @@
 //! Sharp SM83 CPU (Pan Docs: "CPU Registers and Flags", "CPU Instruction Set",
 //! "Interrupts", "halt").
 //!
-//! # Contract (frozen; propose changes to the orchestrator)
+//! # Interface
 //!
 //! * [`Cpu::step`] executes exactly one of: an interrupt dispatch, one halted
 //!   M-cycle, or one instruction. All cycle cost is paid through the
