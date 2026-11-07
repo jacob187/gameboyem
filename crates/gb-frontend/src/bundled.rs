@@ -6,17 +6,18 @@
 //! executable; [`register_all`] lists its ROMs in the library, in place (nothing is
 //! copied; saves still go to the app folder).
 //!
-//! Where `games` is, relative to the executable `exe` (first match that is a folder):
+//! Where `games` is, relative to the executable (first match that is a folder):
 //!
 //! | Package | Executable | Games |
 //! |---------|------------|-------|
-//! | AppImage | `$APPDIR/usr/bin/gb` | `$APPDIR/usr/lib/gb/games` |
-//! | macOS `.app` | `X.app/Contents/MacOS/gb` | `X.app/Contents/Resources/games` |
-//! | `.deb` | `/usr/bin/gb` | `/usr/lib/gb/games` (the packager uses `usr/lib/<binary name>`) |
 //! | Windows installer, portable zip, Linux `.tar.gz` | `<dir>/gb[.exe]` | `<dir>/games` |
+//! | macOS `.app` | `X.app/Contents/MacOS/gb` | `X.app/Contents/Resources/games` |
+//! | `.deb`, AppImage (`$APPDIR/usr/bin/gb`) | `<root>/bin/gb` | `<root>/lib/gb/games` (the packager uses `usr/lib/<binary name>`) |
 //!
-//! `../lib/gameboyem/games` and `../share/gameboyem/games` are tried as well, for a
-//! package built by other means.
+//! `<root>/lib/gameboyem/games` and `<root>/share/gameboyem/games` are tried as well
+//! for a `bin` executable, for a package built by other means. The `games` folder
+//! beside the executable is tried first, and the other two layouts only fit their own
+//! executable folder, so an unrelated folder cannot be picked up by mistake.
 //!
 //! A development build (`cargo run`, running from `target/`) has no such folder and
 //! bundles nothing: it does not fall back to `roms/homebrew`. To try the games there,
@@ -28,9 +29,10 @@ use std::path::{Path, PathBuf};
 
 use crate::library::{BundledReport, Library};
 
-/// Environment variable that names the bundled games folder directly (development,
-/// tests). It wins over the layouts above and is used as given, even if it is not a
-/// folder, so a wrong value shows up as a warning rather than silently bundling nothing.
+/// Environment variable that names the bundled games folder directly. A developer
+/// override (a build run from `target/`, tests), not a setting for players. It must
+/// be an existing folder; anything else is logged as a warning and ignored. When it
+/// is valid it wins over the layouts above.
 pub const ENV_BUNDLED_DIR: &str = "GAMEBOYEM_BUNDLED_DIR";
 
 /// Name of the folder inside the package.
@@ -44,45 +46,49 @@ pub fn bundled_games_dir() -> Option<PathBuf> {
     resolve(
         std::env::current_exe().ok().as_deref(),
         std::env::var_os(ENV_BUNDLED_DIR),
-        std::env::var_os("APPDIR"),
     )
 }
 
-/// [`bundled_games_dir`] over its inputs: the executable's path, the value of
-/// `GAMEBOYEM_BUNDLED_DIR` and the value of `APPDIR`. The same candidates are tried on
-/// every OS (only the ones that exist as folders match), so each layout is testable
-/// anywhere.
-fn resolve(
-    exe: Option<&Path>,
-    override_dir: Option<OsString>,
-    appdir: Option<OsString>,
-) -> Option<PathBuf> {
+/// [`bundled_games_dir`] over its inputs: the executable's path and the value of
+/// `GAMEBOYEM_BUNDLED_DIR`. The same candidates are tried on every OS (only the ones
+/// that exist as folders match), so each layout is testable anywhere.
+fn resolve(exe: Option<&Path>, override_dir: Option<OsString>) -> Option<PathBuf> {
     if let Some(dir) = override_dir.filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(dir));
+        let dir = PathBuf::from(dir);
+        if dir.is_dir() {
+            return Some(dir);
+        }
+        log::warn!(
+            "{ENV_BUNDLED_DIR} is set to {}, which is not a folder; ignoring it",
+            dir.display()
+        );
     }
     let exe = exe?;
     let exe_name = exe.file_name()?;
     let exe_dir = exe.parent()?;
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    // Inside a mounted AppImage. A stale APPDIR inherited from another AppImage is
-    // ignored: the executable must really be under it.
-    if let Some(appdir) = appdir.filter(|v| !v.is_empty()).map(PathBuf::from)
-        && exe.starts_with(&appdir)
-    {
-        candidates.push(appdir.join("usr/lib").join(exe_name).join(GAMES));
-        candidates.push(appdir.join("usr/lib").join(APP_DIR).join(GAMES));
-        candidates.push(appdir.join("usr/share").join(APP_DIR).join(GAMES));
-    }
-    // `exe_dir` is `<root>/bin` or `Contents/MacOS`; its parent is the package root.
-    // The paths are built without `..` so the library index holds clean paths.
+    let dir_name = |p: &Path| p.file_name().map(|n| n.to_owned());
+    // Beside the executable first (Windows, the archives): the one layout that is not
+    // tied to a folder name.
+    let mut candidates: Vec<PathBuf> = vec![exe_dir.join(GAMES)];
     if let Some(root) = exe_dir.parent() {
-        candidates.push(root.join("Resources").join(GAMES));
-        candidates.push(root.join("lib").join(exe_name).join(GAMES));
-        candidates.push(root.join("lib").join(APP_DIR).join(GAMES));
-        candidates.push(root.join("share").join(APP_DIR).join(GAMES));
+        // `X.app/Contents/MacOS/gb`: the resources are `X.app/Contents/Resources`.
+        let in_app_bundle = dir_name(exe_dir).is_some_and(|n| n == "MacOS")
+            && dir_name(root).is_some_and(|n| n == "Contents")
+            && root
+                .parent()
+                .and_then(Path::extension)
+                .is_some_and(|e| e == "app");
+        if in_app_bundle {
+            candidates.push(root.join("Resources").join(GAMES));
+        }
+        // `<root>/bin/gb` (a .deb, an AppImage's `usr/bin`): `<root>/lib/<exe>`.
+        // The paths are built without `..` so the library index holds clean paths.
+        if dir_name(exe_dir).is_some_and(|n| n == "bin") {
+            candidates.push(root.join("lib").join(exe_name).join(GAMES));
+            candidates.push(root.join("lib").join(APP_DIR).join(GAMES));
+            candidates.push(root.join("share").join(APP_DIR).join(GAMES));
+        }
     }
-    // Last, so an unrelated `games` folder next to a `gb` on the PATH is the least likely match.
-    candidates.push(exe_dir.join(GAMES));
     candidates.into_iter().find(|dir| dir.is_dir())
 }
 
@@ -150,7 +156,27 @@ mod tests {
         let games = mkdir(&app.join("Resources/games"));
         mkdir(&app.join("MacOS"));
         let exe = app.join("MacOS/gb");
-        assert_eq!(resolve(Some(&exe), None, None), Some(games));
+        assert_eq!(resolve(Some(&exe), None), Some(games));
+    }
+
+    #[test]
+    fn resources_folder_only_counts_inside_an_app_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `Resources/games` beside an unrelated folder is not a bundle's.
+        mkdir(&tmp.path().join("Contents/Resources/games"));
+        for exe in [
+            "Contents/MacOS/gb",     // no .app around it
+            "other/Contents/bin/gb", // not MacOS
+            "x.app/Resources/gb",
+        ] {
+            let exe = tmp.path().join(exe);
+            assert_eq!(resolve(Some(&exe), None), None, "{}", exe.display());
+        }
+        mkdir(&tmp.path().join("x.app/Resources/games"));
+        assert_eq!(
+            resolve(Some(&tmp.path().join("x.app/Contents/MacOS/gb")), None),
+            None
+        );
     }
 
     #[test]
@@ -159,7 +185,7 @@ mod tests {
         let games = mkdir(&tmp.path().join("gameboyem-0.1.0-linux/games"));
         for name in ["gb", "gb.exe"] {
             let exe = tmp.path().join("gameboyem-0.1.0-linux").join(name);
-            assert_eq!(resolve(Some(&exe), None, None), Some(games.clone()));
+            assert_eq!(resolve(Some(&exe), None), Some(games.clone()));
         }
     }
 
@@ -169,7 +195,19 @@ mod tests {
         let games = mkdir(&tmp.path().join("usr/lib/gb/games"));
         mkdir(&tmp.path().join("usr/bin"));
         let exe = tmp.path().join("usr/bin/gb");
-        assert_eq!(resolve(Some(&exe), None, None), Some(games));
+        assert_eq!(resolve(Some(&exe), None), Some(games));
+    }
+
+    #[test]
+    fn appimage_layout_resolves_inside_the_mounted_appdir() {
+        // The AppImage's executable is `$APPDIR/usr/bin/gb`, the games
+        // `$APPDIR/usr/lib/gb/games`; no APPDIR variable is needed.
+        let tmp = tempfile::tempdir().unwrap();
+        let appdir = tmp.path().join("tmp/.mount_gbXYZ");
+        let games = mkdir(&appdir.join("usr/lib/gb/games"));
+        mkdir(&appdir.join("usr/bin"));
+        let exe = appdir.join("usr/bin/gb");
+        assert_eq!(resolve(Some(&exe), None), Some(games));
     }
 
     #[test]
@@ -177,60 +215,60 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("a");
         let games = mkdir(&lib.join("lib/gameboyem/games"));
-        assert_eq!(resolve(Some(&lib.join("bin/gb")), None, None), Some(games));
+        assert_eq!(resolve(Some(&lib.join("bin/gb")), None), Some(games));
 
         let share = tmp.path().join("b");
         let games = mkdir(&share.join("share/gameboyem/games"));
-        assert_eq!(
-            resolve(Some(&share.join("bin/gb")), None, None),
-            Some(games)
-        );
+        assert_eq!(resolve(Some(&share.join("bin/gb")), None), Some(games));
     }
 
     #[test]
-    fn appimage_uses_appdir() {
+    fn lib_layouts_only_count_for_an_exe_in_a_bin_folder() {
         let tmp = tempfile::tempdir().unwrap();
-        let appdir = tmp.path().join("tmp/.mount_gbXYZ");
-        let games = mkdir(&appdir.join("usr/lib/gb/games"));
-        let exe = appdir.join("usr/bin/gb");
-        assert_eq!(
-            resolve(Some(&exe), None, os(appdir.as_os_str())),
-            Some(games.clone())
-        );
-        // Without APPDIR the relative layout finds the same folder.
-        assert_eq!(resolve(Some(&exe), None, None), Some(games));
+        mkdir(&tmp.path().join("lib/gb/games"));
+        mkdir(&tmp.path().join("share/gameboyem/games"));
+        assert_eq!(resolve(Some(&tmp.path().join("sbin/gb")), None), None);
+        assert_eq!(resolve(Some(&tmp.path().join("gb")), None), None);
     }
 
     #[test]
-    fn a_stale_appdir_from_elsewhere_is_ignored() {
+    fn games_beside_the_exe_win_over_the_package_layouts() {
         let tmp = tempfile::tempdir().unwrap();
-        let other = tmp.path().join("other.AppDir");
-        mkdir(&other.join("usr/lib/gb/games"));
-        let exe = tmp.path().join("install/gb");
-        let games = mkdir(&tmp.path().join("install/games"));
+        mkdir(&tmp.path().join("usr/lib/gb/games"));
+        let beside = mkdir(&tmp.path().join("usr/bin/games"));
         assert_eq!(
-            resolve(Some(&exe), None, os(other.as_os_str())),
-            Some(games)
+            resolve(Some(&tmp.path().join("usr/bin/gb")), None),
+            Some(beside)
         );
     }
 
     #[test]
-    fn the_override_wins_and_is_used_as_given() {
+    fn the_override_wins_when_it_is_a_folder() {
         let tmp = tempfile::tempdir().unwrap();
         mkdir(&tmp.path().join("pkg/games"));
         let exe = tmp.path().join("pkg/gb");
-        let custom = tmp.path().join("roms/homebrew");
+        let custom = mkdir(&tmp.path().join("roms/homebrew"));
         assert_eq!(
-            resolve(Some(&exe), os(custom.as_os_str()), None),
-            Some(custom.clone()),
-            "used even though it does not exist"
+            resolve(Some(&exe), os(custom.as_os_str())),
+            Some(custom.clone())
         );
-        mkdir(&custom);
+        assert_eq!(resolve(None, os(custom.as_os_str())), Some(custom));
+    }
+
+    #[test]
+    fn an_override_that_is_not_a_folder_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let games = mkdir(&tmp.path().join("pkg/games"));
+        let exe = tmp.path().join("pkg/gb");
+        let missing = tmp.path().join("roms/homebrew");
+        assert_eq!(resolve(Some(&exe), os(missing.as_os_str())), Some(games));
+        let file = tmp.path().join("a-file");
+        fs::write(&file, b"x").unwrap();
         assert_eq!(
-            resolve(Some(&exe), os(custom.as_os_str()), None),
-            Some(custom)
+            resolve(Some(&exe), os(file.as_os_str())),
+            Some(tmp.path().join("pkg/games"))
         );
-        assert_eq!(resolve(None, os("/x"), None), Some(PathBuf::from("/x")));
+        assert_eq!(resolve(None, os(missing.as_os_str())), None);
     }
 
     #[test]
@@ -238,7 +276,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let games = mkdir(&tmp.path().join("pkg/games"));
         let exe = tmp.path().join("pkg/gb");
-        assert_eq!(resolve(Some(&exe), os(""), None), Some(games));
+        assert_eq!(resolve(Some(&exe), os("")), Some(games));
     }
 
     #[test]
@@ -249,16 +287,16 @@ mod tests {
         mkdir(&tmp.path().join("roms/homebrew"));
         mkdir(&tmp.path().join("target/release"));
         let exe = tmp.path().join("target/release/gb");
-        assert_eq!(resolve(Some(&exe), None, None), None);
-        assert_eq!(resolve(None, None, None), None);
-        assert_eq!(resolve(Some(Path::new("gb")), None, None), None);
+        assert_eq!(resolve(Some(&exe), None), None);
+        assert_eq!(resolve(None, None), None);
+        assert_eq!(resolve(Some(Path::new("gb")), None), None);
     }
 
     #[test]
     fn a_file_named_games_is_not_a_folder() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("games"), b"x").unwrap();
-        assert_eq!(resolve(Some(&tmp.path().join("gb")), None, None), None);
+        assert_eq!(resolve(Some(&tmp.path().join("gb")), None), None);
     }
 
     fn library(tmp: &Path) -> Library {
