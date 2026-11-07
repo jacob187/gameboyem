@@ -13,8 +13,6 @@
 //! or the one named by `GAMEBOYEM_DATA_DIR`. Resolving never touches the disk; only
 //! [`DataDir::create`] does.
 
-#![allow(dead_code, reason = "wired into main in the next commit")]
-
 use std::ffi::OsString;
 use std::fs;
 use std::io;

@@ -196,7 +196,7 @@ where
         move |data: &mut [T], _| ring.fill(data, channels),
         |e: cpal::Error| {
             if !matches!(e.kind(), cpal::ErrorKind::Xrun) {
-                eprintln!("audio stream error: {e}");
+                log::error!("audio stream error: {e}");
             }
         },
         None,

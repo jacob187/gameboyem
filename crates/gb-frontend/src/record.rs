@@ -59,8 +59,8 @@ impl Recorder {
         }
         if let Err(e) = self.file.write_all(&replay::encode_record(record)) {
             self.failed = true;
-            eprintln!(
-                "warning: recording stopped, cannot write {}: {e}",
+            log::warn!(
+                "recording stopped, cannot write {}: {e}",
                 self.path.display()
             );
         }
@@ -73,26 +73,17 @@ impl Recorder {
             event: replay::Event::End,
         });
         if self.failed {
-            eprintln!(
+            log::warn!(
                 "recording {} is incomplete (it still replays up to the failure)",
                 self.path.display()
             );
             return;
         }
         match self.file.sync_all() {
-            Ok(()) => eprintln!("recording saved: {} ({frames} frames)", self.path.display()),
-            Err(e) => eprintln!(
-                "warning: cannot flush recording {}: {e}",
-                self.path.display()
-            ),
+            Ok(()) => log::info!("recording saved: {} ({frames} frames)", self.path.display()),
+            Err(e) => log::warn!("cannot flush recording {}: {e}", self.path.display()),
         }
     }
-}
-
-/// `dir/game.gb` + frame 1234 -> `dir/game-f0001234.png`.
-pub fn screenshot_path(rom: &Path, frame: u64) -> PathBuf {
-    let stem = rom.file_stem().unwrap_or(rom.as_os_str()).to_string_lossy();
-    rom.with_file_name(format!("{stem}-f{frame:07}.png"))
 }
 
 /// Write the raw frame as a PNG at its own size: greyscale for shades, which
@@ -123,18 +114,6 @@ pub fn write_png(frame: FrameRef<'_>, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn screenshot_names() {
-        assert_eq!(
-            screenshot_path(Path::new("games/Red.gb"), 1234),
-            PathBuf::from("games/Red-f0001234.png")
-        );
-        assert_eq!(
-            screenshot_path(Path::new("noext"), 5),
-            PathBuf::from("noext-f0000005.png")
-        );
-    }
 
     #[test]
     fn png_has_the_frames_own_size() {

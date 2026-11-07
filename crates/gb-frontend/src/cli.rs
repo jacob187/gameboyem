@@ -14,6 +14,8 @@ pub const USAGE: &str = "\
 usage: gb [options] [--] [rom.gb|rom.gbc|rom.gba]
 
 With no ROM path, a file dialog asks for one. A ROM file can also be dropped onto the window.
+Saves, save states and screenshots are kept in the app data folder, not next to the ROM; a .sav
+(and .ss1-9) next to the ROM is copied there the first time the ROM is opened, and left in place.
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)
@@ -25,10 +27,17 @@ options:
   --save-type NAME   auto (default: from the ROM), none, sram, flash64, flash128, eeprom512 or eeprom8k (GBA only)
   --rtc NAME         auto (default: on when the game sets up the cartridge clock), on or off (GBA only)
   --rtc-start TIME   start the GBA cartridge clock at YYYY-MM-DDTHH:MM:SS if the save has none (GBA only; default 2000-01-01, power-loss flag set)
+  --add              copy the ROM into the game library (in the app data folder) and exit; opens no window
   --test-pattern     show a synthetic test pattern and tone instead of running the core
   --record FILE      record every input to FILE (must not exist) for `gb-test --replay`
   -h, --help         show this help
   --                 end of options; the next argument is the ROM path, even if it starts with `-`
+
+environment:
+  GAMEBOYEM_DATA_DIR use this folder for saves, states, screenshots, the library and logs
+                     (default: macOS ~/Library/Application Support/io.github.jacob187.gameboyem,
+                     Windows %APPDATA%\\jacob187\\gameboyem\\data, Linux ~/.local/share/gameboyem)
+  GAMEBOYEM_LOG      log level in logs/gameboyem.log: error, warn, info (default), debug or trace
 
 controls:
   arrows or WASD = D-pad    X or E = A    Z = B    Enter = Start    Backspace / Right Shift = Select
@@ -74,6 +83,8 @@ pub struct Options {
     pub model: ModelChoice,
     pub test_pattern: bool,
     pub record: Option<PathBuf>,
+    /// `--add`: import the ROM into the library and exit.
+    pub add: bool,
     /// `--system`: overrides the choice made from the file name and header.
     pub system: Option<System>,
     /// `--bios`: a GBA BIOS dump.
@@ -111,6 +122,7 @@ where
     let mut model = ModelChoice::Auto;
     let mut test_pattern = false;
     let mut record: Option<PathBuf> = None;
+    let mut add = false;
     let mut system: Option<System> = None;
     let mut bios: Option<PathBuf> = None;
     let mut save_type = SaveChoice::Auto;
@@ -135,6 +147,7 @@ where
             "-h" | "--help" => return Ok(Command::Help),
             "--mute" => mute = true,
             "--test-pattern" => test_pattern = true,
+            "--add" => add = true,
             "--scale" => {
                 let value = option_value("--scale", args.next())?;
                 scale = parse_scale(&value)?;
@@ -212,6 +225,12 @@ where
     if test_pattern && record.is_some() {
         return Err("--record cannot be combined with --test-pattern".into());
     }
+    if add && rom.is_none() {
+        return Err("--add needs a ROM path".into());
+    }
+    if add && (record.is_some() || test_pattern) {
+        return Err("--add cannot be combined with --record or --test-pattern".into());
+    }
     Ok(Command::Run(Options {
         rom,
         scale,
@@ -220,6 +239,7 @@ where
         model,
         test_pattern,
         record,
+        add,
         system,
         bios,
         save_type,
@@ -410,10 +430,21 @@ mod tests {
         assert_eq!(o.scale, 4);
         assert!(!o.mute && !o.test_pattern);
         assert_eq!(o.record, None);
+        assert!(!o.add);
         assert_eq!(o.palette, PaletteKind::Green);
         assert_eq!(o.model, ModelChoice::Auto);
         assert_eq!((o.system, o.bios.as_deref()), (None, None));
         assert!(o.gb_only.is_empty());
+    }
+
+    #[test]
+    fn add_imports_a_rom_and_needs_one() {
+        let o = run(&["--add", "game.gb"]);
+        assert!(o.add);
+        assert_eq!(o.rom, Some(PathBuf::from("game.gb")));
+        assert!(p(&["--add"]).unwrap_err().contains("needs a ROM path"));
+        assert!(p(&["--add", "--record", "r.gbinput", "g.gb"]).is_err());
+        assert!(p(&["--add", "--test-pattern", "g.gb"]).is_err());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Battery-save persistence: `<rom>.sav` next to the ROM, written atomically.
+//! Battery-save persistence: one save file per game (in the app folder, see
+//! `library.rs`), written atomically.
 
 use std::ffi::OsString;
 use std::fs;
@@ -11,7 +12,8 @@ use emu_common::Core;
 /// How often battery RAM is compared against what is on disk.
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// `game.gb` -> `game.sav`. If the ROM itself already ends in `.sav` the
+/// `game.gb` -> `game.sav`: where older versions kept the save, next to the ROM,
+/// which is now only read to import it. If the ROM itself already ends in `.sav` the
 /// extension is appended instead, so a save can never overwrite the ROM.
 pub fn save_path(rom: &Path) -> PathBuf {
     let path = rom.with_extension("sav");
@@ -185,7 +187,7 @@ impl WarnLimiter {
 fn failure_message(path: &Path, err: &io::Error, w: &Warning) -> String {
     if w.first {
         format!(
-            "warning: cannot write save {}: {err}\n  \
+            "cannot write save {}: {err}\n  \
              SAVING IS FAILING: progress since the last successful save will be lost if the \
              emulator exits now. Retrying every {} s; this warning repeats at most every {} s.",
             path.display(),
@@ -194,7 +196,7 @@ fn failure_message(path: &Path, err: &io::Error, w: &Warning) -> String {
         )
     } else {
         format!(
-            "warning: still cannot write save {}: {err} ({} failed attempts since the last warning)",
+            "still cannot write save {}: {err} ({} failed attempts since the last warning)",
             path.display(),
             w.suppressed
         )
@@ -219,9 +221,10 @@ pub struct SaveManager {
 }
 
 impl SaveManager {
-    pub fn new(rom: &Path, now: Instant) -> Self {
+    /// Save to the file `sav` (see `GamePaths::sav`).
+    pub fn new(sav: &Path, now: Instant) -> Self {
         Self {
-            path: save_path(rom),
+            path: sav.to_owned(),
             last: None,
             last_gen: None,
             next_check: now + SAVE_INTERVAL,
@@ -245,19 +248,19 @@ impl SaveManager {
         }
         match read_save(&self.path) {
             Ok(Some(data)) => match gb.load_battery_ram(&data) {
-                Ok(()) => eprintln!("loaded save {}", self.path.display()),
+                Ok(()) => log::info!("loaded save {}", self.path.display()),
                 Err(e) => {
                     // Keep the odd file around: the next write would replace it.
                     match backup_without_overwrite(&self.path) {
-                        Ok(backup) => eprintln!(
-                            "warning: ignoring {}: {e} (copied to {})",
+                        Ok(backup) => log::warn!(
+                            "ignoring {}: {e} (copied to {})",
                             self.path.display(),
                             backup.display()
                         ),
                         Err(c) => {
                             self.write_blocked = true;
-                            eprintln!(
-                                "warning: ignoring {}: {e} (backup failed: {c})\n  {BLOCKED_NOTE}",
+                            log::warn!(
+                                "ignoring {}: {e} (backup failed: {c})\n  {BLOCKED_NOTE}",
                                 self.path.display()
                             );
                         }
@@ -269,8 +272,8 @@ impl SaveManager {
                 // Unreadable, not a regular file, or oversized: no copy is made,
                 // so the file must not be replaced either.
                 self.write_blocked = true;
-                eprintln!(
-                    "warning: cannot use save {}: {e}\n  {BLOCKED_NOTE}",
+                log::warn!(
+                    "cannot use save {}: {e}\n  {BLOCKED_NOTE}",
                     self.path.display()
                 );
             }
@@ -335,8 +338,8 @@ impl SaveManager {
         if self.write_blocked {
             // Said once at load; on exit say what that means for this session.
             if urgent {
-                eprintln!(
-                    "warning: progress NOT saved: {} was not usable at startup and was left untouched",
+                log::warn!(
+                    "progress NOT saved: {} was not usable at startup and was left untouched",
                     self.path.display()
                 );
             }
@@ -346,13 +349,13 @@ impl SaveManager {
             Ok(()) => {
                 self.last = Some(ram);
                 if self.warn.success() {
-                    eprintln!("save writing recovered: {}", self.path.display());
+                    log::info!("save writing recovered: {}", self.path.display());
                 }
                 Outcome::Wrote
             }
             Err(e) => {
                 if let Some(w) = self.warn.failure(now, urgent) {
-                    eprintln!("{}", failure_message(&self.path, &e, &w));
+                    log::warn!("{}", failure_message(&self.path, &e, &w));
                 }
                 Outcome::Failed
             }
@@ -458,7 +461,7 @@ mod tests {
         fs::write(sav.with_extension("sav.bak"), b"other game's save").unwrap();
         fs::write(&sav, b"wrong size").unwrap();
 
-        SaveManager::new(&rom_path, Instant::now()).load(&mut gb);
+        SaveManager::new(&save_path(&rom_path), Instant::now()).load(&mut gb);
 
         assert_eq!(
             fs::read(dir.path().join("g.sav.bak")).unwrap(),
@@ -494,7 +497,7 @@ mod tests {
     fn sync_writes_only_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let rom = dir.path().join("g.gb");
-        let mut m = SaveManager::new(&rom, Instant::now());
+        let mut m = SaveManager::new(&save_path(&rom), Instant::now());
         m.last = Some(vec![0; 4]);
         assert!(!sync(&mut m, Some(vec![0; 4])), "unchanged");
         assert!(!sync(&mut m, None), "no battery");
@@ -508,7 +511,7 @@ mod tests {
     fn failed_write_is_retried() {
         let dir = tempfile::tempdir().unwrap();
         let rom = dir.path().join("missing").join("g.gb");
-        let mut m = SaveManager::new(&rom, Instant::now());
+        let mut m = SaveManager::new(&save_path(&rom), Instant::now());
         assert!(!sync(&mut m, Some(vec![9])));
         fs::create_dir(dir.path().join("missing")).unwrap();
         assert!(sync(&mut m, Some(vec![9])));
@@ -533,7 +536,7 @@ mod tests {
         let mut ram = gb.battery_ram().expect("battery");
         ram[0] = 0xAB;
         fs::write(dir.path().join("g.sav"), &ram).unwrap();
-        let mut m = SaveManager::new(&rom_path, Instant::now());
+        let mut m = SaveManager::new(&save_path(&rom_path), Instant::now());
         m.load(&mut gb);
         assert_eq!(gb.battery_ram().unwrap()[0], 0xAB);
         assert!(
@@ -544,7 +547,7 @@ mod tests {
         // Wrong-size save: ignored, original preserved as .bak, RAM untouched.
         let mut gb = GameBoy::new(battery_rom()).unwrap();
         fs::write(dir.path().join("g.sav"), b"short").unwrap();
-        let mut m = SaveManager::new(&rom_path, Instant::now());
+        let mut m = SaveManager::new(&save_path(&rom_path), Instant::now());
         m.load(&mut gb);
         assert_eq!(gb.battery_ram().unwrap()[0], 0);
         assert_eq!(fs::read(dir.path().join("g.sav.bak")).unwrap(), b"short");
@@ -571,7 +574,7 @@ mod tests {
     /// Returns the manager (for inspection) after asserting nothing was written.
     fn load_then_try_to_save(dir: &Path, gb: &mut dyn Core) -> SaveManager {
         let t0 = Instant::now();
-        let mut m = SaveManager::new(&dir.join("g.gb"), t0);
+        let mut m = SaveManager::new(&save_path(&dir.join("g.gb")), t0);
         m.load(gb);
         assert!(m.write_blocked);
         let mut ram = gb.battery_ram().unwrap();
@@ -666,7 +669,7 @@ mod tests {
             ram[0] = 0xAB;
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("g.sav"), &ram).unwrap();
-            let mut m = SaveManager::new(&dir.path().join("g.gb"), Instant::now());
+            let mut m = SaveManager::new(&save_path(&dir.path().join("g.gb")), Instant::now());
             m.load(&mut gb);
             assert!(!m.write_blocked);
             assert_eq!(gb.battery_ram().unwrap()[0], 0xAB);
@@ -699,7 +702,7 @@ mod tests {
         let mut g = gba_core::Gba::with_options(gba_rom(b"FLASH1M_V"), None, opts).unwrap();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("g.sav"), &ram).unwrap();
-        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        let mut m = SaveManager::new(&save_path(&dir.path().join("g.gba")), Instant::now());
         m.load(&mut g);
         assert!(!m.write_blocked, "a save with a footer is accepted");
         assert_eq!(
@@ -714,7 +717,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("g.sav"), &bad).unwrap();
         let mut g = gba_core::Gba::with_options(gba_rom(b"FLASH1M_V"), None, opts).unwrap();
-        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        let mut m = SaveManager::new(&save_path(&dir.path().join("g.gba")), Instant::now());
         m.load(&mut g);
         assert!(
             dir.path().join("g.sav.bak").exists(),
@@ -731,7 +734,7 @@ mod tests {
         ram[0] = 0xAB;
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("g.sav"), &ram).unwrap();
-        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        let mut m = SaveManager::new(&save_path(&dir.path().join("g.gba")), Instant::now());
         m.load(&mut g);
         assert!(!m.write_blocked);
         assert_eq!(Core::battery_ram(&g).unwrap()[0], 0xAB);
@@ -747,7 +750,7 @@ mod tests {
 
         let mut g = gba(b"EEPROM_V");
         assert_eq!(Core::battery_ram(&g), None, "size unknown until used");
-        let mut m = SaveManager::new(&rom, Instant::now());
+        let mut m = SaveManager::new(&save_path(&rom), Instant::now());
         m.load(&mut g);
         assert_eq!(Core::battery_ram(&g), Some(save.clone()));
         // The loaded image is the baseline: nothing is rewritten.
@@ -761,7 +764,7 @@ mod tests {
     fn an_unsized_eeprom_with_no_save_file_is_quiet_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let mut g = gba(b"EEPROM_V");
-        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        let mut m = SaveManager::new(&save_path(&dir.path().join("g.gba")), Instant::now());
         m.load(&mut g);
         let base = Instant::now();
         for i in 1..=4 {
@@ -785,7 +788,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("g.sav"), vec![3u8; bad]).unwrap();
             let mut g = gba(id);
-            let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+            let mut m = SaveManager::new(&save_path(&dir.path().join("g.gba")), Instant::now());
             m.load(&mut g); // must print the core's error and carry on
             assert!(!m.write_blocked);
             assert_eq!(
@@ -804,7 +807,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("g.sav"), b"stray").unwrap();
         let mut g = gba(b"");
-        let mut m = SaveManager::new(&dir.path().join("g.gba"), Instant::now());
+        let mut m = SaveManager::new(&save_path(&dir.path().join("g.gba")), Instant::now());
         m.load(&mut g);
         m.flush_final(&g);
         assert!(!m.write_blocked);
@@ -821,7 +824,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut gb = GameBoy::new(battery_rom()).unwrap();
         let t0 = Instant::now();
-        let mut m = SaveManager::new(&dir.path().join("g.gb"), t0);
+        let mut m = SaveManager::new(&save_path(&dir.path().join("g.gb")), t0);
         m.load(&mut gb);
         assert!(!m.write_blocked);
         let mut ram = gb.battery_ram().unwrap();
@@ -833,7 +836,7 @@ mod tests {
     /// for `frames` so the free-running RTC makes the image differ from the load.
     fn rtc_cart_after(dir: &Path, frames: u32) -> (GameBoy, SaveManager) {
         let mut gb = cart(0x10, 0x02);
-        let mut m = SaveManager::new(&dir.join("g.gb"), Instant::now());
+        let mut m = SaveManager::new(&save_path(&dir.join("g.gb")), Instant::now());
         m.load(&mut gb);
         let before = gb.battery_ram().unwrap();
         for _ in 0..frames {
@@ -866,7 +869,7 @@ mod tests {
     fn changed_generation_writes_once_then_goes_quiet() {
         let dir = tempfile::tempdir().unwrap();
         let mut gb = cart(0x03, 0x02);
-        let mut m = SaveManager::new(&dir.path().join("g.gb"), Instant::now());
+        let mut m = SaveManager::new(&save_path(&dir.path().join("g.gb")), Instant::now());
         m.load(&mut gb);
         let g0 = gb.battery_generation();
 
@@ -887,7 +890,10 @@ mod tests {
     fn failed_write_keeps_the_old_generation_so_it_is_retried() {
         let dir = tempfile::tempdir().unwrap();
         let mut gb = cart(0x03, 0x02);
-        let mut m = SaveManager::new(&dir.path().join("missing").join("g.gb"), Instant::now());
+        let mut m = SaveManager::new(
+            &save_path(&dir.path().join("missing").join("g.gb")),
+            Instant::now(),
+        );
         m.load(&mut gb);
         let mut ram = gb.battery_ram().unwrap();
         ram[0] = 3;
@@ -905,7 +911,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rom_path = dir.path().join("g.gb");
         let mut gb = GameBoy::new(vec![0u8; 0x8000]).unwrap();
-        let mut m = SaveManager::new(&rom_path, Instant::now());
+        let mut m = SaveManager::new(&save_path(&rom_path), Instant::now());
         m.load(&mut gb);
         m.flush(&gb);
         assert!(!m.path().exists());
@@ -1024,7 +1030,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rom = dir.path().join("missing").join("g.gb");
         let t0 = Instant::now();
-        let mut m = SaveManager::new(&rom, t0);
+        let mut m = SaveManager::new(&save_path(&rom), t0);
         assert!(!m.sync(Some(vec![1]), t0, false));
         assert!(m.warn.last_warned.is_some());
         assert!(!m.sync(Some(vec![1]), secs(t0, 5), false));
@@ -1049,7 +1055,7 @@ mod tests {
         let writable = fs::File::create(dir.path().join("probe")).is_ok();
         if !writable {
             let t0 = Instant::now();
-            let mut m = SaveManager::new(&rom, t0);
+            let mut m = SaveManager::new(&save_path(&rom), t0);
             m.load(&mut gb); // wrong size -> .bak copy fails -> logged
             assert!(
                 m.write_blocked,

@@ -274,14 +274,15 @@ impl GamePaths {
         PathBuf::from(name)
     }
 
-    /// All files in one directory, `dir/<stem>.sav`, `dir/<stem>.ss1`, ... as
-    /// tests want them.
+    /// The old layout, for tests: `dir/game.sav`, `dir/game.ss1`, `dir/game-f0000001.png`
+    /// for the ROM `dir/game.gb`.
     #[cfg(test)]
-    pub fn flat(dir: &Path, stem: &str) -> Self {
+    pub fn beside(rom: &Path) -> Self {
+        let stem = rom.with_extension("");
         Self {
-            sav: dir.join(format!("{stem}.sav")),
-            state_prefix: dir.join(stem),
-            screenshot_prefix: dir.join(stem),
+            sav: save_path(rom),
+            state_prefix: stem.clone(),
+            screenshot_prefix: stem,
         }
     }
 }
@@ -628,10 +629,7 @@ fn adopt_orphans(data: &DataDir, entries: &mut Vec<Entry>) -> usize {
         let id = probe.id();
         let canonical = data.games().join(rom_file_name(&id, probe.game));
         if entries.iter().any(|e| e.id == id) {
-            log::warn!(
-                "library: {} repeats {id}; leaving it alone",
-                path.display()
-            );
+            log::warn!("library: {} repeats {id}; leaving it alone", path.display());
             continue;
         }
         if canonical != path {
@@ -716,7 +714,10 @@ impl Library {
             Ok(Some(loaded)) => (loaded.entries, loaded.dropped, false),
             Ok(None) => (Vec::new(), 0, false),
             Err(why) => {
-                log::warn!("library: {why}; rebuilding it from {}", data.games().display());
+                log::warn!(
+                    "library: {why}; rebuilding it from {}",
+                    data.games().display()
+                );
                 match backup_without_overwrite(&data.index_file()) {
                     Ok(copy) => log::warn!("library: the old index was kept as {}", copy.display()),
                     Err(e) => log::warn!("library: cannot keep a copy of the old index: {e}"),
@@ -730,12 +731,15 @@ impl Library {
         };
         let adopted = adopt_orphans(data, &mut library.entries);
         if adopted > 0 {
-            log::info!("library: found {adopted} game(s) in {}", data.games().display());
+            log::info!(
+                "library: found {adopted} game(s) in {}",
+                data.games().display()
+            );
         }
-        if adopted > 0 || dropped > 0 || damaged {
-            if let Err(e) = library.save_index() {
-                log::warn!("{e}");
-            }
+        if (adopted > 0 || dropped > 0 || damaged)
+            && let Err(e) = library.save_index()
+        {
+            log::warn!("{e}");
         }
         library
     }
@@ -826,7 +830,9 @@ impl Library {
             .position(|e| &e.id == id)
             .ok_or_else(|| format!("{id} is not in the library"))?;
         if self.entries[index].source == Source::Bundled {
-            return Err(format!("{id} is bundled with the app and cannot be removed"));
+            return Err(format!(
+                "{id} is bundled with the app and cannot be removed"
+            ));
         }
         let entry = self.entries.remove(index);
         if let Err(e) = self.save_index() {
@@ -958,9 +964,13 @@ impl Library {
 
     /// The thumbnail PNG of `id`, if it has one that can be read.
     pub fn read_thumbnail(&self, id: &GameId) -> Option<Vec<u8>> {
-        read_capped(&thumbnail_path(&self.data, id), MAX_THUMBNAIL_BYTES, "thumbnail")
-            .ok()
-            .flatten()
+        read_capped(
+            &thumbnail_path(&self.data, id),
+            MAX_THUMBNAIL_BYTES,
+            "thumbnail",
+        )
+        .ok()
+        .flatten()
     }
 
     /// Replace the entries with what the index holds now, if it is readable.
@@ -1123,10 +1133,7 @@ mod tests {
         let p = GamePaths::new(&data, &id);
         let name = id.as_str();
         assert_eq!(p.sav, PathBuf::from(format!("/app/saves/{name}.sav")));
-        assert_eq!(
-            p.state(3),
-            PathBuf::from(format!("/app/states/{name}.ss3"))
-        );
+        assert_eq!(p.state(3), PathBuf::from(format!("/app/states/{name}.ss3")));
         assert_eq!(
             p.screenshot(1234),
             PathBuf::from(format!("/app/screenshots/{name}-f0001234.png"))
@@ -1140,10 +1147,7 @@ mod tests {
     #[test]
     fn the_hash_is_the_one_the_cores_compute() {
         let gb = gb_rom("MOTH", 7);
-        assert_eq!(
-            rom_hash(&gb),
-            GameBoy::new(gb.clone()).unwrap().rom_hash()
-        );
+        assert_eq!(rom_hash(&gb), GameBoy::new(gb.clone()).unwrap().rom_hash());
         let gba = gba_rom("MOTHGBA");
         assert_eq!(
             rom_hash(&gba),
@@ -1178,9 +1182,15 @@ mod tests {
     fn systems_come_from_the_existing_detection() {
         let f = fixture();
         let mut lib = Library::open(&f.data);
-        let gb = lib.add_rom(&write_rom(&f.roms, "a.gb", &gb_rom("A", 0))).unwrap();
-        let gbc = lib.add_rom(&write_rom(&f.roms, "b.gbc", &gbc_rom("B"))).unwrap();
-        let gba = lib.add_rom(&write_rom(&f.roms, "c.gba", &gba_rom("C"))).unwrap();
+        let gb = lib
+            .add_rom(&write_rom(&f.roms, "a.gb", &gb_rom("A", 0)))
+            .unwrap();
+        let gbc = lib
+            .add_rom(&write_rom(&f.roms, "b.gbc", &gbc_rom("B")))
+            .unwrap();
+        let gba = lib
+            .add_rom(&write_rom(&f.roms, "c.gba", &gba_rom("C")))
+            .unwrap();
         // A GBA header is found without the extension too.
         let mut headered = gba_rom("D");
         headered[0xB2] = 0x96;
@@ -1188,7 +1198,9 @@ mod tests {
             .iter()
             .fold(0u8, |a, &b| a.wrapping_add(b));
         headered[0xBD] = 0u8.wrapping_sub(sum).wrapping_sub(0x19);
-        let sniffed = lib.add_rom(&write_rom(&f.roms, "d.bin", &headered)).unwrap();
+        let sniffed = lib
+            .add_rom(&write_rom(&f.roms, "d.bin", &headered))
+            .unwrap();
         assert_eq!(gb.entry.system, GameSystem::Gb);
         assert_eq!(gbc.entry.system, GameSystem::Gbc);
         assert_eq!(gba.entry.system, GameSystem::Gba);
@@ -1231,11 +1243,23 @@ mod tests {
         let f = fixture();
         let mut lib = Library::open(&f.data);
         let empty = write_rom(&f.roms, "empty.gb", b"");
-        assert!(lib.add_rom(&empty).unwrap_err().contains("the file is empty"));
-        let zip = write_rom(&f.roms, "z.gb", b"PK\x03\x04 and so on, padded out to look big enough");
+        assert!(
+            lib.add_rom(&empty)
+                .unwrap_err()
+                .contains("the file is empty")
+        );
+        let zip = write_rom(
+            &f.roms,
+            "z.gb",
+            b"PK\x03\x04 and so on, padded out to look big enough",
+        );
         assert!(lib.add_rom(&zip).unwrap_err().contains("zip archive"));
         let missing = f.roms.join("nope.gb");
-        assert!(lib.add_rom(&missing).unwrap_err().contains("file not found"));
+        assert!(
+            lib.add_rom(&missing)
+                .unwrap_err()
+                .contains("file not found")
+        );
         let dir_err = lib.add_rom(&f.roms).unwrap_err();
         assert!(dir_err.contains("directory"), "{dir_err}");
         let mut huge = gb_rom("BIG", 0);
@@ -1322,7 +1346,10 @@ mod tests {
         );
         fs::write(f.data.index_file(), hostile).unwrap();
         let mut lib = Library::open(&f.data);
-        assert!(lib.get(&e.id).is_some(), "the ROM copy is found again by scanning");
+        assert!(
+            lib.get(&e.id).is_some(),
+            "the ROM copy is found again by scanning"
+        );
         lib.remove(&e.id, RemoveSaves::Delete).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"keep me");
     }
@@ -1378,10 +1405,16 @@ mod tests {
         assert_eq!(lib.entries().len(), 1);
         let e = &lib.entries()[0];
         assert_eq!(e.title, "LOOSE");
-        assert_eq!(e.rom_path.file_name().unwrap().to_string_lossy(), format!("{}.gb", e.id));
+        assert_eq!(
+            e.rom_path.file_name().unwrap().to_string_lossy(),
+            format!("{}.gb", e.id)
+        );
         assert_eq!(fs::read(&e.rom_path).unwrap(), rom);
         assert!(f.data.index_file().exists());
-        assert!(f.data.games().join("broken.gb").exists(), "unusable files are left alone");
+        assert!(
+            f.data.games().join("broken.gb").exists(),
+            "unusable files are left alone"
+        );
     }
 
     #[test]
@@ -1438,7 +1471,11 @@ mod tests {
     #[test]
     fn an_oversized_index_is_not_read() {
         let f = fixture();
-        write_rom(&f.data.games(), "library.json", &vec![b' '; MAX_INDEX_BYTES as usize + 1]);
+        write_rom(
+            &f.data.games(),
+            "library.json",
+            &vec![b' '; MAX_INDEX_BYTES as usize + 1],
+        );
         assert!(load_index(&f.data).is_err());
         assert!(Library::open(&f.data).entries().is_empty());
     }
@@ -1473,9 +1510,11 @@ mod tests {
             assert!(e.rom_path.starts_with(std::path::absolute(&dir).unwrap()));
         }
         assert!(
-            fs::read_dir(f.data.games())
+            fs::read_dir(f.data.games()).unwrap().all(|e| !e
                 .unwrap()
-                .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".gb")),
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".gb")),
             "bundled ROMs are not copied"
         );
         let snapshot = lib.entries().to_vec();
@@ -1511,7 +1550,12 @@ mod tests {
         assert_eq!(report.updated, 1);
         assert_eq!(report.added, 0);
         assert_eq!(lib.entries().len(), 1);
-        assert!(lib.get(&id).unwrap().rom_path.starts_with(std::path::absolute(&new).unwrap()));
+        assert!(
+            lib.get(&id)
+                .unwrap()
+                .rom_path
+                .starts_with(std::path::absolute(&new).unwrap())
+        );
         assert_eq!(lib.get(&id).unwrap().last_played, played);
     }
 
@@ -1523,7 +1567,13 @@ mod tests {
         write_rom(&dir, "two.gb", &gb_rom("TWO", 0));
         let mut lib = Library::open(&f.data);
         lib.register_bundled(&dir).unwrap();
-        let one = lib.entries().iter().find(|e| e.title == "ONE").unwrap().id.clone();
+        let one = lib
+            .entries()
+            .iter()
+            .find(|e| e.title == "ONE")
+            .unwrap()
+            .id
+            .clone();
         fs::write(lib.paths_for(&one).sav, b"progress").unwrap();
         fs::remove_file(rom).unwrap();
         let report = lib.register_bundled(&dir).unwrap();
@@ -1549,7 +1599,13 @@ mod tests {
 
         write_rom(&dir, "two.gb", &gb_rom("TWO", 0));
         lib.register_bundled(&dir).unwrap();
-        let two = lib.entries().iter().find(|e| e.title == "TWO").unwrap().id.clone();
+        let two = lib
+            .entries()
+            .iter()
+            .find(|e| e.title == "TWO")
+            .unwrap()
+            .id
+            .clone();
         let err = lib.remove(&two, RemoveSaves::Delete).unwrap_err();
         assert!(err.contains("bundled"), "{err}");
         assert!(dir.join("two.gb").exists());
@@ -1565,7 +1621,11 @@ mod tests {
             .unwrap()
             .entry;
         lib.touch_played(&e.id).unwrap();
-        let played = Library::open(&f.data).get(&e.id).unwrap().last_played.unwrap();
+        let played = Library::open(&f.data)
+            .get(&e.id)
+            .unwrap()
+            .last_played
+            .unwrap();
         assert!(played >= e.added);
         let missing = GameId::new("nothing", 1);
         assert!(lib.touch_played(&missing).is_err());
@@ -1577,7 +1637,8 @@ mod tests {
         enc.set_color(png::ColorType::Grayscale);
         enc.set_depth(png::BitDepth::Eight);
         let mut w = enc.write_header().unwrap();
-        w.write_image_data(&[0, 50, 100, 150, 200, 250, 1, 2]).unwrap();
+        w.write_image_data(&[0, 50, 100, 150, 200, 250, 1, 2])
+            .unwrap();
         drop(w);
         out
     }
@@ -1597,19 +1658,30 @@ mod tests {
         assert_eq!(lib.get(&e.id).unwrap().thumbnail, Some(path.clone()));
         assert_eq!(lib.read_thumbnail(&e.id), Some(png));
         // It is found again after a restart.
-        assert_eq!(Library::open(&f.data).get(&e.id).unwrap().thumbnail, Some(path));
+        assert_eq!(
+            Library::open(&f.data).get(&e.id).unwrap().thumbnail,
+            Some(path)
+        );
 
         assert!(lib.set_thumbnail(&e.id, b"not a png").is_err());
         assert!(lib.set_thumbnail(&e.id, &tiny_png()[..30]).is_err());
-        assert!(lib.set_thumbnail(&GameId::new("x", 1), &tiny_png()).is_err());
+        assert!(
+            lib.set_thumbnail(&GameId::new("x", 1), &tiny_png())
+                .is_err()
+        );
         let mut huge = Vec::new();
         let mut enc = png::Encoder::new(&mut huge, MAX_THUMBNAIL_SIDE + 1, 1);
         enc.set_color(png::ColorType::Grayscale);
         enc.set_depth(png::BitDepth::Eight);
         let mut w = enc.write_header().unwrap();
-        w.write_image_data(&vec![0u8; MAX_THUMBNAIL_SIDE as usize + 1]).unwrap();
+        w.write_image_data(&vec![0u8; MAX_THUMBNAIL_SIDE as usize + 1])
+            .unwrap();
         drop(w);
-        assert!(lib.set_thumbnail(&e.id, &huge).unwrap_err().contains("at most"));
+        assert!(
+            lib.set_thumbnail(&e.id, &huge)
+                .unwrap_err()
+                .contains("at most")
+        );
         // A rejected thumbnail leaves the good one in place.
         assert!(lib.read_thumbnail(&e.id).is_some());
     }
@@ -1683,7 +1755,7 @@ mod tests {
 
     #[test]
     fn screenshot_names_count_frames_in_seven_digits() {
-        let p = GamePaths::flat(Path::new("shots"), "Red");
+        let p = GamePaths::beside(Path::new("shots/Red.gb"));
         assert_eq!(p.screenshot(1234), PathBuf::from("shots/Red-f0001234.png"));
         assert_eq!(p.screenshot(5), PathBuf::from("shots/Red-f0000005.png"));
         assert_eq!(p.sav, PathBuf::from("shots/Red.sav"));

@@ -10,8 +10,6 @@
 //! crash loses nothing. A file that cannot be written is dropped with one
 //! warning and logging goes on to stderr.
 
-#![allow(dead_code, reason = "wired into main in the next commit")]
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -258,8 +256,8 @@ impl Log for AppLogger {
 /// cannot be opened (reported once), logs to stderr only. Call once, early:
 /// records logged before this are dropped.
 pub fn init(file: Option<&Path>, level: LevelFilter) {
-    let file = file.and_then(|path| {
-        match RotatingFile::open(path, MAX_LOG_BYTES, LOG_FILES) {
+    let file = file.and_then(
+        |path| match RotatingFile::open(path, MAX_LOG_BYTES, LOG_FILES) {
             Ok(f) => Some(f),
             Err(e) => {
                 let _ = writeln!(
@@ -269,8 +267,8 @@ pub fn init(file: Option<&Path>, level: LevelFilter) {
                 );
                 None
             }
-        }
-    });
+        },
+    );
     if log::set_boxed_logger(Box::new(AppLogger::new(level, file))).is_err() {
         return;
     }

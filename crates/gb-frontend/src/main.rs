@@ -31,6 +31,8 @@ use winit::event_loop::EventLoop;
 use crate::app::{App, Storage};
 use crate::audio::AudioOutput;
 use crate::cli::Command;
+use crate::library::{GamePaths, Library};
+use crate::paths::DataDir;
 use crate::picker::Startup;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
@@ -47,7 +49,7 @@ fn build_gb(
     let gb =
         GameBoy::with_model(rom, model).map_err(|e| rom::cartridge_message(path, &e, archive))?;
     if !gb.cartridge_header().header_checksum_ok {
-        eprintln!("warning: ROM header checksum is wrong (running anyway)");
+        log::warn!("ROM header checksum is wrong (running anyway)");
     }
     let rom_hash = gb.rom_hash();
     Ok((Box::new(gb), rom_hash))
@@ -102,7 +104,7 @@ fn power_on(opts: &cli::Options, path: &Path) -> Result<(Box<dyn Core>, u64), Po
     // flag, the name or the header.
     let (system, rom) = rom::load_rom(path, opts.system).map_err(PowerOnError::Load)?;
     match cli::check_system_flags(system, opts) {
-        Ok(Some(warning)) => eprintln!("warning: {warning}"),
+        Ok(Some(warning)) => log::warn!("{warning}"),
         Ok(None) => {}
         Err(msg) => return Err(PowerOnError::Usage(msg)),
     }
@@ -113,9 +115,33 @@ fn power_on(opts: &cli::Options, path: &Path) -> Result<(Box<dyn Core>, u64), Po
     .map_err(PowerOnError::Load)
 }
 
+/// [`power_on`] the ROM at `path` and find the files its player data lives in: the
+/// app folder, keyed by the ROM's content, after importing any save next to the ROM.
+/// The ROM is not added to the library.
+fn open_game(
+    opts: &cli::Options,
+    data: &DataDir,
+    path: &Path,
+) -> Result<(Box<dyn Core>, u64, GamePaths), PowerOnError> {
+    let (core, rom_hash) = power_on(opts, path)?;
+    let paths = library::paths_for_opened_rom(data, path, &core.title(), rom_hash);
+    Ok((core, rom_hash, paths))
+}
+
+/// The first lines of a log: what ran, on what, and where its data is.
+fn log_startup(data: &DataDir) {
+    log::info!(
+        "gameboyem {} on {} {}; data folder {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        data.root().display()
+    );
+}
+
 fn new_event_loop() -> Result<EventLoop<()>, ExitCode> {
     EventLoop::new().map_err(|e| {
-        eprintln!("error: cannot start the windowing system: {e}");
+        log::error!("cannot start the windowing system: {e}");
         ExitCode::FAILURE
     })
 }
@@ -133,6 +159,34 @@ fn main() -> ExitCode {
         }
     };
 
+    // Everything the player makes lives in the app folder, whichever way the ROM is
+    // opened. Help and usage errors above do not create it.
+    let data = match DataDir::locate() {
+        Ok(d) => d,
+        Err(e) => {
+            logging::init(None, logging::level_from_env());
+            log::error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let created = data.create();
+    let log_file = data.log_file();
+    logging::init(
+        created.is_ok().then_some(log_file.as_path()),
+        logging::level_from_env(),
+    );
+    if let Err(e) = created {
+        log::warn!(
+            "cannot create the data folder {}: {e}; saves and the log may not be written",
+            data.root().display()
+        );
+    }
+    log_startup(&data);
+
+    if opts.add {
+        return add_to_library(&data, opts.rom.take());
+    }
+
     // Started from a launcher there is no command line: ask for the ROM. When it
     // will ask, the event loop is built first: on macOS winit creates the
     // application object there and sets up its launch handling, and the dialog
@@ -149,30 +203,37 @@ fn main() -> ExitCode {
             match picker::pick_rom() {
                 Some(path) => path,
                 None => {
-                    eprintln!("no ROM chosen");
+                    log::info!("no ROM chosen");
                     return ExitCode::SUCCESS;
                 }
             }
         }
         Startup::Missing => {
-            eprintln!("error: missing ROM path\n\n{}", cli::USAGE);
+            log::error!("missing ROM path");
+            eprintln!("\n{}", cli::USAGE);
             return ExitCode::from(2);
         }
     };
     let opts = Arc::new(opts);
 
     // The core hashed the ROM as it was built; the recording header reuses that.
-    let (mut core, rom_hash) = match power_on(&opts, &rom_path) {
+    let (mut core, rom_hash, paths) = match open_game(&opts, &data, &rom_path) {
         Ok(c) => c,
         Err(PowerOnError::Usage(msg)) => {
-            eprintln!("error: {msg}\n\n{}", cli::USAGE);
+            log::error!("{msg}");
+            eprintln!("\n{}", cli::USAGE);
             return ExitCode::from(2);
         }
         Err(PowerOnError::Load(msg)) => {
-            eprintln!("error: {msg}");
+            log::error!("{msg}");
             return ExitCode::FAILURE;
         }
     };
+    log::info!(
+        "ROM {} (title {:?}, hash {rom_hash:016x})",
+        rom_path.display(),
+        core.title()
+    );
 
     let audio = if opts.mute {
         None
@@ -184,19 +245,19 @@ fn main() -> ExitCode {
                 match audio::check_core_rate(a.sample_rate, core.audio_sample_rate()) {
                     Ok(()) => Some(a),
                     Err(e) => {
-                        eprintln!("warning: audio disabled: {e}");
+                        log::warn!("audio disabled: {e}");
                         None
                     }
                 }
             }
             Err(e) => {
-                eprintln!("warning: audio disabled: {e}");
+                log::warn!("audio disabled: {e}");
                 None
             }
         }
     };
 
-    let mut saves = SaveManager::new(&rom_path, Instant::now());
+    let mut saves = SaveManager::new(&paths.sav, Instant::now());
     saves.load(core.as_mut());
 
     // The recording starts from the battery RAM the session actually powered on with.
@@ -206,11 +267,11 @@ fn main() -> ExitCode {
             let header = record::header_for(core.as_ref(), rom_hash);
             match record::Recorder::create(path, &header) {
                 Ok(r) => {
-                    eprintln!("recording inputs to {}", path.display());
+                    log::info!("recording inputs to {}", path.display());
                     Some(r)
                 }
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    log::error!("{e}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -231,12 +292,13 @@ fn main() -> ExitCode {
             let _ = proxy.send_event(());
         });
         if let Err(e) = installed {
-            eprintln!("warning: cannot install the Ctrl-C/SIGTERM handler: {e}");
+            log::warn!("cannot install the Ctrl-C/SIGTERM handler: {e}");
         }
     }
     let storage = Storage {
         saves,
-        states: StateSlots::new(&rom_path),
+        states: StateSlots::new(paths.clone()),
+        paths,
     };
     let mut app = App::new(
         core,
@@ -247,24 +309,39 @@ fn main() -> ExitCode {
         opts.test_pattern,
         shutdown,
     )
-    .with_rom_path(rom_path)
     .with_recorder(recorder)
     .with_loader({
         let opts = Arc::clone(&opts);
+        let data = data.clone();
         Box::new(move |path| {
-            power_on(&opts, path)
-                .map(|(core, _)| core)
+            open_game(&opts, &data, path)
+                .map(|(core, _, paths)| (core, paths))
                 .map_err(PowerOnError::message)
         })
     });
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {
-        eprintln!("error: {e}");
+        log::error!("{e}");
         return ExitCode::FAILURE;
     }
     if let Err(e) = run {
-        eprintln!("error: event loop failed: {e}");
+        log::error!("event loop failed: {e}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// `--add`: copy the ROM into the library and exit.
+fn add_to_library(data: &DataDir, rom: Option<std::path::PathBuf>) -> ExitCode {
+    let Some(rom) = rom else {
+        log::error!("--add needs a ROM path");
+        return ExitCode::from(2);
+    };
+    match Library::open(data).add_rom(&rom) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            log::error!("{e}");
+            ExitCode::FAILURE
+        }
+    }
 }

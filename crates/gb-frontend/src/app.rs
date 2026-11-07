@@ -17,6 +17,7 @@ use winit::window::{Window, WindowId};
 
 use crate::audio::{self, AudioOutput, ToneGen};
 use crate::keymap::{Action, InputState, map};
+use crate::library::GamePaths;
 use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::record::{self, Recorder};
 use crate::save::SaveManager;
@@ -75,14 +76,15 @@ struct TestMode {
     tone: ToneGen,
 }
 
-/// Builds the core for a ROM file, for the ROM dropped on the window. The
-/// error is a ready-to-print message.
-pub type Loader<C> = Box<dyn FnMut(&Path) -> Result<C, String>>;
+/// Builds the core for a ROM file, for the ROM dropped on the window, with the
+/// files its player data goes to. The error is a ready-to-print message.
+pub type Loader<C> = Box<dyn FnMut(&Path) -> Result<(C, GamePaths), String>>;
 
-/// Where progress is persisted: battery RAM and save-state slots.
+/// Where progress is persisted: battery RAM, save-state slots and screenshots.
 pub struct Storage {
     pub saves: SaveManager,
     pub states: StateSlots,
+    pub paths: GamePaths,
 }
 
 /// The picture to show: the test pattern if that mode is on, else the core's.
@@ -118,7 +120,8 @@ pub struct App<C: Core> {
     status: Option<(String, Instant)>,
     test: Option<TestMode>,
     shutdown: ShutdownFlag,
-    rom_path: PathBuf,
+    /// Where the running game's screenshots go (its saves are in `saves`/`states`).
+    paths: GamePaths,
     /// Powers on a dropped ROM; `None` ignores drops.
     loader: Option<Loader<C>>,
     recorder: Option<Recorder>,
@@ -142,7 +145,11 @@ pub struct App<C: Core> {
 impl<C: Core> App<C> {
     pub fn new(
         core: C,
-        Storage { saves, states }: Storage,
+        Storage {
+            saves,
+            states,
+            paths,
+        }: Storage,
         audio: Option<AudioOutput>,
         palette: Palette,
         scale: u32,
@@ -175,7 +182,7 @@ impl<C: Core> App<C> {
             status: None,
             test,
             shutdown,
-            rom_path: PathBuf::from("screenshot.gb"),
+            paths,
             loader: None,
             recorder: None,
             frame: 0,
@@ -189,12 +196,6 @@ impl<C: Core> App<C> {
             pixels: None,
             error: None,
         }
-    }
-
-    /// Screenshots are saved next to this ROM path.
-    pub fn with_rom_path(mut self, rom_path: PathBuf) -> Self {
-        self.rom_path = rom_path;
-        self
     }
 
     /// Power on a ROM dropped onto the window with `loader`.
@@ -218,7 +219,7 @@ impl<C: Core> App<C> {
     fn check_shutdown(&self, event_loop: &ActiveEventLoop) -> bool {
         let requested = self.shutdown.requested();
         if requested && !event_loop.exiting() {
-            eprintln!("received a termination signal; saving and exiting");
+            log::info!("received a termination signal; saving and exiting");
             event_loop.exit();
         }
         requested
@@ -251,9 +252,9 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// Report a save-state result on stderr and, briefly, in the title.
+    /// Report a save-state result in the log and, briefly, in the title.
     fn show_status(&mut self, msg: String) {
-        eprintln!("{msg}");
+        log::info!("{msg}");
         self.status = Some((msg, Instant::now() + STATUS_DURATION));
         self.update_title();
     }
@@ -274,7 +275,7 @@ impl<C: Core> App<C> {
     /// End the recording now (writing its `End` record) and say why.
     fn stop_recording(&mut self, why: &str) {
         if let Some(mut r) = self.recorder.take() {
-            eprintln!("recording stopped: {why}, so the rest could not be replayed");
+            log::info!("recording stopped: {why}, so the rest could not be replayed");
             r.finish(self.frame);
             self.update_title();
         }
@@ -319,8 +320,8 @@ impl<C: Core> App<C> {
         let Some(loader) = self.loader.as_mut() else {
             return;
         };
-        let mut core = match loader(&path) {
-            Ok(core) => core,
+        let (mut core, paths) = match loader(&path) {
+            Ok(loaded) => loaded,
             Err(msg) => return self.show_status(format!("error: {msg}")),
         };
         // The old game's progress is written before anything is replaced.
@@ -331,21 +332,21 @@ impl<C: Core> App<C> {
             audio::check_core_rate(a.sample_rate, core.audio_sample_rate())
         });
         if let Some(Err(e)) = rate_check {
-            eprintln!("warning: audio disabled: {e}");
+            log::warn!("audio disabled: {e}");
             self.audio = None;
         }
-        let mut saves = SaveManager::new(&path, Instant::now());
+        let mut saves = SaveManager::new(&paths.sav, Instant::now());
         saves.load(&mut core);
 
         self.core = core;
         self.saves = saves;
-        self.states = StateSlots::new(&path);
+        self.states = StateSlots::new(paths.clone());
+        self.paths = paths;
         self.title = window_title(&self.core.title());
         self.pacer = FramePacer::new(self.core.native_fps());
         if self.fast_forward {
             self.pacer.set_speed(FAST_FORWARD_SPEED);
         }
-        self.rom_path = path;
         self.frame = 0;
         self.paused = false;
         // The new machine starts with no buttons down; apply the keys held now.
@@ -359,7 +360,7 @@ impl<C: Core> App<C> {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
-        eprintln!("opened {}", self.rom_path.display());
+        log::info!("opened {} ({})", path.display(), self.core.title());
     }
 
     fn toggle_pause(&mut self) {
@@ -433,13 +434,13 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// Save the picture on screen next to the ROM and mark the frame.
+    /// Save the picture on screen in the game's screenshots and mark the frame.
     fn screenshot(&mut self) {
-        let path = record::screenshot_path(&self.rom_path, self.frame);
+        let path = self.paths.screenshot(self.frame);
         let frame = frame_of(self.test.as_ref(), &self.core);
         match record::write_png(frame, &path) {
-            Ok(()) => eprintln!("screenshot: {} (frame {})", path.display(), self.frame),
-            Err(e) => eprintln!("warning: cannot write screenshot {}: {e}", path.display()),
+            Ok(()) => log::info!("screenshot: {} (frame {})", path.display(), self.frame),
+            Err(e) => log::warn!("cannot write screenshot {}: {e}", path.display()),
         }
         if let Some(r) = self.recorder.as_mut() {
             r.record(Record {
@@ -458,7 +459,7 @@ impl<C: Core> App<C> {
         if let Some(p) = self.pixels.as_mut()
             && let Err(e) = p.resize_surface(width, height)
         {
-            eprintln!("warning: cannot resize surface to {width}x{height}: {e}");
+            log::warn!("cannot resize surface to {width}x{height}: {e}");
         }
         // Restored from minimised while paused: nothing else would repaint.
         if let Some(w) = &self.window {
@@ -526,9 +527,10 @@ impl<C: Core> App<C> {
                 Ok(()) => self.buffer_size = size,
                 Err(e) => {
                     self.resize_failed = true;
-                    eprintln!(
-                        "warning: cannot resize the frame buffer to {}x{}: {e}; the picture stops updating",
-                        size.0, size.1
+                    log::warn!(
+                        "cannot resize the frame buffer to {}x{}: {e}; the picture stops updating",
+                        size.0,
+                        size.1
                     );
                     return;
                 }
@@ -582,7 +584,7 @@ impl<C: Core> ApplicationHandler for App<C> {
         self.upload();
         self.reset_clock();
         if self.test.is_none() && self.core.system() == emu_common::System::Gb {
-            eprintln!("{}", crate::keymap::SAVE_KEY_NOTICE);
+            log::info!("{}", crate::keymap::SAVE_KEY_NOTICE);
         }
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -681,6 +683,7 @@ impl<C: Core> ApplicationHandler for App<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::save::save_path;
     use emu_common::System;
     use gb_core::{FRAMES_PER_SECOND, GameBoy, M_CYCLES_PER_FRAME, Model};
     use gba_core::Gba;
@@ -716,13 +719,14 @@ mod tests {
     }
 
     fn headless_app_with(dir: &std::path::Path, mut gb: GameBoy) -> App<GameBoy> {
-        let mut saves = SaveManager::new(&dir.join("g.gb"), Instant::now());
+        let mut saves = SaveManager::new(&save_path(&dir.join("g.gb")), Instant::now());
         saves.load(&mut gb); // no .sav yet: the blank RAM is the baseline
         App::new(
             gb,
             Storage {
                 saves,
-                states: StateSlots::new(&dir.join("g.gb")),
+                states: StateSlots::new(GamePaths::beside(&dir.join("g.gb"))),
+                paths: GamePaths::beside(&dir.join("g.gb")),
             },
             None,
             [[0; 4]; 4],
@@ -730,7 +734,6 @@ mod tests {
             false,
             ShutdownFlag::default(),
         )
-        .with_rom_path(dir.join("g.gb"))
     }
 
     fn change_ram(app: &mut App<GameBoy>, first_byte: u8) {
@@ -766,9 +769,12 @@ mod tests {
     fn a_dropped_rom_replaces_the_game_after_saving_the_old_one() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
-        app.loader = Some(Box::new(
-            |_| Ok(GameBoy::new(titled_rom(b"OTHER")).unwrap()),
-        ));
+        app.loader = Some(Box::new(|path| {
+            Ok((
+                GameBoy::new(titled_rom(b"OTHER")).unwrap(),
+                GamePaths::beside(path),
+            ))
+        }));
         change_ram(&mut app, 0xAB);
         app.frame = 99;
         app.paused = true;
@@ -781,7 +787,7 @@ mod tests {
             0xAB,
             "the old game's RAM is written before it is replaced"
         );
-        assert_eq!(app.rom_path, other);
+        assert_eq!(app.paths, GamePaths::beside(&other));
         assert_eq!(app.title, "gb - OTHER");
         assert_eq!((app.frame, app.paused), (0, false));
     }
@@ -798,7 +804,7 @@ mod tests {
 
         app.open_dropped(dir.path().join("x.gb"));
 
-        assert_eq!(app.rom_path, dir.path().join("g.gb"));
+        assert_eq!(app.paths, GamePaths::beside(&dir.path().join("g.gb")));
         assert_eq!((app.title.as_str(), app.frame), (title.as_str(), 7));
         let (msg, _) = app.status.as_ref().expect("the error is shown");
         assert!(msg.contains("file not found"), "{msg}");
@@ -809,7 +815,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
         app.open_dropped(dir.path().join("x.gb"));
-        assert_eq!(app.rom_path, dir.path().join("g.gb"));
+        assert_eq!(app.paths, GamePaths::beside(&dir.path().join("g.gb")));
         assert!(app.status.is_none());
     }
 
@@ -846,7 +852,7 @@ mod tests {
         let rom_path = dir.join("g.gb");
         let mut gb = GameBoy::with_model(rom.to_vec(), model).unwrap();
         gb.set_audio_sample_rate(48_000);
-        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        let mut saves = SaveManager::new(&save_path(&rom_path), Instant::now());
         saves.load(&mut gb);
         let rec_path = dir.join("s.gbinput");
         let header = record::header_for(&gb, rom_hash(rom));
@@ -856,7 +862,8 @@ mod tests {
             gb,
             Storage {
                 saves,
-                states: StateSlots::new(&rom_path),
+                states: StateSlots::new(GamePaths::beside(&rom_path)),
+                paths: GamePaths::beside(&rom_path),
             },
             None,
             [[0; 4]; 4],
@@ -864,7 +871,6 @@ mod tests {
             false,
             ShutdownFlag::default(),
         )
-        .with_rom_path(rom_path)
         .with_recorder(Some(recorder));
         (app, rec_path)
     }
@@ -930,7 +936,7 @@ mod tests {
             }
         };
         step(&mut gb, &mut player, marker);
-        let shot = fs::read(record::screenshot_path(&dir.join("g.gb"), marker)).unwrap();
+        let shot = fs::read(GamePaths::beside(&dir.join("g.gb")).screenshot(marker)).unwrap();
         let replayed = dir.join("replayed.png");
         record::write_png(gb.frame(), &replayed).unwrap();
         assert_eq!(
@@ -1131,13 +1137,14 @@ mod tests {
     /// A headless `App` (no window, graphics or audio) on any core, saving next
     /// to `dir/g.gba`.
     fn gba_app<C: Core>(dir: &std::path::Path, mut core: C) -> App<C> {
-        let mut saves = SaveManager::new(&dir.join("g.gba"), Instant::now());
+        let mut saves = SaveManager::new(&save_path(&dir.join("g.gba")), Instant::now());
         saves.load(&mut core);
         App::new(
             core,
             Storage {
                 saves,
-                states: StateSlots::new(&dir.join("g.gba")),
+                states: StateSlots::new(GamePaths::beside(&dir.join("g.gba"))),
+                paths: GamePaths::beside(&dir.join("g.gba")),
             },
             None,
             [[0; 4]; 4],
@@ -1145,7 +1152,6 @@ mod tests {
             false,
             ShutdownFlag::default(),
         )
-        .with_rom_path(dir.join("g.gba"))
     }
 
     /// The path `main` takes: a GBA core held as `Box<dyn Core>`, stepped through
@@ -1281,7 +1287,7 @@ mod tests {
         let start = RtcTime::new(2024, 2, 29, 13, 45, 9).unwrap();
         let mut gba = Gba::with_options(rom.clone(), None, options).unwrap();
         gba.set_rtc(start);
-        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        let mut saves = SaveManager::new(&save_path(&rom_path), Instant::now());
         saves.load(&mut gba);
         let rec_path = dir.path().join("s.gbinput");
         let header = record::header_for(&gba, rom_hash(&rom));
@@ -1290,7 +1296,8 @@ mod tests {
             gba,
             Storage {
                 saves,
-                states: StateSlots::new(&rom_path),
+                states: StateSlots::new(GamePaths::beside(&rom_path)),
+                paths: GamePaths::beside(&rom_path),
             },
             None,
             [[0; 4]; 4],
@@ -1298,7 +1305,6 @@ mod tests {
             false,
             ShutdownFlag::default(),
         )
-        .with_rom_path(rom_path.clone())
         .with_recorder(Some(Recorder::create(&rec_path, &header).unwrap()));
 
         let frames = |app: &mut App<Gba>, n: u32| (0..n).for_each(|_| _ = app.step_once());
@@ -1337,7 +1343,7 @@ mod tests {
             }
         };
         step(&mut gba, marker);
-        let shot = fs::read(record::screenshot_path(&rom_path, marker)).unwrap();
+        let shot = fs::read(GamePaths::beside(&rom_path).screenshot(marker)).unwrap();
         let replayed = dir.path().join("replayed.png");
         record::write_png(Core::frame(&gba), &replayed).unwrap();
         assert_eq!(
@@ -1375,7 +1381,7 @@ mod tests {
         let rom_path = dir.path().join("g.gba");
         let rom = gba_rom();
         let mut gba = Gba::new(rom.clone(), None).unwrap();
-        let mut saves = SaveManager::new(&rom_path, Instant::now());
+        let mut saves = SaveManager::new(&save_path(&rom_path), Instant::now());
         saves.load(&mut gba);
         let rec_path = dir.path().join("s.gbinput");
         let header = record::header_for(&gba, rom_hash(&rom));
@@ -1385,7 +1391,8 @@ mod tests {
             gba,
             Storage {
                 saves,
-                states: StateSlots::new(&rom_path),
+                states: StateSlots::new(GamePaths::beside(&rom_path)),
+                paths: GamePaths::beside(&rom_path),
             },
             None,
             [[0; 4]; 4],
@@ -1393,7 +1400,6 @@ mod tests {
             false,
             ShutdownFlag::default(),
         )
-        .with_rom_path(rom_path)
         .with_recorder(Some(Recorder::create(&rec_path, &header).unwrap()));
 
         const KEYINPUT: u32 = 0x0400_0130;

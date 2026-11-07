@@ -1,14 +1,15 @@
-//! Save-state slots: `<rom>.ss1` ... `<rom>.ss9` next to the ROM, written
-//! atomically. Loading a state also rewinds battery RAM, which the battery
-//! saver then writes to `<rom>.sav`, so the first load of a session first
-//! backs that file up.
+//! Save-state slots 1 to 9 per game (in the app folder, see `library.rs`), written
+//! atomically. Loading a state also rewinds battery RAM, which the battery saver
+//! then writes to the game's `.sav`, so the first load of a session first backs
+//! that file up.
 
 use std::path::{Path, PathBuf};
 
 use emu_common::{Core, StateError, System};
 use gb_core::Model;
 
-use crate::save::{append_ext, backup_without_overwrite, read_capped, save_path, write_atomic};
+use crate::library::GamePaths;
+use crate::save::{append_ext, backup_without_overwrite, read_capped, write_atomic};
 
 pub const FIRST_SLOT: u8 = 1;
 pub const LAST_SLOT: u8 = 9;
@@ -30,7 +31,8 @@ pub fn max_state_bytes(system: System) -> u64 {
     }
 }
 
-/// `game.gb` -> `game.ss<slot>`. Like the battery save, the extension is
+/// `game.gb` -> `game.ss<slot>`: where older versions kept the slots, next to the
+/// ROM, which is now only read to import them. Like the battery save, the extension is
 /// appended instead if that would name the ROM itself.
 pub fn state_path(rom: &Path, slot: u8) -> PathBuf {
     let ext = format!("ss{slot}");
@@ -70,16 +72,16 @@ fn load_error(e: &StateError, system: System, variant: u8) -> String {
 const NO_STATES: &str = "this core has no save states";
 
 pub struct StateSlots {
-    rom: PathBuf,
+    paths: GamePaths,
     slot: u8,
     /// The `.sav` has been backed up (or there was none) this session.
     sav_backed_up: bool,
 }
 
 impl StateSlots {
-    pub fn new(rom: &Path) -> Self {
+    pub fn new(paths: GamePaths) -> Self {
         Self {
-            rom: rom.to_owned(),
+            paths,
             slot: FIRST_SLOT,
             sav_backed_up: false,
         }
@@ -96,7 +98,7 @@ impl StateSlots {
     }
 
     pub fn path(&self) -> PathBuf {
-        state_path(&self.rom, self.slot)
+        self.paths.state(self.slot)
     }
 
     /// Write the current slot. Returns a message for the user.
@@ -140,15 +142,15 @@ impl StateSlots {
         })
     }
 
-    /// Before the first load of a session, copy `<rom>.sav` aside: the loaded
+    /// Before the first load of a session, copy the game's `.sav` aside: the loaded
     /// state's battery RAM replaces it on the next autosave. Refuses the load
     /// if the copy fails, so real progress is never silently overwritten.
     fn backup_sav_once(&self) -> Result<Option<PathBuf>, String> {
-        let sav = save_path(&self.rom);
+        let sav = &self.paths.sav;
         if self.sav_backed_up || !sav.is_file() {
             return Ok(None);
         }
-        backup_without_overwrite(&sav)
+        backup_without_overwrite(sav)
             .map(Some)
             .map_err(|e| format!("not loading: cannot back up {} first: {e}", sav.display()))
     }
@@ -224,7 +226,7 @@ mod tests {
     #[test]
     fn a_core_without_states_is_not_asked_for_one() {
         let dir = tempfile::tempdir().unwrap();
-        let mut slots = StateSlots::new(&dir.path().join("g.gb"));
+        let mut slots = StateSlots::new(GamePaths::beside(&dir.path().join("g.gb")));
         let mut core = NoStates(GameBoy::new(battery_rom(0x02)).unwrap());
         assert_eq!(slots.save(&core), Err(NO_STATES.to_owned()));
         assert_eq!(slots.load(&mut core), Err(NO_STATES.to_owned()));
@@ -238,7 +240,7 @@ mod tests {
             state_path(Path::new("d/g.ss3"), 3),
             PathBuf::from("d/g.ss3.ss3")
         );
-        let mut s = StateSlots::new(Path::new("g.gb"));
+        let mut s = StateSlots::new(GamePaths::beside(Path::new("g.gb")));
         assert_eq!(s.slot(), 1);
         s.select(9);
         assert_eq!(s.slot(), 9);
@@ -295,7 +297,7 @@ mod tests {
     fn a_model_mismatch_names_the_model_flag() {
         let dir = tempfile::tempdir().unwrap();
         let rom = dir.path().join("g.gb");
-        let mut slots = StateSlots::new(&rom);
+        let mut slots = StateSlots::new(GamePaths::beside(&rom));
         let dmg = GameBoy::with_model(cgb_rom(0x02), Model::Dmg).unwrap();
         let mut cgb = GameBoy::with_model(cgb_rom(0x02), Model::Cgb).unwrap();
         slots.save(&dmg).unwrap(); // a DMG state, as every pre-CGB state is
@@ -313,7 +315,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rom = dir.path().join("g.gb");
         let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
-        let mut slots = StateSlots::new(&rom);
+        let mut slots = StateSlots::new(GamePaths::beside(&rom));
         slots.select(2);
         gb.step_frame();
         let snap = gb.save_state();
@@ -334,7 +336,7 @@ mod tests {
         let rom = dir.path().join("g.gb");
         let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
         let before = gb.save_state();
-        let mut slots = StateSlots::new(&rom);
+        let mut slots = StateSlots::new(GamePaths::beside(&rom));
         assert!(slots.load(&mut gb).unwrap_err().contains("empty"));
         fs::write(dir.path().join("g.ss1"), b"not a state").unwrap();
         assert!(
@@ -361,7 +363,7 @@ mod tests {
         let rom = dir.path().join("g.gb");
         let sav = dir.path().join("g.sav");
         let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
-        let mut slots = StateSlots::new(&rom);
+        let mut slots = StateSlots::new(GamePaths::beside(&rom));
         slots.save(&gb).unwrap();
         fs::write(&sav, vec![0x42; 0x2000]).unwrap();
 
@@ -387,7 +389,7 @@ mod tests {
         fs::write(dir.path().join("g.sav"), vec![1; 0x2000]).unwrap();
         fs::write(dir.path().join("g.ss1"), b"junk").unwrap();
         let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
-        let mut slots = StateSlots::new(&rom);
+        let mut slots = StateSlots::new(GamePaths::beside(&rom));
         assert!(slots.load(&mut gb).is_err());
         assert!(!slots.sav_backed_up);
     }
