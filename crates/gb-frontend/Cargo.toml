@@ -32,6 +32,9 @@ rfd = { version = "=0.18.0", default-features = false, features = ["xdg-portal"]
 egui = { version = "=0.35.0", default-features = false, features = ["default_fonts"] }
 egui-wgpu = { version = "=0.35.0", default-features = false }
 egui-winit = { version = "=0.35.0", default-features = false, features = ["x11", "wayland"] }
+# Local time ("Today 5:41 PM") for the snapshot list. This crate forbids unsafe code, so the
+# time zone comes from jiff. The bundled zone data is only used where the OS has none (Windows).
+jiff = { version = "=0.2.40", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo", "tzdb-concatenated"] }
 # Opens the data folder in the file manager (Finder, Explorer, xdg-open).
 opener = { version = "=0.9.0", default-features = false }
 

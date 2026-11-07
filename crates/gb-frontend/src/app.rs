@@ -24,16 +24,21 @@ use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::record::{self, Recorder};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
-use crate::state::StateSlots;
+use crate::state::{Resume, StateStore};
 use crate::ui::{
-    EscapeEffect, Mode, ThumbnailTrigger, Toasts, UiAction, escape_effect, frame_is_uniform,
+    EscapeEffect, Mode, SnapshotItem, ThumbnailTrigger, Toasts, UiAction, escape_effect,
+    frame_is_uniform, friendly_time_local, snapshot_items,
 };
 use crate::video::{Palette, present, test_pattern};
 
 /// Speed multiplier while Tab is held.
 const FAST_FORWARD_SPEED: f64 = 4.0;
 
-/// How long a save-state message stays in the window title.
+/// How often the resume point is rewritten while a game is played, so a crash loses at most
+/// this much.
+const RESUME_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a snapshot message stays in the window title.
 const STATUS_DURATION: Duration = Duration::from_secs(2);
 
 /// The window's size, in logical pixels, while the library is shown.
@@ -96,10 +101,10 @@ struct TestMode {
 /// files its player data goes to. The error is a ready-to-print message.
 pub type Loader<C> = Box<dyn FnMut(&Path) -> Result<(C, GamePaths), String>>;
 
-/// Where progress is persisted: battery RAM, save-state slots and screenshots.
+/// Where progress is persisted: battery RAM, the resume point, snapshots and screenshots.
 pub struct Storage {
     pub saves: SaveManager,
-    pub states: StateSlots,
+    pub states: StateStore,
     pub paths: GamePaths,
 }
 
@@ -120,7 +125,7 @@ fn frame_of<'a>(test: Option<&'a TestMode>, core: &'a impl Core) -> FrameRef<'a>
 /// concrete machine to reach its debug hooks.
 pub struct App<C: Core> {
     core: C,
-    /// The running game's saves, state slots and screenshot folder; `None` when no game
+    /// The running game's saves, resume point, snapshots and screenshot folder; `None` when no game
     /// is loaded (the library), so nothing can write on a game's behalf then.
     storage: Option<Storage>,
     /// Builds the core that stands in while no game is loaded; `None` keeps the last one.
@@ -135,7 +140,7 @@ pub struct App<C: Core> {
     buffer_size: (u32, u32),
     /// A buffer resize failed (and was reported once); see [`BufferPlan::Skip`].
     resize_failed: bool,
-    /// Save-state feedback shown in the title until the given instant.
+    /// Snapshot feedback shown in the title until the given instant.
     status: Option<(String, Instant)>,
     test: Option<TestMode>,
     shutdown: ShutdownFlag,
@@ -166,6 +171,16 @@ pub struct App<C: Core> {
     library: Option<Library>,
     /// The library game running, if it is one (the key its thumbnail is stored by).
     game_id: Option<GameId>,
+    /// The ROM file the running game was started from, to power it on again (Restart).
+    rom_path: Option<PathBuf>,
+    /// Games leave a resume point and start from it. Off for `--record` and
+    /// `--test-pattern` (a recording must start from power-on), for the whole run.
+    resume_enabled: bool,
+    /// When the resume point is next written during play.
+    next_resume: Instant,
+    /// The running game's snapshots as the pause menu lists them, newest first. Read when
+    /// the menu opens and after a change, not on every frame.
+    snapshot_list: Vec<SnapshotItem>,
     thumbnail: ThumbnailTrigger,
     toasts: Toasts,
     /// When egui asked to be drawn again by itself (an animation).
@@ -229,6 +244,10 @@ impl<C: Core> App<C> {
             surface_ok: true,
             library: None,
             game_id: None,
+            rom_path: None,
+            resume_enabled: false,
+            next_resume: Instant::now() + RESUME_INTERVAL,
+            snapshot_list: Vec::new(),
             thumbnail: ThumbnailTrigger::default(),
             toasts: Toasts::default(),
             ui_wake: None,
@@ -253,7 +272,36 @@ impl<C: Core> App<C> {
 
     /// Record every input from power-on (see `record.rs`).
     pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
+        // A recording must start from power-on to replay, so there is no resume.
+        if recorder.is_some() {
+            self.resume_enabled = false;
+        }
         self.recorder = recorder;
+        self
+    }
+
+    /// Let games leave a resume point when they are left and start from it (see
+    /// `resume_enabled`). Does nothing for the test pattern.
+    pub fn with_resume(mut self, enabled: bool) -> Self {
+        self.resume_enabled = enabled && self.recorder.is_none() && self.test.is_none();
+        self
+    }
+
+    /// The ROM file the running game was started from, so Restart can power it on again.
+    pub fn with_rom_path(mut self, path: Option<PathBuf>) -> Self {
+        self.rom_path = path;
+        self
+    }
+
+    /// Continue the game given to [`App::new`] from its resume point, if resume is on and
+    /// it has one (a game started from the command line; a library game is resumed as it is
+    /// opened). The battery save is already loaded.
+    pub fn continue_game(mut self) -> Self {
+        if self.try_resume() {
+            for button in Button::ALL {
+                self.set_button(button, self.input.is_down(button));
+            }
+        }
         self
     }
 
@@ -283,6 +331,8 @@ impl<C: Core> App<C> {
     /// there is a stand-in, its core. Nothing can act on the game afterwards.
     fn detach_game(&mut self) {
         self.storage = None;
+        self.rom_path = None;
+        self.snapshot_list.clear();
         if let Some(core) = self.idle.as_ref().and_then(|idle| idle()) {
             self.core = core;
         }
@@ -290,13 +340,6 @@ impl<C: Core> App<C> {
         self.thumbnail = ThumbnailTrigger::default();
         self.core_held.clear();
         self.frame = 0;
-    }
-
-    /// The selected save-state slot (the first one when no game is loaded).
-    fn slot(&self) -> u8 {
-        self.storage
-            .as_ref()
-            .map_or(crate::state::FIRST_SLOT, |s| s.states.slot())
     }
 
     /// The running game's files, if a game is loaded.
@@ -434,25 +477,132 @@ impl<C: Core> App<C> {
         }
     }
 
-    fn save_state(&mut self) {
+    /// Say `text` in the title and in a toast, at `level`.
+    fn announce(&mut self, level: log::Level, text: String) {
+        self.show_status(level, text.clone());
+        self.toast(level, text);
+    }
+
+    /// Write the resume point of the running game (after its battery save, so the save is
+    /// never older than the point). Nothing when resume is off, as under `--record`.
+    fn write_resume(&mut self) {
+        if !self.resume_enabled || self.test.is_some() || !self.core.supports_save_state() {
+            return;
+        }
         let Some(storage) = self.storage.as_ref() else {
             return;
         };
-        match storage.states.save(&self.core) {
-            Ok(msg) => self.show_status(log::Level::Info, msg),
+        if let Err(e) = storage.states.save_resume(&self.core) {
+            log::warn!("cannot save the resume point: {e}");
+        }
+    }
+
+    /// Continue the running game from its resume point. Returns whether it did. A resume
+    /// point that cannot be used is kept as `resume.state.bad`, the game starts normally
+    /// and the player is told.
+    fn try_resume(&mut self) -> bool {
+        if !self.resume_enabled || self.test.is_some() {
+            return false;
+        }
+        let Some(storage) = self.storage.as_mut() else {
+            return false;
+        };
+        match storage.states.load_resume(&mut self.core) {
+            Resume::Absent => false,
+            Resume::Loaded { backup } => {
+                if let Some(backup) = backup {
+                    log::info!(
+                        "the game was saved after the resume point; its save is kept as {}",
+                        backup.display()
+                    );
+                }
+                log::info!("resumed {}", self.core.title());
+                self.toast(log::Level::Info, "Resumed where you left off");
+                true
+            }
+            Resume::Failed { why, kept } => {
+                let kept = kept.map_or(String::new(), |k| {
+                    format!(
+                        " The old file was kept as {}.",
+                        k.file_name().map_or_else(
+                            || k.display().to_string(),
+                            |n| n.to_string_lossy().into_owned()
+                        )
+                    )
+                });
+                self.show_status(
+                    log::Level::Warn,
+                    format!("Could not resume ({why}). Starting from the beginning.{kept}"),
+                );
+                false
+            }
+        }
+    }
+
+    /// Read the snapshots of the running game for the pause menu.
+    fn refresh_snapshots(&mut self) {
+        self.snapshot_list = self
+            .storage
+            .as_ref()
+            .map_or_else(Vec::new, |s| snapshot_items(s.states.snapshots()));
+    }
+
+    /// Add a snapshot of the running game: its state, the picture on screen and the time.
+    fn save_snapshot(&mut self) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        let picture = record::encode_png(frame_of(self.test.as_ref(), &self.core));
+        if let Err(e) = &picture {
+            log::warn!("the snapshot gets no picture: {e}");
+        }
+        let saved = storage.states.save_snapshot(
+            &self.core,
+            picture.as_deref().ok(),
+            crate::library::now_secs(),
+        );
+        match saved {
+            Ok(saved) => {
+                self.refresh_snapshots();
+                let text = if saved.evicted > 0 {
+                    format!(
+                        "Snapshot saved. The oldest one was removed; at most {} are kept.",
+                        crate::state::MAX_SNAPSHOTS
+                    )
+                } else {
+                    "Snapshot saved".to_owned()
+                };
+                self.announce(log::Level::Info, text);
+            }
             Err(msg) => self.show_status(log::Level::Warn, msg),
         }
     }
 
-    fn load_state(&mut self) {
-        let Some(storage) = self.storage.as_mut() else {
+    /// L: load the most recent snapshot.
+    fn load_latest_snapshot(&mut self) {
+        let Some(storage) = self.storage.as_ref() else {
             return;
         };
-        match storage.states.load(&mut self.core) {
-            Ok(msg) => {
+        match storage.states.snapshots().first() {
+            Some(latest) => {
+                let secs = latest.secs;
+                self.load_snapshot(secs);
+            }
+            None => self.announce(log::Level::Info, "No snapshots yet".to_owned()),
+        }
+    }
+
+    /// Load the snapshot taken at `secs`. Returns whether it loaded; if not, the machine is
+    /// as it was and the reason is shown.
+    fn load_snapshot(&mut self, secs: u64) -> bool {
+        let Some(storage) = self.storage.as_mut() else {
+            return false;
+        };
+        match storage.states.load_snapshot(&mut self.core, secs) {
+            Ok(backup) => {
                 // The state replaces the machine (and the frame it is on), so
                 // the replay of a recording that goes on would diverge.
-                self.stop_recording("a save state was loaded");
+                self.stop_recording("a snapshot was loaded");
                 // The state holds the buttons pressed when it was saved; apply
                 // the keys held now instead.
                 for button in Button::ALL {
@@ -462,12 +612,46 @@ impl<C: Core> App<C> {
                 self.reset_clock();
                 // Show the restored picture even while paused.
                 self.upload();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-                self.show_status(log::Level::Info, msg);
+                self.request_redraw();
+                let when = friendly_time_local(secs);
+                let text = match backup {
+                    Some(b) => format!(
+                        "Loaded the snapshot from {when} (previous save kept as {})",
+                        b.display()
+                    ),
+                    None => format!("Loaded the snapshot from {when}"),
+                };
+                self.announce(log::Level::Info, text);
+                true
             }
-            Err(msg) => self.show_status(log::Level::Warn, msg),
+            Err(msg) => {
+                self.show_status(log::Level::Warn, msg);
+                false
+            }
+        }
+    }
+
+    fn delete_snapshot(&mut self, secs: u64) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        storage.states.delete_snapshot(secs);
+        if let Some(gui) = self.gui.as_mut() {
+            gui.forget_snapshot(secs);
+        }
+        self.refresh_snapshots();
+        self.announce(log::Level::Info, "Snapshot deleted".to_owned());
+    }
+
+    /// Power-cycle the running game: it is read from its ROM again and starts from the
+    /// beginning, keeping its battery save. The resume point is dropped with it.
+    fn restart_game(&mut self) {
+        let Some(path) = self.rom_path.clone() else {
+            return;
+        };
+        let id = self.game_id.clone();
+        if self.open_rom(&path, id, true) {
+            self.toast(log::Level::Info, "Game restarted");
         }
     }
 
@@ -479,7 +663,7 @@ impl<C: Core> App<C> {
         if self.test.is_some() || self.loader.is_none() {
             return;
         }
-        if !self.open_rom(&path, None) {
+        if !self.open_rom(&path, None, false) {
             return;
         }
         let Some(library) = self.library.as_mut() else {
@@ -505,8 +689,10 @@ impl<C: Core> App<C> {
 
     /// Power on the ROM at `path` in place of the running game, as library game `id`
     /// if it is one. Returns whether it started; if not, the running game carries on
-    /// and the error is shown.
-    fn open_rom(&mut self, path: &Path, id: Option<GameId>) -> bool {
+    /// and the error is shown. The running game is left with a resume point and the new
+    /// one continues from its own, unless `fresh` (Start fresh, Restart): then the old
+    /// game's point is not written and the new game's is discarded.
+    fn open_rom(&mut self, path: &Path, id: Option<GameId>, fresh: bool) -> bool {
         let Some(loader) = self.loader.as_mut() else {
             return false;
         };
@@ -520,6 +706,9 @@ impl<C: Core> App<C> {
         // The old game's progress is written before anything is replaced.
         if let Some(storage) = self.storage.as_mut() {
             storage.saves.flush_final(&self.core);
+        }
+        if !fresh {
+            self.write_resume();
         }
         self.stop_recording("another ROM was opened");
         let rate_check = self.audio.as_ref().map(|a| {
@@ -536,9 +725,21 @@ impl<C: Core> App<C> {
         self.core = core;
         self.storage = Some(Storage {
             saves,
-            states: StateSlots::new(paths.clone()),
+            states: StateStore::new(paths.clone()),
             paths,
         });
+        self.rom_path = Some(path.to_owned());
+        self.refresh_snapshots();
+        self.next_resume = Instant::now() + RESUME_INTERVAL;
+        if fresh {
+            if self.resume_enabled
+                && let Some(storage) = self.storage.as_ref()
+            {
+                storage.states.discard_resume();
+            }
+        } else {
+            self.try_resume();
+        }
         self.title = window_title(&self.core.title());
         self.pacer = FramePacer::new(self.core.native_fps());
         if self.fast_forward {
@@ -612,6 +813,7 @@ impl<C: Core> App<C> {
         if let Some(storage) = self.storage.as_mut() {
             storage.saves.flush(&self.core);
         }
+        self.refresh_snapshots();
         // Keys keep being tracked in the menu but no longer reach the game, so let go
         // of what the game holds now; `resume` presses again what still is held.
         self.release_core_buttons();
@@ -628,6 +830,7 @@ impl<C: Core> App<C> {
             return;
         }
         self.set_mode(self.mode.resume());
+        self.next_resume = Instant::now() + RESUME_INTERVAL;
         self.ui_wake = None;
         self.reset_ui();
         for button in Button::ALL {
@@ -656,6 +859,7 @@ impl<C: Core> App<C> {
         if let Some(storage) = self.storage.as_mut() {
             storage.saves.flush_final(&self.core);
         }
+        self.write_resume();
         self.stop_recording("returned to the library");
         self.release_core_buttons();
         self.detach_game();
@@ -734,23 +938,13 @@ impl<C: Core> App<C> {
             Some(Action::Pause) if down => self.toggle_pause(),
             // A Tab released over a menu must still end fast-forward.
             Some(Action::FastForward) => self.set_fast_forward(down && self.mode.game_input()),
-            // States need the core, which `--test-pattern` bypasses.
+            // Snapshots need the core, which `--test-pattern` bypasses.
             _ if !down || self.test.is_some() || !self.mode.game_input() => {}
-            Some(Action::SaveState) => self.save_state(),
-            Some(Action::LoadState) => self.load_state(),
-            Some(Action::SelectSlot(slot)) => self.select_slot(slot),
+            Some(Action::SaveSnapshot) => self.save_snapshot(),
+            Some(Action::LoadLatestSnapshot) => self.load_latest_snapshot(),
             _ => {}
         }
         Effect::None
-    }
-
-    fn select_slot(&mut self, slot: u8) {
-        let Some(storage) = self.storage.as_mut() else {
-            return;
-        };
-        storage.states.select(slot);
-        let msg = format!("state slot {}", storage.states.slot());
-        self.show_status(log::Level::Info, msg);
     }
 
     /// The part of key handling that needs no event loop: the joypad and the screenshot
@@ -939,10 +1133,15 @@ impl<C: Core> Steps for App<C> {
 }
 
 impl<C: Core> App<C> {
-    /// The periodic battery save check; nothing without a game.
+    /// The periodic battery save check, and the resume point every [`RESUME_INTERVAL`];
+    /// nothing without a game.
     fn tick_saves(&mut self, now: Instant) {
         if let Some(storage) = self.storage.as_mut() {
             storage.saves.tick(&self.core, now);
+        }
+        if now >= self.next_resume {
+            self.next_resume = now + RESUME_INTERVAL;
+            self.write_resume();
         }
     }
 
@@ -951,6 +1150,7 @@ impl<C: Core> App<C> {
         if let Some(storage) = self.storage.as_mut() {
             storage.saves.flush_final(&self.core);
         }
+        self.write_resume();
         if let Some(r) = self.recorder.as_mut() {
             r.finish(self.frame);
         }
@@ -967,8 +1167,8 @@ impl<C: Core> App<C> {
         let (Some(window), Some(pixels)) = (self.window.as_ref(), self.pixels.as_ref()) else {
             return;
         };
-        let slot = self.slot();
         let can_save = self.storage.is_some() && self.test.is_none();
+        let can_restart = can_save && self.loader.is_some() && self.rom_path.is_some();
         let can_return = self.library.is_some() && self.test.is_none();
         let gui = match self.gui.as_mut() {
             Some(gui) if show_ui => gui,
@@ -985,8 +1185,9 @@ impl<C: Core> App<C> {
             library: self.library.as_ref(),
             data_dir: self.library.as_ref().map(|l| l.data_dir().root()),
             game_title: &game_title,
-            slot,
             can_save,
+            can_restart,
+            snapshots: &self.snapshot_list,
             can_return,
             toasts: &self.toasts,
         };
@@ -1011,15 +1212,23 @@ impl<C: Core> App<C> {
     /// Carry out what the player asked for on a screen.
     fn perform(&mut self, action: UiAction) -> Effect {
         match action {
-            UiAction::Play(id) => self.play_library_game(&id),
+            UiAction::Play(id) => self.play_library_game(&id, false),
+            UiAction::StartFresh(id) => self.play_library_game(&id, true),
             UiAction::AddGames => self.add_games(),
             UiAction::Remove { id, delete_saves } => self.remove_game(&id, delete_saves),
             UiAction::OpenDataFolder => self.open_data_folder(),
             UiAction::Resume => self.resume(),
-            UiAction::SelectSlot(slot) => self.select_slot(slot),
-            UiAction::SaveState if self.test.is_none() => self.save_state(),
-            UiAction::LoadState if self.test.is_none() => self.load_state(),
-            UiAction::SaveState | UiAction::LoadState => {}
+            UiAction::SaveSnapshot if self.test.is_none() => self.save_snapshot(),
+            UiAction::LoadSnapshot(secs) if self.test.is_none() => {
+                // Back to the game at once, on the picture just loaded.
+                if self.load_snapshot(secs) {
+                    self.resume();
+                }
+            }
+            UiAction::DeleteSnapshot(secs) if self.test.is_none() => self.delete_snapshot(secs),
+            UiAction::SaveSnapshot | UiAction::LoadSnapshot(_) | UiAction::DeleteSnapshot(_) => {}
+            UiAction::Restart if self.test.is_none() => self.restart_game(),
+            UiAction::Restart => {}
             UiAction::Screenshot => self.screenshot(),
             UiAction::BackToLibrary => self.back_to_library(),
             UiAction::Quit => return Effect::Exit,
@@ -1029,7 +1238,8 @@ impl<C: Core> App<C> {
         Effect::None
     }
 
-    fn play_library_game(&mut self, id: &GameId) {
+    /// Open library game `id`; `fresh` drops its resume point and powers it on normally.
+    fn play_library_game(&mut self, id: &GameId, fresh: bool) {
         let Some(entry) = self.library.as_ref().and_then(|l| l.get(id)) else {
             return;
         };
@@ -1041,7 +1251,7 @@ impl<C: Core> App<C> {
             return self.toast(log::Level::Warn, msg);
         }
         let path = entry.rom_path.clone();
-        self.open_rom(&path, Some(id.clone()));
+        self.open_rom(&path, Some(id.clone()), fresh);
     }
 
     /// The Add game button: choose ROMs and add them to the library (or, with no
@@ -1052,7 +1262,7 @@ impl<C: Core> App<C> {
         self.reset_clock();
         if self.library.is_none() {
             if let Some(first) = paths.into_iter().next() {
-                self.open_rom(&first, None);
+                self.open_rom(&first, None, false);
             }
             return;
         }
@@ -1334,7 +1544,7 @@ mod tests {
             gb,
             Storage {
                 saves,
-                states: StateSlots::new(GamePaths::beside(&dir.join("g.gb"))),
+                states: StateStore::new(GamePaths::beside(&dir.join("g.gb"))),
                 paths: GamePaths::beside(&dir.join("g.gb")),
             },
             None,
@@ -1479,7 +1689,7 @@ mod tests {
             gb,
             Storage {
                 saves,
-                states: StateSlots::new(GamePaths::beside(&rom_path)),
+                states: StateStore::new(GamePaths::beside(&rom_path)),
                 paths: GamePaths::beside(&rom_path),
             },
             None,
@@ -1704,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn loading_a_state_stops_the_recording_and_resyncs_through_set_button() {
+    fn loading_a_snapshot_stops_the_recording_and_resyncs_through_set_button() {
         use gb_core::replay::{Event, Recording};
         use winit::keyboard::KeyCode;
 
@@ -1714,19 +1924,17 @@ mod tests {
         run_frames(&mut app, 2);
         app.on_key_input(KeyCode::ArrowRight, true);
         run_frames(&mut app, 1);
-        app.save_state();
+        app.save_snapshot();
         app.on_key_input(KeyCode::ArrowRight, false);
         run_frames(&mut app, 3);
-        assert!(app.recorder.is_some(), "saving a state keeps recording");
+        assert!(app.recorder.is_some(), "saving a snapshot keeps recording");
 
-        // A failed load (empty slot) changes nothing and keeps recording.
-        app.storage.as_mut().unwrap().states.select(2);
-        app.load_state();
+        // A failed load (no such snapshot) changes nothing and keeps recording.
+        assert!(!app.load_snapshot(12345));
         assert!(app.recorder.is_some());
-        app.storage.as_mut().unwrap().states.select(1);
 
         let frame_at_load = app.frame;
-        app.load_state();
+        app.load_latest_snapshot();
         assert!(app.recorder.is_none(), "recording stopped by the load");
         run_frames(&mut app, 2);
 
@@ -1801,7 +2009,7 @@ mod tests {
             core,
             Storage {
                 saves,
-                states: StateSlots::new(GamePaths::beside(&dir.join("g.gba"))),
+                states: StateStore::new(GamePaths::beside(&dir.join("g.gba"))),
                 paths: GamePaths::beside(&dir.join("g.gba")),
             },
             None,
@@ -1834,34 +2042,57 @@ mod tests {
         present(&f, &app.palette, &mut rgba);
     }
 
-    /// K and L on a GBA, held as the `Box<dyn Core>` `main` builds, write a slot
+    /// The files of the snapshots in `dir`'s `g.states` folder, newest first.
+    fn snapshot_files(dir: &Path) -> Vec<PathBuf> {
+        let paths = GamePaths::beside(&dir.join("g.gb"));
+        let secs: Vec<u64> = crate::state::StateStore::new(paths.clone())
+            .snapshots()
+            .iter()
+            .map(|s| s.secs)
+            .collect();
+        secs.into_iter().map(|s| paths.snapshot_state(s)).collect()
+    }
+
+    /// K and L on a GBA, held as the `Box<dyn Core>` `main` builds, write a snapshot
     /// file and restore from it: a state taken at one frame comes back after the
     /// machine has run on.
     #[test]
-    fn save_state_keys_on_a_gba_round_trip_through_a_slot() {
+    fn snapshot_keys_on_a_gba_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let core: Box<dyn Core> = Box::new(Gba::new(gba_rom(), None).unwrap());
         let mut app = gba_app(dir.path(), core);
         app.step_once();
         let snap = app.core.save_state();
-        app.save_state();
-        assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
-        let slot = fs::read(dir.path().join("g.ss1")).unwrap();
-        assert_eq!(slot, snap);
-        assert!(slot.len() <= gba_core::MAX_STATE_BYTES);
+        app.save_snapshot();
+        assert_eq!(app.status.as_ref().unwrap().0, "Snapshot saved");
+        let files = snapshot_files(dir.path());
+        assert_eq!(files.len(), 1);
+        let saved = fs::read(&files[0]).unwrap();
+        assert_eq!(saved, snap);
+        assert!(saved.len() <= gba_core::MAX_STATE_BYTES);
+        assert!(
+            files[0].with_extension("png").is_file(),
+            "the picture of the frame is kept"
+        );
         for _ in 0..4 {
             app.step_once();
         }
         assert_ne!(app.core.save_state(), snap);
-        app.load_state();
-        assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
+        app.load_latest_snapshot();
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("Loaded the snapshot from")
+        );
         assert_eq!(app.core.save_state(), snap);
     }
 
-    /// A state of a GBA session started with other options or another BIOS says
-    /// what to match, and a corrupt slot leaves the machine as it was.
+    /// A snapshot of a GBA session started with other options or another BIOS says
+    /// what to match, and a corrupt one leaves the machine as it was.
     #[test]
-    fn a_gba_state_load_failure_names_the_cause_and_changes_nothing() {
+    fn a_gba_snapshot_load_failure_names_the_cause_and_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let other = Gba::with_options(
             gba_rom(),
@@ -1872,11 +2103,13 @@ mod tests {
             },
         )
         .unwrap();
-        fs::write(dir.path().join("g.ss1"), other.save_state()).unwrap();
+        let states = dir.path().join("g.states");
+        fs::create_dir_all(&states).unwrap();
+        fs::write(states.join("snap-1.state"), other.save_state()).unwrap();
         let mut app = gba_app(dir.path(), Gba::new(gba_rom(), None).unwrap());
         app.step_once();
         let before = app.core.save_state();
-        app.load_state();
+        app.load_latest_snapshot();
         let msg = app.status.as_ref().unwrap().0.clone();
         assert!(
             msg.contains("--bios") && msg.contains("--save-type"),
@@ -1886,8 +2119,8 @@ mod tests {
 
         let mut bad = before.clone();
         bad.truncate(bad.len() / 2);
-        fs::write(dir.path().join("g.ss1"), bad).unwrap();
-        app.load_state();
+        fs::write(states.join("snap-2.state"), bad).unwrap();
+        app.load_latest_snapshot();
         assert!(app.status.as_ref().unwrap().0.contains("truncated"));
         assert_eq!(app.core.save_state(), before);
     }
@@ -1954,7 +2187,7 @@ mod tests {
             gba,
             Storage {
                 saves,
-                states: StateSlots::new(GamePaths::beside(&rom_path)),
+                states: StateStore::new(GamePaths::beside(&rom_path)),
                 paths: GamePaths::beside(&rom_path),
             },
             None,
@@ -2049,7 +2282,7 @@ mod tests {
             gba,
             Storage {
                 saves,
-                states: StateSlots::new(GamePaths::beside(&rom_path)),
+                states: StateStore::new(GamePaths::beside(&rom_path)),
                 paths: GamePaths::beside(&rom_path),
             },
             None,
@@ -2184,46 +2417,141 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_state_keys_restore_the_machine() {
+    fn k_and_l_save_and_load_a_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
         app.core.step_frame();
         let snap = app.core.save_state();
-        app.save_state();
-        assert!(dir.path().join("g.ss1").is_file());
-        assert!(app.status.as_ref().unwrap().0.contains("saved state 1"));
+        app.on_key(KeyCode::KeyK, true);
+        assert_eq!(snapshot_files(dir.path()).len(), 1);
+        assert_eq!(app.status.as_ref().unwrap().0, "Snapshot saved");
+        assert!(app.toasts.iter().any(|t| t.text == "Snapshot saved"));
 
         for _ in 0..5 {
             app.step_once();
         }
-        app.load_state();
+        app.on_key(KeyCode::KeyL, true);
         assert_eq!(app.core.save_state(), snap);
-        assert!(app.status.as_ref().unwrap().0.contains("loaded state 1"));
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.starts_with("Loaded the snapshot from"))
+        );
     }
 
     #[test]
-    fn failed_state_load_keeps_the_machine() {
+    fn l_loads_the_latest_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.core.step_frame();
+        app.save_snapshot();
+        for _ in 0..3 {
+            app.core.step_frame();
+        }
+        let latest = app.core.save_state();
+        app.save_snapshot();
+        assert_eq!(snapshot_files(dir.path()).len(), 2);
+        for _ in 0..5 {
+            app.core.step_frame();
+        }
+        app.load_latest_snapshot();
+        assert_eq!(app.core.save_state(), latest);
+        // The toast names the time, as the list does.
+        let said = crate::ui::friendly_time_local(app.snapshot_list[0].secs);
+        assert!(app.toasts.iter().any(|t| t.text.contains(&said)), "{said}");
+    }
+
+    #[test]
+    fn l_with_no_snapshots_says_so_and_keeps_the_machine() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
         app.core.step_frame();
         let before = app.core.save_state();
-        app.load_state(); // slot 1 doesn't exist
+        app.on_key(KeyCode::KeyL, true);
         assert_eq!(app.core.save_state(), before);
-        assert!(app.status.as_ref().unwrap().0.contains("empty"));
+        assert!(app.toasts.iter().any(|t| t.text == "No snapshots yet"));
+        assert!(!dir.path().join("g.states").exists());
     }
 
     #[test]
-    fn loading_a_state_rewinds_the_battery_save_after_backing_it_up() {
+    fn snapshots_are_deleted_from_the_list_and_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.save_snapshot();
+        app.save_snapshot();
+        app.on_key(KeyCode::Escape, true);
+        assert_eq!(app.snapshot_list.len(), 2, "read when the menu opens");
+        let oldest = app.snapshot_list[1].clone();
+        app.perform(UiAction::DeleteSnapshot(oldest.secs));
+        assert_eq!(app.snapshot_list.len(), 1);
+        assert_eq!(snapshot_files(dir.path()).len(), 1);
+        assert!(
+            !dir.path()
+                .join(format!("g.states/snap-{}.png", oldest.secs))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn the_snapshot_cap_removes_the_oldest_and_a_toast_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        for _ in 0..crate::state::MAX_SNAPSHOTS {
+            app.save_snapshot();
+        }
+        assert!(app.toasts.iter().all(|t| !t.text.contains("oldest")));
+        let first = snapshot_files(dir.path()).last().cloned().unwrap();
+        app.save_snapshot();
+        assert_eq!(
+            snapshot_files(dir.path()).len(),
+            crate::state::MAX_SNAPSHOTS
+        );
+        assert!(!first.exists(), "the oldest went");
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("oldest one was removed"))
+        );
+    }
+
+    #[test]
+    fn a_snapshot_chosen_in_the_list_loads_and_the_game_carries_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.core.step_frame();
+        let snap = app.core.save_state();
+        app.save_snapshot();
+        app.on_key(KeyCode::Escape, true);
+        for _ in 0..5 {
+            app.core.step_frame();
+        }
+        let secs = app.snapshot_list[0].secs;
+        app.perform(UiAction::LoadSnapshot(secs));
+        assert_eq!(app.core.save_state(), snap);
+        assert_eq!(app.mode, Mode::Playing, "the menu is left");
+        // One that is gone is reported and the menu stays.
+        app.on_key(KeyCode::Escape, true);
+        app.perform(UiAction::LoadSnapshot(secs + 99));
+        assert_eq!(app.mode, Mode::Paused);
+        assert!(app.toasts.iter().any(|t| t.level == log::Level::Warn));
+    }
+
+    #[test]
+    fn loading_a_snapshot_rewinds_the_battery_save_after_backing_it_up() {
         let dir = tempfile::tempdir().unwrap();
         let sav = dir.path().join("g.sav");
         let mut app = headless_app(dir.path());
-        app.save_state(); // blank RAM
+        app.save_snapshot(); // blank RAM
         change_ram(&mut app, 0xAB);
         app.toggle_pause(); // writes 0xAB to g.sav
-        app.load_state();
+        app.load_latest_snapshot();
         app.toggle_pause();
         app.toggle_pause(); // pause flushes the restored RAM
-        assert_eq!(fs::read(&sav).unwrap()[0], 0x00, "rewound with the state");
+        assert_eq!(
+            fs::read(&sav).unwrap()[0],
+            0x00,
+            "rewound with the snapshot"
+        );
         assert_eq!(fs::read(dir.path().join("g.sav.bak")).unwrap()[0], 0xAB);
     }
 
@@ -2307,19 +2635,18 @@ mod tests {
         app.on_key(KeyCode::Escape, true);
         assert_eq!(app.mode, Mode::Paused);
 
-        // In the pause menu: a button, a state key, a slot key and the screenshot key.
+        // In the pause menu: a button, the snapshot keys and the screenshot key.
         for key in [
             KeyCode::ArrowRight,
             KeyCode::KeyK,
-            KeyCode::Digit3,
+            KeyCode::KeyL,
             KeyCode::KeyC,
         ] {
             app.on_key(key, true);
         }
-        assert_eq!(app.slot(), 1, "the slot key is not for the menu");
         assert!(
-            !dir.path().join("g.ss1").exists(),
-            "K does not save a state over the menu"
+            snapshot_files(dir.path()).is_empty(),
+            "K does not save a snapshot over the menu"
         );
         assert!(
             fs::read_dir(dir.path()).unwrap().all(|e| e
@@ -2388,14 +2715,14 @@ mod tests {
     fn problems_are_toasted_and_so_is_everything_over_a_menu() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
-        app.show_status(log::Level::Info, "state slot 2".into());
+        app.show_status(log::Level::Info, "frame skipped".into());
         assert!(app.toasts.is_empty(), "plain feedback stays in the title");
-        app.show_status(log::Level::Warn, "cannot write state".into());
+        app.show_status(log::Level::Warn, "cannot write snapshot".into());
         app.show_status(log::Level::Error, "bad ROM".into());
         assert_eq!(app.toasts.iter().count(), 2);
         app.on_key(KeyCode::Escape, true);
-        app.show_status(log::Level::Info, "saved state 1".into());
-        assert!(app.toasts.iter().any(|t| t.text == "saved state 1"));
+        app.show_status(log::Level::Info, "Screenshot saved".into());
+        assert!(app.toasts.iter().any(|t| t.text == "Screenshot saved"));
     }
 
     /// A library in `dir` holding one game, `ONE`, and its id.
@@ -2665,8 +2992,13 @@ mod tests {
         for delete_saves in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (library, id, _) = library_with_a_game(dir.path());
-            let sav = library.paths_for(&id).sav;
+            let paths = library.paths_for(&id);
+            let sav = paths.sav.clone();
             fs::write(&sav, b"progress").unwrap();
+            fs::create_dir_all(paths.states_dir()).unwrap();
+            fs::write(paths.resume_state(), b"resume").unwrap();
+            fs::write(paths.snapshot_state(7), b"snapshot").unwrap();
+            fs::write(paths.snapshot_image(7), b"png").unwrap();
             let mut app = headless_app(dir.path()).with_library(Some(library));
             app.set_mode(Mode::Library);
 
@@ -2674,6 +3006,14 @@ mod tests {
 
             assert!(app.library.as_ref().unwrap().entries().is_empty());
             assert_eq!(sav.exists(), !delete_saves, "delete_saves = {delete_saves}");
+            for file in [
+                paths.resume_state(),
+                paths.snapshot_state(7),
+                paths.snapshot_image(7),
+            ] {
+                assert_eq!(file.exists(), !delete_saves, "{}", file.display());
+            }
+            assert_eq!(paths.states_dir().exists(), !delete_saves);
         }
     }
 
@@ -2682,8 +3022,362 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
         assert_eq!(app.perform(UiAction::Quit), Effect::Exit);
-        assert_eq!(app.perform(UiAction::SelectSlot(4)), Effect::None);
-        assert_eq!(app.slot(), 4);
+    }
+
+    // --- resume point -----------------------------------------------------------------
+
+    fn resume_file(dir: &Path) -> PathBuf {
+        dir.join("g.states/resume.state")
+    }
+
+    /// A loader that powers on `ONE`, with its files beside `dir/one.gb`.
+    fn one_loader(dir: &Path) -> Loader<GameBoy> {
+        let paths = GamePaths::beside(&dir.join("one.gb"));
+        Box::new(move |_| Ok((GameBoy::new(titled_rom(b"ONE")).unwrap(), paths.clone())))
+    }
+
+    /// The state of `ONE` a few frames after power-on, and the file it was left in.
+    fn left_one_state(dir: &Path) -> Vec<u8> {
+        let mut gb = GameBoy::new(titled_rom(b"ONE")).unwrap();
+        for _ in 0..3 {
+            gb.step_frame();
+        }
+        let left = gb.save_state();
+        fs::create_dir_all(dir.join("one.states")).unwrap();
+        fs::write(dir.join("one.states/resume.state"), &left).unwrap();
+        left
+    }
+
+    #[test]
+    fn leaving_to_the_library_writes_the_resume_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path()).with_resume(true);
+        for _ in 0..3 {
+            app.step_once();
+        }
+        let left = app.core.save_state();
+        app.on_key(KeyCode::Escape, true);
+        assert!(!resume_file(dir.path()).exists(), "not for a mere pause");
+        app.perform(UiAction::BackToLibrary);
+        assert_eq!(fs::read(resume_file(dir.path())).unwrap(), left);
+        assert!(app.storage.is_none());
+    }
+
+    #[test]
+    fn quitting_writes_the_resume_point_after_the_battery_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path()).with_resume(true);
+        app.step_once();
+        change_ram(&mut app, 0xAB);
+        let left = app.core.save_state();
+        assert_eq!(app.perform(UiAction::Quit), Effect::Exit);
+        app.finish(); // what `exiting` runs for Quit, the window's close button and Ctrl-C
+        assert_eq!(fs::read(resume_file(dir.path())).unwrap(), left);
+        assert_eq!(fs::read(dir.path().join("g.sav")).unwrap()[0], 0xAB);
+        let sav = fs::metadata(dir.path().join("g.sav"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let resume = fs::metadata(resume_file(dir.path()))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            resume >= sav,
+            "so the next start does not take it for stale"
+        );
+    }
+
+    #[test]
+    fn the_resume_point_is_refreshed_every_minute_of_play() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path()).with_resume(true);
+        let t0 = Instant::now();
+        app.tick_saves(t0 + Duration::from_secs(59));
+        assert!(!resume_file(dir.path()).exists(), "not before a minute");
+        app.tick_saves(t0 + Duration::from_secs(61));
+        assert!(resume_file(dir.path()).is_file());
+        fs::remove_file(resume_file(dir.path())).unwrap();
+        app.tick_saves(t0 + Duration::from_secs(100));
+        assert!(
+            !resume_file(dir.path()).exists(),
+            "a minute from the last write"
+        );
+        app.tick_saves(t0 + Duration::from_secs(125));
+        assert!(resume_file(dir.path()).is_file());
+    }
+
+    #[test]
+    fn opening_a_game_continues_from_its_resume_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = left_one_state(dir.path());
+        let (library, id, _) = library_with_a_game(dir.path());
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_resume(true);
+        app.loader = Some(one_loader(dir.path()));
+        app.set_mode(Mode::Library);
+
+        app.perform(UiAction::Play(id));
+
+        assert_eq!(app.mode, Mode::Playing);
+        assert_eq!(app.core.save_state(), left);
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text == "Resumed where you left off")
+        );
+    }
+
+    #[test]
+    fn a_game_given_on_the_command_line_continues_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = headless_app(dir.path()).with_resume(true);
+        for _ in 0..4 {
+            first.step_once();
+        }
+        let left = first.core.save_state();
+        first.finish();
+
+        let app = headless_app(dir.path()).with_resume(true).continue_game();
+        assert_eq!(app.core.save_state(), left);
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text == "Resumed where you left off")
+        );
+        // With nothing to continue from, nothing is said.
+        let other = tempfile::tempdir().unwrap();
+        let app = headless_app(other.path()).with_resume(true).continue_game();
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_rom_leaves_the_game_it_replaces_with_a_resume_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path()).with_resume(true);
+        app.step_once();
+        let left = app.core.save_state();
+        app.loader = Some(one_loader(dir.path()));
+        let dropped = dir.path().join("one.gb");
+        fs::write(&dropped, titled_rom(b"ONE")).unwrap();
+        app.open_dropped(dropped);
+        assert_eq!(fs::read(resume_file(dir.path())).unwrap(), left);
+        assert_eq!(app.title, "gb - ONE");
+    }
+
+    #[test]
+    fn a_recording_starts_from_power_on_and_leaves_no_resume_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        // A resume point from an earlier, interactive run.
+        let mut earlier =
+            headless_app_with(dir.path(), GameBoy::new(rom.clone()).unwrap()).with_resume(true);
+        earlier.step_once();
+        earlier.finish();
+        let old = fs::read(resume_file(dir.path())).unwrap();
+
+        let (app, _) = recording_app(dir.path(), &rom, Model::Dmg);
+        let power_on = app.core.save_state();
+        let mut app = app.with_resume(true);
+        assert!(!app.resume_enabled);
+        app = app.continue_game();
+        assert_eq!(app.core.save_state(), power_on, "powered on, not resumed");
+        assert!(app.toasts.is_empty());
+        run_frames(&mut app, 3);
+        app.tick_saves(Instant::now() + Duration::from_secs(120));
+        app.perform(UiAction::BackToLibrary);
+        app.finish();
+        assert_eq!(
+            fs::read(resume_file(dir.path())).unwrap(),
+            old,
+            "the old point is untouched and no new one written"
+        );
+    }
+
+    #[test]
+    fn the_resume_point_stays_off_for_a_recording_that_has_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let rom = joypad_to_palette_rom();
+        let (app, _) = recording_app(dir.path(), &rom, Model::Dmg);
+        let mut app = app.with_resume(true);
+        run_frames(&mut app, 2);
+        app.save_snapshot();
+        app.load_latest_snapshot(); // stops the recording
+        assert!(app.recorder.is_none());
+        app.perform(UiAction::BackToLibrary);
+        assert!(!resume_file(dir.path()).exists());
+    }
+
+    #[test]
+    fn the_test_pattern_neither_writes_nor_uses_a_resume_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.test = Some(TestMode {
+            frame: 0,
+            fb: Box::new([0; SCREEN_WIDTH * SCREEN_HEIGHT]),
+            tone: ToneGen::new(48_000, 60.0),
+        });
+        let mut app = app.with_resume(true);
+        assert!(!app.resume_enabled);
+        app.tick_saves(Instant::now() + Duration::from_secs(120));
+        app.finish();
+        assert!(!dir.path().join("g.states").exists());
+
+        // And `App::new` with the flag turns it off whatever the builders say.
+        let mut gb = GameBoy::new(vec![0u8; 0x8000]).unwrap();
+        let saves = SaveManager::new(&dir.path().join("t.sav"), Instant::now());
+        gb.set_audio_sample_rate(48_000);
+        let paths = GamePaths::beside(&dir.path().join("t.gb"));
+        let mut app = App::new(
+            gb,
+            Storage {
+                saves,
+                states: StateStore::new(paths.clone()),
+                paths,
+            },
+            None,
+            [[0; 4]; 4],
+            1,
+            true,
+            ShutdownFlag::default(),
+        )
+        .with_resume(true);
+        app.finish();
+        assert!(!dir.path().join("t.states").exists());
+    }
+
+    #[test]
+    fn a_corrupt_resume_point_falls_back_to_power_on_and_is_kept_as_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let states = dir.path().join("g.states");
+        fs::create_dir_all(&states).unwrap();
+        fs::write(states.join("resume.state"), b"not a state").unwrap();
+        let power_on = headless_app(dir.path()).core.save_state();
+
+        let app = headless_app(dir.path()).with_resume(true).continue_game();
+
+        assert_eq!(app.core.save_state(), power_on);
+        assert!(!states.join("resume.state").exists());
+        assert_eq!(
+            fs::read(states.join("resume.state.bad")).unwrap(),
+            b"not a state"
+        );
+        let toast = app
+            .toasts
+            .iter()
+            .find(|t| t.level == log::Level::Warn)
+            .unwrap();
+        assert!(toast.text.contains("Could not resume"), "{}", toast.text);
+        assert!(toast.text.contains("resume.state.bad"), "{}", toast.text);
+    }
+
+    #[test]
+    fn a_resume_point_of_another_rom_is_set_aside_when_a_library_game_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = GameBoy::new(vec![0u8; 0x8000]).unwrap().save_state();
+        fs::create_dir_all(dir.path().join("one.states")).unwrap();
+        fs::write(dir.path().join("one.states/resume.state"), &other).unwrap();
+        let (library, id, _) = library_with_a_game(dir.path());
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_resume(true);
+        app.loader = Some(one_loader(dir.path()));
+        app.set_mode(Mode::Library);
+
+        app.perform(UiAction::Play(id));
+
+        assert_eq!(app.mode, Mode::Playing, "the game starts anyway");
+        assert!(dir.path().join("one.states/resume.state.bad").is_file());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("Could not resume"))
+        );
+    }
+
+    #[test]
+    fn start_fresh_discards_the_resume_point_and_keeps_the_battery_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = left_one_state(dir.path());
+        let (library, id, _) = library_with_a_game(dir.path());
+        assert!(library.paths_for(&id).sav.parent().is_some());
+        let mut app = headless_app(dir.path())
+            .with_library(Some(library))
+            .with_resume(true);
+        let power_on = GameBoy::new(titled_rom(b"ONE")).unwrap().save_state();
+        assert_ne!(left, power_on);
+        app.loader = Some(one_loader(dir.path()));
+        app.set_mode(Mode::Library);
+        let sav = dir.path().join("one.sav");
+        fs::write(&sav, b"the games own save").unwrap();
+
+        app.perform(UiAction::StartFresh(id.clone()));
+
+        assert_eq!(app.mode, Mode::Playing);
+        assert_eq!(app.core.save_state(), power_on);
+        assert!(!dir.path().join("one.states/resume.state").exists());
+        assert!(!app.toasts.iter().any(|t| t.text.contains("Resumed")));
+        assert_eq!(fs::read(&sav).unwrap(), b"the games own save");
+        // The next open has nothing to continue from.
+        app.perform(UiAction::BackToLibrary);
+        fs::remove_file(dir.path().join("one.states/resume.state")).ok();
+        app.perform(UiAction::Play(id));
+        assert_eq!(app.core.save_state(), power_on);
+    }
+
+    #[test]
+    fn start_fresh_on_a_missing_game_keeps_the_resume_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = left_one_state(dir.path());
+        let (library, id, _) = library_with_a_game(dir.path());
+        fs::remove_file(&library.get(&id).unwrap().rom_path).unwrap();
+        let library = Library::open(library.data_dir());
+        let mut app = headless_app(dir.path()).with_library(Some(library));
+        app.loader = Some(Box::new(|_| panic!("a missing game must not be loaded")));
+        app.set_mode(Mode::Library);
+        app.perform(UiAction::StartFresh(id));
+        assert_eq!(
+            fs::read(dir.path().join("one.states/resume.state")).unwrap(),
+            left
+        );
+    }
+
+    #[test]
+    fn restart_powers_the_game_on_again_and_keeps_the_battery_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path())
+            .with_resume(true)
+            .with_rom_path(Some(dir.path().join("one.gb")));
+        app.loader = Some(one_loader(dir.path()));
+        let power_on = GameBoy::new(titled_rom(b"ONE")).unwrap().save_state();
+        app.step_once();
+        app.on_key(KeyCode::Escape, true);
+        app.perform(UiAction::Restart);
+        assert_eq!(app.mode, Mode::Playing);
+        assert_eq!(app.core.save_state(), power_on);
+        assert!(!dir.path().join("one.states/resume.state").exists());
+        assert!(
+            !resume_file(dir.path()).exists(),
+            "the old point is not written"
+        );
+        assert_eq!(app.title, "gb - ONE");
+        // No ROM to read it from: nothing happens.
+        let mut app = headless_app(dir.path());
+        app.on_key(KeyCode::Escape, true);
+        app.perform(UiAction::Restart);
+        assert_eq!(app.mode, Mode::Paused);
+    }
+
+    #[test]
+    fn the_library_knows_which_games_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, id, _) = library_with_a_game(dir.path());
+        assert!(!library.has_resume(&id));
+        let paths = library.paths_for(&id);
+        fs::create_dir_all(paths.states_dir()).unwrap();
+        fs::write(paths.resume_state(), b"x").unwrap();
+        assert!(library.has_resume(&id));
     }
 
     // --- review fixes ---------------------------------------------------------------
@@ -2719,7 +3413,7 @@ mod tests {
         app.tick_saves(Instant::now() + crate::save::SAVE_INTERVAL * 2);
         app.finish();
         app.screenshot();
-        app.save_state();
+        app.save_snapshot();
         assert!(
             fs::read_dir(dir.path()).unwrap().all(|e| !e
                 .unwrap()

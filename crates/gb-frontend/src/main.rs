@@ -39,7 +39,7 @@ use crate::paths::DataDir;
 use crate::picker::Startup;
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
-use crate::state::StateSlots;
+use crate::state::StateStore;
 
 /// A Game Boy core for `rom`, as `--model` asks, and the hash of the ROM it hashed.
 fn build_gb(
@@ -191,7 +191,7 @@ fn main() -> ExitCode {
     );
     if let Some(problem) = &data_problem {
         log::warn!(
-            "{problem}; saves, save states and screenshots go next to the ROM instead, \
+            "{problem}; saves, resume points, snapshots and screenshots go next to the ROM instead, \
              and there is no log file or library"
         );
     }
@@ -345,7 +345,7 @@ fn main() -> ExitCode {
     }
     let storage = Storage {
         saves,
-        states: StateSlots::new(paths.clone()),
+        states: StateStore::new(paths.clone()),
         paths,
     };
     let mut app = App::new(
@@ -359,6 +359,9 @@ fn main() -> ExitCode {
     )
     .with_notice(data_problem.map(|_| NO_DATA_NOTICE.to_owned()))
     .with_recorder(recorder)
+    // A run that records or shows the test pattern neither leaves nor uses a resume point.
+    .with_resume(interactive)
+    .with_rom_path(rom_path.clone())
     .with_library(library)
     .with_game(game_id)
     .with_idle(Box::new(|| idle_core().ok()))
@@ -373,6 +376,9 @@ fn main() -> ExitCode {
     });
     if rom_path.is_none() {
         app = app.in_library();
+    } else {
+        // The battery save is loaded; now continue where the game was left.
+        app = app.continue_game();
     }
     let run = event_loop.run_app(&mut app);
     if let Some(e) = app.error.take() {

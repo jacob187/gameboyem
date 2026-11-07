@@ -22,7 +22,9 @@ use winit::window::Window;
 
 use crate::keymap;
 use crate::library::{Entry, GameId, Library, Source};
-use crate::ui::{Mode, Toasts, UiAction, library_order};
+use crate::save::read_capped;
+use crate::state::MAX_IMAGE_BYTES;
+use crate::ui::{Mode, SnapshotItem, Toasts, UiAction, friendly_time_local, library_order};
 
 /// Largest thumbnail side drawn; the library refuses larger ones when they are set, and
 /// a file placed in the folder by hand is held to the same limit.
@@ -33,6 +35,10 @@ const CARD_HEIGHT: f32 = 188.0;
 const CARD_PAD: f32 = 8.0;
 const THUMB_HEIGHT: f32 = 128.0;
 const CARD_GAP: f32 = 12.0;
+
+/// A row of the snapshot list: the picture's size (a Game Boy frame at half size) and the row.
+const SNAP_WIDTH: f32 = 80.0;
+const SNAP_HEIGHT: f32 = 72.0;
 
 const ACCENT: Color32 = Color32::from_rgb(0x3b, 0x82, 0xc4);
 const BADGE: Color32 = Color32::from_rgb(0x48, 0x4f, 0x5c);
@@ -47,10 +53,12 @@ pub struct Screen<'a> {
     pub data_dir: Option<&'a Path>,
     /// The title of the running game (for the pause menu).
     pub game_title: &'a str,
-    /// The selected save-state slot.
-    pub slot: u8,
-    /// The running game has a real core: states and screenshots mean something.
+    /// The running game has a real core: snapshots and screenshots mean something.
     pub can_save: bool,
+    /// The game can be powered on again (there is a ROM to read it from).
+    pub can_restart: bool,
+    /// The running game's snapshots, newest first.
+    pub snapshots: &'a [SnapshotItem],
     /// There is a library to go back to.
     pub can_return: bool,
     pub toasts: &'a Toasts,
@@ -64,17 +72,76 @@ pub struct Drawn {
     pub repaint_after: Option<Duration>,
 }
 
-/// Which pop-up is open in front of the screen, and the library's confirmation.
+/// Which pop-up is open in front of the screen, and the confirmation asked for.
 #[derive(Default)]
 struct View {
     help: bool,
+    /// The list of snapshots to load or delete.
+    snapshots: bool,
     confirm: Option<Confirm>,
 }
 
-struct Confirm {
-    id: GameId,
-    title: String,
-    delete_saves: bool,
+impl View {
+    /// The help, the snapshot list or a confirmation is open.
+    fn overlay_open(&self) -> bool {
+        self.help || self.snapshots || self.confirm.is_some()
+    }
+
+    /// Close the front-most pop-up: a confirmation, else the snapshot list, else the help.
+    fn close_front(&mut self) {
+        if self.confirm.is_some() {
+            self.confirm = None;
+        } else if self.snapshots {
+            self.snapshots = false;
+        } else {
+            self.help = false;
+        }
+    }
+}
+
+/// A question the player answers before something is removed or restarted.
+enum Confirm {
+    /// Take a game out of the library.
+    Remove {
+        id: GameId,
+        title: String,
+        delete_saves: bool,
+    },
+    /// Delete the snapshot taken at `secs`, which is shown as `when`.
+    DeleteSnapshot { secs: u64, when: String },
+    /// Power-cycle the running game.
+    Restart,
+}
+
+impl Confirm {
+    fn heading(&self) -> &'static str {
+        match self {
+            Confirm::Remove { .. } => "Remove from library?",
+            Confirm::DeleteSnapshot { .. } => "Delete snapshot?",
+            Confirm::Restart => "Restart game?",
+        }
+    }
+
+    fn yes(&self) -> &'static str {
+        match self {
+            Confirm::Remove { .. } => "Remove",
+            Confirm::DeleteSnapshot { .. } => "Delete",
+            Confirm::Restart => "Restart",
+        }
+    }
+
+    fn action(&self) -> UiAction {
+        match self {
+            Confirm::Remove {
+                id, delete_saves, ..
+            } => UiAction::Remove {
+                id: id.clone(),
+                delete_saves: *delete_saves,
+            },
+            Confirm::DeleteSnapshot { secs, .. } => UiAction::DeleteSnapshot(*secs),
+            Confirm::Restart => UiAction::Restart,
+        }
+    }
 }
 
 pub struct Gui {
@@ -83,6 +150,7 @@ pub struct Gui {
     renderer: egui_wgpu::Renderer,
     view: View,
     thumbs: Thumbs,
+    snap_thumbs: SnapThumbs,
 }
 
 /// How long a thumbnail that failed to load is left alone before the next try (seconds).
@@ -92,6 +160,10 @@ const THUMBNAIL_RETRY_SECS: f64 = 10.0;
 /// is listed but could not be read is tried again after a while and whenever the
 /// screens are reset (the library is entered again).
 type Thumbs = HashMap<GameId, Thumb>;
+
+/// Textures of the snapshot pictures of the running game by snapshot time; `None` for a
+/// snapshot with no picture (or one that cannot be read). Dropped when the list closes.
+type SnapThumbs = HashMap<u64, Option<TextureHandle>>;
 
 enum Thumb {
     Loaded(TextureHandle),
@@ -128,6 +200,7 @@ impl Gui {
             renderer,
             view: View::default(),
             thumbs: HashMap::new(),
+            snap_thumbs: HashMap::new(),
         }
     }
 
@@ -142,23 +215,30 @@ impl Gui {
         drop(self.state.take_egui_input(window));
     }
 
-    /// The help screen or a confirmation is open in front of the menu: Esc closes it.
+    /// The help screen, the snapshot list or a confirmation is open in front of the menu:
+    /// Esc closes it.
     pub fn overlay_open(&self) -> bool {
-        self.view.help || self.view.confirm.is_some()
+        self.view.overlay_open()
     }
 
+    /// Close the front-most pop-up (see [`View::close_front`]).
     pub fn close_overlay(&mut self) {
-        if self.view.confirm.is_some() {
-            self.view.confirm = None;
-        } else {
-            self.view.help = false;
+        self.view.close_front();
+        if !self.view.snapshots {
+            self.snap_thumbs.clear();
         }
     }
 
     /// Close every pop-up (the screen changed).
     pub fn reset_view(&mut self) {
         self.view = View::default();
+        self.snap_thumbs.clear();
         self.thumbs.retain(|_, t| matches!(t, Thumb::Loaded(_)));
+    }
+
+    /// Forget the picture of the snapshot taken at `secs` (it was deleted).
+    pub fn forget_snapshot(&mut self, secs: u64) {
+        self.snap_thumbs.remove(&secs);
     }
 
     /// Forget the cached thumbnail of `id` (it was set or the game removed).
@@ -183,8 +263,11 @@ impl Gui {
             renderer,
             view,
             thumbs,
+            snap_thumbs,
         } = self;
-        let output = ctx.run_ui(raw, |ui| build(ui, view, thumbs, screen, &mut actions));
+        let output = ctx.run_ui(raw, |ui| {
+            build(ui, view, (thumbs, snap_thumbs), screen, &mut actions);
+        });
         state.handle_platform_output(window, output.platform_output);
         let repaint_after = output
             .viewport_output
@@ -294,7 +377,7 @@ pub fn decode_thumbnail(bytes: &[u8]) -> Option<([usize; 2], Vec<u8>)> {
 fn build(
     ui: &mut egui::Ui,
     view: &mut View,
-    thumbs: &mut Thumbs,
+    (thumbs, snap_thumbs): (&mut Thumbs, &mut SnapThumbs),
     screen: &Screen<'_>,
     actions: &mut Vec<UiAction>,
 ) {
@@ -302,11 +385,14 @@ fn build(
     if screen.mode == Mode::Library {
         library_screen(ui, view, thumbs, screen, actions);
     }
-    // One pop-up at a time: help, else a confirmation, else the pause menu.
+    // One pop-up at a time: help, else a confirmation, else the snapshot list, else the
+    // pause menu.
     if view.help {
         help_modal(&ctx, view, screen, actions);
     } else if view.confirm.is_some() {
         confirm_modal(&ctx, view, actions);
+    } else if view.snapshots && screen.mode == Mode::Paused {
+        snapshots_modal(&ctx, view, snap_thumbs, screen, actions);
     } else if screen.mode == Mode::Paused {
         pause_modal(&ctx, view, screen, actions);
     }
@@ -365,11 +451,14 @@ fn library_screen(
                             Some(library) => thumbnail(ui.ctx(), thumbs, library, entry),
                             None => None,
                         };
-                        card(ui, entry, texture, &mut view.confirm, actions);
+                        let resume = screen.library.is_some_and(|l| l.has_resume(&entry.id));
+                        card(ui, entry, texture, resume, &mut view.confirm, actions);
                     }
                 });
                 ui.add_space(8.0);
-                ui.weak("Click a game to play it. Right-click a game to remove it.");
+                ui.weak(
+                    "Click a game to play it. Right-click a game to start it fresh or remove it.",
+                );
             });
     });
 }
@@ -430,6 +519,7 @@ fn card(
     ui: &mut egui::Ui,
     entry: &Entry,
     texture: Option<&TextureHandle>,
+    resume: bool,
     confirm: &mut Option<Confirm>,
     actions: &mut Vec<UiAction>,
 ) {
@@ -499,7 +589,7 @@ fn card(
         text_color,
     );
 
-    // Badges: the console, then "Bundled" or "missing".
+    // Badges: the console, then "Bundled", "Resume" or "missing".
     let mut x = rect.min.x + CARD_PAD;
     let y = rect.max.y - CARD_PAD - 18.0;
     let mut badge = |label: &str, color: Color32| {
@@ -514,16 +604,45 @@ fn card(
     if entry.source == Source::Bundled {
         badge("Bundled", ACCENT);
     }
+    if resume {
+        badge("Resume", ACCENT);
+    }
     if !entry.available {
         badge("missing", MISSING);
     }
 
+    let response = match entry.last_played {
+        Some(secs) => response.on_hover_ui(|ui| {
+            let resumes = if resume {
+                " It resumes where you left off."
+            } else {
+                ""
+            };
+            ui.label(format!(
+                "Last played {}.{resumes}",
+                friendly_time_local(secs)
+            ));
+        }),
+        None => response,
+    };
     response.context_menu(|ui| {
+        let fresh = egui::Button::new("Start fresh");
+        if ui
+            .add_enabled(entry.available, fresh)
+            .on_hover_text(
+                "Forget where you left off and start from the beginning. The game's own save is kept.",
+            )
+            .on_disabled_hover_text("The ROM is missing")
+            .clicked()
+        {
+            actions.push(UiAction::StartFresh(entry.id.clone()));
+            ui.close();
+        }
         if entry.source == Source::Bundled {
             ui.add_enabled(false, egui::Button::new("Remove from library"))
                 .on_disabled_hover_text("Bundled games come with the app and cannot be removed");
         } else if ui.button("Remove from library").clicked() {
-            *confirm = Some(Confirm {
+            *confirm = Some(Confirm::Remove {
                 id: entry.id.clone(),
                 title: entry.title.clone(),
                 delete_saves: false,
@@ -559,28 +678,33 @@ fn pause_modal(
         if menu_button(ui, "Resume") {
             actions.push(UiAction::Resume);
         }
-        if screen.can_save {
+        if screen.can_save || screen.can_restart {
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("State slot");
-                for slot in crate::state::FIRST_SLOT..=crate::state::LAST_SLOT {
-                    if ui
-                        .selectable_label(screen.slot == slot, slot.to_string())
-                        .clicked()
-                    {
-                        actions.push(UiAction::SelectSlot(slot));
-                    }
-                }
-            });
-            if menu_button(ui, &format!("Save state (slot {})", screen.slot)) {
-                actions.push(UiAction::SaveState);
+        }
+        if screen.can_save {
+            if menu_button(ui, "Save snapshot (K)") {
+                actions.push(UiAction::SaveSnapshot);
             }
-            if menu_button(ui, &format!("Load state (slot {})", screen.slot)) {
-                actions.push(UiAction::LoadState);
+            let load = egui::Button::new("Load snapshot\u{2026}");
+            let none = screen.snapshots.is_empty();
+            if ui
+                .add_enabled_ui(!none, |ui| {
+                    ui.add_sized([ui.available_width(), 32.0], load)
+                        .on_disabled_hover_text("No snapshots yet")
+                })
+                .inner
+                .clicked()
+            {
+                view.snapshots = true;
             }
-            if menu_button(ui, "Screenshot") {
-                actions.push(UiAction::Screenshot);
-            }
+        }
+        if screen.can_restart && menu_button(ui, "Restart game") {
+            view.confirm = Some(Confirm::Restart);
+        }
+        if screen.can_save && menu_button(ui, "Screenshot (C)") {
+            actions.push(UiAction::Screenshot);
+        }
+        if screen.can_save || screen.can_restart {
             ui.separator();
         }
         if menu_button(ui, "Help") {
@@ -595,29 +719,149 @@ fn pause_modal(
     });
 }
 
+/// The picture of a snapshot, loaded the first time its row is drawn.
+fn snapshot_texture<'a>(
+    ctx: &egui::Context,
+    cache: &'a mut SnapThumbs,
+    item: &SnapshotItem,
+) -> Option<&'a TextureHandle> {
+    cache
+        .entry(item.secs)
+        .or_insert_with(|| {
+            let bytes = read_capped(item.image.as_ref()?, MAX_IMAGE_BYTES, "snapshot picture")
+                .ok()
+                .flatten()?;
+            let (size, rgba) = decode_thumbnail(&bytes)?;
+            Some(ctx.load_texture(
+                format!("snapshot-{}", item.secs),
+                egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
+                TextureOptions::NEAREST,
+            ))
+        })
+        .as_ref()
+}
+
+fn snapshots_modal(
+    ctx: &egui::Context,
+    view: &mut View,
+    cache: &mut SnapThumbs,
+    screen: &Screen<'_>,
+    actions: &mut Vec<UiAction>,
+) {
+    let height = (ctx.content_rect().height() - 200.0).max(SNAP_HEIGHT);
+    let width = (ctx.content_rect().width() - 80.0).clamp(280.0, 460.0);
+    let mut close = false;
+    egui::Modal::new(Id::new("snapshots")).show(ctx, |ui| {
+        ui.set_width(width);
+        ui.heading("Load snapshot");
+        if screen.snapshots.is_empty() {
+            ui.label("No snapshots yet. Press K while playing, or choose Save snapshot.");
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(height)
+                .auto_shrink([false, true])
+                .show_rows(ui, SNAP_HEIGHT, screen.snapshots.len(), |ui, rows| {
+                    for item in &screen.snapshots[rows] {
+                        let texture = snapshot_texture(ui.ctx(), cache, item);
+                        snapshot_row(ui, item, texture, &mut view.confirm, actions);
+                    }
+                });
+        }
+        ui.add_space(4.0);
+        if ui.button("Back").clicked() {
+            close = true;
+        }
+    });
+    if close {
+        view.snapshots = false;
+        cache.clear();
+    }
+}
+
+/// One snapshot: its picture (or a placeholder), when it was taken, Load and Delete.
+fn snapshot_row(
+    ui: &mut egui::Ui,
+    item: &SnapshotItem,
+    texture: Option<&TextureHandle>,
+    confirm: &mut Option<Confirm>,
+    actions: &mut Vec<UiAction>,
+) {
+    let size = vec2(ui.available_width(), SNAP_HEIGHT);
+    ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(SNAP_WIDTH, SNAP_HEIGHT), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, egui::CornerRadius::same(4), Color32::from_gray(18));
+        match texture {
+            Some(texture) => {
+                let size = texture.size_vec2();
+                let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                let shown = Rect::from_center_size(rect.center(), size * scale);
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                painter.image(texture.id(), shown, uv, Color32::WHITE);
+            }
+            None => {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "No picture",
+                    FontId::proportional(11.0),
+                    Color32::from_gray(110),
+                );
+            }
+        }
+        ui.label(RichText::new(&item.when).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Load").clicked() {
+                actions.push(UiAction::LoadSnapshot(item.secs));
+            }
+            if ui.button("Delete").clicked() {
+                *confirm = Some(Confirm::DeleteSnapshot {
+                    secs: item.secs,
+                    when: item.when.clone(),
+                });
+            }
+        });
+    });
+}
+
 fn confirm_modal(ctx: &egui::Context, view: &mut View, actions: &mut Vec<UiAction>) {
     let Some(confirm) = view.confirm.as_mut() else {
         return;
     };
     let mut done = false;
-    egui::Modal::new(Id::new("confirm_remove")).show(ctx, |ui| {
+    egui::Modal::new(Id::new("confirm")).show(ctx, |ui| {
         ui.set_width(340.0);
-        ui.heading("Remove from library?");
-        ui.label(format!(
-            "{} will be taken out of the library and its ROM copy deleted. Your original \
-             file is not touched.",
-            confirm.title
-        ));
-        ui.checkbox(
-            &mut confirm.delete_saves,
-            "Also delete its saves, save states and screenshots",
-        );
+        ui.heading(confirm.heading());
+        match confirm {
+            Confirm::Remove {
+                title,
+                delete_saves,
+                ..
+            } => {
+                ui.label(format!(
+                    "{title} will be taken out of the library and its ROM copy deleted. Your \
+                     original file is not touched."
+                ));
+                ui.checkbox(
+                    delete_saves,
+                    "Also delete its saves, resume point, snapshots and screenshots",
+                );
+            }
+            Confirm::DeleteSnapshot { when, .. } => {
+                ui.label(format!(
+                    "The snapshot from {when} will be deleted. This cannot be undone."
+                ));
+            }
+            Confirm::Restart => {
+                ui.label(
+                    "The game starts over from the beginning, as if it were switched off and \
+                     on again. Its own save and your snapshots are kept.",
+                );
+            }
+        }
         ui.horizontal(|ui| {
-            if ui.button("Remove").clicked() {
-                actions.push(UiAction::Remove {
-                    id: confirm.id.clone(),
-                    delete_saves: confirm.delete_saves,
-                });
+            if ui.button(confirm.yes()).clicked() {
+                actions.push(confirm.action());
                 done = true;
             }
             if ui.button("Cancel").clicked() {
@@ -661,6 +905,31 @@ fn help_text(ui: &mut egui::Ui, screen: &Screen<'_>, actions: &mut Vec<UiAction>
     );
     ui.add_space(6.0);
 
+    ui.strong("Saving");
+    for (name, what) in [
+        (
+            "The game's own save.",
+            "Happens when the game saves, for example at a save point. It is kept \
+             automatically.",
+        ),
+        (
+            "Resume.",
+            "When you leave a game, the app remembers exactly where you were and picks up \
+             there next time. Right-click a game and choose Start fresh to begin again.",
+        ),
+        (
+            "Snapshots.",
+            "Save anywhere with K or the pause menu, and load with L (the latest one) or \
+             the menu (any of them).",
+        ),
+    ] {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(name);
+            ui.label(what);
+        });
+    }
+    ui.add_space(6.0);
+
     ui.strong("Controls");
     egui::Grid::new("help_controls")
         .num_columns(2)
@@ -681,8 +950,9 @@ fn help_text(ui: &mut egui::Ui, screen: &Screen<'_>, actions: &mut Vec<UiAction>
         Some(dir) => {
             ui.label(RichText::new(dir.display().to_string()).monospace());
             ui.label(
-                "saves/ holds in-game saves, states/ save states, screenshots/ your \
-                 screenshots, games/ the library, and logs/gameboyem.log the log.",
+                "saves/ holds in-game saves, states/ your resume points and snapshots, \
+                 screenshots/ your screenshots, games/ the library, and logs/gameboyem.log \
+                 the log.",
             );
             if ui.button("Open folder").clicked() {
                 actions.push(UiAction::OpenDataFolder);
@@ -690,8 +960,8 @@ fn help_text(ui: &mut egui::Ui, screen: &Screen<'_>, actions: &mut Vec<UiAction>
         }
         None => {
             ui.label(
-                "There is no data folder this time, so saves, states and screenshots go \
-                 next to the ROM.",
+                "There is no data folder this time, so saves, resume points, snapshots and \
+                 screenshots go next to the ROM.",
             );
         }
     }
@@ -789,6 +1059,7 @@ mod tests {
     fn run(screen: &Screen<'_>, view: &mut View) -> Vec<UiAction> {
         let ctx = egui::Context::default();
         let mut thumbs = HashMap::new();
+        let mut snap_thumbs = HashMap::new();
         let mut actions = Vec::new();
         for _ in 0..3 {
             let input = egui::RawInput {
@@ -796,10 +1067,26 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run_ui(input, |ui| {
-                build(ui, view, &mut thumbs, screen, &mut actions);
+                build(
+                    ui,
+                    view,
+                    (&mut thumbs, &mut snap_thumbs),
+                    screen,
+                    &mut actions,
+                );
             });
         }
         actions
+    }
+
+    fn items() -> Vec<SnapshotItem> {
+        (0..60)
+            .map(|n| SnapshotItem {
+                secs: 1_700_000_000 + n,
+                when: format!("Today {n}"),
+                image: None,
+            })
+            .collect()
     }
 
     #[test]
@@ -810,48 +1097,159 @@ mod tests {
         for title in ["ONE", "TWO"] {
             let path = tmp.path().join(format!("{title}.gb"));
             fs::write(&path, rom(title)).unwrap();
-            library.add_rom(&path).unwrap();
+            let id = library.add_rom(&path).unwrap().entry.id;
+            // One game that resumes, one that does not.
+            if title == "ONE" {
+                let paths = library.paths_for(&id);
+                fs::create_dir_all(paths.states_dir()).unwrap();
+                fs::write(paths.resume_state(), b"x").unwrap();
+            }
         }
         let toasts = Toasts::default();
+        let snapshots = items();
         let screen = |mode, library| Screen {
             mode,
             library,
             data_dir: Some(data.root()),
             game_title: "ONE",
-            slot: 2,
             can_save: true,
+            can_restart: true,
+            snapshots: &snapshots,
             can_return: true,
             toasts: &toasts,
         };
 
+        let confirms = || {
+            [
+                Confirm::Remove {
+                    id: GameId::new("ONE", 1),
+                    title: "ONE".to_owned(),
+                    delete_saves: false,
+                },
+                Confirm::DeleteSnapshot {
+                    secs: 5,
+                    when: "Today 5:41 PM".to_owned(),
+                },
+                Confirm::Restart,
+            ]
+        };
         for view in [
             View::default(),
             View {
                 help: true,
-                confirm: None,
+                ..View::default()
             },
-            View {
-                help: false,
-                confirm: Some(Confirm {
-                    id: GameId::new("ONE", 1),
-                    title: "ONE".to_owned(),
-                    delete_saves: false,
-                }),
-            },
-        ] {
+        ]
+        .into_iter()
+        .chain(confirms().map(|c| View {
+            confirm: Some(c),
+            ..View::default()
+        })) {
             let mut view = view;
             assert!(run(&screen(Mode::Library, Some(&library)), &mut view).is_empty());
         }
         let mut view = View::default();
         assert!(run(&screen(Mode::Paused, Some(&library)), &mut view).is_empty());
+        // The snapshot list, with rows, with none, and with a question in front of it.
+        let mut view = View {
+            snapshots: true,
+            ..View::default()
+        };
+        assert!(run(&screen(Mode::Paused, Some(&library)), &mut view).is_empty());
+        let none = Screen {
+            snapshots: &[],
+            ..screen(Mode::Paused, None)
+        };
+        assert!(run(&none, &mut view).is_empty());
+        for c in confirms() {
+            let mut view = View {
+                snapshots: true,
+                confirm: Some(c),
+                ..View::default()
+            };
+            assert!(run(&screen(Mode::Paused, None), &mut view).is_empty());
+        }
         let mut view = View {
             help: true,
-            confirm: None,
+            ..View::default()
         };
         assert!(run(&screen(Mode::Paused, None), &mut view).is_empty());
         // The empty library and the one without a data folder.
         let mut view = View::default();
         assert!(run(&screen(Mode::Library, None), &mut view).is_empty());
+    }
+
+    #[test]
+    fn the_pause_menu_has_no_slot_picker_and_names_the_snapshot_keys() {
+        // Everything the menu says, found by drawing it and reading the text out.
+        let toasts = Toasts::default();
+        let snapshots = items();
+        let screen = Screen {
+            mode: Mode::Paused,
+            library: None,
+            data_dir: None,
+            game_title: "ONE",
+            can_save: true,
+            can_restart: true,
+            snapshots: &snapshots,
+            can_return: true,
+            toasts: &toasts,
+        };
+        let ctx = egui::Context::default();
+        let (mut view, mut thumbs, mut snap_thumbs, mut actions) =
+            (View::default(), HashMap::new(), HashMap::new(), Vec::new());
+        let mut text = String::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 650.0))),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                build(
+                    ui,
+                    &mut view,
+                    (&mut thumbs, &mut snap_thumbs),
+                    &screen,
+                    &mut actions,
+                );
+            });
+            text = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+        }
+        for wanted in [
+            "Resume",
+            "Save snapshot (K)",
+            "Load snapshot\u{2026}",
+            "Restart game",
+            "Screenshot (C)",
+            "Help",
+            "Back to library",
+            "Quit",
+        ] {
+            assert!(text.contains(wanted), "{wanted} is missing from {text}");
+        }
+        assert!(!text.to_lowercase().contains("slot"), "{text}");
+    }
+
+    #[test]
+    fn esc_closes_the_front_most_pop_up_first() {
+        let mut view = View {
+            snapshots: true,
+            confirm: Some(Confirm::Restart),
+            ..View::default()
+        };
+        assert!(view.overlay_open());
+        view.close_front();
+        assert!(view.snapshots && view.confirm.is_none());
+        view.close_front();
+        assert!(!view.snapshots && !view.overlay_open());
     }
 
     #[test]
@@ -866,8 +1264,9 @@ mod tests {
             library: None,
             data_dir: None,
             game_title: "",
-            slot: 1,
             can_save: false,
+            can_restart: false,
+            snapshots: &[],
             can_return: false,
             toasts: &toasts,
         };

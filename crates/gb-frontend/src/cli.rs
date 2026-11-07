@@ -14,8 +14,13 @@ pub const USAGE: &str = "\
 usage: gb [options] [--] [rom.gb|rom.gbc|rom.gba]
 
 With no ROM path, a file dialog asks for one. A ROM file can also be dropped onto the window.
-Saves, save states and screenshots are kept in the app data folder, not next to the ROM; a .sav
-(and .ss1-9) next to the ROM is copied there the first time the ROM is opened, and left in place.
+Saves, the resume point, snapshots and screenshots are kept in the app data folder, not next to the
+ROM; a .sav next to the ROM is copied there the first time the ROM is opened, and left in place
+(old numbered save states there become snapshots).
+
+Saving: the game's own save is kept automatically. When you leave a game, the app remembers exactly
+where you were and continues there next time (not with --record or --test-pattern). Snapshots save
+the game anywhere (K or the pause menu) and load again later (L, or the menu for any of them).
 
 options:
   --scale N          integer window scale in logical points, 1..=8 (default 4)
@@ -34,7 +39,7 @@ options:
   --                 end of options; the next argument is the ROM path, even if it starts with `-`
 
 environment:
-  GAMEBOYEM_DATA_DIR use this folder for saves, states, screenshots, the library and logs
+  GAMEBOYEM_DATA_DIR use this folder for saves, snapshots, screenshots, the library and logs
                      (default: macOS ~/Library/Application Support/gameboyem,
                      Windows %APPDATA%\\gameboyem\\data, Linux ~/.local/share/gameboyem)
   GAMEBOYEM_LOG      log level in logs/gameboyem.log: error, warn, info (default), debug or trace
@@ -43,9 +48,9 @@ controls:
   arrows or WASD = D-pad    X or E = A    Z = B    Enter = Start    Backspace / Right Shift = Select
   Q / R = GBA L / R shoulders (no effect on a Game Boy)
   P = pause    Tab (hold) = fast-forward    C = screenshot (marks the frame when recording)
-  K = save state    L = load state    1-9 = state slot (default 1)
+  K = save snapshot    L = load the latest snapshot
   (S used to save a state; WASD now drives the D-pad, so S is D-pad Down)
-  Esc = quit";
+  Esc = pause menu (snapshots, restart, back to library); quit from the library";
 
 pub const DEFAULT_SCALE: u32 = 4;
 pub const MAX_SCALE: u32 = 8;
@@ -741,7 +746,9 @@ mod tests {
 
     #[test]
     fn help_says_where_save_state_went() {
-        assert!(USAGE.contains("K = save state    L = load state"));
+        assert!(USAGE.contains("K = save snapshot    L = load the latest snapshot"));
+        assert!(!USAGE.contains("1-9"), "no slot numbers");
+        assert!(!USAGE.to_lowercase().contains("slot"));
         assert!(USAGE.contains("S used to save a state"));
         assert!(USAGE.contains("S is D-pad Down"));
     }

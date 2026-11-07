@@ -13,17 +13,17 @@ pub enum Action {
     Menu,
     Pause,
     FastForward,
-    SaveState,
-    LoadState,
-    /// Choose save-state slot 1..=9.
-    SelectSlot(u8),
+    /// K: add a snapshot of the game.
+    SaveSnapshot,
+    /// L: go back to the most recent snapshot.
+    LoadLatestSnapshot,
     /// Save the current picture as a PNG (and mark the frame in a recording).
     Screenshot,
 }
 
 impl Action {
     /// What the Help screen calls this action. Actions with one label share a row there
-    /// (the nine slot keys).
+    /// (the keys that do the same).
     pub fn label(self) -> &'static str {
         match self {
             Action::Button(Button::Up) => "Up",
@@ -39,9 +39,8 @@ impl Action {
             Action::Menu => "Pause menu / back",
             Action::Pause => "Pause",
             Action::FastForward => "Fast-forward (hold)",
-            Action::SaveState => "Save state",
-            Action::LoadState => "Load state",
-            Action::SelectSlot(_) => "State slot",
+            Action::SaveSnapshot => "Save snapshot",
+            Action::LoadLatestSnapshot => "Load latest snapshot",
             Action::Screenshot => "Screenshot",
         }
     }
@@ -107,22 +106,14 @@ pub const BINDINGS: &[Binding] = &[
     bind(KeyCode::Escape, "Esc", Action::Menu),
     bind(KeyCode::KeyP, "P", Action::Pause),
     bind(KeyCode::Tab, "Tab", Action::FastForward),
-    bind(KeyCode::KeyK, "K", Action::SaveState),
-    bind(KeyCode::KeyL, "L", Action::LoadState),
-    bind(KeyCode::Digit1, "1", Action::SelectSlot(1)),
-    bind(KeyCode::Digit2, "2", Action::SelectSlot(2)),
-    bind(KeyCode::Digit3, "3", Action::SelectSlot(3)),
-    bind(KeyCode::Digit4, "4", Action::SelectSlot(4)),
-    bind(KeyCode::Digit5, "5", Action::SelectSlot(5)),
-    bind(KeyCode::Digit6, "6", Action::SelectSlot(6)),
-    bind(KeyCode::Digit7, "7", Action::SelectSlot(7)),
-    bind(KeyCode::Digit8, "8", Action::SelectSlot(8)),
-    bind(KeyCode::Digit9, "9", Action::SelectSlot(9)),
+    bind(KeyCode::KeyK, "K", Action::SaveSnapshot),
+    bind(KeyCode::KeyL, "L", Action::LoadLatestSnapshot),
     bind(KeyCode::KeyC, "C", Action::Screenshot),
 ];
 
 /// Printed once when the window opens on a Game Boy, where S used to save a state.
-pub const SAVE_KEY_NOTICE: &str = "save state is K, load is L (S is now D-pad Down)";
+pub const SAVE_KEY_NOTICE: &str =
+    "snapshot is K, load the latest snapshot is L (S is now D-pad Down)";
 
 pub fn map(key: KeyCode) -> Option<Action> {
     BINDINGS.iter().find(|b| b.key == key).map(|b| b.action)
@@ -213,19 +204,16 @@ mod tests {
         assert_eq!(map(KeyCode::Escape), Some(Action::Menu));
         assert_eq!(map(KeyCode::KeyP), Some(Action::Pause));
         assert_eq!(map(KeyCode::Tab), Some(Action::FastForward));
-        assert_eq!(map(KeyCode::KeyK), Some(Action::SaveState));
-        assert_eq!(map(KeyCode::KeyL), Some(Action::LoadState));
-        assert_eq!(map(KeyCode::Digit1), Some(Action::SelectSlot(1)));
-        assert_eq!(map(KeyCode::Digit9), Some(Action::SelectSlot(9)));
-        assert_eq!(map(KeyCode::Digit0), None);
+        assert_eq!(map(KeyCode::KeyK), Some(Action::SaveSnapshot));
+        assert_eq!(map(KeyCode::KeyL), Some(Action::LoadLatestSnapshot));
         assert_eq!(map(KeyCode::KeyC), Some(Action::Screenshot));
         assert_eq!(map(KeyCode::KeyJ), None);
     }
 
     #[test]
     fn every_non_button_action_has_its_own_key() {
-        // Screenshot (C) must not collide with save states (K, L, 1-9) or the
-        // joypad: each of these keys maps to a different action.
+        // Screenshot (C) must not collide with snapshots (K, L) or the joypad: each of
+        // these keys maps to a different action.
         let keys = [
             KeyCode::KeyC,
             KeyCode::KeyK,
@@ -233,19 +221,7 @@ mod tests {
             KeyCode::KeyP,
             KeyCode::Tab,
             KeyCode::Escape,
-        ]
-        .into_iter()
-        .chain([
-            KeyCode::Digit1,
-            KeyCode::Digit2,
-            KeyCode::Digit3,
-            KeyCode::Digit4,
-            KeyCode::Digit5,
-            KeyCode::Digit6,
-            KeyCode::Digit7,
-            KeyCode::Digit8,
-            KeyCode::Digit9,
-        ]);
+        ];
         let mut seen = Vec::new();
         for key in keys {
             let action = map(key).expect("bound");
@@ -254,7 +230,7 @@ mod tests {
         }
         assert_eq!(map(KeyCode::KeyC), Some(Action::Screenshot));
         let mut s = InputState::default();
-        for key in [KeyCode::KeyC, KeyCode::KeyK, KeyCode::KeyL, KeyCode::Digit1] {
+        for key in [KeyCode::KeyC, KeyCode::KeyK, KeyCode::KeyL] {
             assert_eq!(s.key(key, true), None, "{key:?} must not move a button");
         }
     }
@@ -308,9 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn save_state_moved_to_k_and_s_is_down() {
-        assert_eq!(map(KeyCode::KeyK), Some(Action::SaveState));
-        assert_eq!(map(KeyCode::KeyL), Some(Action::LoadState));
+    fn snapshots_are_k_and_l_and_s_is_down() {
+        assert_eq!(map(KeyCode::KeyK), Some(Action::SaveSnapshot));
+        assert_eq!(map(KeyCode::KeyL), Some(Action::LoadLatestSnapshot));
         assert_eq!(map(KeyCode::KeyS), Some(Action::Button(Button::Down)));
         let mut s = InputState::default();
         assert_eq!(s.key(KeyCode::KeyK, true), None, "K moves no button");
@@ -442,6 +418,37 @@ mod tests {
         assert_eq!(keys("A"), ["X", "E"]);
         assert_eq!(keys("Select"), ["Backspace", "Right Shift"]);
         assert_eq!(keys("Pause menu / back"), ["Esc"]);
-        assert_eq!(keys("State slot").len(), 9);
+        assert_eq!(keys("Save snapshot"), ["K"]);
+        assert_eq!(keys("Load latest snapshot"), ["L"]);
+    }
+
+    #[test]
+    fn there_are_no_slot_keys() {
+        let digits = [
+            KeyCode::Digit0,
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+            KeyCode::Numpad1,
+        ];
+        for key in digits {
+            assert_eq!(map(key), None, "{key:?}");
+        }
+        assert!(
+            BINDINGS
+                .iter()
+                .all(|b| !b.label.chars().all(|c| c.is_ascii_digit()))
+        );
+        assert!(
+            help_rows()
+                .iter()
+                .all(|r| !r.what.to_lowercase().contains("slot"))
+        );
     }
 }

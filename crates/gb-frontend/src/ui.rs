@@ -15,11 +15,14 @@
 //! A ROM dropped on the window starts playing from any mode. Only `Playing` runs the
 //! emulator and passes keys to the game; the other two show a menu.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use emu_common::{FrameRef, Pixels};
+use jiff::tz::TimeZone;
 
 use crate::library::{Entry, GameId};
+use crate::state::Snapshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -37,7 +40,7 @@ impl Mode {
         self == Mode::Playing
     }
 
-    /// Keys press the game's buttons and trigger its save-state, screenshot and
+    /// Keys press the game's buttons and trigger its snapshot, screenshot and
     /// fast-forward keys. Everywhere else they belong to the menu in front.
     pub fn game_input(self) -> bool {
         self == Mode::Playing
@@ -264,15 +267,93 @@ pub enum UiAction {
         id: GameId,
         delete_saves: bool,
     },
+    /// Discard the game's resume point and power it on normally, keeping its own save.
+    StartFresh(GameId),
     /// Open the app data folder in the file manager.
     OpenDataFolder,
     Resume,
-    SelectSlot(u8),
-    SaveState,
-    LoadState,
+    /// Add a snapshot of the running game.
+    SaveSnapshot,
+    /// Load the snapshot taken at this time (Unix seconds).
+    LoadSnapshot(u64),
+    /// Delete the snapshot taken at this time.
+    DeleteSnapshot(u64),
+    /// Power-cycle the running game; its own save is kept.
+    Restart,
     Screenshot,
     BackToLibrary,
     Quit,
+}
+
+/// One row of the snapshot list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotItem {
+    /// When it was taken (Unix seconds); what the buttons act on.
+    pub secs: u64,
+    /// That time as the player reads it, from [`friendly_time`].
+    pub when: String,
+    /// The picture, if it has one.
+    pub image: Option<PathBuf>,
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `secs` (Unix seconds) as a person says it, in the zone `tz`, relative to `now`:
+/// "Today 5:41 PM", "Yesterday 9:03 PM", then "Nov 3, 9:03 PM" (with the year when it is not
+/// this year's).
+pub fn friendly_time(secs: u64, now: u64, tz: &TimeZone) -> String {
+    let zoned = |secs: u64| {
+        i64::try_from(secs)
+            .ok()
+            .and_then(|s| jiff::Timestamp::from_second(s).ok())
+            .map(|t| t.to_zoned(tz.clone()))
+    };
+    let (Some(at), Some(today)) = (zoned(secs), zoned(now)) else {
+        return "Unknown time".to_owned();
+    };
+    let (hour, minute) = (at.hour(), at.minute());
+    let clock = format!(
+        "{}:{minute:02} {}",
+        match hour % 12 {
+            0 => 12,
+            h => h,
+        },
+        if hour < 12 { "AM" } else { "PM" }
+    );
+    let (date, today) = (at.date(), today.date());
+    if date == today {
+        format!("Today {clock}")
+    } else if today.yesterday().is_ok_and(|y| y == date) {
+        format!("Yesterday {clock}")
+    } else {
+        let month = MONTHS[usize::try_from(date.month() - 1).unwrap_or(0).min(11)];
+        let year = if date.year() == today.year() {
+            String::new()
+        } else {
+            format!(", {}", date.year())
+        };
+        format!("{month} {}{year}, {clock}", date.day())
+    }
+}
+
+/// The snapshot list rows for `list`, with their times worded for the computer's own time
+/// zone and clock.
+pub fn snapshot_items(list: Vec<Snapshot>) -> Vec<SnapshotItem> {
+    let (now, tz) = (crate::library::now_secs(), TimeZone::system());
+    list.into_iter()
+        .map(|s| SnapshotItem {
+            secs: s.secs,
+            when: friendly_time(s.secs, now, &tz),
+            image: s.image,
+        })
+        .collect()
+}
+
+/// [`friendly_time`] for the computer's own time zone and clock.
+pub fn friendly_time_local(secs: u64) -> String {
+    friendly_time(secs, crate::library::now_secs(), &TimeZone::system())
 }
 
 #[cfg(test)]
@@ -294,6 +375,50 @@ mod tests {
                 id,
             })
             .collect()
+    }
+
+    fn secs(text: &str) -> u64 {
+        text.parse::<jiff::Timestamp>().unwrap().as_second() as u64
+    }
+
+    fn est() -> TimeZone {
+        TimeZone::fixed(jiff::tz::offset(-5))
+    }
+
+    #[test]
+    fn times_read_as_today_yesterday_then_a_date() {
+        let now = secs("2026-11-07T17:54:00-05:00");
+        let said = |at: &str| friendly_time(secs(at), now, &est());
+        assert_eq!(said("2026-11-07T17:41:00-05:00"), "Today 5:41 PM");
+        assert_eq!(said("2026-11-06T21:03:00-05:00"), "Yesterday 9:03 PM");
+        assert_eq!(said("2026-11-07T00:05:00-05:00"), "Today 12:05 AM");
+        assert_eq!(said("2026-11-06T12:00:00-05:00"), "Yesterday 12:00 PM");
+        assert_eq!(said("2026-11-03T21:03:00-05:00"), "Nov 3, 9:03 PM");
+        assert_eq!(said("2026-03-02T09:03:00-05:00"), "Mar 2, 9:03 AM");
+        assert_eq!(said("2025-12-31T23:59:00-05:00"), "Dec 31, 2025, 11:59 PM");
+    }
+
+    #[test]
+    fn today_is_the_players_day_not_utc() {
+        // 01:00 UTC on the 8th is still the evening of the 7th in New York.
+        let now = secs("2026-11-08T01:00:00Z");
+        let at = secs("2026-11-07T23:30:00Z");
+        assert_eq!(friendly_time(at, now, &est()), "Today 6:30 PM");
+        assert_eq!(friendly_time(at, now, &TimeZone::UTC), "Yesterday 11:30 PM");
+        // The clock's own day boundary.
+        let after_midnight = secs("2026-11-07T00:01:00-05:00");
+        let before = secs("2026-11-06T23:59:00-05:00");
+        let now = secs("2026-11-07T08:00:00-05:00");
+        assert_eq!(friendly_time(after_midnight, now, &est()), "Today 12:01 AM");
+        assert_eq!(friendly_time(before, now, &est()), "Yesterday 11:59 PM");
+    }
+
+    #[test]
+    fn a_time_from_the_future_is_still_a_date() {
+        let now = secs("2026-11-07T17:54:00-05:00");
+        let later = secs("2026-11-09T08:00:00-05:00");
+        assert_eq!(friendly_time(later, now, &est()), "Nov 9, 8:00 AM");
+        assert_eq!(friendly_time(u64::MAX, now, &est()), "Unknown time");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! <data dir>/
 //!   games/        ROM copies (`<id>.gb|gbc|gba`), thumbnails (`<id>.png`), `library.json`
 //!   saves/        battery saves (`<id>.sav`)
-//!   states/       save-state slots (`<id>.ss1` ... `<id>.ss9`)
+//!   states/       per game: `<id>/resume.state`, `<id>/snap-<unix-secs>.state` and `.png`
 //!   screenshots/  `<id>-fNNNNNNN.png`
 //!   logs/         `gameboyem.log` and its rotated files
 //! ```

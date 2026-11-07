@@ -3,7 +3,8 @@
 //! A game is known by its [`GameId`]: a readable slug from the ROM header title
 //! and the FNV-1a hash of the ROM bytes (`moth-0123456789abcdef`). Everything the
 //! player produces is keyed by that id, in the app folder (see `paths.rs`):
-//! `saves/<id>.sav`, `states/<id>.ss1`..`.ss9`, `screenshots/<id>-fNNNNNNN.png`.
+//! `saves/<id>.sav`, `states/<id>/resume.state` and `states/<id>/snap-<unix-secs>.state`
+//! (with a matching `.png`), `screenshots/<id>-fNNNNNNN.png`.
 //! Nothing depends on the ROM's file name or location, so renaming or moving a
 //! ROM keeps its saves, and a ROM opened from the command line shares them with
 //! the same game added to the library. (The slug comes from the header, never the
@@ -40,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths::DataDir;
 use crate::rom;
 use crate::save::{MAX_SAVE_BYTES, append_ext, read_capped, save_path, write_atomic};
-use crate::state::{FIRST_SLOT, LAST_SLOT, max_state_bytes, state_path};
+use crate::state;
 
 /// Version of the index file format.
 const INDEX_VERSION: u32 = 1;
@@ -54,6 +55,8 @@ const MAX_TITLE_CHARS: usize = 64;
 const MAX_SLUG_CHARS: usize = 24;
 /// The prefix of a game whose header has no usable title.
 const FALLBACK_SLUG: &str = "game";
+/// File name of the resume point inside a game's states folder.
+pub(crate) const RESUME_FILE: &str = "resume.state";
 /// Longest bundled ROM path read from the index.
 const MAX_PATH_CHARS: usize = 4096;
 /// Largest thumbnail PNG accepted, in bytes, and its largest side, in pixels.
@@ -272,7 +275,11 @@ impl RomStamp {
 pub struct GamePaths {
     /// The battery save.
     pub sav: PathBuf,
-    state_prefix: PathBuf,
+    /// The folder of the resume point and the snapshots: `states/<id>/`.
+    states_dir: PathBuf,
+    /// Where older versions kept the numbered slots (`<prefix>.ss1`..`.ss9`); read only to
+    /// convert them to snapshots ([`state::migrate_legacy_states`]).
+    legacy_prefix: PathBuf,
     screenshot_prefix: PathBuf,
 }
 
@@ -282,14 +289,41 @@ impl GamePaths {
         let name = id.as_str();
         Self {
             sav: data.saves().join(format!("{name}.sav")),
-            state_prefix: data.states().join(name),
+            states_dir: data.states().join(name),
+            legacy_prefix: data.states().join(name),
             screenshot_prefix: data.screenshots().join(name),
         }
     }
 
-    /// Save-state slot `slot` (`FIRST_SLOT..=LAST_SLOT`): `states/<id>.ss<slot>`.
-    pub fn state(&self, slot: u8) -> PathBuf {
-        append_ext(&self.state_prefix, &format!("ss{slot}"))
+    /// The folder holding this game's resume point and snapshots. It is made when the
+    /// first file is written; its existence also means the old slots were dealt with.
+    pub fn states_dir(&self) -> &Path {
+        &self.states_dir
+    }
+
+    /// Where the game is left when the player leaves it: `states/<id>/resume.state`.
+    pub fn resume_state(&self) -> PathBuf {
+        self.states_dir.join(RESUME_FILE)
+    }
+
+    /// Where a resume point that could not be loaded is kept.
+    pub fn resume_bad(&self) -> PathBuf {
+        self.states_dir.join(format!("{RESUME_FILE}.bad"))
+    }
+
+    /// The snapshot taken at `unix_secs`: `states/<id>/snap-<unix-secs>.state`.
+    pub fn snapshot_state(&self, unix_secs: u64) -> PathBuf {
+        self.states_dir.join(format!("snap-{unix_secs}.state"))
+    }
+
+    /// The picture of that snapshot: `states/<id>/snap-<unix-secs>.png`.
+    pub fn snapshot_image(&self, unix_secs: u64) -> PathBuf {
+        self.states_dir.join(format!("snap-{unix_secs}.png"))
+    }
+
+    /// The numbered slot `slot` (1..=9) of older versions, `states/<id>.ss<slot>`.
+    pub(crate) fn legacy_state(&self, slot: u8) -> PathBuf {
+        append_ext(&self.legacy_prefix, &format!("ss{slot}"))
     }
 
     /// The screenshot of emulated frame `frame` taken at `unix_secs` (wall clock, UTC):
@@ -304,10 +338,10 @@ impl GamePaths {
         PathBuf::from(name)
     }
 
-    /// The layout older versions used, for when there is no app folder:
-    /// `dir/game.sav`, `dir/game.ss1`..`.ss9` and `dir/game-<time>-f0000001.png` for the
-    /// ROM `dir/game.gb`. A ROM named like one of those files keeps its whole name as
-    /// the stem, so a save can never be the ROM itself.
+    /// The layout for when there is no app folder: `dir/game.sav`, `dir/game.states/`
+    /// and `dir/game-<time>-f0000001.png` for the ROM `dir/game.gb` (and, where older
+    /// versions kept them, `dir/game.ss1`..`.ss9`). A ROM named like one of those files
+    /// keeps its whole name as the stem, so a save can never be the ROM itself.
     pub fn beside(rom: &Path) -> Self {
         let named_like_a_slot = rom.extension().is_some_and(|e| {
             let e = e.to_string_lossy().to_ascii_lowercase();
@@ -318,9 +352,15 @@ impl GamePaths {
         } else {
             rom.with_extension("")
         };
+        let states_dir = append_ext(&stem, "states");
         Self {
             sav: save_path(rom),
-            state_prefix: stem.clone(),
+            states_dir: if states_dir == rom {
+                append_ext(rom, "states")
+            } else {
+                states_dir
+            },
+            legacy_prefix: stem.clone(),
             screenshot_prefix: stem,
         }
     }
@@ -328,10 +368,10 @@ impl GamePaths {
 
 /// The files for a ROM opened directly (a path on the command line, a drop on
 /// the window), which is not added to the library: its [`GamePaths`], after
-/// copying in any `.sav` / `.ss1`..`.ss9` that sit next to the ROM
-/// ([`import_beside_rom`]). `title` and `hash` are the core's. With no app folder
-/// (`data` is `None`) the files stay next to the ROM, as before, and nothing is
-/// imported.
+/// copying in any `.sav` that sits next to the ROM and turning any old `.ss1`..`.ss9`
+/// into snapshots ([`import_beside_rom`]). `title` and `hash` are the core's. With no app folder
+/// (`data` is `None`) the files stay next to the ROM, as before; only the old slots are
+/// turned into snapshots (in a folder beside the ROM).
 pub fn paths_for_opened_rom(
     data: Option<&DataDir>,
     rom_path: &Path,
@@ -339,32 +379,27 @@ pub fn paths_for_opened_rom(
     hash: u64,
 ) -> GamePaths {
     let Some(data) = data else {
-        return GamePaths::beside(rom_path);
+        let paths = GamePaths::beside(rom_path);
+        state::migrate_legacy_states(rom_path, &paths);
+        return paths;
     };
     let paths = GamePaths::new(data, &GameId::new(title, hash));
     import_beside_rom(rom_path, &paths);
     paths
 }
 
-/// Copy the save and save-state slots that sit next to `rom` (`game.sav`,
-/// `game.ss1`..`game.ss9`, where older versions kept them) into the app folder,
-/// for each one that does not exist there yet. The originals are never changed.
-/// A file already in the app folder always wins over the one beside the ROM, even if
-/// that one is newer: progress made here is never overwritten, and the atomic writes
-/// make a half-written app copy unlikely.
+/// Copy the save that sits next to `rom` (`game.sav`, where older versions kept it)
+/// into the app folder if there is none there yet, and turn the old save-state slots
+/// (`game.ss1`..`game.ss9` beside the ROM, `states/<id>.ssN` in the app folder) into
+/// snapshots ([`state::migrate_legacy_states`]). The originals beside the ROM are never
+/// changed. A file already in the app folder always wins over the one beside the ROM,
+/// even if that one is newer: progress made here is never overwritten, and the atomic
+/// writes make a half-written app copy unlikely.
 /// A file that is oversized or unreadable is skipped with a warning. Returns
-/// the files copied, as (from, to).
+/// the saves copied, as (from, to).
 pub fn import_beside_rom(rom: &Path, paths: &GamePaths) -> Vec<(PathBuf, PathBuf)> {
-    let state_cap = max_state_bytes(System::Gb).max(max_state_bytes(System::Gba));
-    let mut wanted = vec![(save_path(rom), paths.sav.clone(), MAX_SAVE_BYTES, "save")];
-    for slot in FIRST_SLOT..=LAST_SLOT {
-        wanted.push((
-            state_path(rom, slot),
-            paths.state(slot),
-            state_cap,
-            "save state",
-        ));
-    }
+    state::migrate_legacy_states(rom, paths);
+    let wanted = [(save_path(rom), paths.sav.clone(), MAX_SAVE_BYTES, "save")];
     let mut copied = Vec::new();
     for (from, to, cap, what) in wanted {
         // `symlink_metadata`: a dangling link in the app folder still counts as "there".
@@ -792,7 +827,7 @@ pub struct BundledReport {
     pub skipped: usize,
 }
 
-/// Whether [`Library::remove`] also deletes the game's saves, save states and
+/// Whether [`Library::remove`] also deletes the game's saves, resume point, snapshots and
 /// screenshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoveSaves {
@@ -871,7 +906,7 @@ impl Library {
         &self.data
     }
 
-    /// Where the save, save states and screenshots of `id` go. Defined for any id,
+    /// Where the save, resume point, snapshots and screenshots of `id` go. Defined for any id,
     /// listed or not.
     pub fn paths_for(&self, id: &GameId) -> GamePaths {
         GamePaths::new(&self.data, id)
@@ -939,7 +974,7 @@ impl Library {
     }
 
     /// Remove game `id` from the library: its ROM copy and thumbnail are deleted
-    /// and the entry unlisted. Saves, save states and screenshots stay unless
+    /// and the entry unlisted. Saves, the resume point, snapshots and screenshots stay unless
     /// `saves` is [`RemoveSaves::Delete`]. A bundled game cannot be removed (its
     /// ROM is not the library's to delete).
     pub fn remove(&mut self, id: &GameId, saves: RemoveSaves) -> Result<Entry, String> {
@@ -970,6 +1005,7 @@ impl Library {
         if saves == RemoveSaves::Delete {
             remove_with_prefix(&self.data.saves(), &format!("{id}."));
             remove_with_prefix(&self.data.states(), &format!("{id}."));
+            remove_states_dir(&GamePaths::new(&self.data, id));
             remove_screenshots(&self.data.screenshots(), id);
         }
         log::info!(
@@ -1114,6 +1150,11 @@ impl Library {
         Ok(path)
     }
 
+    /// Whether opening `id` would continue from a resume point.
+    pub fn has_resume(&self, id: &GameId) -> bool {
+        self.paths_for(id).resume_state().is_file()
+    }
+
     /// The thumbnail PNG of `id`, if it has one that can be read.
     pub fn read_thumbnail(&self, id: &GameId) -> Option<Vec<u8>> {
         read_capped(
@@ -1222,6 +1263,27 @@ fn remove_screenshots(dir: &Path, id: &GameId) {
             remove_file_logged(&entry.path());
         }
     }
+}
+
+/// Delete the resume point and snapshots of a game: the recognised files in its states
+/// folder, then the folder if nothing else is left in it. A folder that is a symbolic
+/// link is never followed.
+fn remove_states_dir(paths: &GamePaths) {
+    let dir = paths.states_dir();
+    if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let Ok(listing) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in listing.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if state::is_state_file_name(&name) && entry.file_type().is_ok_and(|t| t.is_file()) {
+            remove_file_logged(&entry.path());
+        }
+    }
+    // Fails, harmlessly, if the player put something else in there.
+    let _ = fs::remove_dir(dir);
 }
 
 /// Delete the regular files in `dir` whose name starts with `prefix`.
@@ -1344,7 +1406,22 @@ mod tests {
         let p = GamePaths::new(&data, &id);
         let name = id.as_str();
         assert_eq!(p.sav, PathBuf::from(format!("/app/saves/{name}.sav")));
-        assert_eq!(p.state(3), PathBuf::from(format!("/app/states/{name}.ss3")));
+        assert_eq!(
+            p.resume_state(),
+            PathBuf::from(format!("/app/states/{name}/resume.state"))
+        );
+        assert_eq!(
+            p.snapshot_state(1_700_000_000),
+            PathBuf::from(format!("/app/states/{name}/snap-1700000000.state"))
+        );
+        assert_eq!(
+            p.snapshot_image(1_700_000_000),
+            PathBuf::from(format!("/app/states/{name}/snap-1700000000.png"))
+        );
+        assert_eq!(
+            p.legacy_state(3),
+            PathBuf::from(format!("/app/states/{name}.ss3"))
+        );
         assert_eq!(
             p.screenshot(1_700_000_000, 1234),
             PathBuf::from(format!(
@@ -1493,7 +1570,8 @@ mod tests {
             .entry;
         let paths = lib.paths_for(&e.id);
         fs::write(&paths.sav, b"save").unwrap();
-        fs::write(paths.state(1), b"state").unwrap();
+        fs::create_dir_all(paths.states_dir()).unwrap();
+        fs::write(paths.resume_state(), b"state").unwrap();
         fs::write(paths.screenshot(0, 5), b"png").unwrap();
         lib.set_thumbnail(&e.id, &tiny_png()).unwrap();
 
@@ -1502,7 +1580,9 @@ mod tests {
         assert!(lib.entries().is_empty());
         assert!(!e.rom_path.exists());
         assert!(!thumbnail_path(&f.data, &e.id).exists());
-        assert!(paths.sav.exists() && paths.state(1).exists() && paths.screenshot(0, 5).exists());
+        assert!(
+            paths.sav.exists() && paths.resume_state().exists() && paths.screenshot(0, 5).exists()
+        );
         assert!(Library::open(&f.data).entries().is_empty());
         assert!(lib.remove(&e.id, RemoveSaves::Keep).is_err());
     }
@@ -1523,7 +1603,12 @@ mod tests {
             let p = lib.paths_for(id);
             fs::write(&p.sav, b"s").unwrap();
             fs::write(append_ext(&p.sav, "bak"), b"s").unwrap();
-            fs::write(p.state(9), b"s").unwrap();
+            fs::create_dir_all(p.states_dir()).unwrap();
+            fs::write(p.resume_state(), b"s").unwrap();
+            fs::write(p.resume_bad(), b"s").unwrap();
+            fs::write(p.snapshot_state(5), b"s").unwrap();
+            fs::write(p.snapshot_image(5), b"s").unwrap();
+            fs::write(p.legacy_state(9), b"s").unwrap();
             fs::write(p.screenshot(0, 1), b"s").unwrap();
         }
         lib.remove(&e.id, RemoveSaves::Delete).unwrap();
@@ -1531,13 +1616,22 @@ mod tests {
         for path in [
             gone.sav.clone(),
             append_ext(&gone.sav, "bak"),
-            gone.state(9),
+            gone.resume_state(),
+            gone.resume_bad(),
+            gone.snapshot_state(5),
+            gone.snapshot_image(5),
+            gone.states_dir().to_owned(),
+            gone.legacy_state(9),
             gone.screenshot(0, 1),
         ] {
             assert!(!path.exists(), "{}", path.display());
         }
         let kept = lib.paths_for(&other.id);
-        assert!(kept.sav.exists() && kept.state(9).exists() && kept.screenshot(0, 1).exists());
+        assert!(
+            kept.sav.exists() && kept.legacy_state(9).exists() && kept.screenshot(0, 1).exists()
+        );
+        assert!(kept.resume_state().exists() && kept.snapshot_state(5).exists());
+        assert!(kept.snapshot_image(5).exists());
         assert!(lib.get(&other.id).is_some());
     }
 
@@ -2157,11 +2251,18 @@ mod tests {
         let paths = GamePaths::new(&f.data, &id);
 
         let copied = import_beside_rom(&rom, &paths);
-        assert_eq!(copied.len(), 3);
+        assert_eq!(copied.len(), 1, "the save is copied");
         assert_eq!(fs::read(&paths.sav).unwrap(), b"old save");
-        assert_eq!(fs::read(paths.state(1)).unwrap(), b"state one");
-        assert_eq!(fs::read(paths.state(9)).unwrap(), b"state nine");
-        assert!(!paths.state(2).exists());
+        // The old slots become snapshots; nothing is left in their old place.
+        let snapshots = crate::state::StateStore::new(paths.clone()).snapshots();
+        assert_eq!(snapshots.len(), 2);
+        let contents: Vec<Vec<u8>> = snapshots
+            .iter()
+            .map(|s| fs::read(paths.snapshot_state(s.secs)).unwrap())
+            .collect();
+        assert!(contents.contains(&b"state one".to_vec()));
+        assert!(contents.contains(&b"state nine".to_vec()));
+        assert!(!paths.legacy_state(1).exists());
         assert_eq!(fs::read(f.roms.join("moth.sav")).unwrap(), b"old save");
         assert!(f.roms.join("moth.ss1").exists());
 
@@ -2170,6 +2271,11 @@ mod tests {
         fs::write(f.roms.join("moth.sav"), b"changed beside the rom").unwrap();
         assert!(import_beside_rom(&rom, &paths).is_empty());
         assert_eq!(fs::read(&paths.sav).unwrap(), b"new progress");
+        assert_eq!(
+            crate::state::StateStore::new(paths).snapshots().len(),
+            2,
+            "the slots are not imported again"
+        );
     }
 
     #[test]
@@ -2180,7 +2286,8 @@ mod tests {
         fs::write(f.roms.join("moth.ss2"), vec![0u8; 3 * 1024 * 1024]).unwrap();
         let paths = GamePaths::new(&f.data, &GameId::new("MOTH", 1));
         assert!(import_beside_rom(&rom, &paths).is_empty());
-        assert!(!paths.sav.exists() && !paths.state(2).exists());
+        assert!(!paths.sav.exists());
+        assert!(crate::state::StateStore::new(paths).snapshots().is_empty());
     }
 
     #[test]
@@ -2212,7 +2319,8 @@ mod tests {
         fs::write(f.roms.join("moth.sav"), b"old").unwrap();
         let paths = paths_for_opened_rom(None, &rom, "MOTH", 1);
         assert_eq!(paths.sav, f.roms.join("moth.sav"));
-        assert_eq!(paths.state(3), f.roms.join("moth.ss3"));
+        assert_eq!(paths.legacy_state(3), f.roms.join("moth.ss3"));
+        assert_eq!(paths.states_dir(), f.roms.join("moth.states"));
         assert!(paths.screenshot(1_700_000_000, 7).starts_with(&f.roms));
         assert_eq!(
             fs::read(&paths.sav).unwrap(),
@@ -2224,11 +2332,14 @@ mod tests {
 
     #[test]
     fn the_beside_layout_never_names_the_rom_itself() {
-        for name in ["g.sav", "g.ss1", "g.SS9", "g.ss5", "noext", "g.gb"] {
+        for name in [
+            "g.sav", "g.ss1", "g.SS9", "g.ss5", "g.states", "noext", "g.gb",
+        ] {
             let rom = PathBuf::from("d").join(name);
             let p = GamePaths::beside(&rom);
             let mut all = vec![p.sav.clone(), p.screenshot(0, 1)];
-            all.extend((1..=9).map(|n| p.state(n)));
+            all.extend((1..=9).map(|n| p.legacy_state(n)));
+            all.extend([p.states_dir().to_owned(), p.resume_state()]);
             assert!(all.iter().all(|f| *f != rom), "{name}: {all:?}");
         }
     }
@@ -2261,6 +2372,6 @@ mod tests {
         assert!(!is_screenshot_suffix("f0000005.png"));
         assert!(is_screenshot_suffix("20231114-221320-f0000005.png"));
         assert_eq!(p.sav, PathBuf::from("shots/Red.sav"));
-        assert_eq!(p.state(2), PathBuf::from("shots/Red.ss2"));
+        assert_eq!(p.legacy_state(2), PathBuf::from("shots/Red.ss2"));
     }
 }
