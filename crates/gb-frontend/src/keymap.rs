@@ -9,7 +9,8 @@ use winit::keyboard::KeyCode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Button(Button),
-    Quit,
+    /// Esc: what it does depends on where the app is (see `ui::escape_effect`).
+    Menu,
     Pause,
     FastForward,
     SaveState,
@@ -20,39 +21,110 @@ pub enum Action {
     Screenshot,
 }
 
+impl Action {
+    /// What the Help screen calls this action. Actions with one label share a row there
+    /// (the nine slot keys).
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::Button(Button::Up) => "Up",
+            Action::Button(Button::Down) => "Down",
+            Action::Button(Button::Left) => "Left",
+            Action::Button(Button::Right) => "Right",
+            Action::Button(Button::A) => "A",
+            Action::Button(Button::B) => "B",
+            Action::Button(Button::Start) => "Start",
+            Action::Button(Button::Select) => "Select",
+            Action::Button(Button::L) => "L (GBA)",
+            Action::Button(Button::R) => "R (GBA)",
+            Action::Menu => "Pause menu / back",
+            Action::Pause => "Pause",
+            Action::FastForward => "Fast-forward (hold)",
+            Action::SaveState => "Save state",
+            Action::LoadState => "Load state",
+            Action::SelectSlot(_) => "State slot",
+            Action::Screenshot => "Screenshot",
+        }
+    }
+}
+
+/// One key and what it does. `label` is how the Help screen names the key.
+#[derive(Clone, Copy, Debug)]
+pub struct Binding {
+    pub key: KeyCode,
+    pub label: &'static str,
+    pub action: Action,
+}
+
+const fn bind(key: KeyCode, label: &'static str, action: Action) -> Binding {
+    Binding { key, label, action }
+}
+
+/// Every key the app reacts to while a game is running. [`map`] looks keys up here and
+/// the Help screen is built from it ([`help_rows`]), so the two cannot disagree.
+pub const BINDINGS: &[Binding] = &[
+    bind(KeyCode::ArrowUp, "Up arrow", Action::Button(Button::Up)),
+    bind(KeyCode::KeyW, "W", Action::Button(Button::Up)),
+    bind(KeyCode::ArrowDown, "Down arrow", Action::Button(Button::Down)),
+    bind(KeyCode::KeyS, "S", Action::Button(Button::Down)),
+    bind(KeyCode::ArrowLeft, "Left arrow", Action::Button(Button::Left)),
+    bind(KeyCode::KeyA, "A", Action::Button(Button::Left)),
+    bind(KeyCode::ArrowRight, "Right arrow", Action::Button(Button::Right)),
+    bind(KeyCode::KeyD, "D", Action::Button(Button::Right)),
+    bind(KeyCode::KeyX, "X", Action::Button(Button::A)),
+    bind(KeyCode::KeyE, "E", Action::Button(Button::A)),
+    bind(KeyCode::KeyZ, "Z", Action::Button(Button::B)),
+    bind(KeyCode::Enter, "Enter", Action::Button(Button::Start)),
+    bind(KeyCode::NumpadEnter, "Numpad Enter", Action::Button(Button::Start)),
+    bind(KeyCode::Backspace, "Backspace", Action::Button(Button::Select)),
+    bind(KeyCode::ShiftRight, "Right Shift", Action::Button(Button::Select)),
+    // GBA shoulders; a Game Boy has neither and the app drops them.
+    bind(KeyCode::KeyQ, "Q", Action::Button(Button::L)),
+    bind(KeyCode::KeyR, "R", Action::Button(Button::R)),
+    bind(KeyCode::Escape, "Esc", Action::Menu),
+    bind(KeyCode::KeyP, "P", Action::Pause),
+    bind(KeyCode::Tab, "Tab", Action::FastForward),
+    bind(KeyCode::KeyK, "K", Action::SaveState),
+    bind(KeyCode::KeyL, "L", Action::LoadState),
+    bind(KeyCode::Digit1, "1", Action::SelectSlot(1)),
+    bind(KeyCode::Digit2, "2", Action::SelectSlot(2)),
+    bind(KeyCode::Digit3, "3", Action::SelectSlot(3)),
+    bind(KeyCode::Digit4, "4", Action::SelectSlot(4)),
+    bind(KeyCode::Digit5, "5", Action::SelectSlot(5)),
+    bind(KeyCode::Digit6, "6", Action::SelectSlot(6)),
+    bind(KeyCode::Digit7, "7", Action::SelectSlot(7)),
+    bind(KeyCode::Digit8, "8", Action::SelectSlot(8)),
+    bind(KeyCode::Digit9, "9", Action::SelectSlot(9)),
+    bind(KeyCode::KeyC, "C", Action::Screenshot),
+];
+
 /// Printed once when the window opens on a Game Boy, where S used to save a state.
 pub const SAVE_KEY_NOTICE: &str = "save state is K, load is L (S is now D-pad Down)";
 
 pub fn map(key: KeyCode) -> Option<Action> {
-    Some(match key {
-        KeyCode::ArrowUp | KeyCode::KeyW => Action::Button(Button::Up),
-        KeyCode::ArrowDown | KeyCode::KeyS => Action::Button(Button::Down),
-        KeyCode::ArrowLeft | KeyCode::KeyA => Action::Button(Button::Left),
-        KeyCode::ArrowRight | KeyCode::KeyD => Action::Button(Button::Right),
-        KeyCode::KeyX | KeyCode::KeyE => Action::Button(Button::A),
-        KeyCode::KeyZ => Action::Button(Button::B),
-        KeyCode::Enter | KeyCode::NumpadEnter => Action::Button(Button::Start),
-        KeyCode::Backspace | KeyCode::ShiftRight => Action::Button(Button::Select),
-        // GBA shoulders; a Game Boy has neither and the app drops them.
-        KeyCode::KeyQ => Action::Button(Button::L),
-        KeyCode::KeyR => Action::Button(Button::R),
-        KeyCode::Escape => Action::Quit,
-        KeyCode::KeyP => Action::Pause,
-        KeyCode::Tab => Action::FastForward,
-        KeyCode::KeyK => Action::SaveState,
-        KeyCode::KeyL => Action::LoadState,
-        KeyCode::Digit1 => Action::SelectSlot(1),
-        KeyCode::Digit2 => Action::SelectSlot(2),
-        KeyCode::Digit3 => Action::SelectSlot(3),
-        KeyCode::Digit4 => Action::SelectSlot(4),
-        KeyCode::Digit5 => Action::SelectSlot(5),
-        KeyCode::Digit6 => Action::SelectSlot(6),
-        KeyCode::Digit7 => Action::SelectSlot(7),
-        KeyCode::Digit8 => Action::SelectSlot(8),
-        KeyCode::Digit9 => Action::SelectSlot(9),
-        KeyCode::KeyC => Action::Screenshot,
-        _ => return None,
-    })
+    BINDINGS.iter().find(|b| b.key == key).map(|b| b.action)
+}
+
+/// One line of the Help screen's controls table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelpRow {
+    pub what: &'static str,
+    pub keys: Vec<&'static str>,
+}
+
+/// The controls table: [`BINDINGS`] grouped by [`Action::label`], in table order.
+pub fn help_rows() -> Vec<HelpRow> {
+    let mut rows: Vec<HelpRow> = Vec::new();
+    for b in BINDINGS {
+        let what = b.action.label();
+        match rows.iter_mut().find(|r| r.what == what) {
+            Some(row) => row.keys.push(b.label),
+            None => rows.push(HelpRow {
+                what,
+                keys: vec![b.label],
+            }),
+        }
+    }
+    rows
 }
 
 /// Tracks held keys so that two keys bound to one button (Backspace and Right
@@ -114,7 +186,7 @@ mod tests {
             Some(Action::Button(Button::Select))
         );
         assert_eq!(map(KeyCode::ArrowUp), Some(Action::Button(Button::Up)));
-        assert_eq!(map(KeyCode::Escape), Some(Action::Quit));
+        assert_eq!(map(KeyCode::Escape), Some(Action::Menu));
         assert_eq!(map(KeyCode::KeyP), Some(Action::Pause));
         assert_eq!(map(KeyCode::Tab), Some(Action::FastForward));
         assert_eq!(map(KeyCode::KeyK), Some(Action::SaveState));
@@ -289,5 +361,59 @@ mod tests {
         assert!(s.release_all().is_empty());
         // A stale release after focus loss must not report a change.
         assert_eq!(s.key(KeyCode::KeyX, false), None);
+    }
+
+    #[test]
+    fn map_reads_the_binding_table() {
+        for b in BINDINGS {
+            assert_eq!(map(b.key), Some(b.action), "{}", b.label);
+        }
+        assert_eq!(map(KeyCode::KeyJ), None);
+    }
+
+    #[test]
+    fn no_key_is_bound_or_labelled_twice() {
+        for (i, a) in BINDINGS.iter().enumerate() {
+            for b in &BINDINGS[i + 1..] {
+                assert_ne!(a.key, b.key, "{} is bound twice", a.label);
+                assert_ne!(a.label, b.label, "two keys are called {}", a.label);
+            }
+        }
+    }
+
+    #[test]
+    fn help_rows_list_exactly_the_bindings() {
+        let rows = help_rows();
+        // Every binding appears under its action's row, and nothing else does.
+        let mut listed = 0;
+        for b in BINDINGS {
+            let row = rows
+                .iter()
+                .find(|r| r.what == b.action.label())
+                .unwrap_or_else(|| panic!("no help row for {}", b.label));
+            assert!(row.keys.contains(&b.label), "{} is missing from its row", b.label);
+            listed += 1;
+        }
+        assert_eq!(rows.iter().map(|r| r.keys.len()).sum::<usize>(), listed);
+        assert!(rows.iter().all(|r| !r.keys.is_empty()));
+        let mut names: Vec<_> = rows.iter().map(|r| r.what).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), rows.len(), "one row per label");
+    }
+
+    #[test]
+    fn help_groups_the_keys_the_player_knows() {
+        let rows = help_rows();
+        let keys = |what: &str| {
+            rows.iter()
+                .find(|r| r.what == what)
+                .map(|r| r.keys.clone())
+                .unwrap()
+        };
+        assert_eq!(keys("A"), ["X", "E"]);
+        assert_eq!(keys("Select"), ["Backspace", "Right Shift"]);
+        assert_eq!(keys("Pause menu / back"), ["Esc"]);
+        assert_eq!(keys("State slot").len(), 9);
     }
 }

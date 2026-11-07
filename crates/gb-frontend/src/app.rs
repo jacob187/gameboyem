@@ -424,7 +424,7 @@ impl<C: Core> App<C> {
     fn on_key(&mut self, event_loop: &ActiveEventLoop, key: winit::keyboard::KeyCode, down: bool) {
         self.on_key_input(key, down);
         match map(key) {
-            Some(Action::Quit) if down => event_loop.exit(),
+            Some(Action::Menu) if down => event_loop.exit(),
             Some(Action::Pause) if down => self.toggle_pause(),
             Some(Action::FastForward) => self.set_fast_forward(down),
             // States need the core, which `--test-pattern` bypasses.

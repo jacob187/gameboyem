@@ -26,6 +26,14 @@ png = "0.18"
 # Native file-open dialog. On Linux the xdg-portal backend: no GTK build dependency
 # (libdbus is loaded at run time, with zenity as the fallback).
 rfd = { version = "=0.18.0", default-features = false, features = ["xdg-portal"] }
+# The in-app UI (library, pause menu, help), drawn into the pixels window. egui-wgpu 0.35 is
+# built on wgpu 29, the version pixels 0.17 uses, so both share one device; egui-winit 0.35
+# takes winit 0.30. No clipboard, link or accessibility backends: the UI has no text input.
+egui = { version = "=0.35.0", default-features = false, features = ["default_fonts"] }
+egui-wgpu = { version = "=0.35.0", default-features = false }
+egui-winit = { version = "=0.35.0", default-features = false, features = ["x11", "wayland"] }
+# Opens the data folder in the file manager (Finder, Explorer, xdg-open).
+opener = { version = "=0.9.0", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
