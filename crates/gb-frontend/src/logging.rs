@@ -7,13 +7,17 @@
 //! `gameboyem.log.1`, the previous `.1` becomes `.2`, and the oldest goes, so at
 //! most [`LOG_FILES`] files exist. Lines are `2026-11-07T19:03:05.123Z INFO  text`
 //! (UTC, marked with `Z`) and are written as they happen, not buffered, so a
-//! crash loses nothing. A file that cannot be written is dropped with one
-//! warning and logging goes on to stderr.
+//! crash loses nothing. A write that fails is reported once per run of
+//! failures; the file is tried again with the next record.
+//!
+//! One `gb` process owns the log. Two instances at once append to the same file
+//! and can rotate it under each other (on Windows a rotation fails while the other
+//! holds the file open); that is not supported and takes no lock.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -37,6 +41,10 @@ pub struct RotatingFile {
     /// `None` after a failed rotation until the next write reopens it.
     file: Option<File>,
     size: u64,
+    /// Bytes to write before a rotation that failed is tried again.
+    retry_after: u64,
+    /// The last rotation failure, until [`RotatingFile::take_rotation_error`].
+    rotation_error: Option<io::Error>,
 }
 
 impl RotatingFile {
@@ -52,6 +60,8 @@ impl RotatingFile {
             files: files.max(1),
             file: Some(file),
             size,
+            retry_after: 0,
+            rotation_error: None,
         };
         if me.size >= me.max_bytes {
             me.rotate()?;
@@ -59,13 +69,24 @@ impl RotatingFile {
         Ok(me)
     }
 
+    /// The error of a rotation that failed since the last call, if any. A failed
+    /// rotation does not stop logging: records go on being appended to the current
+    /// file, and rotation is tried again after another `max_bytes` of records.
+    pub fn take_rotation_error(&mut self) -> Option<io::Error> {
+        self.rotation_error.take()
+    }
+
     /// Append `text` and a newline, rotating first if it would not fit.
     pub fn write_record(&mut self, text: &str) -> io::Result<()> {
         let text = truncate_at_boundary(text, MAX_RECORD_BYTES);
         let len = text.len() as u64 + 1;
-        if self.size > 0 && self.size + len > self.max_bytes {
-            self.rotate()?;
+        if self.size > 0 && self.size + len > self.max_bytes && self.retry_after == 0 {
+            if let Err(e) = self.rotate() {
+                self.retry_after = self.max_bytes.max(1);
+                self.rotation_error = Some(e);
+            }
         }
+        self.retry_after = self.retry_after.saturating_sub(len);
         if self.file.is_none() {
             let file = open_append(&self.path)?;
             self.size = file.metadata()?.len();
@@ -102,6 +123,7 @@ impl RotatingFile {
         }
         self.file = Some(open_append(&self.path)?);
         self.size = 0;
+        self.retry_after = 0;
         Ok(())
     }
 }
@@ -191,16 +213,25 @@ pub fn level_from_env() -> LevelFilter {
         .unwrap_or(LevelFilter::Info)
 }
 
+struct Sink {
+    file: RotatingFile,
+    /// The last write failed and was reported; the next failure is not repeated.
+    failing: bool,
+}
+
 struct AppLogger {
     level: LevelFilter,
-    file: Mutex<Option<RotatingFile>>,
+    file: Mutex<Option<Sink>>,
 }
 
 impl AppLogger {
     fn new(level: LevelFilter, file: Option<RotatingFile>) -> Self {
         Self {
             level,
-            file: Mutex::new(file),
+            file: Mutex::new(file.map(|file| Sink {
+                file,
+                failing: false,
+            })),
         }
     }
 }
@@ -230,7 +261,7 @@ impl Log for AppLogger {
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(file) = guard.as_mut() {
+        if let Some(sink) = guard.as_mut() {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
@@ -239,17 +270,43 @@ impl Log for AppLogger {
                 utc_timestamp(now),
                 record.level().as_str()
             );
-            if let Err(e) = file.write_record(&line) {
+            let written = sink.file.write_record(&line);
+            if let Some(e) = sink.file.take_rotation_error() {
                 let _ = writeln!(
                     io::stderr().lock(),
-                    "warning: cannot write the log file, logging to stderr only: {e}"
+                    "warning: cannot rotate the log file (it keeps growing, rotation is retried): {e}"
                 );
-                *guard = None;
+            }
+            match written {
+                Ok(()) => sink.failing = false,
+                Err(e) if !sink.failing => {
+                    sink.failing = true;
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "warning: cannot write the log file (retrying with the next record): {e}"
+                    );
+                }
+                Err(_) => {}
             }
         }
     }
 
     fn flush(&self) {}
+}
+
+/// Where the panic hook appends, set by [`init`] when there is a log file.
+static PANIC_LOG: OnceLock<PathBuf> = OnceLock::new();
+
+/// Append a line for a panic straight to the log file, without the logger: the
+/// panic may have happened while this thread held the logger's lock, and taking
+/// it again would hang. Best effort; errors are ignored.
+fn append_panic(path: &Path, message: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    if let Ok(mut file) = open_append(path) {
+        let _ = writeln!(file, "{} ERROR panic: {message}", utc_timestamp(now));
+    }
 }
 
 /// Install the logger. `file` is the log file path; `None`, or a file that
@@ -258,7 +315,10 @@ impl Log for AppLogger {
 pub fn init(file: Option<&Path>, level: LevelFilter) {
     let file = file.and_then(
         |path| match RotatingFile::open(path, MAX_LOG_BYTES, LOG_FILES) {
-            Ok(f) => Some(f),
+            Ok(f) => {
+                let _ = PANIC_LOG.set(path.to_owned());
+                Some(f)
+            }
             Err(e) => {
                 let _ = writeln!(
                     io::stderr().lock(),
@@ -273,11 +333,12 @@ pub fn init(file: Option<&Path>, level: LevelFilter) {
         return;
     }
     log::set_max_level(level);
-    // A panic goes to the file too. Its target is not this program's, so it is
-    // not repeated on stderr, where the default hook prints it.
+    // A panic goes to the file too; the default hook prints it on stderr.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log::error!(target: "panic", "{info}");
+        if let Some(path) = PANIC_LOG.get() {
+            append_panic(path, &info.to_string());
+        }
         previous(info);
     }));
 }
@@ -368,6 +429,29 @@ mod tests {
         let text = read(&path);
         assert!(text.len() <= MAX_RECORD_BYTES + 1);
         assert!(text.ends_with("é\n"));
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_logging_and_is_retried_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.log");
+        // A directory where the oldest file belongs makes removing it fail.
+        fs::create_dir(rotated(dir.path(), 2)).unwrap();
+        let mut f = RotatingFile::open(&path, 25, 3).unwrap();
+        for i in 0..5 {
+            f.write_record(&format!("record-{i:02}")).unwrap();
+        }
+        assert!(f.take_rotation_error().is_some());
+        assert!(f.take_rotation_error().is_none(), "reported once");
+        let all: String = (0..5).map(|i| format!("record-{i:02}\n")).collect();
+        assert_eq!(read(&path), all, "nothing lost, the file just grew");
+
+        // Once the obstacle is gone the next due attempt rotates.
+        fs::remove_dir(rotated(dir.path(), 2)).unwrap();
+        f.write_record("record-05").unwrap();
+        assert!(f.take_rotation_error().is_none());
+        assert_eq!(read(&path), "record-05\n");
+        assert_eq!(read(&rotated(dir.path(), 1)), all);
     }
 
     #[test]
