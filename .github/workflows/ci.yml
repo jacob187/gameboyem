@@ -25,7 +25,7 @@ jobs:
             os: macos-15
             gbdk: gbdk-macos-arm64.tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux system dependencies (X11, Wayland, ALSA, udev)
         if: runner.os == 'Linux'
@@ -40,7 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache test ROMs
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: roms/test
           key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh', 'scripts/fetch-gba-test-roms.sh') }}
@@ -51,7 +51,7 @@ jobs:
           ./scripts/fetch-gba-test-roms.sh
 
       - name: Cache homebrew corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: roms/corpus
           key: homebrew-corpus-${{ hashFiles('scripts/fetch-homebrew-corpus.sh') }}
@@ -60,7 +60,7 @@ jobs:
         run: ./scripts/fetch-homebrew-corpus.sh
 
       - name: Cache GBDK
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: tools/gbdk
           key: gbdk-${{ env.GBDK_VERSION }}-${{ matrix.gbdk }}
@@ -81,7 +81,7 @@ jobs:
       # pins them: the toolchain file and the lockfile. The install step stays: it is a no-op on
       # a hit and fills in anything the cache did not hold.
       - name: Cache the GBA homebrew nightly
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.rustup/toolchains/nightly-2026-07-22-*
@@ -92,13 +92,13 @@ jobs:
         run: rustup toolchain install nightly-2026-07-22 --component rust-src,clippy,rustfmt --profile minimal
 
       - name: Cache the GBA homebrew build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: homebrew/gba/target
           key: gba-target-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('homebrew/gba/rust-toolchain.toml', 'homebrew/gba/Cargo.lock') }}
 
       - name: Cache agb-gbafix
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: tools/agb
           key: agb-gbafix-0.25.0-${{ runner.os }}
@@ -112,7 +112,7 @@ jobs:
 
       - name: Upload homebrew ROMs (consumed by the Windows job)
         if: matrix.name == 'linux-x86_64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: homebrew-roms
           path: |
@@ -144,7 +144,7 @@ jobs:
     name: cores-wasm32
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -161,7 +161,7 @@ jobs:
     name: msrv-1.85
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
       - name: Check gb-core, gba-core, emu-common and gb-test on the MSRV
@@ -179,7 +179,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -188,7 +188,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache test ROMs
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: roms/test
           key: test-roms-${{ hashFiles('scripts/fetch-test-roms.sh', 'scripts/fetch-gba-test-roms.sh') }}
@@ -199,7 +199,7 @@ jobs:
           ./scripts/fetch-gba-test-roms.sh
 
       - name: Cache homebrew corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: roms/corpus
           key: homebrew-corpus-${{ hashFiles('scripts/fetch-homebrew-corpus.sh') }}
@@ -208,7 +208,7 @@ jobs:
         run: ./scripts/fetch-homebrew-corpus.sh
 
       - name: Download homebrew ROMs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: homebrew-roms
           path: roms/homebrew
