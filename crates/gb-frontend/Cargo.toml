@@ -41,6 +41,8 @@ opener = { version = "=0.9.0", default-features = false }
 [dev-dependencies]
 tempfile.workspace = true
 gb-test = { path = "../gb-test" }
+# Waits on wgpu's adapter and device in the GPU colour test; the version pixels already uses.
+pollster = "=0.4.0"
 
 # Installers: `cargo packager --release` (cargo-packager, run by .github/workflows/release.yml).
 # Keys are camelCase because cargo-packager reads this table as JSON. The version comes from

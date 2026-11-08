@@ -164,9 +164,10 @@ const THUMBNAIL_RETRY_SECS: f64 = 10.0;
 /// screens are reset (the library is entered again).
 type Thumbs = HashMap<GameId, Thumb>;
 
-/// Textures of the snapshot pictures of the running game by snapshot time; `None` for a
-/// snapshot with no picture (or one that cannot be read). Dropped when the list closes.
-type SnapThumbs = HashMap<u64, Option<TextureHandle>>;
+/// Textures of the snapshot pictures of the running game by (before the last load, time);
+/// `None` for a snapshot with no picture (or one that cannot be read). Dropped when the list
+/// closes.
+type SnapThumbs = HashMap<(bool, u64), Option<TextureHandle>>;
 
 enum Thumb {
     Loaded(TextureHandle),
@@ -191,7 +192,8 @@ impl Gui {
             None,
         );
         state.set_max_texture_side(pixels.device().limits().max_texture_dimension_2d as usize);
-        // The surface format pixels chose; egui-wgpu draws to either kind.
+        // A plain (not sRGB) surface where there is one, so egui blends as it means to; see
+        // `surface`.
         let renderer = egui_wgpu::Renderer::new(
             pixels.device(),
             pixels.surface_texture_format(),
@@ -232,6 +234,11 @@ impl Gui {
         }
     }
 
+    /// The widget with the keyboard focus is a button (see [`focus_is_button`]).
+    pub fn focus_on_button(&self) -> bool {
+        focus_is_button(&self.ctx)
+    }
+
     /// Close every pop-up (the screen changed).
     pub fn reset_view(&mut self) {
         self.view = View::default();
@@ -241,7 +248,7 @@ impl Gui {
 
     /// Forget the picture of the snapshot taken at `secs` (it was deleted).
     pub fn forget_snapshot(&mut self, secs: u64) {
-        self.snap_thumbs.remove(&secs);
+        self.snap_thumbs.remove(&(false, secs));
     }
 
     /// Forget the cached thumbnail of `id` (it was set or the game removed).
@@ -335,6 +342,14 @@ impl Gui {
             repaint_after,
         })
     }
+}
+
+/// The widget with the keyboard focus is one Enter or Space clicks (a button, a checkbox),
+/// not one that takes typing or dragging (a text field, a slider), which senses drags too.
+fn focus_is_button(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused())
+        .and_then(|id| ctx.read_response(id))
+        .is_some_and(|r| r.sense.senses_click() && !r.sense.senses_drag())
 }
 
 /// Decode a thumbnail PNG to RGBA8 and its size. `None` if it is not a PNG, is empty or
@@ -729,14 +744,14 @@ fn snapshot_texture<'a>(
     item: &SnapshotItem,
 ) -> Option<&'a TextureHandle> {
     cache
-        .entry(item.secs)
+        .entry((item.before_load, item.secs))
         .or_insert_with(|| {
             let bytes = read_capped(item.image.as_ref()?, MAX_IMAGE_BYTES, "snapshot picture")
                 .ok()
                 .flatten()?;
             let (size, rgba) = decode_thumbnail(&bytes)?;
             Some(ctx.load_texture(
-                format!("snapshot-{}", item.secs),
+                format!("snapshot-{}-{}", item.before_load, item.secs),
                 egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
                 TextureOptions::NEAREST,
             ))
@@ -812,12 +827,24 @@ fn snapshot_row(
                 );
             }
         }
-        ui.label(RichText::new(&item.when).strong());
+        if item.before_load {
+            ui.label(RichText::new(format!("Before last load \u{b7} {}", item.when)).strong())
+                .on_hover_text(
+                    "Where the game was before the last load. The next load replaces it.",
+                );
+        } else {
+            ui.label(RichText::new(&item.when).strong());
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.button("Load").clicked() {
-                actions.push(UiAction::LoadSnapshot(item.secs));
+                actions.push(if item.before_load {
+                    UiAction::LoadBeforeLoad
+                } else {
+                    UiAction::LoadSnapshot(item.secs)
+                });
             }
-            if ui.button("Delete").clicked() {
+            // The slot before the last load is replaced by the next load, not deleted.
+            if !item.before_load && ui.button("Delete").clicked() {
                 *confirm = Some(Confirm::DeleteSnapshot {
                     secs: item.secs,
                     when: item.when.clone(),
@@ -1086,6 +1113,7 @@ mod tests {
         (0..60)
             .map(|n| SnapshotItem {
                 secs: 1_700_000_000 + n,
+                before_load: n == 0,
                 when: format!("Today {n}"),
                 image: None,
             })
@@ -1313,6 +1341,329 @@ mod tests {
         assert_eq!(tags(&HashSet::new()), 0, "the set decides, not the disk");
         assert_eq!(tags(&HashSet::from([ids[0].clone()])), 1);
         assert_eq!(tags(&ids.iter().cloned().collect()), 2);
+    }
+
+    /// egui with no window or GPU, driven frame by frame with input events as the app
+    /// drives it, remembering where each piece of text was drawn.
+    struct Driver {
+        ctx: egui::Context,
+        view: View,
+        thumbs: Thumbs,
+        snap_thumbs: SnapThumbs,
+        time: f64,
+        texts: Vec<(String, Rect)>,
+    }
+
+    impl Driver {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                view: View::default(),
+                thumbs: Thumbs::new(),
+                snap_thumbs: SnapThumbs::new(),
+                time: 0.0,
+                texts: Vec::new(),
+            }
+        }
+
+        fn frame(&mut self, screen: &Screen<'_>, events: Vec<egui::Event>) -> Vec<UiAction> {
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 650.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let mut actions = Vec::new();
+            let Self {
+                ctx,
+                view,
+                thumbs,
+                snap_thumbs,
+                ..
+            } = self;
+            let out = ctx.run_ui(input, |ui| {
+                build(
+                    ui,
+                    &mut *view,
+                    (&mut *thumbs, &mut *snap_thumbs),
+                    screen,
+                    &mut actions,
+                );
+            });
+            self.texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => {
+                        Some((t.galley.text().to_owned(), t.visual_bounding_rect()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            actions
+        }
+
+        fn centre(&self, text: &str) -> egui::Pos2 {
+            self.texts
+                .iter()
+                .find(|(t, _)| t == text)
+                .map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("{text} is not drawn"))
+        }
+
+        /// The widget with the keyboard focus covers `at`.
+        fn focus_at(&self, at: egui::Pos2) -> bool {
+            self.ctx
+                .memory(|m| m.focused())
+                .and_then(|id| self.ctx.read_response(id))
+                .is_some_and(|r| r.rect.contains(at))
+        }
+    }
+
+    fn paused<'a>(
+        snapshots: &'a [SnapshotItem],
+        toasts: &'a Toasts,
+        resumable: &'a HashSet<GameId>,
+    ) -> Screen<'a> {
+        Screen {
+            mode: Mode::Paused,
+            library: None,
+            data_dir: None,
+            game_title: "ONE",
+            can_save: true,
+            can_restart: true,
+            snapshots,
+            resumable,
+            can_return: true,
+            toasts,
+        }
+    }
+
+    fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn key(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// The snapshot `App::perform` lists after a save.
+    fn just_saved() -> [SnapshotItem; 1] {
+        [SnapshotItem {
+            secs: 1_700_000_000,
+            before_load: false,
+            when: "Today 10:25 AM".to_owned(),
+            image: None,
+        }]
+    }
+
+    /// Run `frames` of events in the pause menu, the list of snapshots growing after the
+    /// frame that asked for a save as it does in the app, then ten still frames. Returns
+    /// every action asked for and the driver.
+    fn in_pause_menu(mut driver: Driver, frames: Vec<Vec<egui::Event>>) -> (Vec<UiAction>, Driver) {
+        let (toasts, resumable, saved_list) = (Toasts::default(), HashSet::new(), just_saved());
+        let mut saved = false;
+        let mut all = Vec::new();
+        for events in frames.into_iter().chain((0..10).map(|_| Vec::new())) {
+            let list: &[SnapshotItem] = if saved { &saved_list } else { &[] };
+            let actions = driver.frame(&paused(list, &toasts, &resumable), events);
+            saved |= actions.contains(&UiAction::SaveSnapshot);
+            all.extend(actions);
+        }
+        (all, driver)
+    }
+
+    /// A pause menu with no snapshots yet, laid out and ready for input.
+    fn settled_menu() -> Driver {
+        let (toasts, resumable) = (Toasts::default(), HashSet::new());
+        let mut driver = Driver::new();
+        for _ in 0..3 {
+            assert!(
+                driver
+                    .frame(&paused(&[], &toasts, &resumable), vec![])
+                    .is_empty()
+            );
+        }
+        driver
+    }
+
+    /// A click on Save snapshot asks for a save and nothing more: not when the menu changes
+    /// under the still pointer once the snapshot exists ("Load snapshot..." turns on), with
+    /// the press and release in one frame or two, or on a double click.
+    #[test]
+    fn a_click_on_save_snapshot_saves_and_never_loads() {
+        #[derive(Clone, Copy)]
+        enum Step {
+            Press,
+            Release,
+        }
+        use Step::{Press, Release};
+        for (name, steps, saves) in [
+            ("one frame", vec![vec![Press, Release]], 1),
+            ("two frames", vec![vec![Press], vec![Release]], 1),
+            (
+                "double click",
+                vec![vec![Press], vec![Release], vec![Press], vec![Release]],
+                2,
+            ),
+            (
+                "double click, one frame each",
+                vec![vec![Press, Release], vec![Press, Release]],
+                2,
+            ),
+        ] {
+            let driver = settled_menu();
+            let at = driver.centre("Save snapshot (K)");
+            let frames = std::iter::once(vec![egui::Event::PointerMoved(at)])
+                .chain(steps.into_iter().map(|frame| {
+                    frame
+                        .into_iter()
+                        .map(|s| primary(at, matches!(s, Press)))
+                        .collect()
+                }))
+                .collect();
+            let (actions, driver) = in_pause_menu(driver, frames);
+            assert_eq!(actions, vec![UiAction::SaveSnapshot; saves], "{name}");
+            assert!(
+                !driver.view.snapshots && driver.view.confirm.is_none(),
+                "{name}: nothing opens"
+            );
+        }
+    }
+
+    /// Enter on a focused Save snapshot saves once however long it is held: egui takes every
+    /// key repeat as another press, so the app keeps Enter's repeats from it.
+    #[test]
+    fn enter_held_on_save_snapshot_saves_once() {
+        let focused_on_save = || {
+            let (toasts, resumable) = (Toasts::default(), HashSet::new());
+            let mut driver = settled_menu();
+            let at = driver.centre("Save snapshot (K)");
+            for _ in 0..20 {
+                let tab = vec![
+                    key(egui::Key::Tab, true, false),
+                    key(egui::Key::Tab, false, false),
+                ];
+                driver.frame(&paused(&[], &toasts, &resumable), tab);
+                if driver.focus_at(at) {
+                    return driver;
+                }
+            }
+            panic!("Tab never reached Save snapshot");
+        };
+        let driver = focused_on_save();
+        assert!(focus_is_button(&driver.ctx), "Save snapshot is a button");
+        // What the window sends while Enter is held: a press, repeats, a release; and what
+        // of it the app hands to egui.
+        let held = [
+            (true, false),
+            (true, true),
+            (true, true),
+            (true, true),
+            (false, false),
+        ];
+        let enter = winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter);
+        let frames = held
+            .iter()
+            .filter(|&&(_, repeat)| crate::keymap::menu_takes_key(true, enter, repeat, true))
+            .map(|&(pressed, repeat)| vec![key(egui::Key::Enter, pressed, repeat)])
+            .collect();
+        let (actions, driver) = in_pause_menu(driver, frames);
+        assert_eq!(actions, vec![UiAction::SaveSnapshot]);
+        assert!(!driver.view.snapshots);
+    }
+
+    /// The state before the last load leads the list under its own name, loads as itself
+    /// and has no Delete.
+    #[test]
+    fn the_list_shows_the_state_before_the_last_load_first() {
+        let (toasts, resumable) = (Toasts::default(), HashSet::new());
+        let list = [
+            SnapshotItem {
+                secs: 1_700_000_100,
+                before_load: true,
+                when: "Today 10:26 AM".to_owned(),
+                image: None,
+            },
+            SnapshotItem {
+                secs: 1_700_000_000,
+                before_load: false,
+                when: "Today 10:25 AM".to_owned(),
+                image: None,
+            },
+        ];
+        let mut driver = Driver::new();
+        driver.view.snapshots = true;
+        for _ in 0..3 {
+            assert!(
+                driver
+                    .frame(&paused(&list, &toasts, &resumable), vec![])
+                    .is_empty()
+            );
+        }
+        let rows = |text: &str| {
+            let mut found: Vec<Rect> = driver
+                .texts
+                .iter()
+                .filter(|(t, _)| t == text)
+                .map(|(_, r)| *r)
+                .collect();
+            found.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+            found
+        };
+        let label = rows("Before last load \u{b7} Today 10:26 AM");
+        let (loads, deletes) = (rows("Load"), rows("Delete"));
+        assert_eq!((label.len(), loads.len(), deletes.len()), (1, 2, 1));
+        assert!(label[0].min.y < rows("Today 10:25 AM")[0].min.y, "first");
+        assert!(
+            deletes[0].min.y > label[0].max.y,
+            "only the snapshot has Delete"
+        );
+        let at = loads[0].center();
+        let clicked = [
+            vec![egui::Event::PointerMoved(at)],
+            vec![primary(at, true), primary(at, false)],
+        ]
+        .into_iter()
+        .flat_map(|events| driver.frame(&paused(&list, &toasts, &resumable), events))
+        .collect::<Vec<_>>();
+        assert_eq!(clicked, vec![UiAction::LoadBeforeLoad]);
+    }
+
+    /// A focused text field is not a button: it keeps getting held-key repeats.
+    #[test]
+    fn a_focused_text_field_is_not_a_button() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        for frame in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 200.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let field = ui.text_edit_singleline(&mut text);
+                if frame == 0 {
+                    field.request_focus();
+                }
+            });
+        }
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "the field has the focus"
+        );
+        assert!(!focus_is_button(&ctx));
     }
 
     #[test]

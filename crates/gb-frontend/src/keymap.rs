@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use emu_common::Button;
-use winit::keyboard::KeyCode;
+use winit::keyboard::{KeyCode, PhysicalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -117,6 +117,26 @@ pub const SAVE_KEY_NOTICE: &str =
 
 pub fn map(key: KeyCode) -> Option<Action> {
     BINDINGS.iter().find(|b| b.key == key).map(|b| b.action)
+}
+
+/// Whether a key event goes to the menu in front (egui): every key over a menu but Esc,
+/// which is the app's. egui takes each repeat of Enter or Space as another press of the
+/// button that has the keyboard focus, so holding Enter on Save snapshot or a snapshot's
+/// Load would act again with every repeat; those repeats are kept from it while a button
+/// has the focus (`focus_on_button`). Anything else, a text field included, gets them.
+pub fn menu_takes_key(
+    menu_visible: bool,
+    key: PhysicalKey,
+    repeat: bool,
+    focus_on_button: bool,
+) -> bool {
+    let clicks = matches!(
+        key,
+        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space)
+    );
+    menu_visible
+        && key != PhysicalKey::Code(KeyCode::Escape)
+        && !(repeat && clicks && focus_on_button)
 }
 
 /// One line of the Help screen's controls table.
@@ -361,6 +381,27 @@ mod tests {
         assert!(s.release_all().is_empty());
         // A stale release after focus loss must not report a change.
         assert_eq!(s.key(KeyCode::KeyX, false), None);
+    }
+
+    #[test]
+    fn a_held_enter_or_space_does_not_click_a_focused_button_again() {
+        let code = PhysicalKey::Code;
+        for key in [KeyCode::Enter, KeyCode::NumpadEnter, KeyCode::Space] {
+            assert!(menu_takes_key(true, code(key), false, true), "{key:?} once");
+            assert!(
+                !menu_takes_key(true, code(key), true, true),
+                "{key:?} repeat"
+            );
+            // With no button in focus (a text field, nothing) the repeats go through.
+            assert!(menu_takes_key(true, code(key), true, false), "{key:?}");
+        }
+        // Arrows and Tab still repeat (moving the focus); Esc is never the menu's.
+        assert!(menu_takes_key(true, code(KeyCode::ArrowDown), true, true));
+        assert!(menu_takes_key(true, code(KeyCode::Tab), true, true));
+        assert!(!menu_takes_key(true, code(KeyCode::Escape), false, false));
+        // While playing no key reaches the menu.
+        assert!(!menu_takes_key(false, code(KeyCode::Enter), false, false));
+        assert!(!menu_takes_key(false, code(KeyCode::KeyK), false, false));
     }
 
     #[test]

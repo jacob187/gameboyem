@@ -57,6 +57,9 @@ const MAX_SLUG_CHARS: usize = 24;
 const FALLBACK_SLUG: &str = "game";
 /// File name of the resume point inside a game's states folder.
 pub(crate) const RESUME_FILE: &str = "resume.state";
+/// The state the game was in before the last snapshot load, and its picture.
+pub(crate) const BEFORE_LOAD_FILE: &str = "before-load.state";
+pub(crate) const BEFORE_LOAD_IMAGE: &str = "before-load.png";
 /// Longest bundled ROM path read from the index.
 const MAX_PATH_CHARS: usize = 4096;
 /// Largest thumbnail PNG accepted, in bytes, and its largest side, in pixels.
@@ -314,6 +317,16 @@ impl GamePaths {
     /// The picture of that snapshot: `states/<id>/snap-<unix-secs>.png`.
     pub fn snapshot_image(&self, unix_secs: u64) -> PathBuf {
         self.states_dir.join(format!("snap-{unix_secs}.png"))
+    }
+
+    /// Where the game was before the last snapshot load: `states/<id>/before-load.state`.
+    pub fn before_load_state(&self) -> PathBuf {
+        self.states_dir.join(BEFORE_LOAD_FILE)
+    }
+
+    /// Its picture: `states/<id>/before-load.png`.
+    pub fn before_load_image(&self) -> PathBuf {
+        self.states_dir.join(BEFORE_LOAD_IMAGE)
     }
 
     /// The numbered slot `slot` (1..=9) of older versions, `states/<id>.ss<slot>`.

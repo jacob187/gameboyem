@@ -287,6 +287,8 @@ pub enum UiAction {
     SaveSnapshot,
     /// Load the snapshot taken at this time (Unix seconds).
     LoadSnapshot(u64),
+    /// Go back to where the game was before the last load.
+    LoadBeforeLoad,
     /// Delete the snapshot taken at this time.
     DeleteSnapshot(u64),
     /// Power-cycle the running game; its own save is kept.
@@ -301,6 +303,8 @@ pub enum UiAction {
 pub struct SnapshotItem {
     /// When it was taken (Unix seconds); what the buttons act on.
     pub secs: u64,
+    /// This is where the game was before the last load, not a snapshot the player took.
+    pub before_load: bool,
     /// That time as the player reads it, from [`friendly_time`].
     pub when: String,
     /// The picture, if it has one.
@@ -349,13 +353,16 @@ pub fn friendly_time(secs: u64, now: u64, tz: &TimeZone) -> String {
     }
 }
 
-/// The snapshot list rows for `list`, with their times worded for the computer's own time
-/// zone and clock.
-pub fn snapshot_items(list: Vec<Snapshot>) -> Vec<SnapshotItem> {
+/// The snapshot list rows: the state before the last load first, if there is one, then
+/// `list`, with their times worded for the computer's own time zone and clock.
+pub fn snapshot_items(before_load: Option<Snapshot>, list: Vec<Snapshot>) -> Vec<SnapshotItem> {
     let (now, tz) = (crate::library::now_secs(), TimeZone::system());
-    list.into_iter()
-        .map(|s| SnapshotItem {
+    let kinds = before_load.into_iter().map(|s| (s, true));
+    kinds
+        .chain(list.into_iter().map(|s| (s, false)))
+        .map(|(s, before_load)| SnapshotItem {
             secs: s.secs,
+            before_load,
             when: friendly_time(s.secs, now, &tz),
             image: s.image,
         })

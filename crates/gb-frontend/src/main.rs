@@ -18,6 +18,7 @@ mod rom;
 mod save;
 mod shutdown;
 mod state;
+mod surface;
 mod ui;
 mod video;
 
