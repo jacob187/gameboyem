@@ -16,11 +16,12 @@
 //! an sRGB texture on a plain surface would darken it.
 //!
 //! pixels cannot give egui a plain view of an sRGB surface (it configures the surface with
-//! no extra view formats), so the surface itself is made plain.
+//! no extra view formats), so the surface itself is made plain; see [`create_pixels`] for
+//! how its format is picked without ever asking for one the surface lacks.
 
 use std::sync::Arc;
 
-use pixels::wgpu::TextureFormat;
+use pixels::wgpu::{self, Backends, TextureFormat};
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use winit::window::Window;
 
@@ -31,11 +32,21 @@ pub struct Formats {
     pub texture: TextureFormat,
 }
 
+/// The plain pair asked for where the surface is known to offer it.
+const PLAIN_BGRA: Formats = Formats {
+    surface: TextureFormat::Bgra8Unorm,
+    texture: TextureFormat::Rgba8Unorm,
+};
+
+/// Backends whose window surfaces always offer `Bgra8Unorm`: in wgpu-hal 29 the
+/// `surface_capabilities` of the Metal, DX12 and GL adapters list it whatever the device.
+/// A Vulkan surface lists what its driver reports, so Vulkan is not one of them.
+const ALWAYS_BGRA8: Backends = Backends::METAL.union(Backends::DX12).union(Backends::GL);
+
 /// The formats for a surface that supports `supported` (in the surface's order of
 /// preference): the first plain 8-bit format, as egui-wgpu's own
-/// `preferred_framebuffer_format` picks, with a plain RGBA texture. `None` when there is no
-/// such format; pixels' default pair (an sRGB surface with an sRGB texture) is kept then,
-/// which shows the game right and only blends the menus in linear light.
+/// `preferred_framebuffer_format` picks, with a plain RGBA texture. `None` when there is
+/// no such format.
 pub fn choose(supported: &[TextureFormat]) -> Option<Formats> {
     supported
         .iter()
@@ -47,18 +58,56 @@ pub fn choose(supported: &[TextureFormat]) -> Option<Formats> {
         })
 }
 
-/// Create the window's pixel buffer (`width` x `height`) with the formats [`choose`] picks.
-/// pixels only says which formats the surface supports once it is built, so it is built
-/// with its defaults first and then once more with the chosen pair; asking for a format the
-/// surface lacks would panic in wgpu, so it is never guessed.
+/// The backends pixels picks its adapter from: its own default (`WGPU_BACKEND`, else all),
+/// as far as this build of wgpu has them (on macOS only Metal).
+fn backends() -> Backends {
+    Backends::from_env().unwrap_or_else(Backends::all) & wgpu::Instance::enabled_backend_features()
+}
+
+/// Whether whichever adapter pixels picks among `backends` offers [`PLAIN_BGRA`]'s surface.
+fn bgra8_is_certain(backends: Backends) -> bool {
+    !backends.is_empty() && ALWAYS_BGRA8.contains(backends)
+}
+
+/// Create the window's pixel buffer (`width` x `height`) on a plain surface where there
+/// is one.
+///
+/// pixels 0.17 does not check a requested surface format: it hands it to wgpu, which
+/// reports a format the surface lacks as a validation error, and that panics. Nor can the
+/// format be changed once pixels is built. So a format is only asked for where it is
+/// certain, and otherwise only the list of the adapter pixels itself picked is trusted:
+///
+/// - where every backend pixels can pick from always offers `Bgra8Unorm` (Metal, so every
+///   Mac; DX12; GL), pixels is built once, asking for it;
+/// - where Vulkan may be picked, pixels is built with its defaults (an sRGB surface and
+///   texture), and only if the surface of the adapter it picked lists a plain 8-bit format
+///   is it built again asking for that. The same request picks the same adapter: wgpu
+///   lists them in a fixed order.
 pub fn create_pixels(
     width: u32,
     height: u32,
     window: &Arc<Window>,
 ) -> Result<Pixels<'static>, pixels::Error> {
     let size = window.inner_size();
-    let surface = || SurfaceTexture::new(size.width.max(1), size.height.max(1), Arc::clone(window));
-    let first = Pixels::new(width, height, surface())?;
+    let backends = backends();
+    let builder = || {
+        let surface =
+            SurfaceTexture::new(size.width.max(1), size.height.max(1), Arc::clone(window));
+        PixelsBuilder::new(width, height, surface).wgpu_backend(backends)
+    };
+    let with = |formats: Formats| {
+        builder()
+            .texture_format(formats.texture)
+            .surface_texture_format(formats.surface)
+            .build()
+    };
+    if bgra8_is_certain(backends) {
+        return with(PLAIN_BGRA).or_else(|e| {
+            log::warn!("cannot set up a plain surface ({e}); trying the default");
+            builder().build()
+        });
+    }
+    let first = builder().build()?;
     let Some(formats) = choose(&first.context().surface_capabilities.formats) else {
         log::debug!(
             "the surface has no plain 8-bit format; using {:?}",
@@ -69,38 +118,20 @@ pub fn create_pixels(
     // The first surface lets go of the window before the second is configured (Vulkan
     // allows one swapchain per window).
     drop(first);
-    match PixelsBuilder::new(width, height, surface())
-        .texture_format(formats.texture)
-        .surface_texture_format(formats.surface)
-        .build()
-    {
-        Ok(pixels) => {
-            log::debug!(
-                "surface {:?}, picture texture {:?}",
-                formats.surface,
-                formats.texture
-            );
-            Ok(pixels)
-        }
-        Err(e) => {
-            log::warn!(
-                "cannot use a {:?} surface ({e}); using the default",
-                formats.surface
-            );
-            Pixels::new(width, height, surface())
-        }
-    }
+    with(formats).or_else(|e| {
+        log::warn!(
+            "cannot use a {:?} surface ({e}); using the default",
+            formats.surface
+        );
+        builder().build()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui::{Color32, Rect, pos2};
-    use pixels::wgpu;
-    use std::future::Future;
     use std::io::Write;
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
 
     #[test]
     fn a_plain_eight_bit_surface_is_chosen_with_a_plain_texture() {
@@ -123,22 +154,26 @@ mod tests {
         assert_eq!(choose(&[]), None);
     }
 
-    /// wgpu's futures are ready at once on native backends.
-    fn block_on<F: Future>(future: F) -> F::Output {
-        let mut future = pin!(future);
-        let mut cx = Context::from_waker(Waker::noop());
-        loop {
-            if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
-                return v;
-            }
-            std::thread::yield_now();
+    #[test]
+    fn bgra8_is_asked_for_outright_only_where_every_backend_offers_it() {
+        assert!(bgra8_is_certain(Backends::METAL));
+        assert!(bgra8_is_certain(Backends::DX12 | Backends::GL));
+        assert!(!bgra8_is_certain(Backends::VULKAN));
+        assert!(!bgra8_is_certain(
+            Backends::DX12 | Backends::VULKAN | Backends::GL
+        ));
+        assert!(!bgra8_is_certain(Backends::empty()));
+        // Every Mac builds pixels once (unless WGPU_BACKEND names a backend it lacks).
+        if cfg!(target_os = "macos") && std::env::var_os("WGPU_BACKEND").is_none() {
+            assert_eq!(backends(), Backends::METAL);
         }
     }
 
     const W: u32 = 256; // 1024-byte rows, as copies to a buffer need a multiple of 256
     const H: u32 = 8;
-    /// The rows above this one show only the game. egui draws from one row lower, as the
-    /// soft edge of its shapes reaches half a pixel out (into this row).
+    /// Rows `0..UI_TOP` show only the game and are checked byte for byte. egui's shapes
+    /// start at row `UI_TOP + 1`; row `UI_TOP` is left between the two because their soft
+    /// edge reaches half a pixel beyond them.
     const UI_TOP: u32 = 4;
     const FILL: Color32 = Color32::from_rgb(0x40, 0x80, 0xC0);
     /// A menu backdrop: black at half opacity.
@@ -183,14 +218,14 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     fn gpu() -> Option<Gpu> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
         .ok()?;
         let (device, queue) =
-            block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
         Some(Gpu { device, queue })
     }
 
