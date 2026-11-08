@@ -98,6 +98,7 @@ mod tests {
     use egui::{Color32, Rect, pos2};
     use pixels::wgpu;
     use std::future::Future;
+    use std::io::Write;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
 
@@ -463,7 +464,12 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     #[test]
     fn the_game_keeps_its_bytes_and_egui_blends_as_egui_means_to() {
         let Some(gpu) = gpu() else {
-            eprintln!("skipped: no GPU adapter here, so the surface formats were not drawn with");
+            // Straight to stderr: the test harness would swallow `eprintln!` from a pass.
+            let _ = writeln!(
+                std::io::stderr(),
+                "the_game_keeps_its_bytes_and_egui_blends_as_egui_means_to: skipped, no GPU \
+                 adapter here (the format choice is still tested)"
+            );
             return;
         };
         let today = Formats {
