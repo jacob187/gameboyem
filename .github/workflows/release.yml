@@ -312,7 +312,11 @@ jobs:
               # script, if the packager left it in dist/, names every installed file.
               nsi=$(find dist -name installer.nsi | head -n 1)
               if [ -n "$nsi" ]; then
-                check "installer script ($nsi)" "$nsi"
+                # cargo-packager writes installer.nsi as UTF-16 (NSIS Unicode), so grep sees a
+                # NUL after every character. PowerShell detects the encoding from the BOM and
+                # rewrites it as UTF-8 for the check.
+                pwsh -NoProfile -Command "Get-Content -Raw -LiteralPath '$nsi' | Set-Content -Encoding utf8 -LiteralPath '$list.nsi'"
+                check "installer script ($nsi)" "$list.nsi"
               else
                 echo "::warning::installer.nsi not found under dist/: the NSIS layout (games next to gb.exe) is unverified"
               fi
