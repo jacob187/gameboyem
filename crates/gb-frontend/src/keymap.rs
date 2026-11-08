@@ -2,9 +2,10 @@
 //! (`KeyCode`), so Z/X stay put on non-QWERTY layouts.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use emu_common::Button;
-use winit::keyboard::KeyCode;
+use winit::keyboard::{KeyCode, PhysicalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -119,6 +120,29 @@ pub fn map(key: KeyCode) -> Option<Action> {
     BINDINGS.iter().find(|b| b.key == key).map(|b| b.action)
 }
 
+/// Whether a key event goes to the menu in front (egui): every key over a menu but Esc,
+/// which is the app's. egui counts a repeat as a press, so a held Enter or Space would
+/// click the focused button (Save snapshot, a snapshot's Load) again with every repeat;
+/// their repeats are kept from it.
+pub fn menu_takes_key(menu_visible: bool, key: PhysicalKey, repeat: bool) -> bool {
+    let clicks = matches!(
+        key,
+        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space)
+    );
+    menu_visible && key != PhysicalKey::Code(KeyCode::Escape) && !(repeat && clicks)
+}
+
+/// K (save a snapshot) and L (load the latest) sit side by side: a press of K that catches
+/// L as well sends both, a few milliseconds apart, and the load would put the game back to
+/// the snapshot just taken, copying its save aside on the way. An L this soon after a K is
+/// taken to be that slip and ignored. No one means to load within this long of saving.
+pub const SAVE_THEN_LOAD_GAP: Duration = Duration::from_millis(300);
+
+/// Whether an L pressed at `now` is to be ignored, K having last gone down at `saved_at`.
+pub fn load_too_soon_after_save(saved_at: Option<Instant>, now: Instant) -> bool {
+    saved_at.is_some_and(|at| now.saturating_duration_since(at) < SAVE_THEN_LOAD_GAP)
+}
+
 /// One line of the Help screen's controls table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelpRow {
@@ -143,13 +167,18 @@ pub fn help_rows() -> Vec<HelpRow> {
 }
 
 /// Tracks held keys so that two keys bound to one button (Backspace and Right
-/// Shift) only release it when both are up.
+/// Shift) only release it when both are up, and so that a key already down is known.
 #[derive(Default)]
 pub struct InputState {
     held: HashSet<KeyCode>,
 }
 
 impl InputState {
+    /// `key` is down (a press of it now is a repeat).
+    pub fn is_held(&self, key: KeyCode) -> bool {
+        self.held.contains(&key)
+    }
+
     pub fn is_down(&self, button: Button) -> bool {
         self.held
             .iter()
@@ -159,15 +188,16 @@ impl InputState {
     /// Record a key event. Returns `(button, pressed)` only when the aggregate
     /// state of a joypad button actually changed.
     pub fn key(&mut self, key: KeyCode, pressed: bool) -> Option<(Button, bool)> {
-        let Some(Action::Button(button)) = map(key) else {
-            return None;
+        let before = match map(key) {
+            Some(Action::Button(button)) => Some((button, self.is_down(button))),
+            _ => None,
         };
-        let before = self.is_down(button);
         if pressed {
             self.held.insert(key);
         } else {
             self.held.remove(&key);
         }
+        let (button, before) = before?;
         let after = self.is_down(button);
         (before != after).then_some((button, after))
     }
@@ -361,6 +391,54 @@ mod tests {
         assert!(s.release_all().is_empty());
         // A stale release after focus loss must not report a change.
         assert_eq!(s.key(KeyCode::KeyX, false), None);
+    }
+
+    #[test]
+    fn every_key_is_tracked_while_held() {
+        let mut s = InputState::default();
+        assert!(!s.is_held(KeyCode::KeyK));
+        assert_eq!(s.key(KeyCode::KeyK, true), None);
+        assert!(s.is_held(KeyCode::KeyK), "a second press is a repeat");
+        s.key(KeyCode::KeyK, false);
+        assert!(!s.is_held(KeyCode::KeyK));
+        s.key(KeyCode::KeyL, true);
+        s.release_all();
+        assert!(!s.is_held(KeyCode::KeyL), "focus loss lets go of every key");
+    }
+
+    #[test]
+    fn a_held_enter_or_space_does_not_click_a_menu_button_again() {
+        let code = PhysicalKey::Code;
+        for key in [KeyCode::Enter, KeyCode::NumpadEnter, KeyCode::Space] {
+            assert!(
+                menu_takes_key(true, code(key), false),
+                "{key:?} clicks once"
+            );
+            assert!(!menu_takes_key(true, code(key), true), "{key:?} repeat");
+        }
+        // Arrows and Tab still repeat (moving the focus); Esc is never the menu's.
+        assert!(menu_takes_key(true, code(KeyCode::ArrowDown), true));
+        assert!(menu_takes_key(true, code(KeyCode::Tab), true));
+        assert!(!menu_takes_key(true, code(KeyCode::Escape), false));
+        // While playing no key reaches the menu.
+        assert!(!menu_takes_key(false, code(KeyCode::Enter), false));
+        assert!(!menu_takes_key(false, code(KeyCode::KeyK), false));
+    }
+
+    #[test]
+    fn l_right_after_k_is_a_slip_and_later_it_is_a_load() {
+        let t = Instant::now();
+        assert!(!load_too_soon_after_save(None, t), "no save yet");
+        assert!(load_too_soon_after_save(
+            Some(t),
+            t + Duration::from_millis(9)
+        ));
+        assert!(load_too_soon_after_save(Some(t), t));
+        assert!(!load_too_soon_after_save(Some(t), t + SAVE_THEN_LOAD_GAP));
+        assert!(!load_too_soon_after_save(
+            Some(t),
+            t + Duration::from_secs(5)
+        ));
     }
 
     #[test]

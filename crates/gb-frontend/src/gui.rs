@@ -1316,6 +1316,256 @@ mod tests {
         assert_eq!(tags(&ids.iter().cloned().collect()), 2);
     }
 
+    /// egui with no window or GPU, driven frame by frame with input events as the app
+    /// drives it, remembering where each piece of text was drawn.
+    struct Driver {
+        ctx: egui::Context,
+        view: View,
+        thumbs: Thumbs,
+        snap_thumbs: SnapThumbs,
+        time: f64,
+        texts: Vec<(String, Rect)>,
+    }
+
+    impl Driver {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                view: View::default(),
+                thumbs: Thumbs::new(),
+                snap_thumbs: SnapThumbs::new(),
+                time: 0.0,
+                texts: Vec::new(),
+            }
+        }
+
+        fn frame(&mut self, screen: &Screen<'_>, events: Vec<egui::Event>) -> Vec<UiAction> {
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 650.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let mut actions = Vec::new();
+            let Self {
+                ctx,
+                view,
+                thumbs,
+                snap_thumbs,
+                ..
+            } = self;
+            let out = ctx.run_ui(input, |ui| {
+                build(
+                    ui,
+                    &mut *view,
+                    (&mut *thumbs, &mut *snap_thumbs),
+                    screen,
+                    &mut actions,
+                );
+            });
+            self.texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => {
+                        Some((t.galley.text().to_owned(), t.visual_bounding_rect()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            actions
+        }
+
+        fn centre(&self, text: &str) -> egui::Pos2 {
+            self.texts
+                .iter()
+                .find(|(t, _)| t == text)
+                .map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("{text} is not drawn"))
+        }
+
+        /// The widget with the keyboard focus covers `at`.
+        fn focus_at(&self, at: egui::Pos2) -> bool {
+            self.ctx
+                .memory(|m| m.focused())
+                .and_then(|id| self.ctx.read_response(id))
+                .is_some_and(|r| r.rect.contains(at))
+        }
+    }
+
+    fn paused<'a>(
+        snapshots: &'a [SnapshotItem],
+        toasts: &'a Toasts,
+        resumable: &'a HashSet<GameId>,
+    ) -> Screen<'a> {
+        Screen {
+            mode: Mode::Paused,
+            library: None,
+            data_dir: None,
+            game_title: "ONE",
+            can_save: true,
+            can_restart: true,
+            snapshots,
+            resumable,
+            can_return: true,
+            toasts,
+        }
+    }
+
+    fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn key(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// The snapshot `App::perform` lists after a save.
+    fn just_saved() -> [SnapshotItem; 1] {
+        [SnapshotItem {
+            secs: 1_700_000_000,
+            when: "Today 10:25 AM".to_owned(),
+            image: None,
+        }]
+    }
+
+    /// Run `frames` of events in the pause menu, the list of snapshots growing after the
+    /// frame that asked for a save as it does in the app, then ten still frames. Returns
+    /// every action asked for and the driver.
+    fn in_pause_menu(mut driver: Driver, frames: Vec<Vec<egui::Event>>) -> (Vec<UiAction>, Driver) {
+        let (toasts, resumable, saved_list) = (Toasts::default(), HashSet::new(), just_saved());
+        let mut saved = false;
+        let mut all = Vec::new();
+        for events in frames.into_iter().chain((0..10).map(|_| Vec::new())) {
+            let list: &[SnapshotItem] = if saved { &saved_list } else { &[] };
+            let actions = driver.frame(&paused(list, &toasts, &resumable), events);
+            saved |= actions.contains(&UiAction::SaveSnapshot);
+            all.extend(actions);
+        }
+        (all, driver)
+    }
+
+    /// A pause menu with no snapshots yet, laid out and ready for input.
+    fn settled_menu() -> Driver {
+        let (toasts, resumable) = (Toasts::default(), HashSet::new());
+        let mut driver = Driver::new();
+        for _ in 0..3 {
+            assert!(
+                driver
+                    .frame(&paused(&[], &toasts, &resumable), vec![])
+                    .is_empty()
+            );
+        }
+        driver
+    }
+
+    /// A click on Save snapshot asks for a save and nothing more: not when the menu changes
+    /// under the still pointer once the snapshot exists ("Load snapshot..." turns on), with
+    /// the press and release in one frame or two, or on a double click.
+    #[test]
+    fn a_click_on_save_snapshot_saves_and_never_loads() {
+        #[derive(Clone, Copy)]
+        enum Step {
+            Press,
+            Release,
+        }
+        use Step::{Press, Release};
+        for (name, steps, saves) in [
+            ("one frame", vec![vec![Press, Release]], 1),
+            ("two frames", vec![vec![Press], vec![Release]], 1),
+            (
+                "double click",
+                vec![vec![Press], vec![Release], vec![Press], vec![Release]],
+                2,
+            ),
+            (
+                "double click, one frame each",
+                vec![vec![Press, Release], vec![Press, Release]],
+                2,
+            ),
+        ] {
+            let driver = settled_menu();
+            let at = driver.centre("Save snapshot (K)");
+            let frames = std::iter::once(vec![egui::Event::PointerMoved(at)])
+                .chain(steps.into_iter().map(|frame| {
+                    frame
+                        .into_iter()
+                        .map(|s| primary(at, matches!(s, Press)))
+                        .collect()
+                }))
+                .collect();
+            let (actions, driver) = in_pause_menu(driver, frames);
+            assert_eq!(actions, vec![UiAction::SaveSnapshot; saves], "{name}");
+            assert!(
+                !driver.view.snapshots && driver.view.confirm.is_none(),
+                "{name}: nothing opens"
+            );
+        }
+    }
+
+    /// Enter on a focused Save snapshot saves once however long it is held: egui takes every
+    /// key repeat as another press, so the app keeps Enter's repeats from it.
+    #[test]
+    fn enter_held_on_save_snapshot_saves_once() {
+        let focused_on_save = || {
+            let (toasts, resumable) = (Toasts::default(), HashSet::new());
+            let mut driver = settled_menu();
+            let at = driver.centre("Save snapshot (K)");
+            for _ in 0..20 {
+                let tab = vec![
+                    key(egui::Key::Tab, true, false),
+                    key(egui::Key::Tab, false, false),
+                ];
+                driver.frame(&paused(&[], &toasts, &resumable), tab);
+                if driver.focus_at(at) {
+                    return driver;
+                }
+            }
+            panic!("Tab never reached Save snapshot");
+        };
+        // What the window sends while Enter is held: a press, repeats, a release.
+        let held = [
+            (true, false),
+            (true, true),
+            (true, true),
+            (true, true),
+            (false, false),
+        ];
+        let frames = |filtered: bool| -> Vec<Vec<egui::Event>> {
+            held.iter()
+                .filter(|&&(_, repeat)| {
+                    !filtered
+                        || crate::keymap::menu_takes_key(
+                            true,
+                            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter),
+                            repeat,
+                        )
+                })
+                .map(|&(pressed, repeat)| vec![key(egui::Key::Enter, pressed, repeat)])
+                .collect()
+        };
+        let (unfiltered, _) = in_pause_menu(focused_on_save(), frames(false));
+        assert!(
+            unfiltered.len() > 1 && unfiltered.iter().all(|a| *a == UiAction::SaveSnapshot),
+            "egui itself clicks again on a repeat: {unfiltered:?}"
+        );
+        let (actions, driver) = in_pause_menu(focused_on_save(), frames(true));
+        assert_eq!(actions, vec![UiAction::SaveSnapshot]);
+        assert!(!driver.view.snapshots);
+    }
+
     #[test]
     fn esc_closes_the_front_most_pop_up_first() {
         let mut view = View {
