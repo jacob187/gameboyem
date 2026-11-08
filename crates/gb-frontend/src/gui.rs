@@ -191,7 +191,8 @@ impl Gui {
             None,
         );
         state.set_max_texture_side(pixels.device().limits().max_texture_dimension_2d as usize);
-        // The surface format pixels chose; egui-wgpu draws to either kind.
+        // A plain (not sRGB) surface where there is one, so egui blends as it means to; see
+        // `surface`.
         let renderer = egui_wgpu::Renderer::new(
             pixels.device(),
             pixels.surface_texture_format(),

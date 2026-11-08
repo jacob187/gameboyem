@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use emu_common::replay::{Event, Record};
 use emu_common::{Button, Core, FrameRef, Pixels as FramePixels};
 use gb_core::{Framebuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
-use pixels::{Pixels, SurfaceTexture};
+use pixels::Pixels;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -1447,9 +1447,7 @@ impl<C: Core> ApplicationHandler for App<C> {
         };
         // Physical pixels: on HiDPI displays this is `scale * logical size`.
         let size = window.inner_size();
-        let surface =
-            SurfaceTexture::new(size.width.max(1), size.height.max(1), Arc::clone(&window));
-        let mut pixels = match Pixels::new(width, height, surface) {
+        let mut pixels = match crate::surface::create_pixels(width, height, &window) {
             Ok(p) => p,
             Err(e) => return self.fail(event_loop, format!("cannot initialise graphics: {e}")),
         };
