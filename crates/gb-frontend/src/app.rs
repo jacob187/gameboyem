@@ -18,13 +18,13 @@ use winit::window::{Window, WindowId};
 
 use crate::audio::{self, AudioOutput, ToneGen};
 use crate::gui::{Gui, Screen};
-use crate::keymap::{Action, InputState, load_too_soon_after_save, map, menu_takes_key};
+use crate::keymap::{Action, InputState, map, menu_takes_key};
 use crate::library::{GameId, GamePaths, Library, RemoveSaves};
 use crate::pacer::{FramePacer, Steps, audio_seconds, run_due};
 use crate::record::{self, Recorder};
 use crate::save::SaveManager;
 use crate::shutdown::ShutdownFlag;
-use crate::state::{Aside, Resume, StateStore};
+use crate::state::{Aside, Resume, Slot, StateStore};
 use crate::ui::{
     EscapeEffect, Mode, SnapshotItem, ThumbnailTrigger, Toasts, UiAction, escape_effect,
     frame_is_uniform, friendly_time_local, snapshot_items,
@@ -191,9 +191,6 @@ pub struct App<C: Core> {
     /// The running game's snapshots as the pause menu lists them, newest first. Read when
     /// the menu opens and after a change, not on every frame.
     snapshot_list: Vec<SnapshotItem>,
-    /// When K last went down, so an L caught with it is not taken as a load (see
-    /// `keymap::load_too_soon_after_save`).
-    save_key_at: Option<Instant>,
     thumbnail: ThumbnailTrigger,
     toasts: Toasts,
     /// When egui asked to be drawn again by itself (an animation).
@@ -263,7 +260,6 @@ impl<C: Core> App<C> {
             freeze_resume: false,
             resumable: HashSet::new(),
             snapshot_list: Vec::new(),
-            save_key_at: None,
             thumbnail: ThumbnailTrigger::default(),
             toasts: Toasts::default(),
             ui_wake: None,
@@ -617,10 +613,9 @@ impl<C: Core> App<C> {
 
     /// Read the snapshots of the running game for the pause menu.
     fn refresh_snapshots(&mut self) {
-        self.snapshot_list = self
-            .storage
-            .as_ref()
-            .map_or_else(Vec::new, |s| snapshot_items(s.states.snapshots()));
+        self.snapshot_list = self.storage.as_ref().map_or_else(Vec::new, |s| {
+            snapshot_items(s.states.before_load(), s.states.snapshots())
+        });
     }
 
     /// Add a snapshot of the running game: its state, the picture on screen and the time.
@@ -637,9 +632,10 @@ impl<C: Core> App<C> {
             picture.as_deref().ok(),
             crate::library::now_secs(),
         );
+        let before_load = storage.states.before_load();
         match saved {
             Ok(saved) => {
-                self.snapshot_list = snapshot_items(saved.snapshots);
+                self.snapshot_list = snapshot_items(before_load, saved.snapshots);
                 let text = if saved.evicted > 0 {
                     format!(
                         "Snapshot saved. The oldest one was removed; at most {} are kept.",
@@ -668,13 +664,25 @@ impl<C: Core> App<C> {
         }
     }
 
-    /// Load the snapshot taken at `secs`. Returns whether it loaded; if not, the machine is
-    /// as it was and the reason is shown.
+    /// Load the snapshot taken at `secs` (see [`Self::load_slot`]).
     fn load_snapshot(&mut self, secs: u64) -> bool {
+        self.load_slot(Slot::Snapshot(secs))
+    }
+
+    /// Load `slot`, keeping where the game was (with the picture on screen) as "Before last
+    /// load". Returns whether it loaded; if not, the machine is as it was and the reason is
+    /// shown.
+    fn load_slot(&mut self, slot: Slot) -> bool {
+        if self.storage.is_none() {
+            return false;
+        }
+        let picture = record::encode_png(frame_of(self.test.as_ref(), &self.core)).ok();
         let Some(storage) = self.storage.as_mut() else {
             return false;
         };
-        let result = storage.states.load_snapshot(&mut self.core, secs);
+        let result = storage
+            .states
+            .load(&mut self.core, slot, picture.as_deref());
         // A snapshot that was gone or unreadable should not stay in the list.
         self.refresh_snapshots();
         match result {
@@ -695,8 +703,17 @@ impl<C: Core> App<C> {
                 if let Some(backup) = backup {
                     log::info!("the previous save is kept as {}", backup.display());
                 }
-                let when = friendly_time_local(secs);
-                self.announce(log::Level::Info, format!("Loaded the snapshot from {when}"));
+                let text = match slot {
+                    Slot::Snapshot(secs) => format!(
+                        "Loaded snapshot from {} \u{2014} your previous state is kept as \
+                         'Before last load'",
+                        friendly_time_local(secs)
+                    ),
+                    Slot::BeforeLoad => "Back to before the last load \u{2014} the state you \
+                                         left is kept as 'Before last load'"
+                        .to_owned(),
+                };
+                self.announce(log::Level::Info, text);
                 true
             }
             Err(msg) => {
@@ -1004,13 +1021,21 @@ impl<C: Core> App<C> {
         }
     }
 
+    /// A key event from the window. A repeat (the key held down) does nothing: every key
+    /// action happens once per press. Whether it is one is winit's word, not the held-key
+    /// state, so a key whose release never came (macOS swallows it under Cmd) still acts on
+    /// its next press.
+    fn on_key_event(&mut self, key: winit::keyboard::KeyCode, down: bool, repeat: bool) -> Effect {
+        if repeat {
+            return Effect::None;
+        }
+        self.on_key(key, down)
+    }
+
     /// A key went down or up (not a repeat). Keys are always tracked, so one still held
     /// when a menu closes is pressed in the game; but only while the game is running do
     /// they reach it. Esc belongs to the app in every mode.
     fn on_key(&mut self, key: winit::keyboard::KeyCode, down: bool) -> Effect {
-        // A press of a key that is already down is a repeat: the window drops those, and a
-        // snapshot key held down still saves or loads only once.
-        let again = down && self.input.is_held(key);
         self.on_key_input(key, down);
         match map(key) {
             Some(Action::Menu) if down => return self.escape(),
@@ -1018,18 +1043,9 @@ impl<C: Core> App<C> {
             // A Tab released over a menu must still end fast-forward.
             Some(Action::FastForward) => self.set_fast_forward(down && self.mode.game_input()),
             // Snapshots need the core, which `--test-pattern` bypasses.
-            _ if !down || again || self.test.is_some() || !self.mode.game_input() => {}
-            Some(Action::SaveSnapshot) => {
-                self.save_key_at = Some(Instant::now());
-                self.save_snapshot();
-            }
-            Some(Action::LoadLatestSnapshot) => {
-                if load_too_soon_after_save(self.save_key_at, Instant::now()) {
-                    log::info!("L came with K (pressed together?); the load is skipped");
-                } else {
-                    self.load_latest_snapshot();
-                }
-            }
+            _ if !down || self.test.is_some() || !self.mode.game_input() => {}
+            Some(Action::SaveSnapshot) => self.save_snapshot(),
+            Some(Action::LoadLatestSnapshot) => self.load_latest_snapshot(),
             _ => {}
         }
         Effect::None
@@ -1314,8 +1330,16 @@ impl<C: Core> App<C> {
                     self.resume();
                 }
             }
+            UiAction::LoadBeforeLoad if self.test.is_none() => {
+                if self.load_slot(Slot::BeforeLoad) {
+                    self.resume();
+                }
+            }
             UiAction::DeleteSnapshot(secs) if self.test.is_none() => self.delete_snapshot(secs),
-            UiAction::SaveSnapshot | UiAction::LoadSnapshot(_) | UiAction::DeleteSnapshot(_) => {}
+            UiAction::SaveSnapshot
+            | UiAction::LoadSnapshot(_)
+            | UiAction::LoadBeforeLoad
+            | UiAction::DeleteSnapshot(_) => {}
             UiAction::Restart if self.test.is_none() => self.restart_game(),
             UiAction::Restart => {}
             UiAction::Screenshot => self.screenshot(),
@@ -1415,9 +1439,16 @@ impl<C: Core> App<C> {
     fn forward_to_egui(&mut self, event: &WindowEvent) -> bool {
         let wanted = match event {
             // Esc is the app's; every other key reaches egui only over a menu, so
-            // egui never sees a game key (nor a held Enter or Space repeating a click).
+            // egui never sees a game key (nor a held Enter or Space repeating the click
+            // of a focused button).
             WindowEvent::KeyboardInput { event, .. } => {
-                menu_takes_key(self.mode.menu_visible(), event.physical_key, event.repeat)
+                let on_button = self.gui.as_ref().is_some_and(Gui::focus_on_button);
+                menu_takes_key(
+                    self.mode.menu_visible(),
+                    event.physical_key,
+                    event.repeat,
+                    on_button,
+                )
             }
             WindowEvent::ModifiersChanged(_) => self.mode.menu_visible(),
             WindowEvent::DroppedFile(_)
@@ -1514,9 +1545,10 @@ impl<C: Core> ApplicationHandler for App<C> {
             }
             WindowEvent::Occluded(false) => self.reset_clock(),
             WindowEvent::DroppedFile(path) => self.open_dropped(path),
-            WindowEvent::KeyboardInput { event, .. } if !event.repeat => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key
-                    && self.on_key(code, event.state == ElementState::Pressed) == Effect::Exit
+                    && self.on_key_event(code, event.state == ElementState::Pressed, event.repeat)
+                        == Effect::Exit
                 {
                     event_loop.exit();
                 }
@@ -2171,7 +2203,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .0
-                .starts_with("Loaded the snapshot from")
+                .starts_with("Loaded snapshot from")
         );
         assert_eq!(app.core.save_state(), snap);
     }
@@ -2517,79 +2549,91 @@ mod tests {
         for _ in 0..5 {
             app.step_once();
         }
-        // L comes a moment later, not with K.
-        app.save_key_at = app
-            .save_key_at
-            .and_then(|t| t.checked_sub(crate::keymap::SAVE_THEN_LOAD_GAP));
         app.on_key(KeyCode::KeyL, true);
         assert_eq!(app.core.save_state(), snap);
-        assert!(
-            app.toasts
-                .iter()
-                .any(|t| t.text.starts_with("Loaded the snapshot from"))
-        );
+        assert!(app.toasts.iter().any(|t| {
+            t.text.starts_with("Loaded snapshot from")
+                && t.text
+                    .ends_with("your previous state is kept as 'Before last load'")
+        }));
     }
 
-    /// A press of K that catches L too (K then L 9 ms apart) saves and does not load.
+    /// A press of K that catches L too (9 ms apart) saves and loads, and the load can be
+    /// undone: where the game was is in the list as "Before last load".
     #[test]
-    fn k_and_l_pressed_together_save_without_loading() {
+    fn a_load_can_be_undone_from_the_list() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("g.sav"), vec![0u8; 0x2000]).unwrap();
         let mut app = headless_app(dir.path());
         app.core.step_frame();
         app.on_key(KeyCode::KeyK, true);
+        for _ in 0..3 {
+            app.step_once();
+        }
+        let left = app.core.save_state();
         app.on_key(KeyCode::KeyL, true);
-        assert_eq!(snapshot_files(dir.path()).len(), 1);
-        let loaded = |app: &App<GameBoy>| {
+        assert_ne!(app.core.save_state(), left);
+        let paths = GamePaths::beside(&dir.path().join("g.gb"));
+        assert_eq!(fs::read(paths.before_load_state()).unwrap(), left);
+        assert!(
+            paths.before_load_image().is_file(),
+            "with the picture on screen"
+        );
+        assert_eq!(snapshot_files(dir.path()).len(), 1, "not one more snapshot");
+
+        app.on_key(KeyCode::Escape, true);
+        assert!(app.snapshot_list[0].before_load, "listed first");
+        assert_eq!(app.snapshot_list.len(), 2);
+        app.perform(UiAction::LoadBeforeLoad);
+        assert_eq!(app.core.save_state(), left, "back where it was");
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(
             app.toasts
                 .iter()
-                .filter(|t| t.text.starts_with("Loaded the snapshot"))
-                .count()
-        };
-        assert_eq!(loaded(&app), 0, "no load follows the save");
-        assert!(
-            !dir.path().join("g.sav.bak").exists(),
-            "and the save is not copied aside"
+                .any(|t| t.text.starts_with("Back to before the last load"))
         );
-        // Let go of both; a later L loads.
-        app.on_key(KeyCode::KeyK, false);
-        app.on_key(KeyCode::KeyL, false);
-        app.save_key_at = app
-            .save_key_at
-            .and_then(|t| t.checked_sub(crate::keymap::SAVE_THEN_LOAD_GAP));
-        app.on_key(KeyCode::KeyL, true);
-        assert_eq!(loaded(&app), 1);
     }
 
-    /// Holding K or L down (a press with no release between) acts once.
+    /// Holding K or L down (the window repeating the press) acts once; and a key whose
+    /// release never came (lost under Cmd on macOS) still acts on its next press.
     #[test]
-    fn a_held_snapshot_key_acts_once() {
+    fn a_held_snapshot_key_acts_once_and_a_lost_release_does_not_disable_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = headless_app(dir.path());
         app.core.step_frame();
+        app.on_key_event(KeyCode::KeyK, true, false);
         for _ in 0..3 {
-            app.on_key(KeyCode::KeyK, true);
+            app.on_key_event(KeyCode::KeyK, true, true);
         }
         assert_eq!(snapshot_files(dir.path()).len(), 1, "one save while held");
-        app.on_key(KeyCode::KeyK, false);
-        app.on_key(KeyCode::KeyK, true);
+        // No release: the next press is a press all the same.
+        app.on_key_event(KeyCode::KeyK, true, false);
         assert_eq!(
             snapshot_files(dir.path()).len(),
             2,
             "pressed again: saves again"
         );
-        app.on_key(KeyCode::KeyK, false);
 
-        app.save_key_at = None;
+        let saved = app.core.save_state();
         for _ in 0..3 {
-            app.on_key(KeyCode::KeyL, true);
+            app.step_once();
         }
-        let loads = app
-            .toasts
-            .iter()
-            .filter(|t| t.text.starts_with("Loaded the snapshot"))
-            .count();
-        assert_eq!(loads, 1, "one load while held");
+        app.on_key_event(KeyCode::KeyL, true, false);
+        assert_eq!(app.core.save_state(), saved, "L loads");
+        for _ in 0..3 {
+            app.step_once();
+        }
+        let moved = app.core.save_state();
+        assert_ne!(moved, saved);
+        for _ in 0..3 {
+            app.on_key_event(KeyCode::KeyL, true, true);
+        }
+        assert_eq!(app.core.save_state(), moved, "its repeats load nothing");
+        app.on_key_event(KeyCode::KeyL, true, false);
+        assert_eq!(
+            app.core.save_state(),
+            saved,
+            "a lost release does not stop the next L"
+        );
     }
 
     #[test]
@@ -2610,7 +2654,8 @@ mod tests {
         app.load_latest_snapshot();
         assert_eq!(app.core.save_state(), latest);
         // The toast names the time, as the list does.
-        let said = crate::ui::friendly_time_local(app.snapshot_list[0].secs);
+        let latest = app.snapshot_list.iter().find(|s| !s.before_load).unwrap();
+        let said = crate::ui::friendly_time_local(latest.secs);
         assert!(app.toasts.iter().any(|t| t.text.contains(&said)), "{said}");
     }
 
@@ -2623,7 +2668,10 @@ mod tests {
         app.on_key(KeyCode::KeyL, true);
         assert_eq!(app.core.save_state(), before);
         assert!(app.toasts.iter().any(|t| t.text == "No snapshots yet"));
-        assert!(!dir.path().join("g.states").exists());
+        assert!(
+            !dir.path().join("g.states").exists(),
+            "nothing written, no before-load slot either"
+        );
     }
 
     #[test]
@@ -2766,8 +2814,14 @@ mod tests {
         assert_eq!(
             said.text,
             format!(
-                "Loaded the snapshot from {}",
-                crate::ui::friendly_time_local(app.snapshot_list[0].secs)
+                "Loaded snapshot from {} \u{2014} your previous state is kept as 'Before last load'",
+                crate::ui::friendly_time_local(
+                    app.snapshot_list
+                        .iter()
+                        .find(|s| !s.before_load)
+                        .unwrap()
+                        .secs
+                )
             )
         );
         assert!(

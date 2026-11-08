@@ -8,6 +8,9 @@
 //!   fine in itself). The three newest of each kind are kept.
 //! - `snap-<unix-secs>.state` and `snap-<unix-secs>.png`: a snapshot the player took, and
 //!   the picture on screen when they did. The time is the name; there are no numbers.
+//! - `before-load.state` and `before-load.png`: where the game was just before the last
+//!   snapshot load, so a load can be undone. One slot, replaced by every load, outside the
+//!   [`MAX_SNAPSHOTS`] cap.
 //!
 //! Loading a state also rewinds battery RAM, which the battery saver then writes to the
 //! game's `.sav`, so a load that could cost progress backs that file up. The backup is made
@@ -23,7 +26,7 @@ use std::time::UNIX_EPOCH;
 use emu_common::{Core, StateError, System};
 use gb_core::Model;
 
-use crate::library::{GamePaths, RESUME_FILE, now_secs};
+use crate::library::{BEFORE_LOAD_FILE, BEFORE_LOAD_IMAGE, GamePaths, RESUME_FILE, now_secs};
 use crate::save::{append_ext, backup_without_overwrite, read_capped, write_atomic};
 
 /// Snapshots kept per game; one more makes the oldest go.
@@ -145,6 +148,8 @@ fn aside_secs(name: &str, aside: Aside) -> Option<u64> {
 pub fn is_state_file_name(name: &str) -> bool {
     let name = name.strip_suffix(".tmp").unwrap_or(name);
     name == RESUME_FILE
+        || name == BEFORE_LOAD_FILE
+        || name == BEFORE_LOAD_IMAGE
         || Aside::ALL.iter().any(|&a| aside_secs(name, a).is_some())
         || snapshot_secs(name, "state").is_some()
         || snapshot_secs(name, "png").is_some()
@@ -157,6 +162,15 @@ pub struct Snapshot {
     pub secs: u64,
     /// The picture, if the file is there.
     pub image: Option<PathBuf>,
+}
+
+/// A state the player can load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// The snapshot taken at this time (Unix seconds).
+    Snapshot(u64),
+    /// Where the game was before the last load.
+    BeforeLoad,
 }
 
 /// What [`StateStore::save_snapshot`] did.
@@ -354,23 +368,54 @@ impl StateStore {
         })
     }
 
-    /// Load the snapshot taken at `secs` into `core`. On error `core` is unchanged. The
-    /// first load of a session copies the `.sav` aside, once the state is known to load; the
-    /// path of the copy is returned.
+    /// Load the snapshot taken at `secs` into `core`; see [`Self::load`].
+    #[cfg(test)]
     pub fn load_snapshot(
         &mut self,
         core: &mut dyn Core,
         secs: u64,
     ) -> Result<Option<PathBuf>, String> {
+        self.load(core, Slot::Snapshot(secs), None)
+    }
+
+    /// Where the game was before the last load (its time is when the load happened), if a
+    /// load has kept it.
+    pub fn before_load(&self) -> Option<Snapshot> {
+        let secs = modified(&self.paths.before_load_state())?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let image = self.paths.before_load_image();
+        Some(Snapshot {
+            secs,
+            image: image.is_file().then_some(image),
+        })
+    }
+
+    /// Load `slot` into `core`. On error `core` is unchanged. Where the game was is kept in
+    /// the "before last load" slot, with `picture` (the screen) if given, replacing the
+    /// one there; loading that slot itself swaps the two. The first load of a session also
+    /// copies the `.sav` aside, once the state is known to load; the path of the copy is
+    /// returned.
+    pub fn load(
+        &mut self,
+        core: &mut dyn Core,
+        slot: Slot,
+        picture: Option<&[u8]>,
+    ) -> Result<Option<PathBuf>, String> {
         if !core.supports_save_state() {
             return Err(NO_STATES.to_owned());
         }
-        let path = self.paths.snapshot_state(secs);
+        let path = match slot {
+            Slot::Snapshot(secs) => self.paths.snapshot_state(secs),
+            Slot::BeforeLoad => self.paths.before_load_state(),
+        };
         let data = match read_capped(&path, max_state_bytes(core.system()), "snapshot") {
             Ok(Some(d)) => d,
             Ok(None) => return Err("that snapshot is gone".to_owned()),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
+        let current = core.save_state();
         let backup = self
             .apply(core, &data, true)
             .map_err(|refused| match refused {
@@ -381,7 +426,39 @@ impl StateStore {
                 Refused::Backup(why) => why,
             })?;
         self.sav_backed_up = true;
+        // Kept only now, so a state that does not load leaves the slot as it was. Without it
+        // the load could not be undone, so it is undone instead.
+        if let Err(why) = self.keep_before_load(&current, picture) {
+            if let Err(undo) = core.load_state(&current) {
+                log::error!("cannot put the game back after a refused load: {undo}");
+            }
+            return Err(format!(
+                "not loading: cannot keep the current state first: {why}"
+            ));
+        }
         Ok(backup)
+    }
+
+    /// Write `state` (and `picture`) to the "before last load" slot.
+    fn keep_before_load(&self, state: &[u8], picture: Option<&[u8]>) -> Result<(), String> {
+        self.write(&self.paths.before_load_state(), state)?;
+        let image = self.paths.before_load_image();
+        let written = match picture {
+            Some(png) => write_atomic(&image, png),
+            None => Err(std::io::ErrorKind::NotFound.into()),
+        };
+        if let Err(e) = written {
+            if picture.is_some() {
+                log::warn!("cannot write {}: {e}", image.display());
+            }
+            // No picture rather than the one of an older state.
+            match fs::remove_file(&image) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("cannot delete {}: {e}", image.display()),
+            }
+        }
+        Ok(())
     }
 
     /// Load `data` into `core`. If `backup_wanted`, the game's `.sav` is copied aside first
@@ -746,6 +823,9 @@ mod tests {
             "snap-5.state",
             "snap-5.png",
             "snap-5.state.tmp",
+            "before-load.state",
+            "before-load.png",
+            "before-load.state.tmp",
         ] {
             assert!(is_state_file_name(ours), "{ours}");
         }
@@ -859,6 +939,84 @@ mod tests {
         assert_eq!(list.last().unwrap().secs, 20, "the snapshot at 10 went");
         assert!(!store.paths.snapshot_state(10).exists());
         assert!(!store.paths.snapshot_image(10).exists(), "its picture too");
+    }
+
+    #[test]
+    fn a_load_keeps_where_the_game_was_in_one_slot_that_the_next_load_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let mut store = store_in(dir.path());
+        assert_eq!(store.before_load(), None);
+        gb.step_frame();
+        let snap = gb.save_state();
+        store.save_snapshot(&gb, None, 1).unwrap();
+        let state = |store: &StateStore| fs::read(store.paths.before_load_state()).unwrap();
+
+        gb.step_frame();
+        let first = gb.save_state();
+        store
+            .load(&mut gb, Slot::Snapshot(1), Some(b"pic"))
+            .unwrap();
+        assert_eq!(gb.save_state(), snap);
+        assert_eq!(state(&store), first, "where the game was");
+        let kept = store.before_load().unwrap();
+        assert_eq!(kept.image, Some(store.paths.before_load_image()));
+        assert!(store.snapshots().iter().all(|s| s.image != kept.image));
+        assert_eq!(store.snapshots().len(), 1, "not a snapshot");
+
+        gb.step_frame();
+        gb.step_frame();
+        let second = gb.save_state();
+        store.load(&mut gb, Slot::Snapshot(1), None).unwrap();
+        assert_eq!(state(&store), second, "the next load replaces it");
+        assert_eq!(
+            store.before_load().unwrap().image,
+            None,
+            "and no older picture stays with it"
+        );
+        let slots = fs::read_dir(store.paths.states_dir())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("before-load")
+            })
+            .count();
+        assert_eq!(slots, 1, "one slot");
+
+        // Loading the slot undoes the load, and keeps what it left in its place.
+        store.load(&mut gb, Slot::BeforeLoad, None).unwrap();
+        assert_eq!(gb.save_state(), second);
+        assert_eq!(state(&store), snap);
+    }
+
+    #[test]
+    fn a_load_that_fails_leaves_the_before_load_slot_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let mut store = store_in(dir.path());
+        assert!(store.load(&mut gb, Slot::BeforeLoad, None).is_err());
+        assert!(store.load_snapshot(&mut gb, 7).is_err());
+        assert_eq!(store.before_load(), None, "nothing to undo, nothing kept");
+        assert!(!store.paths.states_dir().exists());
+    }
+
+    #[test]
+    fn the_before_load_slot_is_not_counted_or_removed_by_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gb = GameBoy::new(battery_rom(0x02)).unwrap();
+        let store = &mut store_in(dir.path());
+        store.save_snapshot(&gb, None, 1).unwrap();
+        store.load_snapshot(&mut gb, 1).unwrap();
+        let kept = fs::read(store.paths.before_load_state()).unwrap();
+        for n in 2..=MAX_SNAPSHOTS as u64 + 5 {
+            store.save_snapshot(&gb, None, n).unwrap();
+        }
+        assert_eq!(store.snapshots().len(), MAX_SNAPSHOTS);
+        assert_eq!(fs::read(store.paths.before_load_state()).unwrap(), kept);
+        assert!(store.before_load().is_some());
     }
 
     #[test]
