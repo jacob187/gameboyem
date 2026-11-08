@@ -158,7 +158,9 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/share/gameboyem")),
         )
         .unwrap();
-        assert_eq!(d.root(), Path::new("/data/gb"));
+        // `resolve` makes the override absolute, which on Windows adds the current drive
+        // (`/data/gb` becomes `C:\data\gb`), so compare against the same conversion.
+        assert_eq!(d.root(), std::path::absolute("/data/gb").unwrap());
     }
 
     #[test]
